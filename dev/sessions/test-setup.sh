@@ -42,6 +42,7 @@ for shell in bash zsh ""; do
   home="$(mktemp -d)"
   mkdir -p "$home/.claude"
   if [ -n "$shell" ]; then first=$(run_setup "$home" "--shell=$shell"); else first=$(run_setup "$home"); fi
+  # shellcheck disable=SC2001 # a prefix on every line of a multi-line output
   echo "$first" | sed "s/^/[$label] /"
   detected=$(echo "$first" | sed -n 's/^  shell: \([a-z]*\) → \(.*\)$/\1 \2/p')
   rc="${detected#* }"
@@ -67,6 +68,7 @@ printf '{"statusLine": {"type": "command", "command": "%s/.claude/mods/sessions-
 printf "export FOO=1\n\n# >>> sessions plugin >>>\n# Open this folder's Claude sessions in the agents view, without starting a new one\nalias ccc='bash ~/.claude/mods/sessions-bin/visor.sh agents'\n# <<< sessions plugin <<<\n" > "$home/.bashrc"
 printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > "$home/.bash_profile"
 first=$(run_setup "$home" --shell=bash)
+# shellcheck disable=SC2001 # a prefix on every line of a multi-line output
 echo "$first" | sed "s/^/[$label] /"
 check "$label" "$home" "$home/.bashrc"
 grep -q "sessions-bin" "$home/.bashrc" && fail "$label" "the old ccc is still there"

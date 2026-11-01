@@ -50,6 +50,19 @@ jobs:
           done
           git ls-files '*.py' | while read -r file; do echo "py_compile $file"; python3 -m py_compile "$file"; done
 
+      - name: Lint every shell script with shellcheck
+        run: |
+          # The same scripts as the syntax check. Preinstalled on the Ubuntu runners; installed with Homebrew on macOS
+          command -v shellcheck >/dev/null || brew install shellcheck
+          shellcheck --version
+          status=0
+          for file in $(git ls-files); do
+            if [ "${file##*.}" = sh ] || head -n 1 "$file" 2>/dev/null | grep -Eq '^#!.*(bash|/sh)( |$)'; then
+              echo "shellcheck $file"; shellcheck "$file" || status=1
+            fi
+          done
+          exit "$status"
+
       - name: Run each plugin's own checks (dev/<plugin>/ci.sh)
         run: |
           for plugin in plugins/*/; do

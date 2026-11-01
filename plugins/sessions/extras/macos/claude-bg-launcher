@@ -39,6 +39,7 @@ version_of() {
 # 0 if version $1 is newer than $2 (dot-separated numbers)
 newer() {
   local IFS=. i
+  # shellcheck disable=SC2206 # splitting on IFS=. is the point: "2.1.316" becomes (2 1 316)
   local -a a=($1) b=($2)
   for i in 0 1 2 3; do
     if [ "${a[i]:-0}" -gt "${b[i]:-0}" ] 2>/dev/null; then return 0; fi

@@ -77,7 +77,7 @@ order() {
   printf 'format=1\nat=%s\nroot=%s\n' "${ORDER_AT:-$(now_ms)}" "$proj" > "$file"
   for id in "$@"; do printf 'row=%s-0000-0000-0000-000000000000\tgreen\t%s\tx\n' "$id" "$id" >> "$file"; done
 }
-reset() { rm -rf "$data" "$fix"/*; mkdir -p "$fix"; : > "$fix/calls.log"; : > "$fix/ps.txt"; }
+reset() { rm -rf "$data" "${fix:?}"/*; mkdir -p "$fix"; : > "$fix/calls.log"; : > "$fix/ps.txt"; }
 pick() { (cd "${PICK_IN:-$proj}" && python3 "$hooks/launcher.py" pick --tty "$SESSIONS_TTY" "$@"); }
 expect() { [ "$1" = "$2" ] || fail "$3" "expected $2, got $1"; }
 field() { python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get(sys.argv[2]))' "$1" "$2"; }
@@ -150,6 +150,7 @@ printf 'TEST one\n\n' | (cd "$proj" && /bin/bash "$hooks/visor.sh" start) > "$wo
 grep -q "^--bg -n TEST one" "$fix/calls.log" || fail "create" "no claude --bg -n: $(cat "$fix/calls.log")"
 expect "$(grep -c '^respawn ffff0001' "$fix/calls.log")" 1 "exactly one automatic restart"
 grep -q "^attach ffff0001" "$fix/calls.log" || fail "create" "the new session wasn't opened"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
 grep -q "Starting “TEST one”" "$work/out.txt" || fail "create" "no progress line: $(cat "$work/out.txt")"
 [ -f "$data/inbox/ffff0001-0000-0000-0000-000000000000" ] || fail "create" "no focus request for the new session"
 grep -q '^action=focus' "$data/inbox/ffff0001-0000-0000-0000-000000000000" || fail "create" "the request isn't a focus one"
@@ -171,6 +172,7 @@ grep -q "^attach" "$fix/calls.log" && fail "empty name" "something was opened"
 grep -q "alpha" "$work/out.txt" || fail "empty name" "the stopped session isn't listed"
 printf '1\n' | (cd "$proj" && /bin/bash "$hooks/visor.sh" start) > /dev/null 2>&1 || true
 grep -q "^attach aaaaaaaa" "$fix/calls.log" || fail "number" "the stopped session wasn't reopened"
+# shellcheck disable=SC2016 # Claude's own message, backticks included
 echo 'Workspace not trusted. Run `claude` in /x once and accept the trust prompt, then retry.' > "$fix/bg-error"
 printf 'TEST two\n' | (cd "$proj" && /bin/bash "$hooks/visor.sh" start) > "$work/out.txt" 2>&1 || true
 grep -q "doesn't trust this folder" "$work/out.txt" || fail "trust" "no trust message: $(cat "$work/out.txt")"

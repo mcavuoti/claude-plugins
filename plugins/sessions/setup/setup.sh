@@ -123,6 +123,7 @@ setup_keys() {
   say "Keyboard"
   local result
   [ -f "$keybindings" ] && [ "$dry" -eq 0 ] && cp -p "$keybindings" "$keybindings.bak-antes-keys-$stamp"
+  # shellcheck disable=SC2016 # a Python program: "$schema" is a JSON key, not a shell variable
   result=$(edit_json "$keybindings" '
 data = {"$schema": data.get("$schema", "https://www.schemastore.org/claude-code-keybindings.json"),
         "$docs": data.get("$docs", "https://code.claude.com/docs/en/keybindings"), **data}
@@ -179,6 +180,7 @@ setup_alias() {
   say "Shell shortcut (ccc)"
   local shell rc line comment="# ccc: open this folder's top Claude session here, with its panel (ccc <name>, ccc --new, ccc --agents)"
   local command="$bin/ccc"
+  # shellcheck disable=SC2088 # the ~ is written as is into the startup file, where the alias expands it
   [ "$command" = "$HOME/.claude/mods/sessions-data/bin/ccc" ] && command="~/.claude/mods/sessions-data/bin/ccc"
   shell="$(detect_shell)"
   case "$shell" in

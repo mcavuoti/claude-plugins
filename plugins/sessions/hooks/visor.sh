@@ -82,7 +82,8 @@ main() {
     # Outside macOS, the window title is the session's name: the panel brings a window forward by its title (wmctrl,
     # xdotool). On macOS Terminal.app keeps the title the panel gave the window when it opened it
     if [ -n "$title" ] && [ "$(uname -s)" != Darwin ]; then printf '\033]0;%s\007' "$title"; fi
-    [ -n "$folder" ] && cd "$folder" 2>/dev/null
+    # The agent view opens in its folder; if that folder is gone, in the current one
+    if [ -n "$folder" ]; then cd "$folder" 2>/dev/null || true; fi
     began=$(date +%s)
     code=0
     case "$cmd" in
