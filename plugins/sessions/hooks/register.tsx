@@ -8,6 +8,7 @@ import {
   type Action,
   actionFromAnswer,
   reconcilePins,
+  adoptAutoPins,
   paneWidth,
   buildNotice,
   sparkline,
@@ -508,11 +509,11 @@ async function pinRemoteSessions($: any) {
     await withLock($, file, async () => {
       const pins = await pinsFromFile($)
       if (!pins) return
+      // With no record of what the mod pinned (a new store, or a lost one), it's rebuilt from what's there: the pinned
+      // sessions with Remote Control on count as the mod's (adoptAutoPins)
       const previous = await storeGet($, 'autoPins')
-      const auto: AutoPins = {
-        ids: Array.isArray(previous?.ids) ? previous.ids : [],
-        released: Array.isArray(previous?.released) ? previous.released : [],
-      }
+      const recorded = !!previous && Array.isArray(previous.ids) && Array.isArray(previous.released)
+      const auto: AutoPins = recorded ? { ids: previous.ids, released: previous.released } : adoptAutoPins(pins, remote)
       const r = reconcilePins(pins, remote, auto)
       if (r.toPin.length || r.toUnpin.length) {
         // The way Claude writes it: the list indented by 2, in a separate file that then replaces the original
@@ -525,7 +526,7 @@ async function pinRemoteSessions($: any) {
         // When unpinning, Claude also deletes the position it had among the pinned ones
         for (const id of r.toUnpin) await runSafe($, ['rm', '-f', `${jobsDir}/${id}/order`])
       }
-      if (JSON.stringify(r.auto) !== JSON.stringify(auto)) await storeSet($, 'autoPins', r.auto)
+      if (!recorded || JSON.stringify(r.auto) !== JSON.stringify(auto)) await storeSet($, 'autoPins', r.auto)
     })
   } finally {
     pinning = false

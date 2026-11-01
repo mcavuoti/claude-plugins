@@ -47,6 +47,7 @@ import {
   rootFrom,
   autoName,
   debugLogName,
+  adoptAutoPins,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -502,4 +503,15 @@ test('debug log names: the session name with anything unusual replaced', () => {
   expect(debugLogName('TEST one')).toBe('TEST_one.log')
   expect(debugLogName('../x/y')).toBe('x_y.log')
   expect(debugLogName('')).toBe('session.log')
+})
+
+test('pinned: with no record of what the mod pinned, the pinned sessions with Remote Control on become the mod\'s', () => {
+  const auto = adoptAutoPins(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'], { aaaaaaaa: true, bbbbbbbb: false, cccccccc: null, dddddddd: true })
+  // Only pinned ones (dddddddd isn't pinned), and only with Remote Control on for sure
+  expect(auto).toEqual({ ids: ['aaaaaaaa'], released: [] })
+  // From then on the usual rules: Remote Control off unpins the adopted one, and leaves the others
+  const r = reconcilePins(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'], { aaaaaaaa: false, bbbbbbbb: false, cccccccc: null }, auto)
+  expect(r.toUnpin).toEqual(['aaaaaaaa'])
+  expect(r.pins).toEqual(['bbbbbbbb', 'cccccccc'])
+  expect(adoptAutoPins([], { aaaaaaaa: true })).toEqual({ ids: [], released: [] })
 })

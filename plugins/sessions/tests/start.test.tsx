@@ -324,3 +324,22 @@ test('debug logs on: the launcher is told, and a session the panel creates write
   const created = w.runs.find(a => a[1] === '--bg')
   expect(created).toEqual(['/bin/claude', '--bg', '-n', 'TEST one', '--debug-file', `${DATA}/debug/TEST_one.log`])
 })
+
+test('a missing auto-pin record is rebuilt once, under the pins lock, from the pinned sessions with Remote Control', async ($, on) => {
+  const list = [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
+    { id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'two' },
+  ]
+  const w = world(on, { list })
+  w.files.set('/Users/x/jobs/pins.json', '[\n  "aaaaaaaa",\n  "bbbbbbbb"\n]')
+  w.files.set('/Users/x/jobs/aaaaaaaa/state.json', '{"bridgeSessionId": "x"}')
+  w.files.set('/Users/x/jobs/bbbbbbbb/state.json', '{}')
+  await startSession($, w)
+  await w.clock.advance(100)
+  expect(w.store.get('autoPins')).toEqual({ ids: ['aaaaaaaa'], released: [] })
+  // The lock was taken and given back
+  expect(w.runs.some(a => a[0] === 'mkdir' && a[1] === '/Users/x/jobs/pins.json.lock')).toBe(true)
+  expect(w.runs.some(a => a[0] === 'rmdir' && a[1] === '/Users/x/jobs/pins.json.lock')).toBe(true)
+  // Nothing was pinned or unpinned
+  expect(w.files.get('/Users/x/jobs/pins.json')).toBe('[\n  "aaaaaaaa",\n  "bbbbbbbb"\n]')
+})
