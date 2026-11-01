@@ -55,6 +55,7 @@ import {
   windowTargetText,
   autoName,
   debugLogName,
+  reloadDecision,
   FORMAT,
   NOTICE_MARKER,
 } from './state'
@@ -128,6 +129,8 @@ let lastBeat = 0
 // the mod logs its start steps to the debug log. The mod mirrors it to <data>/config for the launcher, which can't read
 // plugin options
 let debugLogs = false
+// The installed version this session's mod already tried to update itself to (once per version)
+let reloadTriedFor = ''
 const startProblems: string[] = []
 
 // A command that can't be run (it doesn't exist on this computer: Linux has no osascript or ioreg, and lsof isn't
@@ -172,7 +175,8 @@ function debugLine($: any, text: string) {
 // restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (cached session list),
 // installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
 // autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
-// panelClosed (you closed the panel: sessions start without it until you open it again).
+// panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
+// session's mod updated itself with /reload-plugins: from, to, at).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
@@ -651,9 +655,12 @@ async function refresh($: any) {
     })
   }
   installedVersion = newest
+  // ↑ also when a session runs an older version of this mod than the installed one (its heartbeat says which)
+  const modInstalled = plugin?.version ?? ''
   for (const f of fresh) {
     const v = versions[f.sessionId]
-    f.outdated = !!v && compareVersions(v, installedVersion) < 0
+    const mod = f.current ? modVersion : (beats[f.sessionId]?.version ?? '')
+    f.outdated = (!!v && compareVersions(v, installedVersion) < 0) || (!!mod && !!modInstalled && compareVersions(mod, modInstalled) < 0)
   }
   const sorted = sortRows(fresh)
   await writeOrder($, sorted, now)
@@ -1422,6 +1429,59 @@ async function rebind($: any) {
   bg(refresh($))
 }
 
+// A newer version of this mod is installed: update this session's in place with /reload-plugins, when that cuts
+// nothing (reloadDecision). The new copy says so when it starts ("Panel updated"). /reload-plugins reloads every
+// plugin of the session; a Claude update, settings and MCP servers still need u (a restart). If the update doesn't
+// take, the ↑ mark stays and u is the way
+async function updateInPlace($: any) {
+  if (!active || !myId) return
+  const plugin = await installedPlugin($)
+  const own = lastList.find(s => s.sessionId === myId)
+  const quick = reloadDecision({
+    running: modVersion,
+    runningDir: PLUGIN_DIR.replace(/\/hooks\/\.\.$/, ''),
+    installed: plugin,
+    triedFor: reloadTriedFor,
+    status: 'idle',
+    tasks: 0,
+    paneFocused: false,
+    fieldOpen: false,
+  })
+  if (quick !== 'reload' || !plugin) return
+  const panes = await $.ui.panes()
+  const tasks = own?.id ? ((await backgroundTasks($, own.id))?.count ?? null) : 0
+  const decision = reloadDecision({
+    running: modVersion,
+    runningDir: PLUGIN_DIR.replace(/\/hooks\/\.\.$/, ''),
+    installed: plugin,
+    triedFor: reloadTriedFor,
+    status: await statusNow($, myId),
+    tasks,
+    paneFocused: !!panes.find((p: any) => p.id === PANE)?.isFocused,
+    fieldOpen: (await read($, askingName)) || !!(await read($, renaming)),
+  })
+  if (decision !== 'reload') return
+  reloadTriedFor = plugin.version
+  await storeSet($, `reloaded:${myId}`, { from: modVersion, to: plugin.version, at: await $.clock.now() })
+  debugLine($, `updating in place: ${modVersion} → ${plugin.version}`)
+  try {
+    await $.command.run({ command: 'reload-plugins' })
+  } catch {}
+}
+
+// The new copy, after updating in place: say so (only if it really is the new version)
+async function announceUpdate($: any) {
+  const r = await storeGet($, `reloaded:${myId}`)
+  if (!r || typeof r !== 'object') return
+  if ((await $.clock.now()) - Number(r.at) > 120000) {
+    await storeDelete($, `reloaded:${myId}`)
+    return
+  }
+  if (r.to !== modVersion) return
+  await storeDelete($, `reloaded:${myId}`)
+  $.ui.toast(`Panel updated to ${modVersion}`)
+}
+
 // /sessions status: whether and how the mod started here, who this session is, which copy of the mod runs, and which
 // sessions of the project have no running panel
 async function statusText($: any): Promise<string> {
@@ -1505,6 +1565,7 @@ async function start($: any) {
     await storeSet($, `state:${myId}`, { ...e, created: e.created ?? (await $.clock.now()) })
   })
   await step('heartbeat', () => beat($))
+  await step('update notice', () => announceUpdate($))
   await step('timers', async () => {
     // If this session was restarted from its own panel (u), announce that it's back
     const restartedAt = Number(await storeGet($, `restarted:${myId}`)) || 0
@@ -1532,6 +1593,7 @@ async function start($: any) {
         await rebind($)
         await beat($).catch(() => {})
         await publishUsage($)
+        await updateInPlace($)
       })().catch(() => {})
     })
     $.clock.every(60000, () => {
@@ -1940,7 +2002,7 @@ export const register: Register = (on, options) => {
         {list.some(f => f.outdated) && (
           <Text dimColor>
             <Text color="claude">↑</Text>
-            {` Claude ${installedVersion} available · u: Restart`}
+            {' A newer Claude or panel is installed · u: Restart'}
           </Text>
         )}
         {marks && (

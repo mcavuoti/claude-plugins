@@ -48,6 +48,7 @@ import {
   autoName,
   debugLogName,
   adoptAutoPins,
+  reloadDecision,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -514,4 +515,33 @@ test('pinned: with no record of what the mod pinned, the pinned sessions with Re
   expect(r.toUnpin).toEqual(['aaaaaaaa'])
   expect(r.pins).toEqual(['bbbbbbbb', 'cccccccc'])
   expect(adoptAutoPins([], { aaaaaaaa: true })).toEqual({ ids: [], released: [] })
+})
+
+test('updating in place: only to a newer version of the same install, once, and only when it cuts nothing', () => {
+  const base = {
+    running: '0.10.0',
+    runningDir: '/Users/x/.claude/plugins/cache/m/sessions/0.10.0',
+    installed: { path: '/Users/x/.claude/plugins/cache/m/sessions/0.11.0', version: '0.11.0', since: 0 },
+    triedFor: '',
+    status: 'idle',
+    tasks: 0,
+    paneFocused: false,
+    fieldOpen: false,
+  }
+  expect(reloadDecision(base)).toBe('reload')
+  // Not newer, not installed, or another copy (a folder copy, in development)
+  expect(reloadDecision({ ...base, installed: { ...base.installed, version: '0.10.0' } })).toBe('no')
+  expect(reloadDecision({ ...base, installed: null })).toBe('no')
+  expect(reloadDecision({ ...base, runningDir: '/Users/x/src/claude-plugins/plugins/sessions' })).toBe('no')
+  // Once per version: if it didn't take, the ↑ mark and u remain
+  expect(reloadDecision({ ...base, triedFor: '0.11.0' })).toBe('no')
+  expect(reloadDecision({ ...base, triedFor: '0.10.5' })).toBe('reload')
+  // Not now: working, waiting for you, background tasks (or unknown), you in the panel or in a field
+  expect(reloadDecision({ ...base, status: 'busy' })).toBe('wait')
+  expect(reloadDecision({ ...base, status: 'waiting' })).toBe('wait')
+  expect(reloadDecision({ ...base, status: null })).toBe('wait')
+  expect(reloadDecision({ ...base, tasks: 1 })).toBe('wait')
+  expect(reloadDecision({ ...base, tasks: null })).toBe('wait')
+  expect(reloadDecision({ ...base, paneFocused: true })).toBe('wait')
+  expect(reloadDecision({ ...base, fieldOpen: true })).toBe('wait')
 })
