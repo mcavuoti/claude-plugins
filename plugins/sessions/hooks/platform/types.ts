@@ -24,11 +24,6 @@ export type Platform = {
   userPresent(run: Run): Promise<boolean>
   // A window's visible text, used to tell which session an agent view shows; '' where windows can't be read
   readWindow(run: Run, tty: string): Promise<string>
-  // Whether a command can be typed into a window that has no launcher yet. If not, such a window can't be switched in
-  // place (closing its viewer would just leave a shell)
-  canTypeIntoWindows: boolean
-  // Types a command into a window (after its viewer was closed)
-  typeIntoWindow(run: Run, tty: string, command: string): Promise<boolean>
   // Brings a window forward: by its terminal, or by its title where only titles can be matched
   bringWindow(run: Run, tty: string, title: string): Promise<boolean>
   // When the window showing the target session can't be brought forward: show the target in the current window too
@@ -51,5 +46,7 @@ export type Platform = {
     regularUnreachable: (title: string) => string
     cantOpen: (title: string) => string
     cantOpenAgents: string
+    // Why ccc couldn't bring a window forward (it opens the session in its own window instead)
+    cantBring: string
   }
 }

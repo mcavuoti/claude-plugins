@@ -1,4 +1,4 @@
-"""Compares hooks/uso.py's output (argv[1]) with usage-recount.py's (argv[2]) and prints the differences.
+"""Compares hooks/usage.py's output (argv[1]) with usage-recount.py's (argv[2]) and prints the differences.
 
 Usage: python3 usage-compare.py plugin.json recount.json
 """
@@ -20,11 +20,11 @@ def compare(label, a, b):
         print('  ', d)
 
 
-compare('days', plugin['dias'], recount['dias'])
-compare('hours', plugin['horas'], recount['horas'])
+compare('days', plugin['days'], recount['days'])
+compare('hours', plugin['hours'], recount['hours'])
 totals = [0] * 5
-for cwd in plugin['dias']:
-    for values in plugin['dias'][cwd].values():
+for cwd in plugin['days']:
+    for values in plugin['days'][cwd].values():
         totals = [p + q for p, q in zip(totals, values)]
 print('35 days, everything: in %d · out %d · cache read %d · cache written %d · thinking %d' % tuple(totals))
-print('today', plugin['hoy'], 'hour', plugin['hora'], '| folders:', len(plugin['dias']))
+print('today', plugin['today'], 'hour', plugin['hour'], '| folders:', len(plugin['days']))

@@ -9,7 +9,7 @@ import {
   actionFromAnswer,
   reconcilePins,
   paneWidth,
-  buildMessage,
+  buildNotice,
   sparkline,
   closedForLowMemory,
   colorOf,
@@ -21,9 +21,16 @@ import {
   type Windows,
   type SessionState,
   type AutoPins,
-  parseMessage,
+  type Heartbeat,
+  type InstalledPlugin,
+  type NoticeKind,
+  type WindowTarget,
+  parseNotice,
   parsePins,
   parseVersion,
+  parseHeartbeat,
+  parseInbox,
+  parsePluginList,
   shortModelName,
   RESTART_OPTIONS,
   recentReopens,
@@ -36,20 +43,21 @@ import {
   remainingNeighbor,
   usageWindow,
   versionFromExecutable,
+  expectsHeartbeat,
+  heartbeatStatus,
+  heartbeatText,
+  keyLines,
+  fileKey,
+  orderFileText,
+  rootFrom,
+  sortRows,
+  windowTargetText,
+  FORMAT,
+  NOTICE_MARKER,
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run } from './platform'
 
 const PANE = 'sessions'
-// Notices between sessions: one session's mod sends them and the other's intercepts them (they never reach the model).
-// "You arrived here from the panel"; "ask here" (sent by the session where Stop or Update was pressed) and the answer;
-// "rename yourself" (key r). The marker strings are a wire format shared with other sessions; they stay as they are
-const FOCUS_MARKER = 'sessions:focus-panel:7f3a'
-const ASK_MARKER = 'sessions:ask-stop:7f3a'
-const ANSWER_MARKER = 'sessions:stop-answer:7f3a'
-const RENAME_MARKER = 'sessions:rename:7f3a'
-// Which notices each session's mod understands (recorded in its state): 1 the focus one, 2 the Stop question, 3 the
-// Update one, 4 the rename one
-const PROTOCOL = 4
 
 const DOT: Record<Color, string> = { red: '🔴', blue: '🔵', yellow: '🟡', green: '🟢', gray: '⚫' }
 // The colors for each state, from Claude's theme (they adapt to light, dark and colorblind modes)
@@ -60,14 +68,26 @@ const askingName = atom({ plugin: 'sessions', key: 'askingName' } as const, fals
 const renaming = atom({ plugin: 'sessions', key: 'renaming' } as const, null as Renaming)
 const notice = atom({ plugin: 'sessions', key: 'notice' } as const, '')
 const usage = atom({ plugin: 'sessions', key: 'usage' } as const, { summary: null, note: '' } as Usage)
-const usageView = atom({ plugin: 'sessions', key: 'usageView' } as const, { periodo: 'day', alcance: 'all' } as UsageView)
+const usageView = atom({ plugin: 'sessions', key: 'usageView' } as const, { period: 'day', scope: 'all' } as UsageView)
+// The session's short id, for the line above the prompt: empty until the mod has started in this session
+const shortId = atom({ plugin: 'sessions', key: 'shortId' } as const, '')
 
 let claude = 'claude'
 let myId = ''
 let myPid = 0
 let myCwd = ''
+let home = ''
+// Where the mod keeps its files (heartbeats, the order file, the launcher's window files, requests, usage cache):
+// ~/.claude/mods/sessions-data, or SESSIONS_DATA_DIR. Claude's background service's folder and log are read from
+// ~/.claude/jobs and ~/.claude/daemon.log, or SESSIONS_JOBS_DIR and SESSIONS_DAEMON_LOG: test sessions point all three
+// elsewhere, so they never touch the files of the sessions you use
+let dataDir = ''
+let jobsDir = ''
+let daemonLog = ''
+// This copy of the mod: its folder and version (from its plugin.json)
+const PLUGIN_DIR = `${(import.meta as any).dir}/..`
+let modVersion = ''
 let lastList: any[] = []
-let active = false
 // The row selected with the arrows (the session button's key, "s:<sessionId>") and the element that has the focus now
 let selectedRow: string | undefined
 let currentFocus: string | undefined
@@ -85,9 +105,19 @@ let pendingAsk: { sessionId: string; at: number; fallback?: string } | undefined
 let personMoves = 0
 // The installed Claude version (the newest one known): sessions with an older one get marked with ↑
 let installedVersion = ''
-// How this system's windows, processes and memory are handled: hooks/platform/macos.ts or linux.ts, chosen when the
-// session starts (choosePlatform)
+// How this system's windows, processes and memory are handled: hooks/platform/macos.ts or linux.ts
 let platform: Platform = macos
+
+// Starting the mod in this session. It's started once, by whichever comes first: session.start, the first draw of the
+// line above the prompt (a session draws even with no window attached), a prompt you type, or a notice from another
+// session. session.start alone isn't enough: a session that got an old pre-started process can run without it, and
+// then the panel, the heartbeat and /sessions never started
+let starting: Promise<void> | null = null
+let active = false
+let startedVia = ''
+let sawSessionStart = false
+let renderScheduled = false
+const startProblems: string[] = []
 
 // A command that can't be run (it doesn't exist on this computer: Linux has no osascript or ioreg, and lsof isn't
 // always there) or that didn't finish in time counts as one more failure (exit code 127), instead of aborting
@@ -113,12 +143,19 @@ function me(): Me {
   return { shortId: myId.slice(0, 8), pid: myPid || undefined, background: lastList.find(s => s.sessionId === myId)?.kind === 'background' }
 }
 
-// Data shared between sessions: the mod's official store ($.store), a JSON file managed by Claude.
-// Stored key/field names are a wire format shared with other sessions; they stay in Spanish. Keys: estado:<id> (the
-// SessionState), visto:<id> (seen at), titulo:<id> (title from the first prompt), esperando:<id> (waiting since),
-// reiniciada:<id> (restarted from its own panel at), revividas:<id> (reopen times), lista (cached session list),
-// instalada (installed version), vistaUso (usage view), fijado (last auto-pin pass), fijadoAuto (AutoPins),
-// reapertura (last reopen pass, and normalDesde: since when memory has been normal)
+// A line in the debug log only (claude --debug, or --debug-file)
+function debugLine($: any, text: string) {
+  try {
+    void Promise.resolve($.ui.log(`sessions: ${text}`, { to: 'debug' })).catch(() => {})
+  } catch {}
+}
+
+// Data shared between sessions: the mod's official store ($.store), a JSON file managed by Claude. Keys:
+// state:<id> (SessionState), seen:<id> (seen at), title:<id> (title from the first prompt), waiting:<id> (waiting since),
+// restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (cached session list),
+// installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
+// autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal).
+// When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
     return await $.store.get(key)
@@ -133,8 +170,19 @@ async function storeSet($: any, key: string, value: unknown) {
   } catch {}
 }
 
+async function storeDelete($: any, key: string) {
+  try {
+    await $.store.delete(key)
+  } catch {}
+}
+
 async function seenAt($: any, sessionId: string): Promise<number> {
-  return Number(await storeGet($, `visto:${sessionId}`)) || 0
+  return Number(await storeGet($, `seen:${sessionId}`)) || 0
+}
+
+async function readState($: any, sessionId: string): Promise<SessionState | null> {
+  const e = await storeGet($, `state:${sessionId}`)
+  return e && typeof e === 'object' ? (e as SessionState) : null
 }
 
 // Which terminal windows show each session: "claude attach <id>" viewers, agent views, and classic sessions by their pid
@@ -143,93 +191,52 @@ async function windows($: any): Promise<Windows> {
   return parseWindows((await run($, ['ps', '-A', '-o', 'pid=,tty=,command='])).stdout)
 }
 
-
 // The window this session's panel was just used from (macOS: the front Terminal window, if it shows this session;
 // Linux: the one whose launcher has it open)
 async function frontWindowShowingMe($: any): Promise<string | null> {
   return platform.windowShowingMe(sys($), await windows($), me())
 }
 
-// The launcher (hooks/visor.sh, next to this file): runs in the window and opens one session after another. To switch,
-// the next one is written to a file for that window (in the sessions-visor folder) and the current viewer is closed.
-// Windows run it from a fixed copy (sessions-bin, refreshed at startup by copyToBin): an installed plugin's folder
-// changes with every update, and the `ccc` shortcut and the status line setting need a path that stays put
-const PLUGIN_DIR = `${(import.meta as any).dir}/..`
-let launcherScript = `${PLUGIN_DIR}/hooks/visor.sh`
-let viewerDir = ''
-let home = ''
+// The launcher (hooks/visor.sh, next to this file) runs in each window opened with ccc and opens one session after
+// another there. To switch, the next one is written to that window's file (<data>/windows/<tty>) and the current
+// viewer is closed. Windows the panel opens run the launcher of this very copy of the mod; `ccc` runs the enabled
+// plugin's launcher through the small command the setup installs, which nothing rewrites
+const LAUNCHER = `${PLUGIN_DIR}/hooks/visor.sh`
 
-// Copies the launcher and the status line script to ~/.claude/mods/sessions-bin when they differ (after an update,
-// or the first time), so the `ccc` shortcut and the status line setting (written once by setup/setup.sh) always run
-// this version. If the copy fails, windows keep using the launcher inside the plugin's folder
-async function copyToBin($: any) {
-  if (!home) return
-  const bin = `${home}/.claude/mods/sessions-bin`
-  let copied = true
-  for (const [from, to] of [
-    [`${PLUGIN_DIR}/hooks/visor.sh`, `${bin}/visor.sh`],
-    [`${PLUGIN_DIR}/statusline/statusline.sh`, `${bin}/statusline.sh`],
-  ]) {
-    try {
-      const text = await $.fs.read(from)
-      const current = (await $.fs.exists(to)) ? await $.fs.read(to) : null
-      if (current !== text) {
-        await $.fs.write(to, text)
-        await runSafe($, ['chmod', '+x', to])
-      }
-    } catch {
-      copied = false
-    }
-  }
-  if (copied) launcherScript = `${bin}/visor.sh`
+function windowFile(tty: string): string {
+  return `${dataDir}/windows/${fileKey(tty)}`
 }
 
-// What the launcher opens next. Its file is a wire format (read by launchers already running): the lines comando=,
-// id=, titulo= and carpeta= (command, id, title, folder) stay in Spanish
-type ViewerTarget = { command: 'attach'; id: string; title: string } | { command: 'agents'; title: string }
-
-function viewerFile(tty: string): string {
-  return `${viewerDir}/${tty.replace(/\//g, '_')}`
+function launcherCommand(t: WindowTarget): string {
+  return `cd ${JSON.stringify(myCwd)} && bash ${JSON.stringify(LAUNCHER)} ${t.command === 'attach' ? `attach ${t.id}` : 'agents'}`
 }
 
-function targetFileText(t: ViewerTarget): string {
-  const title = t.title.replace(/[\r\n]+/g, ' ')
-  return t.command === 'attach' ? `comando=attach\nid=${t.id}\ntitulo=${title}\n` : `comando=agents\ntitulo=${title}\ncarpeta=${myCwd}\n`
+function agentsTarget(): WindowTarget {
+  return { command: 'agents', title: 'Agents', folder: myCwd }
 }
 
-// The command that starts the launcher in a window that doesn't have it yet (the only thing ever typed into the terminal)
-function launcherCommand(t: ViewerTarget): string {
-  return `cd ${JSON.stringify(myCwd)} && bash ${JSON.stringify(launcherScript)} ${t.command === 'attach' ? `attach ${t.id}` : 'agents'}`
-}
-
-// A single window: if a viewer or the agent view (clients) is in front, switch to the target session in that same tab.
-// With a launcher: write it the target and close the viewer; the launcher opens the next one without typing anything
-// into the terminal. Without a launcher (the first time in that window): close the client and type the command that
-// starts the launcher
-async function switchInPlace($: any, target: ViewerTarget, front: string): Promise<boolean> {
+// A single window: if a viewer or the agent view (clients) is in front and the window runs the launcher, switch to the
+// target in that same tab: write it the target and close the viewer; the launcher opens the next one. A window that
+// wasn't opened with ccc has no launcher and can't be switched in place (false): the caller opens a new window
+async function switchInPlace($: any, target: WindowTarget, front: string): Promise<boolean> {
   const v = await windows($)
   const pid = v.clients[front]
-  if (!pid) return false
-  if (v.launchers[front] && viewerDir) {
-    try {
-      await $.fs.write(viewerFile(front), targetFileText(target))
-      await run($, ['kill', '-HUP', pid])
-      return true
-    } catch {}
+  if (!pid || !v.launchers[front] || !dataDir) return false
+  try {
+    await $.fs.write(windowFile(front), windowTargetText(target))
+  } catch {
+    return false
   }
-  // Where commands can't be typed into a window (Linux), one without the launcher can't be switched in place: closing
-  // its viewer would just leave a shell. Open it with ccc to get the launcher
-  if (!platform.canTypeIntoWindows) return false
   await run($, ['kill', '-HUP', pid])
-  await $.clock.sleep(300)
-  return platform.typeIntoWindow(sys($), front, launcherCommand(target))
+  return true
 }
 
 async function myWindows($: any): Promise<string[]> {
   const v = await windows($)
   const short = myId.slice(0, 8)
   const list = [...(v.byId[short] ?? [])]
-  if (myPid && v.byPid[String(myPid)]) list.push(v.byPid[String(myPid)])
+  const own = myPid ? v.byPid[String(myPid)] : undefined
+  if (own) list.push(own)
   return list
 }
 
@@ -237,7 +244,7 @@ async function myWindows($: any): Promise<string[]> {
 // window in front with one of my viewers, or an agent view showing my tag. Where the front window can't be known
 // (Linux), a session counts as seen only when you type in it
 async function markSeenIfLooking($: any) {
-  const finished = (await readState($, myId))?.terminado ?? 0
+  const finished = (await readState($, myId))?.finished ?? 0
   const seen = await seenAt($, myId)
   if (finished <= seen) return
   const tty = await platform.windowInFront(sys($))
@@ -246,68 +253,102 @@ async function markSeenIfLooking($: any) {
   if (!looking && (await windows($)).agentsViews.some(c => c.tty === tty)) {
     looking = (await platform.readWindow(sys($), tty)).includes(`⟨${myId.slice(0, 8)}⟩`)
   }
-  if (looking) await storeSet($, `visto:${myId}`, await $.clock.now())
+  if (looking) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
 
-async function readState($: any, sessionId: string): Promise<SessionState | null> {
-  const e = await storeGet($, `estado:${sessionId}`)
-  return e && typeof e === 'object' ? (e as SessionState) : null
-}
-
-// A single query every 2.5 s for all sessions: the first one that finds it stale refreshes it
+// A single query every 3.5 s for all sessions: the first one that finds it stale refreshes it
 async function officialList($: any): Promise<any[] | string> {
   const now = await $.clock.now()
-  const c = await storeGet($, 'lista')
-  if (c && now - c.at < 3500 && Array.isArray(c.lista)) return c.lista
+  const c = await storeGet($, 'list')
+  if (c && now - c.at < 3500 && Array.isArray(c.sessions)) return c.sessions
   const r = await run($, [claude, 'agents', '--json', '--all'])
   if (r.exitCode !== 0) return "Couldn't read the session list (claude agents --json)"
   const list = validateList(r.stdout)
   if (typeof list === 'string') return list
-  await storeSet($, 'lista', { at: now, lista: list })
+  await storeSet($, 'list', { at: now, sessions: list })
   return list
 }
 
-// Every 10 minutes, the data of sessions no longer in the official list (fetched right then) is deleted; never that of
-// a session created in the last 5 minutes
+// The heartbeats of the sessions in a list, by sessionId (only the ones that exist and parse)
+async function readHeartbeats($: any, ids: string[]): Promise<Record<string, Heartbeat>> {
+  const out: Record<string, Heartbeat> = {}
+  if (!dataDir) return out
+  let names: Set<string>
+  try {
+    names = new Set((await $.fs.list(`${dataDir}/alive`)).map((f: any) => String(f.name)))
+  } catch {
+    return out
+  }
+  for (const id of ids) {
+    if (!names.has(id)) continue
+    try {
+      const h = parseHeartbeat(await $.fs.read(`${dataDir}/alive/${id}`))
+      if (h) out[id] = h
+    } catch {}
+  }
+  return out
+}
+
+// This session's heartbeat (see Heartbeat in state.ts), every 15 s
+async function beat($: any) {
+  if (!dataDir || !myId) return
+  await $.fs.write(`${dataDir}/alive/${myId}`, heartbeatText({ pid: myPid, at: await $.clock.now(), version: modVersion, via: startedVia }))
+}
+
+// Every 10 minutes, the data of sessions no longer in the official list (fetched right then) is deleted: their stored
+// keys, heartbeats and requests. Never that of a session created in the last 5 minutes, nor of one with a fresh
+// heartbeat: the agent view's pre-started session is running and hidden from the list
 let lastPrune = 0
 async function prune($: any) {
   const now = await $.clock.now()
   if (now - lastPrune < 600000) return
   lastPrune = now
   const r = await run($, [claude, 'agents', '--json', '--all'])
-  let list: unknown
+  const list = r.exitCode === 0 ? validateList(r.stdout) : 'failed'
+  if (typeof list === 'string') return
+  const alive = new Set(list.map(s => String(s.sessionId)))
+  const ids = new Set<string>()
+  let keys: string[] = []
   try {
-    list = JSON.parse(r.stdout)
-  } catch {
-    return
+    keys = await $.store.keys()
+  } catch {}
+  for (const k of keys) {
+    const m = k.match(/^(state|seen|title|waiting|restarted|reopened):(.+)$/)
+    if (m?.[2] && !alive.has(m[2])) ids.add(m[2])
   }
-  if (r.exitCode !== 0 || !Array.isArray(list) || !list.every(s => typeof s?.sessionId === 'string')) return
-  const alive = new Set(list.map(s => s.sessionId))
-  for (const k of await $.store.keys()) {
-    const m = k.match(/^(estado|visto|titulo|esperando|reiniciada|revividas):(.+)$/)
-    if (!m || alive.has(m[2])) continue
-    const e = await storeGet($, `estado:${m[2]}`)
-    if (e?.creado && now - e.creado < 300000) continue
-    await $.store.delete(k)
+  let files: string[] = []
+  try {
+    files = (await $.fs.list(`${dataDir}/alive`)).map((f: any) => String(f.name))
+  } catch {}
+  for (const f of files) if (!alive.has(f)) ids.add(f)
+  const beats = await readHeartbeats($, [...ids])
+  for (const id of ids) {
+    if (id === myId) continue
+    const created = (await readState($, id))?.created ?? 0
+    if (now - created < 300000) continue
+    const h = beats[id]
+    if (h && now - h.at < 120000) continue
+    for (const k of keys.filter(k => k.endsWith(`:${id}`))) await storeDelete($, k)
+    await runSafe($, ['rm', '-f', `${dataDir}/alive/${id}`, `${dataDir}/inbox/${id}`])
   }
 }
 
-// The version of a session whose mod doesn't record it (an earlier mod that hasn't been reloaded yet): the program its
+// The version of a session whose own mod doesn't record it (no mod, or one that never started): the program its
 // process runs. A process's program doesn't change, so it's cached by pid
 const versionByPid: Record<string, string> = {}
 async function processVersion($: any, pid: number): Promise<string> {
   const key = String(pid)
-  if (key in versionByPid) return versionByPid[key]
+  if (key in versionByPid) return versionByPid[key] ?? ''
   const v = versionFromExecutable(await platform.processProgram(sys($), key)) ?? ''
   versionByPid[key] = v
   return v
 }
 
-// Tokens spent: uso.py (next to this file) reads them from the conversation logs; it reads only what's new since the
-// previous run (its cache is in ~/.claude/mods/sessions-uso) and several sessions can run it at once.
+// Tokens spent: usage.py (next to this file) reads them from the conversation logs; it reads only what's new since the
+// previous run (its cache is in <data>/usage) and several sessions can run it at once.
 // It needs python3: on a Mac without the developer tools, /usr/bin/python3 pops up a prompt to install them, so there
 // that one isn't used without them (on Linux /usr/bin/python3 is the usual one)
-const USAGE_READER = `${(import.meta as any).dir}/uso.py`
+const USAGE_READER = `${(import.meta as any).dir}/usage.py`
 let python: string | null | undefined
 async function usablePython($: any): Promise<string | null> {
   if (python !== undefined) return python
@@ -321,7 +362,7 @@ async function usablePython($: any): Promise<string | null> {
 
 let readingUsage = false
 async function readUsage($: any) {
-  if (readingUsage || !home) return
+  if (readingUsage || !home || !dataDir) return
   if (!(await $.ui.panes()).some((p: any) => p.id === PANE)) return
   readingUsage = true
   try {
@@ -330,11 +371,11 @@ async function readUsage($: any) {
       await update($, usage, () => ({ summary: null, note: 'Token usage needs python3' }))
       return
     }
-    const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${home}/.claude/mods/sessions-uso`], { timeoutMs: 120000 })
+    const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`], { timeoutMs: 120000 })
     let summary: UsageSummary | null = null
     try {
       const d = JSON.parse(r.stdout)
-      if (r.exitCode === 0 && typeof d?.hoy === 'string' && typeof d?.hora === 'string' && d.dias && d.horas) summary = d
+      if (r.exitCode === 0 && d?.format === FORMAT && typeof d?.today === 'string' && typeof d?.hour === 'string' && d.days && d.hours) summary = d
     } catch {}
     await update($, usage, previous => (summary ? { summary, note: '' } : { summary: previous.summary, note: previous.summary ? '' : "Couldn't read token usage" }))
   } finally {
@@ -346,24 +387,40 @@ async function readUsage($: any) {
 async function chooseUsageView($: any, change: Partial<UsageView>) {
   const next = { ...(await read($, usageView)), ...change }
   await update($, usageView, () => next)
-  await storeSet($, 'vistaUso', next)
+  await storeSet($, 'usageView', next)
 }
 
 // What `claude --version` says, once every 5 minutes for all sessions (shared through the store)
 async function readInstalledVersion($: any): Promise<string> {
   const now = await $.clock.now()
-  const c = await storeGet($, 'instalada')
+  const c = await storeGet($, 'installed')
   if (c && now - c.at < 300000 && typeof c.version === 'string') return c.version
   const r = await run($, [claude, '--version'])
   const v = r.exitCode === 0 ? parseVersion(r.stdout) : null
-  if (v) await storeSet($, 'instalada', { at: now, version: v })
+  if (v) await storeSet($, 'installed', { at: now, version: v })
   return v ?? (typeof c?.version === 'string' ? c.version : '')
+}
+
+// The installed plugin (`claude plugin list --json`), once every 5 minutes for all sessions: which version of the mod
+// sessions start with, and since when, to tell which sessions should have a heartbeat. SESSIONS_PLUGIN_VERSION and
+// SESSIONS_PLUGIN_SINCE (ms) stand in for it in tests
+async function installedPlugin($: any): Promise<InstalledPlugin | null> {
+  const version = await $.env.get('SESSIONS_PLUGIN_VERSION')
+  if (version) return { path: '', version, since: Number(await $.env.get('SESSIONS_PLUGIN_SINCE')) || 0 }
+  const now = await $.clock.now()
+  const c = await storeGet($, 'plugin')
+  if (c && now - c.at < 300000) return c.plugin ?? null
+  const r = await run($, [claude, 'plugin', 'list', '--json'])
+  if (r.exitCode !== 0) return c?.plugin ?? null
+  const plugin = parsePluginList(r.stdout)
+  await storeSet($, 'plugin', { at: now, plugin })
+  return plugin
 }
 
 // The pinned sessions: the ones the background service doesn't close for being idle. It's the file Ctrl+T writes in
 // `claude agents` (there's no command to pin) and the service re-reads it every time it decides
 function pinsPath(): string {
-  return `${home}/.claude/jobs/pins.json`
+  return `${jobsDir}/pins.json`
 }
 
 async function pinsFromFile($: any): Promise<string[] | null> {
@@ -401,7 +458,7 @@ async function withLock($: any, file: string, body: () => Promise<void>) {
 // (bridgeSessionId) while it's on, also during a relaunch, and deletes it when it's turned off. null if it couldn't be read
 async function hasRemoteControl($: any, id: string): Promise<boolean | null> {
   try {
-    const e = JSON.parse(await $.fs.read(`${home}/.claude/jobs/${id}/state.json`))
+    const e = JSON.parse(await $.fs.read(`${jobsDir}/${id}/state.json`))
     return typeof e?.bridgeSessionId === 'string' && e.bridgeSessionId !== ''
   } catch {
     return null
@@ -414,11 +471,11 @@ async function hasRemoteControl($: any, id: string): Promise<boolean | null> {
 // previous pass stale
 let pinning = false
 async function pinRemoteSessions($: any) {
-  if (pinning || !home) return
+  if (pinning || !jobsDir) return
   const now = await $.clock.now()
-  const c = await storeGet($, 'fijado')
+  const c = await storeGet($, 'pinPass')
   if (c && now - c.at < 15000) return
-  await storeSet($, 'fijado', { at: now })
+  await storeSet($, 'pinPass', { at: now })
   pinning = true
   try {
     const list = await officialList($)
@@ -432,10 +489,10 @@ async function pinRemoteSessions($: any) {
     await withLock($, file, async () => {
       const pins = await pinsFromFile($)
       if (!pins) return
-      const previous = await storeGet($, 'fijadoAuto')
+      const previous = await storeGet($, 'autoPins')
       const auto: AutoPins = {
         ids: Array.isArray(previous?.ids) ? previous.ids : [],
-        soltadas: Array.isArray(previous?.soltadas) ? previous.soltadas : [],
+        released: Array.isArray(previous?.released) ? previous.released : [],
       }
       const r = reconcilePins(pins, remote, auto)
       if (r.toPin.length || r.toUnpin.length) {
@@ -447,18 +504,14 @@ async function pinRemoteSessions($: any) {
           return
         }
         // When unpinning, Claude also deletes the position it had among the pinned ones
-        for (const id of r.toUnpin) await runSafe($, ['rm', '-f', `${home}/.claude/jobs/${id}/order`])
+        for (const id of r.toUnpin) await runSafe($, ['rm', '-f', `${jobsDir}/${id}/order`])
       }
-      if (JSON.stringify(r.auto) !== JSON.stringify(auto)) await storeSet($, 'fijadoAuto', r.auto)
+      if (JSON.stringify(r.auto) !== JSON.stringify(auto)) await storeSet($, 'autoPins', r.auto)
     })
   } finally {
     pinning = false
   }
 }
-
-// Claude's background service log. SESSIONS_DAEMON_LOG points it to another file, only for testing the mod
-let daemonLog = ''
-
 
 // Pinned sessions with Remote Control that the background service closed for lack of memory (it closes them even when
 // pinned, if memory pressure stays critical) are reopened automatically once memory has been normal for 3 minutes
@@ -469,15 +522,15 @@ let daemonLog = ''
 const NORMAL_BEFORE_REOPEN = 180000
 let reopening = false
 async function reopenRetiredSessions($: any) {
-  if (reopening || !home || !daemonLog) return
+  if (reopening || !daemonLog) return
   const now = await $.clock.now()
-  const c = await storeGet($, 'reapertura')
+  const c = await storeGet($, 'reopenPass')
   if (c && now - c.at < 15000) return
   reopening = true
   try {
     const normal = await platform.memoryNormal(sys($))
-    const normalSince = normal ? (typeof c?.normalDesde === 'number' ? c.normalDesde : now) : undefined
-    await storeSet($, 'reapertura', { at: now, normalDesde: normalSince })
+    const normalSince = normal ? (typeof c?.normalSince === 'number' ? c.normalSince : now) : undefined
+    await storeSet($, 'reopenPass', { at: now, normalSince })
     if (normalSince === undefined || now - normalSince < NORMAL_BEFORE_REOPEN) return
     const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
     if (r.exitCode !== 0) return
@@ -492,18 +545,32 @@ async function reopenRetiredSessions($: any) {
       // Memory has to have been normal since after the closure (if no pass saw it, since the closure)
       if (now - Math.max(when, normalSince) < NORMAL_BEFORE_REOPEN) continue
       if (!(await hasRemoteControl($, s.id))) continue
-      const previous = recentReopens(await storeGet($, `revividas:${s.sessionId}`), now)
+      const previous = recentReopens(await storeGet($, `reopened:${s.sessionId}`), now)
       if (previous.length >= 3) continue
-      await storeSet($, `revividas:${s.sessionId}`, [...previous, now])
+      await storeSet($, `reopened:${s.sessionId}`, [...previous, now])
       const name = s.name && s.name !== s.id ? s.name : s.id
       const done = await run($, [claude, 'respawn', s.id])
       $.ui.toast(done.exitCode === 0 ? `Reopened “${name}”: Claude had closed it for lack of memory` : `Couldn't reopen “${name}”`)
-      await storeSet($, 'lista', {})
+      await storeSet($, 'list', {})
       return
     }
   } finally {
     reopening = false
   }
+}
+
+// The order file the launcher reads (see orderFileText): written when the rows change, and every 20 s so it stays fresh
+let lastOrder = ''
+let lastOrderAt = 0
+async function writeOrder($: any, list: Row[], now: number) {
+  if (!dataDir || !myCwd) return
+  const body = orderFileText(myCwd, sortRows(list), 0)
+  if (body === lastOrder && now - lastOrderAt < 20000) return
+  try {
+    await $.fs.write(`${dataDir}/order/${fileKey(myCwd)}`, orderFileText(myCwd, sortRows(list), now))
+    lastOrder = body
+    lastOrderAt = now
+  } catch {}
 }
 
 async function refresh($: any) {
@@ -517,24 +584,25 @@ async function refresh($: any) {
   if (own?.pid) myPid = own.pid
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const now = await $.clock.now()
+  const project = list.filter(s => typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home) && typeof s.sessionId === 'string')
+  const beats = await readHeartbeats($, project.map(s => s.sessionId))
+  const plugin = await installedPlugin($)
   const fresh: Row[] = []
   // Each session's version, to mark afterwards the ones with an older one than the installed version
   const versions: Record<string, string> = {}
   let newest = await readInstalledVersion($)
-  for (const s of list) {
-    // The project folder and its subfolders
-    if (typeof s.cwd !== 'string' || !inProject(s.cwd, myCwd, home) || typeof s.sessionId !== 'string') continue
+  for (const s of project) {
     const e = await readState($, s.sessionId)
     const seen = await seenAt($, s.sessionId)
     const unnamed = !s.name || s.name === s.id
-    const ownTitle = String((await storeGet($, `titulo:${s.sessionId}`)) ?? '')
+    const ownTitle = String((await storeGet($, `title:${s.sessionId}`)) ?? '')
     // Since when it's been waiting for you: the panel records it the first time it sees it "waiting"
-    let waitingSince = Number(await storeGet($, `esperando:${s.sessionId}`)) || undefined
+    let waitingSince = Number(await storeGet($, `waiting:${s.sessionId}`)) || undefined
     if (s.status === 'waiting' && !waitingSince) {
       waitingSince = now
-      await storeSet($, `esperando:${s.sessionId}`, now)
+      await storeSet($, `waiting:${s.sessionId}`, now)
     } else if (s.status !== 'waiting' && waitingSince) {
-      await $.store.delete(`esperando:${s.sessionId}`)
+      await storeDelete($, `waiting:${s.sessionId}`)
     }
     const { color, since } = colorOf(s, e, seen, waitingSince)
     // A stopped session doesn't run any version: it opens with the installed one
@@ -543,42 +611,51 @@ async function refresh($: any) {
       versions[s.sessionId] = version
       if (compareVersions(version, newest) > 0) newest = version
     }
+    const current = s.sessionId === myId
+    const hb = heartbeatStatus(beats[s.sessionId] ?? null, s.pid, now)
     fresh.push({
       sessionId: s.sessionId,
       id: s.id ?? null,
       title: unnamed ? ownTitle || s.id || s.sessionId.slice(0, 8) : s.name,
       color,
       time: since ? timeSince(since, now) : '',
-      model: e?.modelo ?? '',
-      context: typeof e?.contexto === 'number' ? `${Math.round(e.contexto)}%` : '',
-      current: s.sessionId === myId,
+      model: e?.model ?? '',
+      context: typeof e?.context === 'number' ? `${Math.round(e.context)}%` : '',
+      current,
       background: s.kind === 'background',
       outdated: false,
       pinned: s.kind === 'background' && typeof s.id === 'string' && pinned.has(s.id),
+      noPanel: !current && color !== 'gray' && hb === 'missing' && expectsHeartbeat(s, plugin, now),
+      otherFormat: !current && color !== 'gray' && hb === 'other-format',
+      reachable: current || (color !== 'gray' && hb === 'ok'),
     })
   }
   installedVersion = newest
-  for (const f of fresh) f.outdated = !!versions[f.sessionId] && compareVersions(versions[f.sessionId], installedVersion) < 0
-  const order: Record<Color, number> = { red: 0, yellow: 1, blue: 2, green: 3, gray: 4 }
-  fresh.sort((a, b) => order[a.color] - order[b.color] || a.title.localeCompare(b.title))
+  for (const f of fresh) {
+    const v = versions[f.sessionId]
+    f.outdated = !!v && compareVersions(v, installedVersion) < 0
+  }
+  const sorted = sortRows(fresh)
+  await writeOrder($, sorted, now)
   // Claude tracks the panel's focus by position, not by session: if rows move while you're in the panel, the highlight
   // would jump to another session. With the keyboard in the panel the rows stay in place (new ones go at the end); on
   // leaving they're sorted again. If one left the list, the focus goes back to its session (or the one next to it)
   const focused = !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
   const before = (await read($, rows)).map(f => f.sessionId)
-  if (focused) {
-    const place = (f: Row) => {
-      const i = before.indexOf(f.sessionId)
-      return i < 0 ? Number.MAX_SAFE_INTEGER : i
-    }
-    fresh.sort((a, b) => place(a) - place(b))
-  }
-  await update($, rows, () => fresh)
-  const after = fresh.map(f => f.sessionId)
+  const shown = focused
+    ? [...sorted].sort((a, b) => {
+        const place = (f: Row) => {
+          const i = before.indexOf(f.sessionId)
+          return i < 0 ? Number.MAX_SAFE_INTEGER : i
+        }
+        return place(a) - place(b)
+      })
+    : sorted
+  await update($, rows, () => shown)
+  const after = shown.map(f => f.sessionId)
   if (focused && currentFocus?.startsWith('s:') && before.some(id => !after.includes(id))) {
     const id = currentFocus.slice(2)
-    const ids = fresh.map(f => f.sessionId)
-    void focusSession($, ids.includes(id) ? id : remainingNeighbor(before, id, ids))
+    void focusSession($, after.includes(id) ? id : remainingNeighbor(before, id, after))
   }
   await update($, notice, () => '')
   await adjustWidth($)
@@ -613,20 +690,21 @@ async function adjustWidth($: any) {
   await $.ui.open({ id: PANE, title: 'Sessions', columns: width })
 }
 
-// You arrived from another session's panel: the panel takes the keyboard, on the session next to this one, so you can
-// keep going through them
+// You arrived from another session's panel, or with ccc: the panel takes the keyboard, on the session next to this one,
+// so you can keep going through them
 async function focusPanel($: any) {
   const list = await read($, rows)
   const i = list.findIndex(f => f.current)
   const find = (from: number, step: number) => {
-    for (let k = from; k >= 0 && k < list.length; k += step) if (!list[k].current) return list[k]
+    for (let k = from; k >= 0 && k < list.length; k += step) if (!list[k]?.current) return list[k]
     return undefined
   }
   await takeKeyboard($, (find(i + 1, 1) ?? find(i - 1, -1))?.sessionId)
 }
 
 // The panel takes the keyboard, on a session. Claude gives the panel the keyboard a moment after it's requested, on the
-// row that was selected in the previous render, so the focus is moved to the chosen row afterwards
+// row that was selected in the previous render, so the focus is moved to the chosen row afterwards. It works with no
+// window attached too: the keyboard is the panel's when the window attaches
 async function takeKeyboard($: any, sessionId: string | undefined) {
   if (sessionId) selectedRow = `s:${sessionId}`
   await $.ui.open({ id: PANE, title: 'Sessions', focus: true, columns: requestedWidth || undefined })
@@ -682,21 +760,27 @@ async function agentsViewShowing($: any, v: { agentsViews: { pid: string; tty: s
   return undefined
 }
 
+// A notice to another session's mod (see buildNotice), only if it answers: its heartbeat says it runs and speaks this
+// format. Anything else would reach that session's model as text
+async function sendNotice($: any, f: Row, kind: NoticeKind, data: Record<string, unknown> = {}): Promise<boolean> {
+  if (!f.reachable || f.current) return false
+  try {
+    await $.session.send({ to: { sessionId: f.sessionId }, text: buildNotice(kind, data) })
+    return true
+  } catch {
+    return false
+  }
+}
+
 // Switches the front window to another session. With notifyFocus set to false, the target doesn't take the keyboard
 // with its panel (when it's about to show a question, or when it'll do so itself afterwards)
 async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
   if (f.current) return false
-  // If the jump was made with the keyboard in the panel, the target session receives you with the focus on its panel
-  // (only if its mod understands the notice: an earlier version would get it as text for the model). When leaving,
-  // this session's panel releases the keyboard
+  // If the jump was made with the keyboard in the panel, the target session receives you with the focus on its panel.
+  // When leaving, this session's panel releases the keyboard
   const fromKeyboard = notifyFocus && !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
   const notifyAndRelease = async () => {
-    // A stopped session isn't sent anything: it isn't running to intercept it
-    if (fromKeyboard && f.color !== 'gray' && ((await readState($, f.sessionId))?.protocolo ?? 0) >= 1) {
-      try {
-        await $.session.send({ to: { sessionId: f.sessionId }, text: FOCUS_MARKER })
-      } catch {}
-    }
+    if (fromKeyboard) await sendNotice($, f, 'focus')
     await releaseFocus($)
   }
   // A regular session lives in its own window: bring that one forward, whichever is in front. If it runs where the
@@ -730,22 +814,21 @@ async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
       return false
     }
   }
-  if (f.id && (await switchInPlace($, { command: 'attach', id: f.id, title: f.title }, front))) return true
   if (!f.id) {
     $.ui.toast(`Can't find the window for “${f.title}”`)
     return false
   }
-  // No window: open another one next to the current one, same size and position, already with the launcher
+  if (await switchInPlace($, { command: 'attach', id: f.id, title: f.title }, front)) return true
+  // This window can't switch (it wasn't opened with ccc): open another one next to it, same size and position, with
+  // the launcher
   const opened = await platform.openWindow(sys($), front, `${DOT[f.color]} ${f.title}`, launcherCommand({ command: 'attach', id: f.id, title: f.title }))
-  if (!opened) {
-    $.ui.toast(platform.text.cantOpen(f.title))
-  }
+  $.ui.toast(opened ? `Opened “${f.title}” in a new window: this one wasn't opened with ccc, so it can't switch` : platform.text.cantOpen(f.title))
   return opened
 }
 
-// What's being asked: stop a running session, remove a stopped one from the list, or update one that's in the middle
-// of something. The values are sent to other sessions (the tema field), so they're part of the wire format
-type Topic = 'stop' | 'remove' | 'update'
+// What's being asked: stop a running session, remove a stopped one from the list, or restart one. The values are sent
+// to other sessions (the topic field of the ask notice)
+type Topic = 'stop' | 'remove' | 'restart'
 
 // The question, with Claude's dialog. Cancel, Esc or hand-typed text do nothing
 async function askDialog($: any, title: string, topic: Topic, detail = ''): Promise<Action | null> {
@@ -753,10 +836,10 @@ async function askDialog($: any, title: string, topic: Topic, detail = ''): Prom
   const question =
     topic === 'remove'
       ? `Remove “${title}” from the list? The conversation is kept.`
-      : topic === 'update'
+      : topic === 'restart'
         ? `Restart “${title}”?${extra} It reloads MCP servers, plugins and settings; the conversation is kept.`
         : `Stop “${title}”?${extra} The conversation is kept either way.`
-  const options = topic === 'remove' ? REMOVE_OPTIONS : topic === 'update' ? RESTART_OPTIONS : STOP_OPTIONS
+  const options = topic === 'remove' ? REMOVE_OPTIONS : topic === 'restart' ? RESTART_OPTIONS : STOP_OPTIONS
   try {
     return actionFromAnswer(await $.ui.ask(question, { options, header: 'Sessions' }))
   } catch {
@@ -766,16 +849,16 @@ async function askDialog($: any, title: string, topic: Topic, detail = ''): Prom
 
 // Does what was chosen to another session. Stop and Remove: stops it and/or removes it from the list, and closes the
 // windows that showed it (never one showing this session; with closeWindows false, none: that's when the window you're
-// in still shows that session). Update: claude respawn, the same session with its conversation in a process running
+// in still shows that session). Restart: claude respawn, the same session with its conversation in a process running
 // the installed version; the windows with a launcher that showed it reopen it on their own
 async function perform($: any, f: Row, action: Action, closeWindows = true) {
   if (!f.id) return
-  if (action === 'update') {
+  if (action === 'restart') {
     const v = await windows($)
     for (const tty of v.byId[f.id] ?? []) {
-      if (!v.launchers[tty] || !viewerDir) continue
+      if (!v.launchers[tty] || !dataDir) continue
       try {
-        await $.fs.write(viewerFile(tty), targetFileText({ command: 'attach', id: f.id, title: f.title }))
+        await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id: f.id, title: f.title }))
       } catch {}
     }
     const r = await run($, [claude, 'respawn', f.id])
@@ -784,10 +867,10 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
     } else {
       // The ↑ mark goes away right away, without waiting for the new session to record its version
       const e = await readState($, f.sessionId)
-      if (e && installedVersion) await storeSet($, `estado:${f.sessionId}`, { ...e, version: installedVersion })
+      if (e && installedVersion) await storeSet($, `state:${f.sessionId}`, { ...e, version: installedVersion })
       $.ui.toast(`“${f.title}” restarted${f.outdated && installedVersion ? ` on Claude ${installedVersion}` : ''}`)
     }
-    await storeSet($, 'lista', {})
+    await storeSet($, 'list', {})
     await refresh($)
     return
   }
@@ -803,7 +886,7 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
     const r = await run($, [claude, 'rm', f.id])
     if (r.exitCode !== 0) $.ui.toast(`Couldn't remove “${f.title}” from the list`)
   }
-  await storeSet($, 'lista', {})
+  await storeSet($, 'list', {})
   await refresh($)
   if (closeWindows && before.length) {
     await $.clock.sleep(1500)
@@ -822,34 +905,35 @@ async function focusRow($: any, sessionId: string, fallback: string | undefined)
 // The tasks a session has running in the background even while it's idle (artifact watches don't count).
 // The background service records them in its state; if the file isn't there or changed shape, it's unknown (null)
 async function backgroundTasks($: any, id: string): Promise<{ count: number; kinds: string[] } | null> {
-  if (!home) return null
+  if (!jobsDir) return null
   try {
-    return realTasks(JSON.parse(await $.fs.read(`${home}/.claude/jobs/${id}/state.json`))?.inFlight)
+    return realTasks(JSON.parse(await $.fs.read(`${jobsDir}/${id}/state.json`))?.inFlight)
   } catch {
     return null
   }
 }
 
-// What gets added to the question: whether it's busy (Update cuts what it's doing) and whether it has background tasks
+// What gets added to the question: whether it's busy (Restart cuts what it's doing) and whether it has background tasks
 // (they get cut too). A background terminal task already shows it as busy; watching an artifact's comments doesn't
 async function detailFor($: any, f: Row, topic: Topic): Promise<string> {
   if (topic === 'remove' || !f.id) return ''
   const busy = f.color === 'blue' || f.color === 'red'
   const bg = await backgroundTasks($, f.id)
   const n = bg?.count ?? 0
-  const verb = topic === 'update' ? 'restarting it now' : 'stopping it'
+  const verb = topic === 'restart' ? 'restarting it now' : 'stopping it'
   const tasks = n > 0 ? `${n === 1 ? '1 task' : `${n} tasks`} in the background${bg?.kinds.length ? ` (${bg.kinds.join(', ')})` : ''}` : ''
-  const version = topic === 'update' && f.outdated && installedVersion ? ` It also moves to Claude ${installedVersion}.` : ''
-  if (busy && tasks) return `It's busy, with ${tasks}: ${verb} cuts them.${version}`
-  if (tasks) return `It has ${tasks}: ${verb} cuts ${n === 1 ? 'it' : 'them'}.${version}`
-  if (busy && topic === 'update') return `It's busy: ${verb} cuts what it's doing.${version}`
-  return version.trim()
+  const version = topic === 'restart' && f.outdated && installedVersion ? ` It also moves to Claude ${installedVersion}.` : ''
+  const panel = topic === 'restart' && f.noPanel ? " Its panel isn't running: a restart starts it." : ''
+  if (busy && tasks) return `It's busy, with ${tasks}: ${verb} cuts them.${version}${panel}`
+  if (tasks) return `It has ${tasks}: ${verb} cuts ${n === 1 ? 'it' : 'them'}.${version}${panel}`
+  if (busy && topic === 'restart') return `It's busy: ${verb} cuts what it's doing.${version}${panel}`
+  return `${version}${panel}`.trim()
 }
 
-// Stop or Update from the panel. The question shows up in the session being acted on: the window goes to that
+// Stop or Restart from the panel. The question shows up in the session being acted on: the window goes to that
 // session, you answer there and the window comes back here with the keyboard in the panel. This session does what was
 // chosen (that one can't stop or restart itself and then hand the window back to you). If going there isn't a good
-// idea (stopped, already waiting for you, old mod, no Terminal window in front), it's asked here.
+// idea (stopped, already waiting for you, its mod doesn't answer, no Terminal window in front), it's asked here.
 async function decide($: any, f: Row, topic: Topic) {
   if (!f.id) return
   const detail = await detailFor($, f, topic)
@@ -858,13 +942,10 @@ async function decide($: any, f: Row, topic: Topic) {
   // If that session is already waiting for you (a permission, a question), this question would queue up behind that one
   // and on arriving you'd answer its own by mistake: so it's asked here.
   // First go there, then send the question: if going failed, no question is left waiting where nobody sees it
-  const needed = topic === 'update' ? 3 : 2
-  const askThere = topic !== 'remove' && f.color !== 'red' && ((await readState($, f.sessionId))?.protocolo ?? 0) >= needed
+  const askThere = topic !== 'remove' && f.color !== 'red' && f.reachable
   if (askThere && (await frontWindowShowingMe($)) && (await jump($, f, false))) {
     pendingAsk = { sessionId: f.sessionId, at: await $.clock.now(), fallback }
-    try {
-      await $.session.send({ to: { sessionId: f.sessionId }, text: buildMessage(ASK_MARKER, { desde: myId, tema: topic, detalle: detail }) })
-    } catch {
+    if (!(await sendNotice($, f, 'ask', { from: myId, topic, detail }))) {
       pendingAsk = undefined
       $.ui.toast(`Couldn't ask “${f.title}”; nothing was changed`)
     }
@@ -882,9 +963,7 @@ async function answerQuestion($: any, from: string, topic: Topic, detail: string
   const action = await askDialog($, own?.title ?? 'this session', topic, detail)
   const origin = (await read($, rows)).find(f => f.sessionId === from)
   const cameBack = origin ? await jump($, origin, false) : false
-  try {
-    await $.session.send({ to: { sessionId: from }, text: buildMessage(ANSWER_MARKER, { sessionId: myId, accion: action ?? 'cancel', volvio: cameBack }) })
-  } catch {}
+  if (origin) await sendNotice($, origin, 'answer', { sessionId: myId, action: action ?? 'cancel', cameBack })
 }
 
 // Back in this session: do what was chosen over there (only if it's the answer to the question that was sent)
@@ -894,9 +973,9 @@ async function receiveAnswer($: any, data: Record<string, unknown>) {
   const { fallback } = pendingAsk
   pendingAsk = undefined
   const f = (await read($, rows)).find(x => x.sessionId === data.sessionId)
-  const action = data.accion
+  const action = data.action
   // If the window couldn't come back here, it still shows that session: it isn't closed
-  if (f && (action === 'stop' || action === 'stop-rm' || action === 'update')) await perform($, f, action, data.volvio === true)
+  if (f && (action === 'stop' || action === 'stop-rm' || action === 'restart')) await perform($, f, action, data.cameBack === true)
   await focusRow($, String(data.sessionId), fallback)
 }
 
@@ -929,7 +1008,7 @@ async function stopSelected($: any) {
 // The u key: restarts the selected session, this one too: a new process with the same conversation, which re-reads the
 // MCP servers, plugins and settings, and moves to the installed Claude version. It always asks. If the other one is in
 // the middle of something (working, waiting for you or with background tasks), the question goes to that session, like
-// Stop, so you see what you'd cut; if it's idle, it's asked here
+// Stop, so you see what you'd cut; if it's idle, or its mod doesn't answer, it's asked here
 async function restartSelected($: any) {
   const f = await selectedSession($, 'restart')
   if (!f) return
@@ -948,59 +1027,43 @@ async function restartSelected($: any) {
     return
   }
   if (status !== 'idle') {
-    await decide($, { ...f, color: status === 'waiting' ? 'red' : 'blue' }, 'update')
+    await decide($, { ...f, color: status === 'waiting' ? 'red' : 'blue' }, 'restart')
     return
   }
   // Idle, but with background tasks (or no way to know): ask over there, because restarting it cuts them
   const bg = await backgroundTasks($, f.id as string)
   if (!bg || bg.count > 0) {
-    await decide($, f, 'update')
+    await decide($, f, 'restart')
     return
   }
-  const action = await askDialog($, f.title, 'update', await detailFor($, f, 'update'))
-  if (action === 'update') await perform($, f, 'update')
+  const action = await askDialog($, f.title, 'restart', await detailFor($, f, 'restart'))
+  if (action === 'restart') await perform($, f, 'restart')
   await focusRow($, f.sessionId, undefined)
 }
 
-// Restart this very session. Its process ends, so first the windows showing it are left ready to come back on their
-// own: the ones with a launcher (visor.sh with claude attach) are found by their processes, as when another session is
-// restarted. If none has one, the front one (the one you pressed u from: a hand-typed claude attach, or the agent view)
-// first gets a launcher, as in a jump. Then each launcher is told to reopen this session and the restart is requested:
-// the viewers close and the launchers reopen it with the new process
+// Restart this very session. Its process ends, so first the windows showing it with a launcher (opened with ccc) are
+// told to reopen it: the viewers close and the launchers reopen it with the new process. A window without a launcher
+// doesn't come back by itself: the question says so
 async function restartSelf($: any, f: Row) {
-  const action = await askDialog($, f.title, 'update', await detailFor($, f, 'update'))
-  if (action !== 'update' || !f.id) {
+  const id = f.id
+  if (!id) return
+  const v = await windows($)
+  const returning = (v.byId[id] ?? []).filter(tty => v.launchers[tty])
+  const front = await frontWindowShowingMe($)
+  const stranded = !!front && !returning.includes(front)
+  const extra = stranded ? " This window wasn't opened with ccc, so it won't reopen by itself: run ccc here afterwards." : ''
+  const action = await askDialog($, f.title, 'restart', `${await detailFor($, f, 'restart')}${extra}`.trim())
+  if (action !== 'restart') {
     await focusRow($, f.sessionId, undefined)
     return
   }
-  const id = f.id
-  const target: ViewerTarget = { command: 'attach', id, title: f.title }
-  const withLauncher = (v: Awaited<ReturnType<typeof windows>>) => (v.byId[id] ?? []).filter(tty => v.launchers[tty])
-  let v = await windows($)
-  let returning = withLauncher(v)
-  if (returning.length === 0) {
-    const front = await frontWindowShowingMe($)
-    if (!front || !viewerDir || !(await switchInPlace($, target, front))) {
-      $.ui.toast("Couldn't find this session's window to bring it back; nothing was restarted")
-      return
-    }
-    for (let i = 0; i < 40 && !withLauncher(v).includes(front); i++) {
-      await $.clock.sleep(200)
-      v = await windows($)
-    }
-    returning = withLauncher(v)
-    if (!returning.includes(front)) {
-      $.ui.toast("Couldn't prepare this window to come back; nothing was restarted")
-      return
-    }
-  }
   // The ↑ mark goes away right away, and the new process announces on startup that it was restarted
   const e = await readState($, myId)
-  if (e && installedVersion) await storeSet($, `estado:${myId}`, { ...e, version: installedVersion })
-  await storeSet($, `reiniciada:${myId}`, await $.clock.now())
+  if (e && installedVersion) await storeSet($, `state:${myId}`, { ...e, version: installedVersion })
+  await storeSet($, `restarted:${myId}`, await $.clock.now())
   for (const tty of returning) {
     try {
-      await $.fs.write(viewerFile(tty), targetFileText(target))
+      await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id, title: f.title }))
     } catch {}
   }
   // claude respawn ends this process. Run as a child of this session, it went away with it before starting it again
@@ -1018,8 +1081,8 @@ async function restartSelf($: any, f: Row) {
   // If this session is still here after 15 s, it wasn't restarted: the launchers mustn't reopen it when you close the
   // viewer, and you're told
   await $.clock.sleep(15000)
-  for (const tty of returning) await runSafe($, ['rm', '-f', viewerFile(tty)])
-  await $.store.delete(`reiniciada:${myId}`)
+  for (const tty of returning) await runSafe($, ['rm', '-f', windowFile(tty)])
+  await storeDelete($, `restarted:${myId}`)
   $.ui.toast(`Couldn't restart “${f.title}”`)
 }
 
@@ -1107,8 +1170,7 @@ async function toggleRename($: any) {
     return
   }
   const list = await read($, rows)
-  const f =
-    list.find(x => `s:${x.sessionId}` === selectedRow) ?? (list.every(x => x.current) ? list.find(x => x.current) : undefined)
+  const f = list.find(x => `s:${x.sessionId}` === selectedRow) ?? (list.every(x => x.current) ? list.find(x => x.current) : undefined)
   if (!f) {
     $.ui.toast('Select a session with ↑↓ first (to rename this one, use /rename)')
     return
@@ -1147,11 +1209,13 @@ async function rename($: any, text: string) {
   try {
     if (r.sessionId === myId) {
       await $.command.run({ command: 'rename', args: name })
-    } else if (((await readState($, r.sessionId))?.protocolo ?? 0) >= 4) {
-      await $.session.send({ to: { sessionId: r.sessionId }, text: buildMessage(RENAME_MARKER, { nombre: name }) })
+      return
+    }
+    const f = (await read($, rows)).find(x => x.sessionId === r.sessionId)
+    if (f && (await sendNotice($, f, 'rename', { name }))) {
       $.ui.toast(`Renaming “${r.title}” to “${name}”…`)
     } else {
-      $.ui.toast(`“${r.title}” runs an older panel: use /rename there`)
+      $.ui.toast(`“${r.title}” doesn't answer (its panel isn't running, or runs another version): use /rename there`)
     }
   } catch {
     $.ui.toast(`Couldn't rename “${r.title}”`)
@@ -1171,25 +1235,20 @@ async function openAgentsView($: any) {
     if ((await platform.processCwd(sys($), c.pid)) !== myCwd) continue
     if (c.tty === front || (await platform.bringWindow(sys($), c.tty, 'Agents'))) return
   }
-  const target: ViewerTarget = { command: 'agents', title: 'Agents' }
-  if (await switchInPlace($, target, front)) return
-  if (!(await platform.openWindow(sys($), front, 'Agents', launcherCommand(target)))) {
+  if (await switchInPlace($, agentsTarget(), front)) return
+  if (!(await platform.openWindow(sys($), front, 'Agents', launcherCommand(agentsTarget())))) {
     $.ui.toast(platform.text.cantOpenAgents)
   }
 }
 
-// The project root: the nearest folder upwards with AGENTS.md or CLAUDE.md (not the home folder); if there's none,
-// where the session started
+// The project root (rootFrom): the nearest folder upwards with AGENTS.md or CLAUDE.md, else where the session started
 async function projectRoot($: any): Promise<string> {
-  const root = await $.session.root()
+  const root = String(await $.session.root())
   let markers: readonly any[] = []
   try {
     markers = await $.fs.ancestors({ names: ['AGENTS.md', 'CLAUDE.md'] })
   } catch {}
-  const dirs = markers
-    .map(m => String(m.dir))
-    .filter(d => d.split('/').filter(Boolean).length > 2 && (root === d || root.startsWith(`${d}/`)))
-  return dirs.length ? dirs[dirs.length - 1] : root
+  return rootFrom(root, markers.map(m => String(m.dir)))
 }
 
 function truncate(text: string, width: number): string {
@@ -1210,8 +1269,8 @@ async function publishUsage($: any) {
     return
   }
   const previous = (await readState($, myId)) ?? {}
-  if (previous.modelo === model && previous.contexto === context && previous.version === version) return
-  await storeSet($, `estado:${myId}`, { ...previous, modelo: model, contexto: context, version })
+  if (previous.model === model && previous.context === context && previous.version === version) return
+  await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? (await $.clock.now()), model, context, version })
 }
 
 // After restarting with u from its own panel, the notice is shown when the window reconnects: at startup nobody is
@@ -1233,79 +1292,215 @@ async function notifyWhenBack($: any) {
 
 async function markTurnStart($: any) {
   const previous = (await readState($, myId)) ?? {}
-  await storeSet($, `estado:${myId}`, { ...previous, empezado: await $.clock.now() })
+  await storeSet($, `state:${myId}`, { ...previous, turnStarted: await $.clock.now() })
 }
 
 async function recordTitle($: any) {
-  if (await storeGet($, `titulo:${myId}`)) return
+  if (await storeGet($, `title:${myId}`)) return
   const first = (await $.session.messages()).find((m: any) => m.role === 'user' && m.text?.trim())
-  if (first) await storeSet($, `titulo:${myId}`, first.text.trim().split('\n')[0].slice(0, 50))
+  if (first) await storeSet($, `title:${myId}`, first.text.trim().split('\n')[0].slice(0, 50))
 }
 
-export const register: Register = on => {
-  on('session.start', async ($, e, next) => {
-    const r = await next(e)
-    // In a non-interactive run (claude -p) the mod does nothing
-    if (!e.isInteractive) return r
-    active = true
-    myId = String(await $.session.id())
-    myCwd = await projectRoot($)
-    const which = await runSafe($, ['/bin/sh', '-lc', 'command -v claude'])
-    if (which.exitCode === 0 && which.stdout.trim()) claude = which.stdout.trim()
-    const homeOut = await runSafe($, ['/bin/sh', '-c', 'printf %s "$HOME"'])
-    if (homeOut.exitCode === 0 && homeOut.stdout.startsWith('/')) {
-      home = homeOut.stdout
-      viewerDir = `${home}/.claude/mods/sessions-visor`
+// A request from the launcher in this session's inbox (see InboxRequest): consumed once, then acted on
+let checkingInbox = false
+async function checkInbox($: any) {
+  if (checkingInbox || !dataDir || !myId) return
+  const path = `${dataDir}/inbox/${myId}`
+  checkingInbox = true
+  try {
+    if (!(await $.fs.exists(path))) return
+    let text = ''
+    try {
+      text = await $.fs.read(path)
+    } catch {}
+    await runSafe($, ['rm', '-f', path])
+    const r = parseInbox(text)
+    if (!r) return
+    const answer = async (result: 'ok' | 'failed', reason = '') => {
+      if (!r.reply.startsWith(`${dataDir}/replies/`)) return
+      try {
+        await $.fs.write(r.reply, keyLines({ format: FORMAT, result, reason }))
+      } catch {}
     }
-    void copyToBin($)
+    if (r.format !== FORMAT) {
+      $.ui.toast('ccc runs another version of the sessions mod than this session: restart it (u, or claude respawn)')
+      await answer('failed', 'another version')
+      return
+    }
+    if ((await $.clock.now()) - r.at > 30000) return
+    debugLine($, `inbox: ${r.action}`)
+    if (r.action === 'focus') {
+      await focusPanel($)
+    } else if (r.action === 'bring') {
+      const ok = !!r.tty && (await platform.bringWindow(sys($), r.tty, r.title))
+      await answer(ok ? 'ok' : 'failed', ok ? '' : platform.text.cantBring)
+    }
+  } finally {
+    checkingInbox = false
+  }
+}
+
+// /clear starts a new conversation in the same session: its id changes (the short id that claude attach takes doesn't)
+// and no session.start comes. /resume can do the same. The mod keeps going with the new id: the session's own record
+// moves over (minus what belonged to the old conversation), and so do its heartbeat and its inbox
+async function rebind($: any) {
+  let id = ''
+  try {
+    id = String(await $.session.id())
+  } catch {
+    return
+  }
+  if (!id || !myId || id === myId) return
+  const old = myId
+  myId = id
+  debugLine($, `rebind: ${old} → ${id}`)
+  await update($, shortId, () => id.slice(0, 8))
+  const previous = await readState($, old)
+  const existing = await readState($, id)
+  const now = await $.clock.now()
+  await storeSet($, `state:${id}`, existing ?? { created: previous?.created ?? now, model: previous?.model, context: undefined, version: previous?.version })
+  const seen = await storeGet($, `seen:${old}`)
+  if (seen && !(await storeGet($, `seen:${id}`))) await storeSet($, `seen:${id}`, seen)
+  for (const k of ['state', 'seen', 'title', 'waiting', 'restarted']) await storeDelete($, `${k}:${old}`)
+  await runSafe($, ['rm', '-f', `${dataDir}/alive/${old}`, `${dataDir}/inbox/${old}`])
+  try {
+    await beat($)
+  } catch {}
+  await storeSet($, 'list', {})
+  void refresh($)
+}
+
+// Starts the mod in this session, once (see `starting`). The steps that can fail go one by one, each on its own, so one
+// that fails doesn't take the rest with it, and in order of need: who this session is, where its files are, its
+// record and its heartbeat, the timers, the panel, and /sessions last
+function ensureStarted($: any, via: string): Promise<void> {
+  if (!starting) {
+    startedVia = via
+    starting = start($)
+  }
+  return starting
+}
+
+async function start($: any) {
+  const step = async (name: string, body: () => Promise<unknown>) => {
+    try {
+      await body()
+      debugLine($, `start (${startedVia}): ${name}`)
+    } catch (err) {
+      startProblems.push(`${name}: ${String(err).slice(0, 200)}`)
+      debugLine($, `start (${startedVia}): ${name} failed: ${String(err).slice(0, 200)}`)
+    }
+  }
+  await step('session id', async () => {
+    myId = String(await $.session.id())
+    await update($, shortId, () => myId.slice(0, 8))
+  })
+  await step('folders', async () => {
+    home = (await $.env.get('HOME')) ?? ''
+    dataDir = (await $.env.get('SESSIONS_DATA_DIR')) || (home ? `${home}/.claude/mods/sessions-data` : '')
+    jobsDir = (await $.env.get('SESSIONS_JOBS_DIR')) || (home ? `${home}/.claude/jobs` : '')
+    daemonLog = (await $.env.get('SESSIONS_DAEMON_LOG')) || (home ? `${home}/.claude/daemon.log` : '')
+    if (dataDir) {
+      const sub = ['alive', 'order', 'inbox', 'windows', 'replies', 'debug', 'usage'].map(d => `${dataDir}/${d}`)
+      await runSafe($, ['mkdir', '-p', ...sub])
+    }
+    myCwd = await projectRoot($)
+  })
+  await step('claude and platform', async () => {
+    const fixed = await $.env.get('SESSIONS_CLAUDE')
+    const which = fixed ? { exitCode: 0, stdout: fixed } : await runSafe($, ['/bin/sh', '-lc', 'command -v claude'])
+    if (which.exitCode === 0 && which.stdout.trim()) claude = which.stdout.trim()
     platform = await choosePlatform(sys($))
-    await $.command.register({
-      name: 'sessions',
-      description: 'Sessions panel: open, focus or close. /sessions setup: status line, shortcuts and the ccc command',
-      argumentHint: '[setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
-      immediate: true,
-    })
-    // Record that this session understands the focus notice (sessions on earlier versions don't have it and aren't sent it)
-    const initial = (await readState($, myId)) ?? { creado: await $.clock.now() }
-    await storeSet($, `estado:${myId}`, { ...initial, protocolo: PROTOCOL })
+    try {
+      modVersion = String(JSON.parse(await $.fs.read(`${PLUGIN_DIR}/.claude-plugin/plugin.json`))?.version ?? '')
+    } catch {}
+  })
+  await step('state', async () => {
+    const e = (await readState($, myId)) ?? {}
+    await storeSet($, `state:${myId}`, { ...e, created: e.created ?? (await $.clock.now()) })
+  })
+  await step('heartbeat', () => beat($))
+  await step('timers', async () => {
     // If this session was restarted from its own panel (u), announce that it's back
-    const restartedAt = Number(await storeGet($, `reiniciada:${myId}`)) || 0
+    const restartedAt = Number(await storeGet($, `restarted:${myId}`)) || 0
     if (restartedAt) {
-      await $.store.delete(`reiniciada:${myId}`)
+      await storeDelete($, `restarted:${myId}`)
       if ((await $.clock.now()) - restartedAt < 120000) void notifyWhenBack($)
     }
     // A New or Rename field left open before a reload or a restart would come back stuck in the pane: start closed
     await closeFields($)
-    void refresh($)
-    void recordTitle($)
+    const view = await storeGet($, 'usageView')
+    if (view && ['day', 'week', 'month'].includes(view.period) && ['all', 'project'].includes(view.scope)) {
+      await update($, usageView, () => ({ period: view.period, scope: view.scope }))
+    }
+    $.clock.every(500, () => {
+      void checkInbox($)
+    })
     $.clock.every(3000, () => {
       void refresh($)
     })
     $.clock.every(2000, () => {
       void markSeenIfLooking($)
     })
-    void publishUsage($)
     $.clock.every(15000, () => {
-      void publishUsage($)
+      void (async () => {
+        await rebind($)
+        await beat($).catch(() => {})
+        await publishUsage($)
+      })()
     })
-    const view = await storeGet($, 'vistaUso')
-    if (view && ['day', 'week', 'month'].includes(view.periodo) && ['all', 'project'].includes(view.alcance)) {
-      await update($, usageView, () => ({ periodo: view.periodo, alcance: view.alcance }))
-    }
     $.clock.every(60000, () => {
       void readUsage($)
     })
-    void pinRemoteSessions($)
     $.clock.every(20000, () => {
       void pinRemoteSessions($)
-    })
-    const logPath = await runSafe($, ['/bin/sh', '-c', 'printf %s "${SESSIONS_DAEMON_LOG:-$HOME/.claude/daemon.log}"'])
-    if (logPath.exitCode === 0 && logPath.stdout.startsWith('/')) daemonLog = logPath.stdout
-    $.clock.every(20000, () => {
       void reopenRetiredSessions($)
     })
-    void $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined }).then(() => readUsage($))
-    return r
+    active = true
+    void refresh($)
+    void recordTitle($).catch(() => {})
+    void publishUsage($)
+    void pinRemoteSessions($)
+  })
+  await step('panel', async () => {
+    await $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined })
+    void readUsage($)
+  })
+  await step('command', () =>
+    $.command.register({
+      name: 'sessions',
+      description: 'Sessions panel: open, focus or close. /sessions setup: status line, shortcuts and the ccc command',
+      argumentHint: '[setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
+      immediate: true,
+    }),
+  )
+}
+
+export const register: Register = on => {
+  // In a non-interactive run (claude -p) the mod does nothing. The start isn't awaited before next(e): a step that hangs
+  // mustn't hold the session up
+  on('session.start', async ($, e, next) => {
+    if (e.isInteractive) {
+      sawSessionStart = true
+      void ensureStarted($, 'session.start')
+    }
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    // /clear (and /resume) keep this process and change the session's id: follow it
+    if (active && (e.reason === 'clear' || e.reason === 'resume')) {
+      $.clock.after(300, () => {
+        void (async () => {
+          for (let i = 0; i < 10; i++) {
+            await rebind($)
+            if (String(await $.session.id()) === myId) return
+            await $.clock.sleep(500)
+          }
+        })()
+      })
+    }
+    return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
@@ -1313,33 +1508,37 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A turn triggered by another session (SendMessage) doesn't go through turn.start. The focus notice from another
-  // session's panel is intercepted here: it isn't queued, isn't shown and the model doesn't read it; the panel takes
-  // the keyboard
+  // A turn triggered by another session (SendMessage) doesn't go through turn.start. Notices from another session's
+  // panel are intercepted here: they aren't queued, aren't shown and the model doesn't read them
   on('session.receive', async ($, e, next) => {
-    if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(FOCUS_MARKER)) {
-      if (active) void focusPanel($)
-      return { consumed: 'sessions: focus the panel after a switch' }
-    }
-    // The Stop question for this session, and the answer when the question was asked in another one
-    if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(ASK_MARKER)) {
-      const data = parseMessage(e.text, ASK_MARKER)
-      const from = String(data?.desde ?? '')
-      const detail = typeof data?.detalle === 'string' ? data.detalle.slice(0, 300) : ''
-      if (active && from) void answerQuestion($, from, data?.tema === 'update' ? 'update' : 'stop', detail)
-      return { consumed: 'sessions: ask here about stopping or updating this session' }
-    }
-    if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(ANSWER_MARKER)) {
-      const data = parseMessage(e.text, ANSWER_MARKER)
-      if (active && data) void receiveAnswer($, data)
-      return { consumed: 'sessions: the answer to a stop question' }
-    }
-    // The new name typed for this session in another one's panel (key r): rename with /rename
-    if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(RENAME_MARKER)) {
-      const data = parseMessage(e.text, RENAME_MARKER)
-      const name = typeof data?.nombre === 'string' ? data.nombre.trim().slice(0, 80) : ''
-      if (active && name) void $.command.run({ command: 'rename', args: name }).catch(() => {})
-      return { consumed: "sessions: rename this session from another session's panel" }
+    if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(NOTICE_MARKER)) {
+      void ensureStarted($, 'notice')
+      const n = parseNotice(e.text)
+      if (!n || n.format !== FORMAT) {
+        $.ui.toast('A session running another version of the sessions mod sent this one a notice: restart them (u)')
+        return { consumed: 'sessions: a notice in another format' }
+      }
+      const d = n.data
+      if (n.kind === 'focus') {
+        if (active) void focusPanel($)
+        return { consumed: 'sessions: focus the panel after a switch' }
+      }
+      if (n.kind === 'ask') {
+        const from = String(d.from ?? '')
+        const detail = typeof d.detail === 'string' ? d.detail.slice(0, 300) : ''
+        if (active && from) void answerQuestion($, from, d.topic === 'restart' ? 'restart' : 'stop', detail)
+        return { consumed: 'sessions: ask here about stopping or restarting this session' }
+      }
+      if (n.kind === 'answer') {
+        if (active) void receiveAnswer($, d)
+        return { consumed: 'sessions: the answer to a stop question' }
+      }
+      if (n.kind === 'rename') {
+        const name = typeof d.name === 'string' ? d.name.trim().slice(0, 80) : ''
+        if (active && name) void $.command.run({ command: 'rename', args: name }).catch(() => {})
+        return { consumed: "sessions: rename this session from another session's panel" }
+      }
+      return { consumed: 'sessions: an unknown notice' }
     }
     if (active) await markTurnStart($)
     return next(e)
@@ -1349,16 +1548,21 @@ export const register: Register = on => {
     const r = await next(e)
     if (active && e.agentId === undefined) {
       const answer = String(e.answer ?? '').trim()
-      const line = answer.split('\n').map(l => l.trim()).filter(Boolean).at(-1) ?? ''
+      const line =
+        answer
+          .split('\n')
+          .map(l => l.trim())
+          .filter(Boolean)
+          .at(-1) ?? ''
       const state: SessionState = {
         ...((await readState($, myId)) ?? {}),
-        terminado: await $.clock.now(),
-        motivo: e.reason,
-        respuesta: line.slice(0, 70),
-        pregunta: line.endsWith('?'),
+        finished: await $.clock.now(),
+        reason: e.reason,
+        answer: line.slice(0, 70),
+        question: line.endsWith('?'),
       }
-      await storeSet($, `estado:${myId}`, state)
-      void recordTitle($)
+      await storeSet($, `state:${myId}`, state)
+      void recordTitle($).catch(() => {})
       void publishUsage($)
     }
     return r
@@ -1366,8 +1570,9 @@ export const register: Register = on => {
 
   // Typing in the box (or from the phone) counts as having seen the session; a message from another session doesn't
   on('prompt.submit', async ($, e, next) => {
-    if (active && (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge')) {
-      await storeSet($, `visto:${myId}`, await $.clock.now())
+    if (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') {
+      void ensureStarted($, 'prompt')
+      if (active) await storeSet($, `seen:${myId}`, await $.clock.now())
     }
     return next(e)
   })
@@ -1375,12 +1580,14 @@ export const register: Register = on => {
   on('command.run', { command: 'sessions' }, async ($, e) => {
     // /sessions setup: the one-time setup (setup/setup.sh) for what a plugin can't configure by itself. Only its own
     // options are passed on, as separate arguments (no shell in between)
-    const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
+    const words = String(e.args ?? '')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
     if (words[0] === 'setup') {
       const allowed = /^--(dry-run|force-statusline|macos-launcher|statusline|keys|alias|all|help|shell=(bash|zsh|fish))$/
       const bad = words.slice(1).filter(w => !allowed.test(w))
       if (bad.length) return { text: `Unknown option: ${bad.join(' ')} (see /sessions setup --help)` }
-      await copyToBin($)
       const r = await runSafe($, ['bash', `${PLUGIN_DIR}/setup/setup.sh`, ...words.slice(1)], { timeoutMs: 60000 })
       return { text: (r.stdout + (r.stderr ? `\n${r.stderr}` : '')).trim() || `setup exited with code ${r.exitCode}` }
     }
@@ -1440,24 +1647,35 @@ export const register: Register = on => {
     return r
   })
 
+  // The line above the prompt: how many sessions wait for you (red) or have something unseen (yellow), and this
+  // session's short id. Its first draw starts the mod when nothing else did (a session draws even with no window
+  // attached; a draw only draws, so the start runs from a timer)
   on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
     const { Text } = $.ui.resolve(e)
+    if (!starting && !renderScheduled) {
+      renderScheduled = true
+      $.clock.after(0, () => {
+        void ensureStarted($, 'first draw')
+      })
+    }
     const others = (await read($, rows)).filter(f => !f.current)
     const reds = others.filter(f => f.color === 'red').length
     const yellows = others.filter(f => f.color === 'yellow').length
+    const id = await read($, shortId)
     return (
       <Text dimColor>
         {reds > 0 && <Text color={TINT.red}>● </Text>}
         {reds > 0 && `${reds}  `}
         {yellows > 0 && <Text color={TINT.yellow}>● </Text>}
         {yellows > 0 && `${yellows}  `}
-        {reds + yellows > 0 && '/sessions  '}⟨{myId.slice(0, 8)}⟩
+        {reds + yellows > 0 && '/sessions  '}⟨{id}⟩
       </Text>
     )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Input, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const Input = e.surface === 'mobile' ? undefined : $.ui.resolve(e).Input
     const list = await read($, rows)
     const asking = await read($, askingName)
     const renamingRow = await read($, renaming)
@@ -1478,6 +1696,7 @@ export const register: Register = on => {
         remeasure = true
       }
     }
+    const marks = list.some(f => f.noPanel || f.otherFormat)
     const overflows = list.length + 6 + (note !== '' ? 1 : 0) > height
     // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
@@ -1489,10 +1708,8 @@ export const register: Register = on => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      list.length + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + 5 <= room
-    const help = e.props.isFocused
-      ? overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back'
-      : 'shift+→ to use the panel'
+      list.length + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + 5 <= room
+    const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
     // Columns: [▌][● ][name…][↑][◆][ model  ctx  time]; in narrow panels the model is left out
     // Rows use only the width they need: in the box above the prompt (small windows or not fullscreen) the panel takes
     // the whole screen, and without this the model and time would end up far away from the name
@@ -1504,6 +1721,10 @@ export const register: Register = on => {
     const padLeft = (t: string, w: number) => ' '.repeat(Math.max(0, w - displayWidth(t))) + t
     const info = (f: Row) => `${showModel ? `  ${padRight(f.model, 9)}` : ''} ${padLeft(f.context, 4)} ${padLeft(f.time, 4)}`
     const name = (f: Row) => padRight(truncate(f.title, nameWidth), nameWidth)
+    // ↑: runs an older Claude version than the installed one; !: its panel isn't running there, or runs another version
+    // (u restarts it). Both take the first space after the name
+    const mark = (f: Row) =>
+      f.noPanel || f.otherFormat ? <Text color={TINT.yellow}>!</Text> : <Text color="claude">{f.outdated ? '↑' : ' '}</Text>
     // On entering the panel (ctrl+x tab) the focus goes to a session: the last selected one, or the first
     const jumpable = list.filter(f => !f.current)
     const initial = (list.find(f => `s:${f.sessionId}` === selectedRow) ?? jumpable[0] ?? list[0])?.sessionId
@@ -1547,7 +1768,7 @@ export const register: Register = on => {
                 ) : (
                   <Text bold>{name(f)}</Text>
                 )}
-                <Text color="claude">{f.outdated ? '↑' : ' '}</Text>
+                {mark(f)}
                 <Text>{f.pinned ? '◆' : ' '}</Text>
                 <Text dimColor>{padRight(info(f), total - 4 - nameWidth).slice(1)}</Text>
               </Box>
@@ -1569,9 +1790,8 @@ export const register: Register = on => {
               ) : (
                 <Text>{name(f)}</Text>
               )}
-              {/* ↑: runs an older Claude version than the installed one (takes the first space of the column);
-                  ◆: pinned, the background service doesn't close it for being idle */}
-              <Text color="claude">{f.outdated ? '↑' : ' '}</Text>
+              {/* ◆: pinned, the background service doesn't close it for being idle */}
+              {mark(f)}
               <Text>{f.pinned ? '◆' : ' '}</Text>
               <Text dimColor>{info(f).slice(1)}</Text>
             </Box>
@@ -1580,7 +1800,7 @@ export const register: Register = on => {
         {/* The New and Rename fields go below the rows: above them, opening or closing shifted the rows by one, and since
             Claude tracks the focus by position, what you typed landed on another row or the focus ended up on d: Day */}
         {inTerminal && Input && asking && (
-          <Input key="name" label="Name" placeholder="session name (Esc cancels)" autoFocus onSubmit={v => { void createSession($, v) }} />
+          <Input key="name" label="Name" placeholder="session name (Esc cancels)" autoFocus onSubmit={(v: string) => { void createSession($, v) }} />
         )}
         {inTerminal && Input && renamingRow && !asking && (
           <Input
@@ -1588,7 +1808,7 @@ export const register: Register = on => {
             label={`Rename “${truncate(renamingRow.title, 24)}”`}
             placeholder="new name (Esc cancels)"
             autoFocus
-            onSubmit={v => { void rename($, v) }}
+            onSubmit={(v: string) => { void rename($, v) }}
           />
         )}
         <Text> </Text>
@@ -1601,48 +1821,56 @@ export const register: Register = on => {
             {` Claude ${installedVersion} available · u: Restart`}
           </Text>
         )}
+        {marks && (
+          <Text dimColor>
+            <Text color={TINT.yellow}>!</Text>
+            {' Panel not running there · u: Restart'}
+          </Text>
+        )}
         {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (auto with Remote Control)</Text>}
         {/* Tokens spent: period (d, w, m) and scope (p: all of Claude or this project); bars per hour or per day */}
         {showUsage && <Box flexGrow={1} minHeight={1} />}
         {showUsage && (
           <Box flexDirection="row" flexWrap="wrap">
-            <Button key="usage-day" plain dimColor={view.periodo !== 'day' ? true : undefined} hotkey="d" label="Day" onPress={() => { void chooseUsageView($, { periodo: 'day' }) }} />
+            <Button key="usage-day" plain dimColor={view.period !== 'day' ? true : undefined} hotkey="d" label="Day" onPress={() => { void chooseUsageView($, { period: 'day' }) }} />
             <Text dimColor> · </Text>
-            <Button key="usage-week" plain dimColor={view.periodo !== 'week' ? true : undefined} hotkey="w" label="Week" onPress={() => { void chooseUsageView($, { periodo: 'week' }) }} />
+            <Button key="usage-week" plain dimColor={view.period !== 'week' ? true : undefined} hotkey="w" label="Week" onPress={() => { void chooseUsageView($, { period: 'week' }) }} />
             <Text dimColor> · </Text>
-            <Button key="usage-month" plain dimColor={view.periodo !== 'month' ? true : undefined} hotkey="m" label="Month" onPress={() => { void chooseUsageView($, { periodo: 'month' }) }} />
+            <Button key="usage-month" plain dimColor={view.period !== 'month' ? true : undefined} hotkey="m" label="Month" onPress={() => { void chooseUsageView($, { period: 'month' }) }} />
             <Text dimColor> · </Text>
             <Button
               key="usage-scope"
               plain
               hotkey="p"
-              label={view.alcance === 'all' ? 'All' : 'Project'}
-              onPress={() => { void chooseUsageView($, { alcance: view.alcance === 'all' ? 'project' : 'all' }) }}
+              label={view.scope === 'all' ? 'All' : 'Project'}
+              onPress={() => { void chooseUsageView($, { scope: view.scope === 'all' ? 'project' : 'all' }) }}
             />
           </Box>
         )}
         {showUsage && !usageData.summary && <Text dimColor>{usageData.note || 'Reading token usage…'}</Text>}
-        {showUsage && usageData.summary && (() => {
-          const includes = view.alcance === 'all' ? () => true : (cwd: string) => inProject(cwd, myCwd, home)
-          const w = usageWindow(usageData.summary, view.periodo, includes)
-          const [input, output, cacheRead, cacheWritten, thinking] = w.totals
-          const sumLabel = abbreviate(input + output + cacheRead + cacheWritten)
-          const barsWidth = Math.max(4, total - displayWidth(sumLabel) - 2)
-          return (
-            <Box flexDirection="column">
-              <Text>
-                <Text color="claude">{padRight(sparkline(w.bars, barsWidth), barsWidth)}</Text>
-                <Text>{`  ${sumLabel}`}</Text>
-              </Text>
-              {/* in is all the input: the new part and what comes from the cache (Claude re-reads the conversation on
-                  every response, almost all of it from the cache, so the new part is few tokens per response) */}
-              <Text dimColor>{`in ${abbreviate(input + cacheRead + cacheWritten)}${input + cacheRead + cacheWritten > 0 ? ` (${Math.round((cacheRead / (input + cacheRead + cacheWritten)) * 100)}% cached)` : ''} · out ${abbreviate(output)}${thinking ? ` (think ${abbreviate(thinking)})` : ''}`}</Text>
-              {/* written: what's new at each step (messages, command results, files) plus what gets stored again when
-                  the cache expired; uncached: the little that comes in without going through the cache */}
-              <Text dimColor>{`cache ${abbreviate(cacheRead)} read · ${abbreviate(cacheWritten)} written · ${abbreviate(input)} uncached`}</Text>
-            </Box>
-          )
-        })()}
+        {showUsage &&
+          usageData.summary &&
+          (() => {
+            const includes = view.scope === 'all' ? () => true : (cwd: string) => inProject(cwd, myCwd, home)
+            const w = usageWindow(usageData.summary, view.period, includes)
+            const [input = 0, output = 0, cacheRead = 0, cacheWritten = 0, thinking = 0] = w.totals
+            const sumLabel = abbreviate(input + output + cacheRead + cacheWritten)
+            const barsWidth = Math.max(4, total - displayWidth(sumLabel) - 2)
+            return (
+              <Box flexDirection="column">
+                <Text>
+                  <Text color="claude">{padRight(sparkline(w.bars, barsWidth), barsWidth)}</Text>
+                  <Text>{`  ${sumLabel}`}</Text>
+                </Text>
+                {/* in is all the input: the new part and what comes from the cache (Claude re-reads the conversation on
+                    every response, almost all of it from the cache, so the new part is few tokens per response) */}
+                <Text dimColor>{`in ${abbreviate(input + cacheRead + cacheWritten)}${input + cacheRead + cacheWritten > 0 ? ` (${Math.round((cacheRead / (input + cacheRead + cacheWritten)) * 100)}% cached)` : ''} · out ${abbreviate(output)}${thinking ? ` (think ${abbreviate(thinking)})` : ''}`}</Text>
+                {/* written: what's new at each step (messages, command results, files) plus what gets stored again when
+                    the cache expired; uncached: the little that comes in without going through the cache */}
+                <Text dimColor>{`cache ${abbreviate(cacheRead)} read · ${abbreviate(cacheWritten)} written · ${abbreviate(input)} uncached`}</Text>
+              </Box>
+            )
+          })()}
       </Box>
     )
   })

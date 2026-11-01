@@ -1,14 +1,14 @@
-"""Independent token usage count, from scratch and without a cache, to check the plugin's hooks/uso.py against.
+"""Independent token usage count, from scratch and without a cache, to check the plugin's hooks/usage.py against.
 
-Reads ~/.claude/projects/**/*.jsonl the simplest possible way and prints the same totals uso.py keeps: per folder
+Reads ~/.claude/projects/**/*.jsonl the simplest possible way and prints the same totals usage.py keeps: per folder
 (the session's cwd), per day (35 days) and per hour (48 hours), each [input, output, cache read, cache written,
 thinking]. Each model response is counted once, by message.id + requestId (a response is repeated once per content
 block, and copied into another file when a session is resumed).
 
 Usage: python3 usage-recount.py > recount.json
-       python3 ~/.claude/plugins/…/hooks/uso.py ~/.claude/projects /tmp/usage-cache > plugin.json
+       python3 ~/.claude/plugins/…/hooks/usage.py ~/.claude/projects /tmp/usage-cache > plugin.json
        python3 usage-compare.py plugin.json recount.json
-The output keys (dias, horas) match uso.py's, which keeps its original names as a wire format.
+The output keys (days, hours) match usage.py's.
 """
 import glob
 import json
@@ -56,4 +56,4 @@ for path in sorted(glob.glob(root + '/**/*.jsonl', recursive=True)):
         if hour >= since_hour:
             per_hour = hours.setdefault(cwd, {})
             per_hour[hour] = [a + b for a, b in zip(per_hour.get(hour, [0] * 5), values)]
-json.dump({'dias': days, 'horas': hours}, sys.stdout)
+json.dump({'days': days, 'hours': hours}, sys.stdout)

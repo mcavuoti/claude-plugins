@@ -1,15 +1,18 @@
 ---
 paths:
   - "plugins/sessions/hooks/**"
+  - "plugins/sessions/setup/**"
   - "plugins/sessions/types/**"
 ---
 
-# sessions: the wire format stays as it is
+# sessions: shared formats carry a version, and nothing keeps old ones alive
 
-Sessions running different versions of the `sessions` mod share stored data and send each other notices, and launchers already running in terminal windows keep reading the same file format. These names are in Spanish on purpose and must stay byte-identical:
+Several sessions run the `sessions` mod at once and talk through shared data: the store, the files in the data folder, the notices between sessions, and the launcher. After an update the owner restarts every session, so there is no compatibility code for older versions of the mod. Instead, version skew must be harmless and visible:
 
-- `$.store` keys and the fields inside stored values: `estado:<id>` (with `creado`, `empezado`, `terminado`, `motivo`, `respuesta`, `pregunta`, `modelo`, `contexto`, `version`, `protocolo`), `visto:`, `titulo:`, `esperando:`, `reiniciada:`, `revividas:`, `lista`, `instalada`, `vistaUso` (`periodo`, `alcance`), `fijado`, `fijadoAuto` (`ids`, `soltadas`), `reapertura` (`at`, `normalDesde`).
-- The notices between sessions (`sessions:focus-panel:7f3a`, `sessions:ask-stop:7f3a`, `sessions:stop-answer:7f3a`, `sessions:rename:7f3a`) and their payload fields and values (`desde`, `tema`, `detalle`, `sessionId`, `accion`, `volvio`, `nombre`).
-- The launcher's file lines (`comando=`, `id=`, `titulo=`, `carpeta=`), the folders `~/.claude/mods/sessions-visor`, `sessions-uso`, `sessions-bin`, and `uso.py`'s cache and output keys (`hoy`, `hora`, `dias`, `horas`).
+- **Files and notices carry `format`.** `FORMAT` in `hooks/state.ts` (and the same constant in `hooks/launcher.py`, `hooks/visor.sh` and `hooks/usage.py`) is the format of the heartbeats (`alive/`), the order file (`order/`), the inbox requests (`inbox/`), the launcher's window files (`windows/`), the mirrored settings (`config`), `usage.py`'s output and cache, and the notices (`sessions-notice:7f3a` + JSON with `format` and `kind`). Change any of their keys or meanings → raise the format in all of those places in the same commit.
+- **A reader that meets another format does nothing harmful and says so:** it doesn't act on the data, consumes a notice so it never reaches the model, and tells the person to restart sessions (`u`, or `claude respawn <id>`). Senders only send notices to sessions whose heartbeat shows the same format.
+- **Store keys are English.** When a stored value changes meaning, give it a new key name rather than reading two shapes.
+- **Locations are overridable** for tests: `SESSIONS_DATA_DIR` (the mod's files), `SESSIONS_JOBS_DIR` and `SESSIONS_DAEMON_LOG` (Claude's background service), `SESSIONS_CLAUDE` (the claude command), `SESSIONS_PLUGIN_VERSION`/`SESSIONS_PLUGIN_SINCE` (the installed plugin). A new location gets an override too, so test sessions never touch the owner's files.
+- **Nothing a running session does rewrites what other sessions or the shell run.** The `ccc` command and the status line copy are installed by the setup (`~/.claude/mods/sessions-data/bin/`); `ccc` finds the enabled plugin each time it runs.
 
-Never translate or rename them. New keys and fields can have English names. If a notice changes meaning, raise `PROTOCOL` in `register.tsx` and send it only to sessions whose stored `protocolo` is high enough, the way the existing notices do.
+The keys, files and fields are listed where they're defined: the comment above `storeGet` in `register.tsx`, and `state.ts` (Heartbeat, orderFileText, InboxRequest, WindowTarget, buildNotice).

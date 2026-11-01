@@ -8,14 +8,13 @@ keeps totals per day (35 days) and per hour (48 hours), split by the session's f
 The same response shows up several times (one line per block) and is also copied into another file when a session is
 resumed: it's counted only once, by its message id and request id (the same thing ccusage does).
 
-Prints a JSON: {"hoy", "hora", "dias": {cwd: {day: [in, out, cache_read, cache_written, thinking]}}, "horas": ...}
-Usage: uso.py [logs folder] [cache folder]
+Prints a JSON: {"format", "generated", "today", "hour", "days": {cwd: {day: [in, out, cache_read, cache_written,
+thinking]}}, "hours": ...}
+Usage: usage.py [logs folder] [cache folder]
 
-The keys of the printed JSON and of the cache file (version, generado, hoy, hora, dias, horas; archivos, vistos,
-desde, tam) are a wire format: the panel of any mod version reads the output, and the cache on disk is shared by every
-session, so they stay in Spanish. hoy = today, hora = current hour, dias = per-day totals, horas = per-hour totals,
-generado = generated at (ms), archivos = per-file read position, vistos = responses already counted (by day),
-desde = byte offset read up to, tam = file size at that point.
+The cache file (in the cache folder) is shared by every session: files = each log's read position (offset read up to,
+size at that point), seen = responses already counted (by day), days and hours = the totals. `format` is the format of
+the output and the cache (the panel reads only its own; a cache in another format is started over).
 """
 import fcntl
 import hashlib
@@ -27,7 +26,7 @@ from datetime import datetime, timedelta
 
 DAYS = 35
 HOURS = 48
-VERSION = 1
+FORMAT = 1
 
 
 def day_key(t):
@@ -47,25 +46,25 @@ def read_cache(path):
     try:
         with open(path) as f:
             c = json.load(f)
-        if c.get('version') == VERSION:
+        if c.get('format') == FORMAT:
             return c
     except (OSError, ValueError):
         pass
-    return {'version': VERSION, 'archivos': {}, 'vistos': {}, 'dias': {}, 'horas': {}}
+    return {'format': FORMAT, 'files': {}, 'seen': {}, 'days': {}, 'hours': {}}
 
 
 def prune(c, now):
     first_day = day_key(now - timedelta(days=DAYS))
     first_hour = hour_key(now - timedelta(hours=HOURS))
-    for cwd in list(c['dias']):
-        c['dias'][cwd] = {d: v for d, v in c['dias'][cwd].items() if d >= first_day}
-        if not c['dias'][cwd]:
-            del c['dias'][cwd]
-    for cwd in list(c['horas']):
-        c['horas'][cwd] = {h: v for h, v in c['horas'][cwd].items() if h >= first_hour}
-        if not c['horas'][cwd]:
-            del c['horas'][cwd]
-    c['vistos'] = {k: d for k, d in c['vistos'].items() if d >= first_day}
+    for cwd in list(c['days']):
+        c['days'][cwd] = {d: v for d, v in c['days'][cwd].items() if d >= first_day}
+        if not c['days'][cwd]:
+            del c['days'][cwd]
+    for cwd in list(c['hours']):
+        c['hours'][cwd] = {h: v for h, v in c['hours'][cwd].items() if h >= first_hour}
+        if not c['hours'][cwd]:
+            del c['hours'][cwd]
+    c['seen'] = {k: d for k, d in c['seen'].items() if d >= first_day}
 
 
 def process_line(line, c, since):
@@ -91,10 +90,10 @@ def process_line(line, c, since):
         return
     id_ = f"{m.get('id')}:{r.get('requestId')}"
     key = hashlib.sha1(id_.encode()).hexdigest()[:16]
-    if key in c['vistos']:
+    if key in c['seen']:
         return
     day = day_key(t)
-    c['vistos'][key] = day
+    c['seen'][key] = day
     details = u.get('output_tokens_details') or {}
     values = [
         int(u.get('input_tokens') or 0),
@@ -106,8 +105,8 @@ def process_line(line, c, since):
     if not any(values):
         return
     cwd = r.get('cwd') if isinstance(r.get('cwd'), str) else ''
-    add(c['dias'].setdefault(cwd, {}), day, values)
-    add(c['horas'].setdefault(cwd, {}), hour_key(t), values)
+    add(c['days'].setdefault(cwd, {}), day, values)
+    add(c['hours'].setdefault(cwd, {}), hour_key(t), values)
 
 
 def update(root, c, now):
@@ -124,12 +123,12 @@ def update(root, c, now):
             except OSError:
                 continue
             present.add(path)
-            previous = c['archivos'].get(path)
+            previous = c['files'].get(path)
             # A file that hasn't changed since before the period can't have anything to count
             if previous is None and st.st_mtime < cutoff:
-                c['archivos'][path] = {'desde': st.st_size, 'tam': st.st_size}
+                c['files'][path] = {'offset': st.st_size, 'size': st.st_size}
                 continue
-            start_byte = previous['desde'] if previous and previous['tam'] <= st.st_size else 0
+            start_byte = previous['offset'] if previous and previous['size'] <= st.st_size else 0
             if previous and start_byte == st.st_size:
                 continue
             with open(path, 'rb') as f:
@@ -139,16 +138,16 @@ def update(root, c, now):
             end = data.rfind(b'\n') + 1
             for line in data[:end].splitlines():
                 process_line(line, c, since)
-            c['archivos'][path] = {'desde': start_byte + end, 'tam': st.st_size}
-    for path in list(c['archivos']):
+            c['files'][path] = {'offset': start_byte + end, 'size': st.st_size}
+    for path in list(c['files']):
         if path not in present:
-            del c['archivos'][path]
+            del c['files'][path]
 
 
 def main():
     home = os.path.expanduser('~')
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(home, '.claude', 'projects')
-    folder = sys.argv[2] if len(sys.argv) > 2 else os.path.join(home, '.claude', 'mods', 'sessions-uso')
+    folder = sys.argv[2] if len(sys.argv) > 2 else os.path.join(home, '.claude', 'mods', 'sessions-data', 'usage')
     os.makedirs(folder, exist_ok=True)
     cache_path = os.path.join(folder, 'cache.json')
     # Only one update at a time (several sessions run this): the others wait and read the result
@@ -163,12 +162,12 @@ def main():
             json.dump(c, f, separators=(',', ':'))
         os.replace(temporary, cache_path)
     json.dump({
-        'version': VERSION,
-        'generado': int(time.time() * 1000),
-        'hoy': day_key(now),
-        'hora': hour_key(now),
-        'dias': c['dias'],
-        'horas': c['horas'],
+        'format': FORMAT,
+        'generated': int(time.time() * 1000),
+        'today': day_key(now),
+        'hour': hour_key(now),
+        'days': c['days'],
+        'hours': c['hours'],
     }, sys.stdout, separators=(',', ':'))
 
 

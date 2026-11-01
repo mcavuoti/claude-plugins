@@ -92,11 +92,6 @@ export const linux: Platform = {
     return ''
   },
 
-  canTypeIntoWindows: false,
-  async typeIntoWindow() {
-    return false
-  },
-
   // By title (the launcher titles each window with its session's name), with wmctrl, else xdotool; X11 only
   async bringWindow(run, _tty, title) {
     if ((await run(['wmctrl', '-a', title])).exitCode === 0) return true
@@ -147,5 +142,6 @@ export const linux: Platform = {
     regularUnreachable: title => `“${title}” runs in its own window, which this panel can't bring forward here: switch to it there`,
     cantOpen: title => `Couldn't open a window for “${title}”: open a terminal and run ccc there`,
     cantOpenAgents: "Couldn't open the agent view here: open a terminal and run ccc",
+    cantBring: 'windows can only be brought forward on X11 with wmctrl or xdotool',
   },
 }

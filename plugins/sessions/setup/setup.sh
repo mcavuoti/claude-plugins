@@ -3,14 +3,16 @@
 # reads them from your own settings.
 #   - status line: "statusLine" in ~/.claude/settings.json → the plugin's status line script
 #   - keyboard: shift+→ focuses the panel from the prompt, ← goes back to the prompt (~/.claude/keybindings.json)
-#   - shell: `ccc` opens the current folder's sessions in the agents view through the launcher, without starting a
-#     new session. It goes in your shell's startup file: bash ~/.bashrc (plus making the login file load it, since
-#     macOS Terminal starts login shells), zsh ~/.zshrc, fish ~/.config/fish/config.fish
+#   - shell: `ccc` opens the current folder's top session in the terminal window, with its panel (or a Name prompt
+#     when there's none). It goes in your shell's startup file: bash ~/.bashrc (plus making the login file load it,
+#     since macOS Terminal starts login shells), zsh ~/.zshrc, fish ~/.config/fish/config.fish
 #
-# The status line and the launcher run from fixed copies in ~/.claude/mods/sessions-bin/, which the mod refreshes
-# every time a session starts: an installed plugin lives in a folder that changes with each update.
+# The status line and the ccc command are installed in ~/.claude/mods/sessions-data/bin/ (SESSIONS_DATA_DIR): an
+# installed plugin lives in a folder that changes with each update, and nothing else writes there. ccc finds the
+# enabled plugin each time it runs, so it follows updates; the status line is a copy (run the setup again after an
+# update that changes it). An earlier setup's ccc and status line (in ~/.claude/mods/sessions-bin) are moved over.
 #
-# Every file it changes is backed up first (<file>.bak-sessions-<date-time>). Running it again changes nothing.
+# Every file it changes is backed up first (<file>.bak-antes-<what>-<date-time>). Running it again changes nothing.
 #
 # Usage: setup.sh [--statusline] [--keys] [--alias] [--force-statusline] [--macos-launcher] [--shell=NAME] [--dry-run]
 #   With none of --statusline/--keys/--alias, it does all three.
@@ -22,7 +24,9 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bin="$HOME/.claude/mods/sessions-bin"
+data="${SESSIONS_DATA_DIR:-$HOME/.claude/mods/sessions-data}"
+bin="$data/bin"
+old_bin="$HOME/.claude/mods/sessions-bin"
 settings="$HOME/.claude/settings.json"
 keybindings="$HOME/.claude/keybindings.json"
 stamp="$(date +%Y%m%d-%H%M%S)"
@@ -47,15 +51,21 @@ if [ $((do_statusline + do_keys + do_alias)) -eq 0 ]; then do_statusline=1 do_ke
 command -v python3 >/dev/null || { echo "setup needs python3 (to edit JSON settings safely)" >&2; exit 1; }
 
 say() { printf '%s\n' "$*"; }
-backup() { if [ -f "$1" ] && [ "$dry" -eq 0 ]; then cp -p "$1" "$1.bak-sessions-$stamp"; say "  backup: $1.bak-sessions-$stamp"; fi; }
+# $1 file, $2 what for (the backup is <file>.bak-antes-<what>-<date-time>)
+backup() { if [ -f "$1" ] && [ "$dry" -eq 0 ]; then cp -p "$1" "$1.bak-antes-$2-$stamp"; say "  backup: $1.bak-antes-$2-$stamp"; fi; }
 
-# The fixed copies (the mod keeps them up to date afterwards)
+# The ccc command (it remembers this copy of the plugin, for when no installed one is found) and the status line
 install_copies() {
-  if [ "$dry" -eq 1 ]; then say "would copy the launcher and the status line to $bin/"; return; fi
+  if [ "$dry" -eq 1 ]; then say "would install the ccc command and the status line in $bin/"; return; fi
   mkdir -p "$bin"
-  cp "$root/hooks/visor.sh" "$bin/visor.sh"
-  cp "$root/statusline/statusline.sh" "$bin/statusline.sh"
-  chmod +x "$bin/visor.sh" "$bin/statusline.sh"
+  ROOT="$root" python3 - "$root/setup/ccc" "$bin/ccc.tmp" <<'PY'
+import os, shlex, sys
+text = open(sys.argv[1], encoding='utf-8').read()
+open(sys.argv[2], 'w', encoding='utf-8').write(text.replace("SETUP_ROOT=''\n", 'SETUP_ROOT=%s\n' % shlex.quote(os.environ['ROOT']), 1))
+PY
+  mv -f "$bin/ccc.tmp" "$bin/ccc"
+  cp "$root/statusline/statusline.sh" "$bin/statusline.sh.tmp" && mv -f "$bin/statusline.sh.tmp" "$bin/statusline.sh"
+  chmod +x "$bin/ccc" "$bin/statusline.sh"
 }
 
 # Edits a JSON file with a small Python program; prints CHANGED or UNCHANGED, then a note (what was left as is).
@@ -87,24 +97,24 @@ setup_statusline() {
   say "Status line"
   local want="$bin/statusline.sh"
   command -v jq >/dev/null || say "  note: the status line script needs jq (brew install jq / apt install jq)"
-  [ -f "$settings" ] && [ "$dry" -eq 0 ] && cp -p "$settings" "$settings.bak-sessions-$stamp"
+  [ -f "$settings" ] && [ "$dry" -eq 0 ] && cp -p "$settings" "$settings.bak-antes-statusline-$stamp"
   local result
   result=$(edit_json "$settings" '
-want, force = sys.argv[1], sys.argv[2] == "1"
+want, force, old = sys.argv[1], sys.argv[2] == "1", sys.argv[3]
 current = (data.get("statusLine") or {}).get("command")
 if current == want:
     note = "(already set)"
-elif current and not force:
+elif current and current != old and not force:
     note = "(you already have one: " + str(current) + "; run with --force-statusline to replace it)"
 else:
     data["statusLine"] = {"type": "command", "command": want, "padding": 0}
     changed = True
-' "$want" "$force_statusline")
+' "$want" "$force_statusline" "$old_bin/statusline.sh")
   if [ "${result%% *}" = CHANGED ]; then
     if [ "$dry" -eq 1 ]; then say "  would set statusLine → $want"
-    else [ -f "$settings.bak-sessions-$stamp" ] && say "  backup: $settings.bak-sessions-$stamp"; say "  statusLine → $want"; fi
+    else [ -f "$settings.bak-antes-statusline-$stamp" ] && say "  backup: $settings.bak-antes-statusline-$stamp"; say "  statusLine → $want"; fi
   else
-    rm -f "$settings.bak-sessions-$stamp"
+    rm -f "$settings.bak-antes-statusline-$stamp"
     say "  ${result#UNCHANGED }"
   fi
 }
@@ -112,7 +122,7 @@ else:
 setup_keys() {
   say "Keyboard"
   local result
-  [ -f "$keybindings" ] && [ "$dry" -eq 0 ] && cp -p "$keybindings" "$keybindings.bak-sessions-$stamp"
+  [ -f "$keybindings" ] && [ "$dry" -eq 0 ] && cp -p "$keybindings" "$keybindings.bak-antes-keys-$stamp"
   result=$(edit_json "$keybindings" '
 data = {"$schema": data.get("$schema", "https://www.schemastore.org/claude-code-keybindings.json"),
         "$docs": data.get("$docs", "https://code.claude.com/docs/en/keybindings"), **data}
@@ -135,10 +145,10 @@ note = "; ".join(notes) if notes else ("" if changed else "(already set)")
 ')
   if [ "${result%% *}" = CHANGED ]; then
     if [ "$dry" -eq 1 ]; then say "  would add the missing keys: shift+right (to the panel), left (back to the prompt)"
-    else [ -f "$keybindings.bak-sessions-$stamp" ] && say "  backup: $keybindings.bak-sessions-$stamp"; say "  added the missing keys: shift+right (to the panel), left (back to the prompt)"; fi
+    else [ -f "$keybindings.bak-antes-keys-$stamp" ] && say "  backup: $keybindings.bak-antes-keys-$stamp"; say "  added the missing keys: shift+right (to the panel), left (back to the prompt)"; fi
     note="${result#CHANGED }"; if [ -n "$note" ]; then say "  $note"; fi
   else
-    rm -f "$keybindings.bak-sessions-$stamp"
+    rm -f "$keybindings.bak-antes-keys-$stamp"
     say "  ${result#UNCHANGED }"
   fi
 }
@@ -161,41 +171,48 @@ add_block() {
   if [ -f "$file" ] && grep -q '^# >>> sessions plugin >>>' "$file"; then return 1; fi
   [ "$dry" -eq 1 ] && return 0
   mkdir -p "$(dirname "$file")"
-  backup "$file"
+  backup "$file" ccc
   printf '\n# >>> sessions plugin >>>\n%s\n# <<< sessions plugin <<<\n' "$body" >> "$file"
 }
 
 setup_alias() {
   say "Shell shortcut (ccc)"
-  local shell rc line comment="# Open this folder's Claude sessions in the agents view, without starting a new one"
-  local launcher="~/.claude/mods/sessions-bin/visor.sh"
+  local shell rc line comment="# ccc: open this folder's top Claude session here, with its panel (ccc <name>, ccc --new, ccc --agents)"
+  local command="$bin/ccc"
+  [ "$command" = "$HOME/.claude/mods/sessions-data/bin/ccc" ] && command="~/.claude/mods/sessions-data/bin/ccc"
   shell="$(detect_shell)"
   case "$shell" in
-    bash) rc="$HOME/.bashrc"; line="alias ccc='bash $launcher agents'" ;;
-    zsh) rc="${ZDOTDIR:-$HOME}/.zshrc"; line="alias ccc='bash $launcher agents'" ;;
-    fish) rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"; line="alias ccc 'bash $launcher agents'" ;;
+    bash) rc="$HOME/.bashrc"; line="alias ccc='bash $command'" ;;
+    zsh) rc="${ZDOTDIR:-$HOME}/.zshrc"; line="alias ccc='bash $command'" ;;
+    fish) rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"; line="alias ccc 'bash $command'" ;;
     *) say "  your shell is $shell: add a shortcut that runs this command to its startup file yourself:"
-       say "    bash $launcher agents"; return ;;
+       say "    bash $command"; return ;;
   esac
   say "  shell: $shell → $rc"
-  # A ccc that runs the launcher from the plugin's old folder (manual installs) is replaced; any other ccc is the user's
-  if [ -f "$rc" ] && grep -Eq "^[[:space:]]*alias ccc[= ].*sessions/hooks/visor\.sh" "$rc"; then
-    if [ "$dry" -eq 1 ]; then say "  would replace the old ccc (pointing at the old launcher folder)"
+  if [ -f "$rc" ] && grep -Fxq "$line" "$rc"; then say "  already set"; return; fi
+  # A ccc this plugin wrote before (inside its block, or pointing at an old launcher) is replaced; any other is yours
+  if [ -f "$rc" ] && { sed -n '/^# >>> sessions plugin >>>/,/^# <<< sessions plugin <<</p' "$rc" | grep -Eq '^[[:space:]]*alias ccc[= ]' \
+      || grep -Eq "^[[:space:]]*alias ccc[= ].*(sessions/hooks|sessions-bin)/visor\.sh" "$rc"; }; then
+    if [ "$dry" -eq 1 ]; then say "  would replace the plugin's earlier ccc with: $line"
     else
-      backup "$rc"
-      CCC_LINE="$line" python3 - "$rc" <<'PY'
+      backup "$rc" ccc-start
+      CCC_LINE="$line" CCC_COMMENT="$comment" python3 - "$rc" <<'PY'
 import os, re, sys
 path = sys.argv[1]
 text = open(path, encoding='utf-8').read()
-new = re.sub(r'(?m)^[ \t]*alias ccc[= ].*sessions/hooks/visor\.sh.*$', lambda m: os.environ['CCC_LINE'], text)
-open(path, 'w', encoding='utf-8').write(new)
+line, comment = os.environ['CCC_LINE'], os.environ['CCC_COMMENT']
+def block(m):
+    body = re.sub(r'(?m)^[ \t]*alias ccc[= ].*$', lambda _: line, m.group(0))
+    return re.sub(r'(?m)^# (Open this folder|ccc: open).*$', lambda _: comment, body)
+text = re.sub(r'(?ms)^# >>> sessions plugin >>>$.*?^# <<< sessions plugin <<<$', block, text)
+text = re.sub(r'(?m)^[ \t]*alias ccc[= ].*(sessions/hooks|sessions-bin)/visor\.sh.*$', lambda _: line, text)
+open(path, 'w', encoding='utf-8').write(text)
 PY
-      say "  replaced the old ccc (it pointed at the old launcher folder)"
+      say "  replaced the plugin's earlier ccc (it opened the agent view): $line"
     fi
     return
   fi
-  if [ -f "$rc" ] && grep -Fxq "$line" "$rc"; then say "  already set"; return; fi
-  if [ -f "$rc" ] && grep -Eq '^[[:space:]]*(alias ccc[= ]|function ccc|ccc[[:space:]]*\(\))' "$rc" && ! grep -q '^# >>> sessions plugin >>>' "$rc"; then
+  if [ -f "$rc" ] && grep -Eq '^[[:space:]]*(alias ccc[= ]|function ccc|ccc[[:space:]]*\(\))' "$rc"; then
     say "  $rc already defines ccc: left as is. To use the plugin's, replace it with:"; say "    $line"; return
   fi
   if add_block "$rc" "$comment"$'\n'"$line"; then
@@ -226,7 +243,7 @@ setup_macos_launcher() {
   mkdir -p "$(dirname "$dest")"
   cp "$root/extras/macos/claude-bg-launcher" "$dest"
   chmod +x "$dest"
-  [ -f "$settings" ] && cp -p "$settings" "$settings.bak-sessions-$stamp"
+  [ -f "$settings" ] && cp -p "$settings" "$settings.bak-antes-macos-launcher-$stamp"
   local result
   result=$(edit_json "$settings" '
 dest = sys.argv[1]
@@ -236,10 +253,10 @@ if env.get("CLAUDE_CODE_PROCESS_WRAPPER") != dest:
     changed = True
 ' "$dest")
   if [ "${result%% *}" = CHANGED ]; then
-    say "  backup: $settings.bak-sessions-$stamp"
+    say "  backup: $settings.bak-antes-macos-launcher-$stamp"
     say "  CLAUDE_CODE_PROCESS_WRAPPER → $dest (takes effect when the background service restarts)"
   else
-    rm -f "$settings.bak-sessions-$stamp"; say "  already set"
+    rm -f "$settings.bak-antes-macos-launcher-$stamp"; say "  already set"
   fi
 }
 

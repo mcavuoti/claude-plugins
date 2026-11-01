@@ -8,13 +8,13 @@ import {
   closedForLowMemory,
   daysUpTo,
   paneWidth,
-  buildMessage,
+  buildNotice,
   colorOf,
   displayWidth,
   compareVersions,
   timeSince,
   inProject,
-  parseMessage,
+  parseNotice,
   parsePins,
   parseVersion,
   shortModelName,
@@ -29,22 +29,38 @@ import {
   usageWindow,
   versionFromExecutable,
   parseWindows,
+  sortRows,
+  orderFileText,
+  parseOrderFile,
+  fileKey,
+  keyLines,
+  parseKeyLines,
+  windowTargetText,
+  parseInbox,
+  parseHeartbeat,
+  heartbeatText,
+  heartbeatStatus,
+  type Heartbeat,
+  expectsHeartbeat,
+  HEARTBEAT_VERSION,
+  parsePluginList,
+  rootFrom,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
 const NOW = 1_000_000_000
 
 test('colors: each official status gives its color and when the time counts from', () => {
-  expect(colorOf({ status: 'busy' }, { empezado: 5 }, 0)).toEqual({ color: 'blue', since: 5 })
+  expect(colorOf({ status: 'busy' }, { turnStarted: 5 }, 0)).toEqual({ color: 'blue', since: 5 })
   expect(colorOf({ status: 'waiting' }, null, 0, 7)).toEqual({ color: 'red', since: 7 })
   expect(colorOf({}, null, 0).color).toBe('gray')
-  expect(colorOf({ status: 'idle' }, { terminado: 100 }, 0)).toEqual({ color: 'yellow', since: 100 })
-  expect(colorOf({ status: 'idle' }, { terminado: 100 }, 200)).toEqual({ color: 'green', since: 100 })
-  expect(colorOf({ status: 'idle' }, { creado: 3 }, 0)).toEqual({ color: 'green', since: 3 })
+  expect(colorOf({ status: 'idle' }, { finished: 100 }, 0)).toEqual({ color: 'yellow', since: 100 })
+  expect(colorOf({ status: 'idle' }, { finished: 100 }, 200)).toEqual({ color: 'green', since: 100 })
+  expect(colorOf({ status: 'idle' }, { created: 3 }, 0)).toEqual({ color: 'green', since: 3 })
 })
 
 test("colors: a status that doesn't exist today shows as gray, not as done", () => {
-  expect(colorOf({ status: 'paused' }, { terminado: 1 }, 0).color).toBe('gray')
+  expect(colorOf({ status: 'paused' }, { finished: 1 }, 0).color).toBe('gray')
 })
 
 test('short time: now, minutes, hours and days', () => {
@@ -92,10 +108,10 @@ test('pinned: pins.json is only read if it is a list of ids', () => {
 })
 
 test('pinned: with Remote Control it gets pinned automatically, and unpinned when turned off', () => {
-  const none = { ids: [], soltadas: [] }
+  const none = { ids: [], released: [] }
   // Remote Control turned on: it gets pinned, after the ones already there
   const a = reconcilePins(['other'], { s1: true, other: false }, none)
-  expect(a).toEqual({ pins: ['other', 's1'], auto: { ids: ['s1'], soltadas: [] }, toPin: ['s1'], toUnpin: [] })
+  expect(a).toEqual({ pins: ['other', 's1'], auto: { ids: ['s1'], released: [] }, toPin: ['s1'], toUnpin: [] })
   // The next pass changes nothing
   expect(reconcilePins(a.pins, { s1: true, other: false }, a.auto)).toEqual({ pins: ['other', 's1'], auto: a.auto, toPin: [], toUnpin: [] })
   // Turned off: the one the mod pinned is unpinned; the one you pinned (other) stays
@@ -109,21 +125,21 @@ test('pinned: with Remote Control it gets pinned automatically, and unpinned whe
 })
 
 test("pinned: if you unpin it by hand it doesn't insist, until you turn Remote Control on again", () => {
-  const pinned = { ids: ['s1'], soltadas: [] }
+  const pinned = { ids: ['s1'], released: [] }
   // The mod pinned it and it's not in pins.json: you unpinned it (Ctrl+T)
   const a = reconcilePins([], { s1: true }, pinned)
-  expect(a).toEqual({ pins: [], auto: { ids: [], soltadas: ['s1'] }, toPin: [], toUnpin: [] })
+  expect(a).toEqual({ pins: [], auto: { ids: [], released: ['s1'] }, toPin: [], toUnpin: [] })
   expect(reconcilePins([], { s1: true }, a.auto).pins).toEqual([])
   // You turn Remote Control off and on: it gets pinned again
   const b = reconcilePins([], { s1: false }, a.auto)
-  expect(b.auto).toEqual({ ids: [], soltadas: [] })
+  expect(b.auto).toEqual({ ids: [], released: [] })
   expect(reconcilePins([], { s1: true }, b.auto).toPin).toEqual(['s1'])
 })
 
 test('pinned: a deleted session the mod pinned gets unpinned', () => {
-  expect(reconcilePins(['s1', 'other'], { other: false }, { ids: ['s1'], soltadas: ['s3'] })).toEqual({
+  expect(reconcilePins(['s1', 'other'], { other: false }, { ids: ['s1'], released: ['s3'] })).toEqual({
     pins: ['other'],
-    auto: { ids: [], soltadas: [] },
+    auto: { ids: [], released: [] },
     toPin: [],
     toUnpin: ['s1'],
   })
@@ -182,14 +198,16 @@ test('Stop: Stop & Remove is the second option, and only the dialog options do a
   expect(actionFromAnswer('Stop it please')).toBe(null)
 })
 
-test("notices between sessions: round trip, and nothing if the text isn't a notice", () => {
-  const m = buildMessage('sessions:ask-stop:7f3a', { desde: 'abc' })
-  expect(parseMessage(m, 'sessions:ask-stop:7f3a')).toEqual({ desde: 'abc' })
+test("notices between sessions: round trip with format and kind, and nothing if the text isn't a notice", () => {
+  const m = buildNotice('ask', { from: 'abc', topic: 'stop' })
+  expect(parseNotice(m)).toEqual({ format: 1, kind: 'ask', data: { format: 1, kind: 'ask', from: 'abc', topic: 'stop' } })
   // Even if Claude wraps something around it when delivering it
-  expect(parseMessage(`<from peer>${m}</from peer>`, 'sessions:ask-stop:7f3a')).toEqual({ desde: 'abc' })
-  expect(parseMessage(m, 'sessions:stop-answer:7f3a')).toBe(null)
-  expect(parseMessage('sessions:ask-stop:7f3a no data', 'sessions:ask-stop:7f3a')).toBe(null)
-  expect(parseMessage('sessions:ask-stop:7f3a [1, 2]', 'sessions:ask-stop:7f3a')).toBe(null)
+  expect(parseNotice(`<from peer>${m}</from peer>`)?.kind).toBe('ask')
+  expect(parseNotice('sessions-notice:7f3a no data')).toBe(null)
+  expect(parseNotice('sessions-notice:7f3a [1, 2]')).toBe(null)
+  expect(parseNotice('hello')).toBe(null)
+  // A notice from another format is still recognized (to be consumed and reported), with its format
+  expect(parseNotice('sessions-notice:7f3a {"format": 2, "kind": "focus"}')?.format).toBe(2)
 })
 
 test('selected row when the chosen one leaves the list: the next one, or the previous one if it was the last', () => {
@@ -209,11 +227,10 @@ test('selected row when the one that had the focus already left the list', () =>
   expect(remainingNeighbor(['a', 'b'], 'z', ['b'])).toBe('b')
 })
 
-test("Restart: only the dialog's answer triggers it (also the previous mod's)", () => {
+test("Restart: only the dialog's answer triggers it", () => {
   expect(RESTART_OPTIONS).toEqual(['Restart', 'Cancel'])
-  expect(actionFromAnswer('Restart')).toBe('update')
-  expect(actionFromAnswer('Update now')).toBe('update')
-  expect(actionFromAnswer('update')).toBe(null)
+  expect(actionFromAnswer('Restart')).toBe('restart')
+  expect(actionFromAnswer('restart')).toBe(null)
   expect(actionFromAnswer('Cancel')).toBe(null)
 })
 
@@ -278,13 +295,13 @@ test('usage: days in the window, also across month and year boundaries', () => {
 
 test('usage: sum for the period and per folder', () => {
   const r = {
-    hoy: '2026-10-06',
-    hora: '2026-10-06T02',
-    dias: {
+    today: '2026-10-06',
+    hour: '2026-10-06T02',
+    days: {
       '/myapp': { '2026-10-06': [1, 10, 100, 5, 4], '2026-10-01': [2, 20, 200, 6, 3], '2026-09-01': [9, 9, 9, 9, 9] },
       '/other': { '2026-10-06': [1, 1, 1, 1, 0] },
     },
-    horas: { '/myapp': { '2026-10-06T00': [1, 2, 3, 4, 1], '2026-10-06T02': [0, 1, 0, 0, 0], '2026-10-05T23': [5, 5, 5, 5, 5] } },
+    hours: { '/myapp': { '2026-10-06T00': [1, 2, 3, 4, 1], '2026-10-06T02': [0, 1, 0, 0, 0], '2026-10-05T23': [5, 5, 5, 5, 5] } },
   }
   const all = () => true
   const week = usageWindow(r, 'week', all)
@@ -356,15 +373,15 @@ test('reopen: only those from the last 2 h count towards the limit', () => {
 
 // One window of each kind, as `ps -A -o pid=,tty=,command=` lists them on macOS and on Linux
 const PS_MAC = [
-  '  101 ttys001  bash /Users/x/.claude/mods/sessions-bin/visor.sh attach aaaaaaaa',
+  '  101 ttys001  bash /Users/x/.claude/plugins/cache/m/sessions/0.10.0/hooks/visor.sh attach aaaaaaaa',
   '  102 ttys001  claude attach aaaaaaaa',
   '  103 ttys002  claude agents --cwd .',
-  '  104 ttys002  bash /Users/x/.claude/mods/sessions-bin/visor.sh agents',
+  '  104 ttys002  bash /Users/x/.claude/plugins/cache/m/sessions/0.10.0/hooks/visor.sh agents',
   '  105 ??       /Users/x/.local/share/claude/stable/claude --bg-spare /tmp/x.sock',
   '  106 ttys003  claude',
 ].join('\n')
 const PS_LINUX = [
-  ' 2001 pts/0    bash /home/x/.claude/mods/sessions-bin/visor.sh attach aaaaaaaa',
+  ' 2001 pts/0    bash /home/x/.claude/plugins/cache/m/sessions/0.10.0/hooks/visor.sh attach aaaaaaaa',
   ' 2002 pts/0    claude attach aaaaaaaa',
   ' 2003 ?        /home/x/.local/share/claude/versions/2.1.314 --bg-spare /tmp/x.sock',
   ' 2004 pts/1    claude attach aaaaaaaa',
@@ -382,4 +399,88 @@ test('windows: viewers, agent views and launchers, from ps on macOS and on Linux
   expect(linux.clients['/dev/pts/1']).toBe('2004')
   expect(linux.launchers).toEqual({ '/dev/pts/0': '2001' })
   expect(linux.byPid['2003']).toBe(undefined)
+})
+
+test('order: the panel order (waiting, done, working, idle, stopped, then title) and its file round trip', () => {
+  const rows = [
+    { sessionId: 's1', color: 'green' as const, id: 'aaaaaaaa', title: 'beta' },
+    { sessionId: 's2', color: 'red' as const, id: 'bbbbbbbb', title: 'zeta' },
+    { sessionId: 's3', color: 'gray' as const, id: null, title: 'alpha' },
+    { sessionId: 's4', color: 'green' as const, id: 'cccccccc', title: 'alpha\tx' },
+    { sessionId: 's5', color: 'yellow' as const, id: 'dddddddd', title: 'mid' },
+  ]
+  const sorted = sortRows(rows)
+  expect(sorted.map(r => r.sessionId)).toEqual(['s2', 's5', 's4', 's1', 's3'])
+  const text = orderFileText('/Users/x/myapp', sorted, 1234)
+  const back = parseOrderFile(text)
+  expect(back?.format).toBe(1)
+  expect(back?.at).toBe(1234)
+  expect(back?.root).toBe('/Users/x/myapp')
+  expect(back?.rows.map(r => r.sessionId)).toEqual(['s2', 's5', 's4', 's1', 's3'])
+  // A tab in a title doesn't break the columns; a stopped regular session has no id
+  expect(back?.rows[2]).toEqual({ sessionId: 's4', color: 'green', id: 'cccccccc', title: 'alpha x' })
+  expect(back?.rows[4]?.id).toBe(null)
+  expect(fileKey('/Users/x/myapp')).toBe('_Users_x_myapp')
+})
+
+test('shared files: key=value lines, one value per key, line breaks flattened', () => {
+  expect(keyLines({ format: 1, title: 'a\nb', none: undefined })).toBe('format=1\ntitle=a b\n')
+  expect(parseKeyLines('format=1\ntitle=x=y\nformat=2\njunk\n')).toEqual({ format: '1', title: 'x=y' })
+  expect(windowTargetText({ command: 'attach', id: 'aaaaaaaa', title: 'One' })).toBe('format=1\ncommand=attach\nid=aaaaaaaa\ntitle=One\n')
+  expect(windowTargetText({ command: 'agents', title: 'Agents', folder: '/Users/x/myapp' })).toBe('format=1\ncommand=agents\ntitle=Agents\nfolder=/Users/x/myapp\n')
+  expect(parseInbox('format=1\naction=bring\nat=5\ntty=/dev/ttys001\nreply=/r\n')).toEqual({ format: 1, action: 'bring', at: 5, tty: '/dev/ttys001', title: '', reply: '/r' })
+  expect(parseInbox('action=focus\n')).toBe(null)
+})
+
+test('heartbeat: fresh, same format and same process is ok; old, missing or another process is missing', () => {
+  const now = 1_000_000
+  const h = parseHeartbeat(heartbeatText({ pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' }))
+  expect(h).toEqual({ format: 1, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' })
+  expect(heartbeatStatus(h, 42, now)).toBe('ok')
+  expect(heartbeatStatus(h, 43, now)).toBe('missing')
+  expect(heartbeatStatus(h, undefined, now)).toBe('ok')
+  expect(heartbeatStatus(h, 42, now + 40000)).toBe('missing')
+  expect(heartbeatStatus(null, 42, now)).toBe('missing')
+  expect(heartbeatStatus({ ...(h as Heartbeat), format: 2 }, 42, now)).toBe('other-format')
+  // Written before the mod knew its pid: no pid to compare
+  expect(heartbeatStatus({ ...(h as Heartbeat), pid: 0 }, 42, now)).toBe('ok')
+  expect(parseHeartbeat('pid=1\n')).toBe(null)
+})
+
+test('heartbeat expected: a running session started after a version with heartbeats was installed, after 30 s', () => {
+  const now = 10_000_000
+  const plugin = { version: '0.10.0', since: 5_000_000 }
+  const s = { pid: 1, status: 'idle', startedAt: 6_000_000 }
+  expect(expectsHeartbeat(s, plugin, now)).toBe(true)
+  // Started before that version was installed: it runs an older mod, which a restart would fix but isn't broken
+  expect(expectsHeartbeat({ ...s, startedAt: 4_000_000 }, plugin, now)).toBe(false)
+  // The installed version doesn't write heartbeats (development: a test session with the repo's copy)
+  expect(expectsHeartbeat(s, { ...plugin, version: '0.9.2' }, now)).toBe(false)
+  expect(expectsHeartbeat(s, { ...plugin, version: 'x' }, now)).toBe(false)
+  expect(expectsHeartbeat(s, null, now)).toBe(false)
+  // Just started: its mod has 30 s to come up
+  expect(expectsHeartbeat({ ...s, startedAt: now - 10000 }, plugin, now)).toBe(false)
+  // Stopped
+  expect(expectsHeartbeat({ startedAt: 6_000_000 }, plugin, now)).toBe(false)
+  expect(HEARTBEAT_VERSION).toBe('0.10.0')
+})
+
+test('installed plugin: the enabled sessions entry of claude plugin list --json', () => {
+  const list = JSON.stringify([
+    { id: 'other@m', version: '1.0.0', enabled: true, installPath: '/x/other' },
+    { id: 'sessions@m', version: '0.10.0', enabled: true, installPath: '/Users/x/.claude/plugins/cache/m/sessions/0.10.0', lastUpdated: '2026-01-01T00:00:00.000Z' },
+  ])
+  expect(parsePluginList(list)).toEqual({ path: '/Users/x/.claude/plugins/cache/m/sessions/0.10.0', version: '0.10.0', since: Date.parse('2026-01-01T00:00:00.000Z') })
+  expect(parsePluginList(JSON.stringify([{ id: 'sessions@m', version: '0.10.0', enabled: false, installPath: '/x' }]))).toBe(null)
+  expect(parsePluginList('nope')).toBe(null)
+})
+
+test('project root: the nearest folder with AGENTS.md or CLAUDE.md, below the top two levels', () => {
+  expect(rootFrom('/Users/x/myapp/src', ['/Users/x/myapp'])).toBe('/Users/x/myapp')
+  expect(rootFrom('/Users/x/myapp/src', ['/Users/x/myapp', '/Users/x/myapp/src'])).toBe('/Users/x/myapp/src')
+  expect(rootFrom('/Users/x/myapp/src', [])).toBe('/Users/x/myapp/src')
+  // /Users/CLAUDE.md is too high up
+  expect(rootFrom('/Users/x/myapp', ['/Users'])).toBe('/Users/x/myapp')
+  // A marker on another branch doesn't count
+  expect(rootFrom('/Users/x/myapp', ['/Users/x/other'])).toBe('/Users/x/myapp')
 })

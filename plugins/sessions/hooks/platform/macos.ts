@@ -4,10 +4,9 @@
 import type { Platform, Run } from './types'
 
 // Terminal.app via AppleScript: which window is in front, bring one forward, open a new one, read a screen.
-// The script text is kept verbatim, including its Spanish mode words (the first argument): "frente" = which window is
-// in front, "leer" = read a tab's contents, "traer" = bring a tab's window forward, "escribir" = type a command into a
-// tab, "cerrar" = close the window (answers "ocupada" = busy, if the tab is running something), "abrir" = open a new
-// window with the same bounds
+// The script's mode words (the first argument) are Spanish: "frente" = which window is in front, "leer" = read a tab's
+// contents, "traer" = bring a tab's window forward, "cerrar" = close the window (answers "ocupada" = busy, if the tab is
+// running something), "abrir" = open a new window with the same bounds
 const TERMINAL = `on run argv
   set modo to item 1 of argv
   tell application "Terminal"
@@ -24,10 +23,6 @@ const TERMINAL = `on run argv
             set selected of tab i of w to true
             set index of w to 1
             activate
-            return "ok"
-          end if
-          if modo is "escribir" then
-            do script (item 3 of argv) in tab i of w
             return "ok"
           end if
           if modo is "cerrar" then
@@ -57,10 +52,6 @@ async function terminal(run: Run, args: string[]): Promise<string> {
   const r = await run(['osascript', '-', ...args], { stdin: TERMINAL, timeoutMs: 8000 })
   return r.exitCode === 0 ? r.stdout.trim() : ''
 }
-
-// Puts the terminal back the way it was before a viewer (mouse, paste, keyboard modes, alternate screen, cursor) and
-// clears it, before the launcher command is typed into a window
-const RESET_TERMINAL = "printf '\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l\\033[?2004l\\033[<u\\033[>4;0m\\033[?1049l\\033[?25h'; stty sane; clear"
 
 // "frente" answers "<is Terminal the frontmost app> <tty of the front window's selected tab>" ("no" without windows):
 // the tty, only if Terminal is in front
@@ -113,11 +104,6 @@ export const macos: Platform = {
     return terminal(run, ['leer', tty])
   },
 
-  canTypeIntoWindows: true,
-  async typeIntoWindow(run, tty, command) {
-    return (await terminal(run, ['escribir', tty, `${RESET_TERMINAL}; ${command}`])) === 'ok'
-  },
-
   async bringWindow(run, tty) {
     return (await terminal(run, ['traer', tty])) === 'ok'
   },
@@ -155,5 +141,6 @@ export const macos: Platform = {
     regularUnreachable: title => `“${title}” isn't in a Terminal window this panel can reach (another app or tmux): switch to it there`,
     cantOpen: title => `Couldn't open a window for “${title}”`,
     cantOpenAgents: "Couldn't open the agent view",
+    cantBring: "Terminal didn't bring that window forward",
   },
 }

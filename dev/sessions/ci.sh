@@ -6,3 +6,6 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The one-time setup, in throwaway home folders, for bash, zsh and the account's shell; a second run changes nothing
 bash "$here/test-setup.sh"
+
+# What ccc opens (the launcher's decisions and its window loop), with a stand-in claude in a throwaway home folder
+bash "$here/test-launcher.sh"

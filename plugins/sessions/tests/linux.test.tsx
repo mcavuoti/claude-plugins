@@ -7,15 +7,15 @@ import { parseWindows } from '../hooks/state'
 
 // One window of each kind, as `ps -A -o pid=,tty=,command=` lists them on macOS and on Linux
 const PS_MAC = [
-  '  101 ttys001  bash /Users/x/.claude/mods/sessions-bin/visor.sh attach aaaaaaaa',
+  '  101 ttys001  bash /Users/x/.claude/plugins/cache/m/sessions/0.10.0/hooks/visor.sh attach aaaaaaaa',
   '  102 ttys001  claude attach aaaaaaaa',
   '  103 ttys002  claude agents --cwd .',
-  '  104 ttys002  bash /Users/x/.claude/mods/sessions-bin/visor.sh agents',
+  '  104 ttys002  bash /Users/x/.claude/plugins/cache/m/sessions/0.10.0/hooks/visor.sh agents',
   '  105 ??       /Users/x/.local/share/claude/stable/claude --bg-spare /tmp/x.sock',
   '  106 ttys003  claude',
 ].join('\n')
 const PS_LINUX = [
-  ' 2001 pts/0    bash /home/x/.claude/mods/sessions-bin/visor.sh attach aaaaaaaa',
+  ' 2001 pts/0    bash /home/x/.claude/plugins/cache/m/sessions/0.10.0/hooks/visor.sh attach aaaaaaaa',
   ' 2002 pts/0    claude attach aaaaaaaa',
   ' 2003 ?        /home/x/.local/share/claude/versions/2.1.314 --bg-spare /tmp/x.sock',
   ' 2004 pts/1    claude attach aaaaaaaa',

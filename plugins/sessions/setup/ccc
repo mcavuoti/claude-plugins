@@ -1,0 +1,49 @@
+#!/bin/bash
+# ccc: opens this folder's top Claude Code session in this window, with its sessions panel (the sessions plugin).
+#
+# Usage: ccc              the top session of the panel's list (or a Name prompt when there's none to open)
+#        ccc <name>       the session with that name, created if there's none
+#        ccc --new        this window, even if the project is already open in another one
+#        ccc --agents     Claude's agent view for this folder
+#
+# The plugin's setup installs this file in ~/.claude/mods/sessions-data/bin/ (SESSIONS_DATA_DIR) and nothing rewrites
+# it while sessions run. It runs the launcher (hooks/visor.sh) of the copy of the plugin that Claude Code has enabled,
+# found with `claude plugin list --json`, so the launcher always matches the installed version; it passes that version
+# and since when it's installed on to the launcher. SESSIONS_PLUGIN_DIR names another copy (tests); without an installed
+# plugin (a folder copy), it uses the copy the setup was run from.
+SETUP_ROOT=''
+
+main() {
+  local dir="${SESSIONS_PLUGIN_DIR:-}" py info version since
+  if [ -z "$dir" ] && py=$(command -v python3) && ! { [ "$py" = /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; }; then
+    info=$("${SESSIONS_CLAUDE:-claude}" plugin list --json 2>/dev/null | "$py" -c '
+import json, sys
+from datetime import datetime
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for p in rows if isinstance(rows, list) else []:
+    if str(p.get("id", "")).startswith("sessions@") and p.get("enabled") is True and p.get("installPath"):
+        when = str(p.get("lastUpdated") or p.get("installedAt") or "")
+        try:
+            since = int(datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            since = 0
+        print("%s\t%s\t%d" % (p["installPath"], p.get("version", ""), since))
+        break
+')
+    if [ -n "$info" ]; then
+      IFS=$'\t' read -r dir version since <<<"$info"
+      export SESSIONS_PLUGIN_VERSION="${SESSIONS_PLUGIN_VERSION:-$version}" SESSIONS_PLUGIN_SINCE="${SESSIONS_PLUGIN_SINCE:-$since}"
+    fi
+  fi
+  [ -n "$dir" ] || dir="$SETUP_ROOT"
+  if [ ! -f "$dir/hooks/visor.sh" ]; then
+    echo "ccc: can't find the sessions plugin (install it, then run /sessions setup in a session)"
+    return 1
+  fi
+  exec bash "$dir/hooks/visor.sh" start "$@"
+}
+
+main "$@"; exit

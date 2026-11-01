@@ -11,7 +11,7 @@ In `plugins/sessions`:
 
 | Files | What | Edit from |
 |---|---|---|
-| `hooks/register.tsx`, `hooks/state.ts`, `hooks/visor.sh`, `hooks/uso.py`, `statusline/`, `setup/` | shared: the panel, its data and actions, the launcher, token usage, the status line, the setup | either |
+| `hooks/register.tsx`, `hooks/state.ts`, `hooks/visor.sh`, `hooks/launcher.py`, `hooks/usage.py`, `statusline/`, `setup/` | shared: the panel, its data and actions, the launcher (`ccc`), token usage, the status line, the setup | either |
 | `hooks/platform/types.ts` | the contract: what each system has to provide (windows, processes, memory) | either, together with both implementations |
 | `hooks/platform/macos.ts` | macOS: Terminal.app through AppleScript, `ioreg`, `lsof`, `sysctl` | a Mac |
 | `hooks/platform/linux.ts` | Linux: windows found by process and switched through the launcher, `wmctrl`/`xdotool`, terminal emulators, `/proc` | Linux |
@@ -32,7 +32,7 @@ Rules:
 `.claude/rules/` holds rules that Claude Code reads only when it works on matching files, so they apply on any computer without anyone opening this file:
 
 - `platform-code.md` (files in `plugins/*/hooks/platform/`): edit each platform file from its own system, and the rest of the rules above.
-- `sessions-wire-format.md` (the `sessions` mod's code): the stored keys, notices and launcher file lines that must stay as they are.
+- `sessions-wire-format.md` (the `sessions` mod's code): shared files and notices carry a format version, a mismatch is harmless and visible, and every location is overridable for tests.
 
 A rule that should apply only to some files goes there, with `paths:` in its front matter; what applies to every task in the repository goes in a `CLAUDE.md`.
 
@@ -42,6 +42,6 @@ A rule that should apply only to some files goes there, with `paths:` in its fro
 - `git pull --rebase` before you start, keep commits small, push when done.
 - A release: bump `version` in the plugin's `.claude-plugin/plugin.json`, commit, push. Each machine that uses the plugins then runs `claude plugin marketplace update mcavuoti && claude plugin update <plugin>@mcavuoti` (or has auto-update on).
 
-## Wire formats
+## Shared formats
 
-Running sessions with different versions of the `sessions` mod talk to each other and share stored data. Keep these as they are, even though they're in Spanish: the stored keys and fields (`estado:`, `visto:`, `fijadoAuto`…), the notices between sessions and their fields, and the lines of the launcher's file (`comando=`, `id=`, `titulo=`, `carpeta=`). The comments in `register.tsx` and `visor.sh` list them.
+Sessions running the `sessions` mod share stored data, files in its data folder and notices, and the launcher (`ccc`) reads and writes the same files. There's no compatibility code for older versions: after an update every session is restarted. Instead, every shared file and notice carries `format=<n>` (`FORMAT` in `hooks/state.ts`, `hooks/launcher.py`, `hooks/visor.sh` and `hooks/usage.py`): change a format and raise it everywhere in the same commit. A reader that meets another format acts on nothing and tells the person to restart the sessions. Store keys are English; a stored value that changes meaning gets a new key. Every location can be pointed elsewhere for tests (`SESSIONS_DATA_DIR`, `SESSIONS_JOBS_DIR`, `SESSIONS_DAEMON_LOG`, `SESSIONS_CLAUDE`, `SESSIONS_PLUGIN_VERSION`/`SESSIONS_PLUGIN_SINCE`), so a test session never touches the files of the sessions you use. Details: `.claude/rules/sessions-wire-format.md`.
