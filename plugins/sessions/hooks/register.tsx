@@ -133,19 +133,36 @@ let debugLogs = false
 let reloadTriedFor = ''
 const startProblems: string[] = []
 
+// Where the mod's commands run: the home folder (/ until it's known, or if it's missing), never the session's own
+// folder. A command left to inherit the session's folder can't start once that folder is gone (a worktree the session
+// left and that was then deleted), and then every command fails. A command that needs the project passes it itself
+let workDir = '/'
+
 // A command that can't be run (it doesn't exist on this computer: Linux has no osascript or ioreg, and lsof isn't
 // always there) or that didn't finish in time counts as one more failure (exit code 127), instead of aborting
 // everything that called it
-async function runSafe($: any, argv: string[], init?: Record<string, unknown>): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+async function runSafe(
+  $: any,
+  argv: string[],
+  init?: { stdin?: string; timeoutMs?: number; cwd?: string },
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   try {
-    return await $.process.run(argv, init)
+    return await $.process.run(argv, { ...init, cwd: init?.cwd || workDir })
   } catch (err) {
     return { exitCode: 127, stdout: '', stderr: String(err) }
   }
 }
 
 async function run($: any, argv: string[], cwd?: string) {
-  return runSafe($, argv, { cwd: cwd ?? myCwd, timeoutMs: 15000 })
+  return runSafe($, argv, { cwd, timeoutMs: 15000 })
+}
+
+async function exists($: any, path: string): Promise<boolean> {
+  try {
+    return !!(await $.fs.exists(path))
+  } catch {
+    return false
+  }
 }
 
 // The platform's commands run through runSafe, with this hook's $
@@ -1159,13 +1176,18 @@ function hexDigit(): string {
 
 async function createSession($: any, name: string) {
   await update($, askingName, () => false)
+  // The new session starts in the project root, only if it's still there
+  if (!myCwd || !(await exists($, myCwd))) {
+    $.ui.toast(`Can't create a session: this session's folder no longer exists${myCwd ? ` (${myCwd})` : ''}`)
+    return
+  }
   // Enter without a name: an automatic one after the folder, like the names Claude gives regular sessions
   // ("myapp-1f"), not used by another session of the project
   const taken = lastList.filter(x => typeof x.cwd === 'string' && inProject(x.cwd, myCwd, home)).flatMap(x => [x.name, x.id].filter(Boolean))
   const clean = name.trim() || autoName(myCwd, taken, hexDigit)
   const since = (await $.clock.now()) - 5000
   const debug = debugLogs && dataDir ? ['--debug-file', `${dataDir}/debug/${debugLogName(clean)}`] : []
-  const r = await run($, [claude, '--bg', '-n', clean, ...debug])
+  const r = await run($, [claude, '--bg', '-n', clean, ...debug], myCwd)
   if (r.exitCode !== 0) {
     $.ui.toast(`Couldn't create “${clean}”`)
     return
@@ -1536,6 +1558,7 @@ async function start($: any) {
     dataDir = (await $.env.get('SESSIONS_DATA_DIR')) || (home ? `${home}/.claude/mods/sessions-data` : '')
     jobsDir = (await $.env.get('SESSIONS_JOBS_DIR')) || (home ? `${home}/.claude/jobs` : '')
     daemonLog = (await $.env.get('SESSIONS_DAEMON_LOG')) || (home ? `${home}/.claude/daemon.log` : '')
+    if (home && (await exists($, home))) workDir = home
     if (dataDir) {
       const sub = ['alive', 'order', 'inbox', 'windows', 'replies', 'debug', 'usage'].map(d => `${dataDir}/${d}`)
       await runSafe($, ['mkdir', '-p', ...sub])

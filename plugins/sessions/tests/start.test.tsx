@@ -18,11 +18,22 @@ type World = {
   panes: any[]
   store: Map<string, unknown>
   runs: string[][]
+  // The folder each command ran in
+  cwds: (string | undefined)[]
+  // The folders that exist, and the session's root and current folder ($.session.root(), $.session.cwd())
+  dirs: Set<string>
+  root: { value: string }
+  cwd: { value: string }
+  toasts: string[]
 }
 
 // The world the mod sees: a session with an id and a root, an in-memory folder tree, a claude that lists one session
 function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<string, unknown>; placed?: boolean; env?: Record<string, string> } = {}): World {
   const files = new Map<string, string>()
+  const dirs = new Set(['/', '/Users', '/Users/x', ROOT])
+  const root = { value: ROOT }
+  const cwd = { value: ROOT }
+  const toasts: string[] = []
   const opens: any[] = []
   const registered: string[] = []
   const id = { value: options.id ?? SID }
@@ -43,7 +54,8 @@ function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<
   mock.env(on, { HOME: '/Users/x', SESSIONS_CLAUDE: '/bin/claude', SESSIONS_JOBS_DIR: '/Users/x/jobs', SESSIONS_DAEMON_LOG: '/Users/x/daemon.log', ...options.env })
   const list = options.list ?? [{ id: id.value.slice(0, 8), sessionId: id.value, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' }]
   on('session.id', () => ({ value: id.value }))
-  on('session.root', () => ({ value: ROOT }))
+  on('session.root', () => ({ value: root.value }))
+  on('session.cwd', () => ({ value: cwd.value }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({ value: { context: { percent: 10 } } as any }))
   on('session.version', () => ({ value: { version: '2.1.316' } as any }))
@@ -60,17 +72,22 @@ function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<
     files.set(e.path, e.text)
     return { value: undefined }
   })
-  on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
+  on('fs.exists', (_, e) => ({ value: files.has(e.path) || dirs.has(e.path) }))
   on('fs.list', (_, e) => ({
     value: [...files.keys()].filter(p => p.startsWith(`${e.path}/`)).map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
   }))
   on('fs.ancestors', () => ({ value: [] }))
   on('fs.stat', () => ({ value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }))
   const runs: string[][] = []
+  const cwds: (string | undefined)[] = []
   on('process.run', (_, e) => {
     const argv = e.argv
     runs.push([...argv])
-    const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    cwds.push(e.init?.cwd)
+    // As on a real computer: a command can't start in a folder that's gone (its own, or else the session's)
+    const where = e.init?.cwd ?? cwd.value
+    if (!dirs.has(where)) throw new Error(`can't start in ${where}: no such folder`)
+    const ok =(stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[0] === 'rm') {
       for (const p of argv.slice(2)) files.delete(p)
       return ok()
@@ -100,9 +117,12 @@ function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<
   })
   on('ui.panes', () => ({ value: panes.map(p => ({ ...p })) }))
   on('ui.focus', () => ({}))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_, e) => {
+    toasts.push(String(e.text))
+    return { value: undefined }
+  })
   on('ui.log', () => ({ value: undefined }))
-  return { files, opens, registered, clock, id, panes, store, runs }
+  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, root, cwd, toasts }
 }
 
 async function startSession($: any, w: World, isInteractive = true) {
@@ -263,10 +283,12 @@ test("New: Enter on an empty name creates a session named after the folder, unus
   await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface: 'terminal' })
   await $.ui.input({ plugin: 'sessions', key: 'name', text: '', requestId: 'sessions', surface: 'terminal' })
   await w.clock.advance(4000)
-  const created = w.runs.find(a => a[1] === '--bg')
-  expect(created?.slice(0, 3)).toEqual(['/bin/claude', '--bg', '-n'])
-  expect(created?.[3]).toMatch(/^myapp-[0-9a-f]{2,3}$/)
-  expect(created?.[3]).not.toBe('myapp-00')
+  const created = w.runs.findIndex(a => a[1] === '--bg')
+  expect(w.runs[created]?.slice(0, 3)).toEqual(['/bin/claude', '--bg', '-n'])
+  expect(w.runs[created]?.[3]).toMatch(/^myapp-[0-9a-f]{2,3}$/)
+  expect(w.runs[created]?.[3]).not.toBe('myapp-00')
+  // In the project root, the only command that runs there
+  expect(w.cwds[created]).toBe(ROOT)
 })
 
 for (const reason of ['clear', 'resume'] as const) {
@@ -342,4 +364,50 @@ test('a missing auto-pin record is rebuilt once, under the pins lock, from the p
   expect(w.runs.some(a => a[0] === 'rmdir' && a[1] === '/Users/x/jobs/pins.json.lock')).toBe(true)
   // Nothing was pinned or unpinned
   expect(w.files.get('/Users/x/jobs/pins.json')).toBe('[\n  "aaaaaaaa",\n  "bbbbbbbb"\n]')
+})
+
+// A session whose folder can be deleted: a worktree it left, for one
+const WT = `${ROOT}/.claude/worktrees/w1`
+const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
+
+function folderList(): any[] {
+  return [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
+    { id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'two' },
+    { id: 'cccccccc', sessionId: 'cccccccc-0000-0000-0000-000000000000', cwd: WT, kind: 'background', status: 'idle', pid: 4244, name: 'three' },
+  ]
+}
+
+test("every command runs in a folder that exists, never the session's own, which can be gone", async ($, on) => {
+  const w = world(on, { list: folderList() })
+  // The session's folder is deleted under it: nothing can start there any more
+  w.dirs.delete(ROOT)
+  await startSession($, w)
+  await w.clock.advance(20000)
+  expect(w.runs.length).toBeGreaterThan(5)
+  expect(w.cwds.filter(c => c !== '/Users/x')).toEqual([])
+  const ui = await $.ui.mount(PANEL)
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).not.toContain("Couldn't read the session list")
+  expect(drawn).toContain('one')
+  await ui.unmount()
+})
+
+test('New in a session whose folder is gone: a clear notice, nothing created, and the session still in its own list', async ($, on) => {
+  const GONE = '/Users/x/gone'
+  const list = folderList()
+  list[0].cwd = GONE
+  const w = world(on, { list })
+  w.root.value = GONE
+  w.cwd.value = GONE
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  expect(JSON.stringify(await ui.drawn())).toContain('one')
+  await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface: 'terminal' })
+  await $.ui.input({ plugin: 'sessions', key: 'name', text: 'TEST two', requestId: 'sessions', surface: 'terminal' })
+  await w.clock.advance(1000)
+  expect(w.runs.some(a => a[1] === '--bg')).toBe(false)
+  expect(w.toasts).toContain(`Can't create a session: this session's folder no longer exists (${GONE})`)
+  await ui.unmount()
 })
