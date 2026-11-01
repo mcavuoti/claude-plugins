@@ -155,6 +155,14 @@ grep -q "Starting “TEST one”" "$work/out.txt" || fail "create" "no progress 
 grep -q '^action=focus' "$data/inbox/ffff0001-0000-0000-0000-000000000000" || fail "create" "the request isn't a focus one"
 pass "empty folder: name, create, one restart, open, focus request"
 
+# 5b. With the debug-logs option on (the mod mirrors it to <data>/config), a session ccc creates writes its debug log
+reset
+sessions
+mkdir -p "$data"; printf 'format=1\ndebug=1\n' > "$data/config"
+printf 'TEST one\n' | (cd "$proj" && /bin/bash "$hooks/visor.sh" start) > /dev/null 2>&1 || true
+grep -q "^--bg -n TEST one --debug-file $data/debug/TEST_one.log" "$fix/calls.log" || fail "debug" "no --debug-file: $(cat "$fix/calls.log")"
+pass "debug logs option: --debug-file for new sessions"
+
 # 6. Enter on an empty name goes back to the shell; a number reopens a stopped session; an untrusted folder says how
 reset
 sessions aaaaaaaa:alpha:-:600

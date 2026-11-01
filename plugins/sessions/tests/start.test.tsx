@@ -306,3 +306,21 @@ test('an id change nobody announced (no session.end) is caught by the 15 s beat'
   expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=1\n')
   expect(w.files.has(`${DATA}/alive/${SID}`)).toBe(false)
 })
+
+test('debug logs off (the default): no --debug-file, and the launcher is told so', async ($, on) => {
+  const w = world(on)
+  await startSession($, w)
+  expect(w.files.get(`${DATA}/config`)).toBe('format=1\ndebug=0\n')
+})
+
+test('debug logs on: the launcher is told, and a session the panel creates writes its debug log', { options: { debugLogs: true } }, async ($, on) => {
+  const w = world(on)
+  await startSession($, w)
+  expect(w.files.get(`${DATA}/config`)).toBe('format=1\ndebug=1\n')
+  await $.ui.mount({ plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
+  await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface: 'terminal' })
+  await $.ui.input({ plugin: 'sessions', key: 'name', text: 'TEST one', requestId: 'sessions', surface: 'terminal' })
+  await w.clock.advance(4000)
+  const created = w.runs.find(a => a[1] === '--bg')
+  expect(created).toEqual(['/bin/claude', '--bg', '-n', 'TEST one', '--debug-file', `${DATA}/debug/TEST_one.log`])
+})

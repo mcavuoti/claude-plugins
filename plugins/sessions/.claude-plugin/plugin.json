@@ -4,5 +4,13 @@
   "description": "Side panel with this folder's sessions: status colors, one-window switching, stop, restart, rename, auto-pin and reopen with Remote Control, token usage and a status line",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "debugLogs": {
+      "type": "boolean",
+      "title": "Debug logs for new sessions",
+      "description": "Sessions the panel (n) or ccc create write Claude's debug log to ~/.claude/mods/sessions-data/debug/<name>.log, and the mod logs each step of its start there",
+      "default": false
+    }
+  }
 }

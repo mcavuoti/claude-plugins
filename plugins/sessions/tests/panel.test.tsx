@@ -46,6 +46,7 @@ import {
   parsePluginList,
   rootFrom,
   autoName,
+  debugLogName,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -495,4 +496,10 @@ test('automatic names: the folder and two hex characters, never one the project 
   // myapp-1f is taken: the next draw
   expect(autoName('/Users/x/myapp', ['myapp-1f', 'other'], random)).toBe('myapp-a0')
   expect(autoName('/', [], () => '0')).toBe('session-00')
+})
+
+test('debug log names: the session name with anything unusual replaced', () => {
+  expect(debugLogName('TEST one')).toBe('TEST_one.log')
+  expect(debugLogName('../x/y')).toBe('x_y.log')
+  expect(debugLogName('')).toBe('session.log')
 })

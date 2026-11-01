@@ -53,6 +53,7 @@ import {
   sortRows,
   windowTargetText,
   autoName,
+  debugLogName,
   FORMAT,
   NOTICE_MARKER,
 } from './state'
@@ -122,6 +123,10 @@ let sawSessionStart = false
 let renderScheduled = false
 let startedAt = 0
 let lastBeat = 0
+// The plugin's option (the config menu): sessions the panel or ccc create write Claude's debug log to <data>/debug, and
+// the mod logs its start steps to the debug log. The mod mirrors it to <data>/config for the launcher, which can't read
+// plugin options
+let debugLogs = false
 const startProblems: string[] = []
 
 // A command that can't be run (it doesn't exist on this computer: Linux has no osascript or ioreg, and lsof isn't
@@ -153,8 +158,9 @@ function bg(work: Promise<unknown>) {
   work.catch(() => {})
 }
 
-// A line in the debug log only (claude --debug, or --debug-file)
+// A line in the debug log only (claude --debug, or --debug-file), when the option is on
 function debugLine($: any, text: string) {
+  if (!debugLogs) return
   try {
     void Promise.resolve($.ui.log(`sessions: ${text}`, { to: 'debug' })).catch(() => {})
   } catch {}
@@ -1150,7 +1156,8 @@ async function createSession($: any, name: string) {
   const taken = lastList.filter(x => typeof x.cwd === 'string' && inProject(x.cwd, myCwd, home)).flatMap(x => [x.name, x.id].filter(Boolean))
   const clean = name.trim() || autoName(myCwd, taken, hexDigit)
   const since = (await $.clock.now()) - 5000
-  const r = await run($, [claude, '--bg', '-n', clean])
+  const debug = debugLogs && dataDir ? ['--debug-file', `${dataDir}/debug/${debugLogName(clean)}`] : []
+  const r = await run($, [claude, '--bg', '-n', clean, ...debug])
   if (r.exitCode !== 0) {
     $.ui.toast(`Couldn't create “${clean}”`)
     return
@@ -1474,6 +1481,15 @@ async function start($: any) {
     }
     myCwd = await projectRoot($)
   })
+  await step('settings for the launcher', async () => {
+    if (!dataDir) return
+    const text = keyLines({ format: FORMAT, debug: debugLogs ? 1 : 0 })
+    let current = ''
+    try {
+      current = await $.fs.read(`${dataDir}/config`)
+    } catch {}
+    if (current !== text) await $.fs.write(`${dataDir}/config`, text)
+  })
   await step('claude and platform', async () => {
     const fixed = await $.env.get('SESSIONS_CLAUDE')
     const which = fixed ? { exitCode: 0, stdout: fixed } : await runSafe($, ['/bin/sh', '-lc', 'command -v claude'])
@@ -1547,7 +1563,8 @@ async function start($: any) {
   )
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  debugLogs = options?.debugLogs === true
   // In a non-interactive run (claude -p) the mod does nothing. The start isn't awaited before next(e): a step that hangs
   // mustn't hold the session up
   on('session.start', async ($, e, next) => {

@@ -109,6 +109,10 @@ With the panel focused (`shift+→` after the setup, `ctrl+x Tab`, or `/sessions
 
 A plain `→` can't go to the panel only when the prompt is empty, the way `←` goes to the agent view: that `←` is built into the prompt box, and Claude's key bindings can't be conditioned on an empty prompt. Hence `shift+→`.
 
+## Debug logs
+
+Off by default. Turn on **Debug logs for new sessions** in the plugin's options (`/config`, or `"pluginConfigs": {"sessions@mcavuoti": {"options": {"debugLogs": true}}}` in `~/.claude/settings.json`). Then every session the panel (`n`) or `ccc` creates starts with `--debug-file ~/.claude/mods/sessions-data/debug/<name>.log` (Claude's own debug log, which works with background sessions), and the mod writes a line there for each step of its start. Restarting such a session (`u`, `claude respawn`) keeps writing to the same file. Sessions created before you turned it on, or another way, don't log. The mod mirrors the option to `~/.claude/mods/sessions-data/config` for `ccc`, which can't read plugin options.
+
 ## Linux
 
 On macOS the panel drives Terminal.app (which window is in front, bring one forward, open one). On Linux there's no portable way to do that, so the panel works from processes and its launcher only, which every terminal has:
@@ -201,7 +205,7 @@ plugins/sessions/
 └── tsconfig.json
 ```
 
-What the plugin creates at runtime, all in `~/.claude/mods/sessions-data/` (`SESSIONS_DATA_DIR` points it elsewhere): `bin/` (the `ccc` command and the status line, from the setup), `alive/` (heartbeats), `order/` (each project's panel order), `inbox/` and `replies/` (requests from `ccc` to a session's mod), `windows/` (one file per window with a launcher: which session comes next), `usage/` (token usage cache).
+What the plugin creates at runtime, all in `~/.claude/mods/sessions-data/` (`SESSIONS_DATA_DIR` points it elsewhere): `bin/` (the `ccc` command and the status line, from the setup), `config` (the options `ccc` reads), `debug/` (debug logs, when on), `alive/` (heartbeats), `order/` (each project's panel order), `inbox/` and `replies/` (requests from `ccc` to a session's mod), `windows/` (one file per window with a launcher: which session comes next), `usage/` (token usage cache).
 
 ## Develop
 
@@ -242,7 +246,7 @@ Claude's background service keeps a pre-started Claude process ready (a "spare")
 - **A `ui.render` hook's own `$` can start the mod**: from a timer it schedules (`$.clock.after(0, …)`, since a draw only draws), it can read the session's id, write the store and files, start more timers, open the panel and register commands. The line above the prompt is drawn even in a background session with no window attached, sometimes before `session.start`.
 - **Focus taken with no window attached holds**: `$.ui.open({ focus: true })` in a background session nobody is viewing gives the panel the keyboard, and it still has it when `claude attach` connects.
 - **A panel opened unasked at the pre-started process's 200 columns stays placed** when a narrower window attaches.
-- **`claude --bg` refuses folders Claude never trusted** ("Workspace not trusted…", exit 1) and your home folder; a subfolder of a trusted folder is trusted. `--debug-file` works with `--bg`.
+- **`claude --bg` refuses folders Claude never trusted** ("Workspace not trusted…", exit 1) and your home folder; a subfolder of a trusted folder is trusted. `--debug-file` works with `--bg` (in a claimed pre-started process too), and `claude respawn` keeps it.
 - **The agent view draws no panes**: a mod's panel shows only in a session's own screen.
 - **`/clear` changes `$.session.id()`** (the transcript's id) but not the short id of `claude agents` and `claude attach`; `session.end` comes with `reason: 'clear'` and no `session.start` follows, and the module, its timers and its panel stay.
 - **The agent view's hidden pre-started session isn't in `claude agents --json`**: a cleanup of the data of sessions missing from the list must spare sessions with a fresh heartbeat.
