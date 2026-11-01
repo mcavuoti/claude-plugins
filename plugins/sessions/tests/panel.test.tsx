@@ -45,6 +45,7 @@ import {
   HEARTBEAT_VERSION,
   parsePluginList,
   rootFrom,
+  autoName,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -483,4 +484,15 @@ test('project root: the nearest folder with AGENTS.md or CLAUDE.md, below the to
   expect(rootFrom('/Users/x/myapp', ['/Users'])).toBe('/Users/x/myapp')
   // A marker on another branch doesn't count
   expect(rootFrom('/Users/x/myapp', ['/Users/x/other'])).toBe('/Users/x/myapp')
+})
+
+test('automatic names: the folder and two hex characters, never one the project already uses', () => {
+  const digits = ['1', 'f', '1', 'f', 'a', '0']
+  let i = 0
+  const random = () => digits[i++ % digits.length] as string
+  expect(autoName('/Users/x/myapp', [], random)).toBe('myapp-1f')
+  i = 0
+  // myapp-1f is taken: the next draw
+  expect(autoName('/Users/x/myapp', ['myapp-1f', 'other'], random)).toBe('myapp-a0')
+  expect(autoName('/', [], () => '0')).toBe('session-00')
 })

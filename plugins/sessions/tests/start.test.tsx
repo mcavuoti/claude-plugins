@@ -17,6 +17,7 @@ type World = {
   id: { value: string }
   panes: any[]
   store: Map<string, unknown>
+  runs: string[][]
 }
 
 // The world the mod sees: a session with an id and a root, an in-memory folder tree, a claude that lists one session
@@ -65,8 +66,10 @@ function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<
   }))
   on('fs.ancestors', () => ({ value: [] }))
   on('fs.stat', () => ({ value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }))
+  const runs: string[][] = []
   on('process.run', (_, e) => {
     const argv = e.argv
+    runs.push([...argv])
     const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[0] === 'rm') {
       for (const p of argv.slice(2)) files.delete(p)
@@ -99,7 +102,7 @@ function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<
   on('ui.focus', () => ({}))
   on('ui.toast', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
-  return { files, opens, registered, clock, id, panes, store }
+  return { files, opens, registered, clock, id, panes, store, runs }
 }
 
 async function startSession($: any, w: World, isInteractive = true) {
@@ -247,4 +250,21 @@ test('/sessions status: how the mod started, the session, the copy of the mod, t
   expect(r.text).toContain(`Session: ${SID} · project: ${ROOT}`)
   expect(r.text).toContain('Heartbeat: written 3 s ago')
   expect(r.text).toContain('No panel running in: two (no heartbeat)')
+})
+
+test("New: Enter on an empty name creates a session named after the folder, unused in the project", async ($, on) => {
+  const list = [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
+    { id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'myapp-00' },
+  ]
+  const w = world(on, { list })
+  await startSession($, w)
+  await $.ui.mount({ plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
+  await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface: 'terminal' })
+  await $.ui.input({ plugin: 'sessions', key: 'name', text: '', requestId: 'sessions', surface: 'terminal' })
+  await w.clock.advance(4000)
+  const created = w.runs.find(a => a[1] === '--bg')
+  expect(created?.slice(0, 3)).toEqual(['/bin/claude', '--bg', '-n'])
+  expect(created?.[3]).toMatch(/^myapp-[0-9a-f]{2,3}$/)
+  expect(created?.[3]).not.toBe('myapp-00')
 })

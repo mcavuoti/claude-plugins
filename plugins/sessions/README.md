@@ -80,8 +80,8 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
 - **Rename** (`r`): opens a field under the list for the selected session's new name (yours, if it's the only one). The session renames itself with the official `/rename`, so the name changes in `claude agents` and on your phone too; if it's busy, it does so when it finishes. A session started with plain `claude` gets an automatic name (folder + two characters, like `myapp-1f`): rename it with `r` from another panel or `/rename <name>` inside it, and the panel picks it up within 3 s. You can also start with a name: `claude -n "name"`.
 - **Pinning with Remote Control** (◆): Claude's background service closes an idle session with no window attached after an hour, or after 8 hours if it has Remote Control. A pinned session (Ctrl+T in `claude agents`) isn't closed. The mod pins every background session you turn Remote Control on for, in any folder, within 20 s, and unpins it when you turn it off. It only unpins the ones it pinned: yours stay. If you unpin one it pinned, it won't pin it again until Remote Control goes off and on again.
 - **Reopening after a memory shortage**: when the machine runs out of memory (critical memory pressure on macOS, less than 1 GB free on Linux), the background service closes idle sessions, pinned ones too. The mod reopens the pinned ones with Remote Control that were closed for that reason once memory has been back to normal for 3 minutes in a row: same conversation, same Remote Control address, one at a time, at most 3 times in 2 hours each. One you stopped yourself isn't reopened. It needs at least one other live session running the mod.
-- **New** (`n`): asks for a name, creates a background session and switches to it.
-- **The New and Rename fields** keep you in them until you're done: Enter does it (an empty field cancels), Esc cancels, and the arrows and Tab don't take you out, so a half-typed field can't be left behind.
+- **New** (`n`): asks for a name, creates a background session and switches to it. Enter without a name gives it one after the folder, like the names Claude gives regular sessions (`myapp-1f`), unused by the project's other sessions. (In `ccc`'s Name prompt, Enter on an empty line still goes back to the shell.)
+- **The New and Rename fields** keep you in them until you're done: Enter does it (an empty Rename field cancels), Esc cancels, and the arrows and Tab don't take you out, so a half-typed field can't be left behind.
 - **Agents** (`a`): opens Claude's agent view (`claude agents`) in the same window. The agent view draws no panels (they show only in a session's own screen): open a session from it, or `←` back from one, to see the panel again.
 - **Token usage**, at the bottom: bars for today by hour (`d`), 7 days (`w`) or 30 days (`m`), for all of Claude on this machine or just this project (`p`).
 - **Status line** (after `/sessions setup`): model · effort · folder · git branch · context % · cost.
@@ -99,7 +99,7 @@ With the panel focused (`shift+→` after the setup, `ctrl+x Tab`, or `/sessions
 | `s` | Stop / Stop & Remove (or Remove from list if it was already stopped) |
 | `u` | Restart the selected session (yours too) |
 | `r` | Rename the selected session |
-| `n` | New: ask for a name and create a session |
+| `n` | New: ask for a name (or Enter for an automatic one) and create a session |
 | `a` | Agents: Claude's agent view |
 | `d` `w` `m` | tokens for today, 7 days, 30 days |
 | `p` | tokens for all of Claude or just this project |

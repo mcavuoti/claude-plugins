@@ -52,6 +52,7 @@ import {
   rootFrom,
   sortRows,
   windowTargetText,
+  autoName,
   FORMAT,
   NOTICE_MARKER,
 } from './state'
@@ -1130,14 +1131,19 @@ async function statusNow($: any, sessionId: string): Promise<string | null | und
   return s ? (s.status ?? null) : undefined
 }
 
+// One random hex digit, for automatic names
+function hexDigit(): string {
+  const b = new Uint8Array(1)
+  crypto.getRandomValues(b)
+  return ((b[0] ?? 0) % 16).toString(16)
+}
+
 async function createSession($: any, name: string) {
   await update($, askingName, () => false)
-  const clean = name.trim()
-  // Without a name nothing is created: the focus goes back to the selected session (the field that had it is gone)
-  if (!clean) {
-    if (selectedRow) void focusSession($, selectedRow.slice(2))
-    return
-  }
+  // Enter without a name: an automatic one after the folder, like the names Claude gives regular sessions
+  // ("myapp-1f"), not used by another session of the project
+  const taken = lastList.filter(x => typeof x.cwd === 'string' && inProject(x.cwd, myCwd, home)).flatMap(x => [x.name, x.id].filter(Boolean))
+  const clean = name.trim() || autoName(myCwd, taken, hexDigit)
   const since = (await $.clock.now()) - 5000
   const r = await run($, [claude, '--bg', '-n', clean])
   if (r.exitCode !== 0) {
@@ -1893,7 +1899,7 @@ export const register: Register = on => {
         {/* The New and Rename fields go below the rows: above them, opening or closing shifted the rows by one, and since
             Claude tracks the focus by position, what you typed landed on another row or the focus ended up on d: Day */}
         {inTerminal && Input && asking && (
-          <Input key="name" label="Name" placeholder="session name (Esc cancels)" autoFocus onSubmit={(v: string) => { void createSession($, v) }} />
+          <Input key="name" label="Name" placeholder="session name, or Enter for one after the folder (Esc cancels)" autoFocus onSubmit={(v: string) => { void createSession($, v).catch(() => {}) }} />
         )}
         {inTerminal && Input && renamingRow && !asking && (
           <Input
