@@ -20,7 +20,7 @@ type World = {
 }
 
 // The world the mod sees: a session with an id and a root, an in-memory folder tree, a claude that lists one session
-function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<string, unknown>; placed?: boolean } = {}): World {
+function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<string, unknown>; placed?: boolean; env?: Record<string, string> } = {}): World {
   const files = new Map<string, string>()
   const opens: any[] = []
   const registered: string[] = []
@@ -39,7 +39,7 @@ function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<
     return { value: undefined }
   })
   on('store.keys', () => ({ value: [...store.keys()] }))
-  mock.env(on, { HOME: '/Users/x', SESSIONS_CLAUDE: '/bin/claude', SESSIONS_JOBS_DIR: '/Users/x/jobs', SESSIONS_DAEMON_LOG: '/Users/x/daemon.log' })
+  mock.env(on, { HOME: '/Users/x', SESSIONS_CLAUDE: '/bin/claude', SESSIONS_JOBS_DIR: '/Users/x/jobs', SESSIONS_DAEMON_LOG: '/Users/x/daemon.log', ...options.env })
   const list = options.list ?? [{ id: id.value.slice(0, 8), sessionId: id.value, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' }]
   on('session.id', () => ({ value: id.value }))
   on('session.root', () => ({ value: ROOT }))
@@ -231,4 +231,20 @@ test('a panel waiting for a wider window: the band says so', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(JSON.stringify(await ui.drawn())).toContain('panel hidden: window too narrow · /sessions to show')
   await ui.unmount()
+})
+
+test('/sessions status: how the mod started, the session, the copy of the mod, the heartbeat, the silent peers', async ($, on) => {
+  const list = [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one', startedAt: 1 },
+    { id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'two', startedAt: 999_000_000 },
+  ]
+  const w = world(on, { list, env: { SESSIONS_PLUGIN_VERSION: '0.10.0', SESSIONS_PLUGIN_SINCE: '0' } })
+  await startSession($, w)
+  await w.clock.advance(3000)
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
+  expect(r.text).toContain('sessions 0.10.0 · folder copy')
+  expect(r.text).toContain('started 3 s ago by session.start')
+  expect(r.text).toContain(`Session: ${SID} · project: ${ROOT}`)
+  expect(r.text).toContain('Heartbeat: written 3 s ago')
+  expect(r.text).toContain('No panel running in: two (no heartbeat)')
 })

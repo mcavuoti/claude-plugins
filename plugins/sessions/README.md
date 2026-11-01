@@ -105,7 +105,7 @@ With the panel focused (`shift+→` after the setup, `ctrl+x Tab`, or `/sessions
 | `p` | tokens for all of Claude or just this project |
 | ← or Esc | back to the prompt |
 
-`/sessions` opens the panel with the keyboard (or closes it, if it has it).
+`/sessions` opens the panel with the keyboard (or closes it, if it has it). `/sessions status` says whether the mod runs in this session and what started it (`session.start`, or the first draw, prompt or notice when that never came), the session's id and project folder, the mod's version and whether it's the installed copy or a folder copy, when it last wrote its heartbeat, and which sessions of the project have no running panel.
 
 A plain `→` can't go to the panel only when the prompt is empty, the way `←` goes to the agent view: that `←` is built into the prompt box, and Claude's key bindings can't be conditioned on an empty prompt. Hence `shift+→`.
 
@@ -222,7 +222,7 @@ What the plugin creates at runtime, all in `~/.claude/mods/sessions-data/` (`SES
 Claude's background service keeps a pre-started Claude process ready (a "spare") and hands it to the next session that starts: `claude --bg`, a new session in the agent view, the agent view's own hidden pre-started session, `claude respawn`. A spare runs none of a mod's code until it's claimed, and the claim checks no age: one started hours earlier, before a plugin update, can come up running no mod at all (no panel, no heartbeat, no `/sessions`). There's no setting to turn spares off. So:
 
 - the mod starts from its first draw, prompt or notice when `session.start` didn't come;
-- its heartbeat shows from outside whether it runs: the other panels mark the row with `!`, and `ccc` offers to restart the session before opening it (`u` does the same from a panel);
+- its heartbeat shows from outside whether it runs: the other panels mark the row with `!`, and `ccc` offers to restart the session before opening it (`u` does the same from a panel); `/sessions status` inside a session says how its mod started;
 - a restart (`claude respawn`) starts a new process; right after a claim the next spare is seconds old, so a session `ccc` just created gets one automatic restart if its panel doesn't come up.
 
 ## Lessons (API pitfalls)

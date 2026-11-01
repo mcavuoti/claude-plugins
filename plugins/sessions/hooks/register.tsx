@@ -119,6 +119,8 @@ let active = false
 let startedVia = ''
 let sawSessionStart = false
 let renderScheduled = false
+let startedAt = 0
+let lastBeat = 0
 const startProblems: string[] = []
 
 // A command that can't be run (it doesn't exist on this computer: Linux has no osascript or ioreg, and lsof isn't
@@ -295,7 +297,9 @@ async function readHeartbeats($: any, ids: string[]): Promise<Record<string, Hea
 // This session's heartbeat (see Heartbeat in state.ts), every 15 s
 async function beat($: any) {
   if (!dataDir || !myId) return
-  await $.fs.write(`${dataDir}/alive/${myId}`, heartbeatText({ pid: myPid, at: await $.clock.now(), version: modVersion, via: startedVia }))
+  const at = await $.clock.now()
+  await $.fs.write(`${dataDir}/alive/${myId}`, heartbeatText({ pid: myPid, at, version: modVersion, via: startedVia }))
+  lastBeat = at
 }
 
 // Every 10 minutes, the data of sessions no longer in the official list (fetched right then) is deleted: their stored
@@ -1399,6 +1403,27 @@ async function rebind($: any) {
   void refresh($)
 }
 
+// /sessions status: whether and how the mod started here, who this session is, which copy of the mod runs, and which
+// sessions of the project have no running panel
+async function statusText($: any): Promise<string> {
+  const now = await $.clock.now()
+  const ago = (t: number) => (t ? `${Math.max(0, Math.round((now - t) / 1000))} s ago` : 'never')
+  const dir = PLUGIN_DIR.replace(/\/hooks\/\.\.$/, '')
+  const plugin = await installedPlugin($)
+  const copy = plugin?.path && plugin.path === dir ? `installed (${plugin.version})` : `folder copy: ${dir}${plugin?.version ? ` (installed: ${plugin.version})` : ''}`
+  const rowsNow = await read($, rows)
+  const silent = rowsNow.filter(f => f.noPanel || f.otherFormat).map(f => `${f.title} (${f.noPanel ? 'no heartbeat' : 'another version'})`)
+  const lines = [
+    `sessions ${modVersion || '?'} · ${copy}`,
+    `Running here: started ${ago(startedAt)} by ${startedVia || 'nothing'}${startedVia !== 'session.start' ? (sawSessionStart ? ' (session.start came later)' : ' (session.start never came)') : ''}`,
+    `Session: ${myId} · project: ${myCwd}`,
+    `Heartbeat: ${lastBeat ? `written ${ago(lastBeat)}` : 'not written'} (${dataDir}/alive)`,
+    silent.length ? `No panel running in: ${silent.join(', ')}` : 'Every session of the project that should run a panel does',
+  ]
+  if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)
+  return lines.join('\n')
+}
+
 // Starts the mod in this session, once (see `starting`). The steps that can fail go one by one, each on its own, so one
 // that fails doesn't take the rest with it, and in order of need: who this session is, where its files are, its
 // record and its heartbeat, the timers, the panel, and /sessions last
@@ -1411,6 +1436,9 @@ function ensureStarted($: any, via: string): Promise<void> {
 }
 
 async function start($: any) {
+  try {
+    startedAt = await $.clock.now()
+  } catch {}
   const step = async (name: string, body: () => Promise<unknown>) => {
     try {
       await body()
@@ -1501,8 +1529,8 @@ async function start($: any) {
   await step('command', () =>
     $.command.register({
       name: 'sessions',
-      description: 'Sessions panel: open, focus or close. /sessions setup: status line, shortcuts and the ccc command',
-      argumentHint: '[setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
+      description: 'Sessions panel: open, focus or close. /sessions status: is the mod running here. /sessions setup: status line, shortcuts and the ccc command',
+      argumentHint: '[status | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
       immediate: true,
     }),
   )
@@ -1616,6 +1644,7 @@ export const register: Register = on => {
       .trim()
       .split(/\s+/)
       .filter(Boolean)
+    if (words[0] === 'status') return { text: await statusText($) }
     if (words[0] === 'setup') {
       const allowed = /^--(dry-run|force-statusline|macos-launcher|statusline|keys|alias|all|help|shell=(bash|zsh|fish))$/
       const bad = words.slice(1).filter(w => !allowed.test(w))
