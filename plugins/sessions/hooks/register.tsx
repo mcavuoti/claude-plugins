@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Color, Renaming, Row, Usage, UsageView } from '../types'
+import type { Color, PaneNote, Renaming, Row, Usage, UsageView } from '../types'
 
 import {
   abbreviate,
@@ -71,6 +71,8 @@ const usage = atom({ plugin: 'sessions', key: 'usage' } as const, { summary: nul
 const usageView = atom({ plugin: 'sessions', key: 'usageView' } as const, { period: 'day', scope: 'all' } as UsageView)
 // The session's short id, for the line above the prompt: empty until the mod has started in this session
 const shortId = atom({ plugin: 'sessions', key: 'shortId' } as const, '')
+// Why the panel isn't shown, for the line above the prompt (see paneState)
+const paneNote = atom({ plugin: 'sessions', key: 'paneNote' } as const, '' as PaneNote)
 
 let claude = 'claude'
 let myId = ''
@@ -154,7 +156,8 @@ function debugLine($: any, text: string) {
 // state:<id> (SessionState), seen:<id> (seen at), title:<id> (title from the first prompt), waiting:<id> (waiting since),
 // restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (cached session list),
 // installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
-// autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal).
+// autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
+// panelClosed (you closed the panel: sessions start without it until you open it again).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
@@ -658,8 +661,32 @@ async function refresh($: any) {
     void focusSession($, after.includes(id) ? id : remainingNeighbor(before, id, after))
   }
   await update($, notice, () => '')
+  await paneState($)
   await adjustWidth($)
   await prune($)
+}
+
+// The panel stays closed once you close it yourself (its close mark or key, or /sessions): what you chose wins over
+// the mod opening it at start or on arrival. /sessions, or the line above the prompt's button, opens it again
+async function closedByYou($: any): Promise<boolean> {
+  return (await storeGet($, 'panelClosed')) === true
+}
+
+async function openByYou($: any) {
+  await storeDelete($, 'panelClosed')
+  await $.ui.open({ id: PANE, title: 'Sessions', focus: true, columns: requestedWidth || undefined })
+  await paneState($)
+}
+
+// What the line above the prompt says about the panel: closed (by you, or gone), or waiting undrawn for a wider window
+// (opened unasked, Claude draws it from 144 columns)
+async function paneState($: any) {
+  let note: PaneNote = ''
+  try {
+    const pane = (await $.ui.panes()).find((p: any) => p.id === PANE)
+    note = !pane ? 'closed' : pane.isPlaced === false ? 'narrow' : ''
+  } catch {}
+  if (note !== (await read($, paneNote))) await update($, paneNote, () => note)
 }
 
 // When leaving a session, its panel releases the keyboard: when you come back, the text box receives you
@@ -693,6 +720,8 @@ async function adjustWidth($: any) {
 // You arrived from another session's panel, or with ccc: the panel takes the keyboard, on the session next to this one,
 // so you can keep going through them
 async function focusPanel($: any) {
+  // A panel you closed stays closed: you land on the prompt, and the line above it says how to open it
+  if (await closedByYou($)) return
   const list = await read($, rows)
   const i = list.findIndex(f => f.current)
   const find = (from: number, step: number) => {
@@ -1463,8 +1492,11 @@ async function start($: any) {
     void pinRemoteSessions($)
   })
   await step('panel', async () => {
-    await $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined })
-    void readUsage($)
+    if (!(await closedByYou($))) {
+      await $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined })
+      void readUsage($)
+    }
+    await paneState($)
   })
   await step('command', () =>
     $.command.register({
@@ -1593,11 +1625,25 @@ export const register: Register = on => {
     }
     const pane = (await $.ui.panes()).find(p => p.id === PANE)
     if (pane?.isFocused) {
+      await storeSet($, 'panelClosed', true)
       await $.ui.close({ id: PANE })
+      await paneState($)
       return { text: '' }
     }
-    await $.ui.open({ id: PANE, title: 'Sessions', focus: true, columns: requestedWidth || undefined })
+    await openByYou($)
+    void readUsage($)
     return { text: '' }
+  })
+
+  // You closed the panel (its close mark or key): it stays closed in every session that starts, until you open it again.
+  // The mod's own closes (to release the keyboard, to measure its width) don't count
+  on('ui.close', async ($, e, next) => {
+    const r = await next(e)
+    if (e.id === PANE && e.origin.kind === 'person') {
+      await storeSet($, 'panelClosed', true)
+      await update($, paneNote, () => 'closed')
+    }
+    return r
   })
 
   // The arrows (and Tab) only go through the sessions: they skip the [stop] buttons and don't leave the list towards the
@@ -1647,11 +1693,12 @@ export const register: Register = on => {
     return r
   })
 
-  // The line above the prompt: how many sessions wait for you (red) or have something unseen (yellow), and this
-  // session's short id. Its first draw starts the mod when nothing else did (a session draws even with no window
-  // attached; a draw only draws, so the start runs from a timer)
+  // The line above the prompt: how many sessions wait for you (red) or have something unseen (yellow), why the panel
+  // isn't shown (with a button that opens it: shift+→ then Enter, or a click), and this session's short id. One row.
+  // Its first draw starts the mod when nothing else did (a session draws even with no window attached; a draw only
+  // draws, so the start runs from a timer)
   on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
-    const { Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     if (!starting && !renderScheduled) {
       renderScheduled = true
       $.clock.after(0, () => {
@@ -1662,14 +1709,31 @@ export const register: Register = on => {
     const reds = others.filter(f => f.color === 'red').length
     const yellows = others.filter(f => f.color === 'yellow').length
     const id = await read($, shortId)
-    return (
+    const note = await read($, paneNote)
+    const why = note === 'closed' ? 'panel closed · /sessions to open' : note === 'narrow' ? 'panel hidden: window too narrow · /sessions to show' : ''
+    const counts = (
       <Text dimColor>
         {reds > 0 && <Text color={TINT.red}>● </Text>}
         {reds > 0 && `${reds}  `}
         {yellows > 0 && <Text color={TINT.yellow}>● </Text>}
         {yellows > 0 && `${yellows}  `}
-        {reds + yellows > 0 && '/sessions  '}⟨{id}⟩
+        {reds + yellows > 0 && !why && '/sessions  '}
       </Text>
+    )
+    if (!why || e.surface !== 'terminal') {
+      return (
+        <Text dimColor>
+          {counts}
+          {why && `${why}  `}⟨{id}⟩
+        </Text>
+      )
+    }
+    return (
+      <Box flexDirection="row">
+        {counts}
+        <Button key="show-panel" plain dimColor label={why} onPress={() => { void openByYou($) }} />
+        <Text dimColor>{`  ⟨${id}⟩`}</Text>
+      </Box>
     )
   })
 

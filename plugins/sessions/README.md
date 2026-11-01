@@ -85,7 +85,8 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
 - **Agents** (`a`): opens Claude's agent view (`claude agents`) in the same window. The agent view draws no panels (they show only in a session's own screen): open a session from it, or `←` back from one, to see the panel again.
 - **Token usage**, at the bottom: bars for today by hour (`d`), 7 days (`w`) or 30 days (`m`), for all of Claude on this machine or just this project (`p`).
 - **Status line** (after `/sessions setup`): model · effort · folder · git branch · context % · cost.
-- Above each session's prompt: how many sessions are waiting for you (red) or have something unseen (yellow).
+- **Closing the panel**: close it yourself (its ✕ or close key, or `/sessions` while it has the keyboard) and it stays closed, in this session and in every session that starts afterwards, until you open it again with `/sessions` or the button on the line above the prompt (`shift+→` then Enter, or a click). What you chose wins: arriving with `ccc` or Enter then lands on the prompt instead of the panel.
+- Above each session's prompt, one line: how many sessions are waiting for you (red) or have something unseen (yellow), and when the panel isn't shown, why: `panel closed · /sessions to open`, or `panel hidden: window too narrow · /sessions to show` (Claude draws a panel the mod opened on its own only from 144 columns, 110 once you've opened it yourself; one you open with `/sessions` shows at any width).
 
 ## Keys
 
@@ -103,6 +104,8 @@ With the panel focused (`shift+→` after the setup, `ctrl+x Tab`, or `/sessions
 | `d` `w` `m` | tokens for today, 7 days, 30 days |
 | `p` | tokens for all of Claude or just this project |
 | ← or Esc | back to the prompt |
+
+`/sessions` opens the panel with the keyboard (or closes it, if it has it).
 
 A plain `→` can't go to the panel only when the prompt is empty, the way `←` goes to the agent view: that `←` is built into the prompt box, and Claude's key bindings can't be conditioned on an empty prompt. Hence `shift+→`.
 

@@ -16,17 +16,29 @@ type World = {
   clock: ReturnType<typeof mock.clock>
   id: { value: string }
   panes: any[]
+  store: Map<string, unknown>
 }
 
 // The world the mod sees: a session with an id and a root, an in-memory folder tree, a claude that lists one session
-function world(on: On, options: { id?: string; list?: unknown[] } = {}): World {
+function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<string, unknown>; placed?: boolean } = {}): World {
   const files = new Map<string, string>()
   const opens: any[] = []
   const registered: string[] = []
   const id = { value: options.id ?? SID }
   const panes: any[] = []
   const clock = mock.clock(on, { now: 1_000_000_000 })
-  mock.store(on)
+  // The store, in memory (readable by the tests)
+  const store = new Map<string, unknown>(Object.entries(options.store ?? {}))
+  on('store.get', (_, e) => ({ value: store.get(e.key) as any }))
+  on('store.set', (_, e) => {
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }))
   mock.env(on, { HOME: '/Users/x', SESSIONS_CLAUDE: '/bin/claude', SESSIONS_JOBS_DIR: '/Users/x/jobs', SESSIONS_DAEMON_LOG: '/Users/x/daemon.log' })
   const list = options.list ?? [{ id: id.value.slice(0, 8), sessionId: id.value, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' }]
   on('session.id', () => ({ value: id.value }))
@@ -73,9 +85,10 @@ function world(on: On, options: { id?: string; list?: unknown[] } = {}): World {
   on('ui.open', (_, e) => {
     opens.push(e)
     const pane = panes.find(p => p.id === e.id)
+    const placed = options.placed ?? true
     if (pane) pane.isFocused = !!e.focus
-    else panes.push({ id: e.id, title: e.title ?? e.id, isShown: true, isFocused: !!e.focus, isPlaced: true })
-    return { value: { isPlaced: true } }
+    else panes.push({ id: e.id, title: e.title ?? e.id, isShown: placed, isFocused: !!e.focus, isPlaced: placed })
+    return { value: placed ? { isPlaced: true } : ({ isPlaced: false, reason: 'narrow' } as any) }
   })
   on('ui.close', (_, e) => {
     const i = panes.findIndex(p => p.id === e.id)
@@ -86,7 +99,7 @@ function world(on: On, options: { id?: string; list?: unknown[] } = {}): World {
   on('ui.focus', () => ({}))
   on('ui.toast', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
-  return { files, opens, registered, clock, id, panes }
+  return { files, opens, registered, clock, id, panes, store }
 }
 
 async function startSession($: any, w: World, isInteractive = true) {
@@ -184,4 +197,38 @@ test('a notice in another format is consumed, never handed to the model', async 
   await startSession($, w)
   const r = await $.session.receive({ text: 'sessions-notice:7f3a {"format": 9, "kind": "focus"}', origin: { kind: 'peer', plugin: 'sessions' } } as any)
   expect((r as any).consumed).toBeDefined()
+})
+
+test('closed by you: no panel at start, no panel on arrival, the band says how to open it, and its button opens it', async ($, on) => {
+  const w = world(on, { store: { panelClosed: true } })
+  await startSession($, w)
+  expect(w.opens.filter(o => o.id === 'sessions')).toEqual([])
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await ui.drawn())).toContain('panel closed · /sessions to open')
+  // Arriving with ccc (a focus request) lands on the prompt
+  w.files.set(`${DATA}/inbox/${SID}`, `format=1\naction=focus\nat=${w.clock.now()}\n`)
+  await w.clock.advance(600)
+  expect(w.opens.filter(o => o.id === 'sessions')).toEqual([])
+  await ui.press({ key: 'show-panel' })
+  expect(w.opens.some(o => o.id === 'sessions' && o.focus === true)).toBe(true)
+  expect(w.store.get('panelClosed')).toBe(undefined)
+  await ui.unmount()
+})
+
+test('/sessions opens a panel you closed (and forgets the close); closing it with /sessions is yours too', async ($, on) => {
+  const w = world(on, { store: { panelClosed: true } })
+  await startSession($, w)
+  await $.command.run({ command: 'sessions', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
+  expect(w.opens.some(o => o.id === 'sessions' && o.focus === true)).toBe(true)
+  expect(w.store.get('panelClosed')).toBe(undefined)
+  await $.command.run({ command: 'sessions', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
+  expect(w.store.get('panelClosed')).toBe(true)
+})
+
+test('a panel waiting for a wider window: the band says so', async ($, on) => {
+  const w = world(on, { placed: false })
+  await startSession($, w)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await ui.drawn())).toContain('panel hidden: window too narrow · /sessions to show')
+  await ui.unmount()
 })
