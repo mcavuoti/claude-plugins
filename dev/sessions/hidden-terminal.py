@@ -36,7 +36,8 @@ import time
 import pyte
 
 fifo, log, command = sys.argv[1], sys.argv[2], sys.argv[3:]
-ROWS, COLS = 45, 230
+# The size: 230 x 45 unless HT_COLS / HT_ROWS say otherwise (to try narrow windows)
+ROWS, COLS = int(os.environ.get('HT_ROWS', '45')), int(os.environ.get('HT_COLS', '230'))
 pid, fd = pty.fork()
 if pid == 0:
     os.execvp(command[0], command)
