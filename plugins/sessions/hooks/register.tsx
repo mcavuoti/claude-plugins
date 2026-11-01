@@ -148,6 +148,11 @@ function me(): Me {
   return { shortId: myId.slice(0, 8), pid: myPid || undefined, background: lastList.find(s => s.sessionId === myId)?.kind === 'background' }
 }
 
+// Work started and not awaited: a failure (or the mod being reloaded meanwhile) is dropped quietly
+function bg(work: Promise<unknown>) {
+  work.catch(() => {})
+}
+
 // A line in the debug log only (claude --debug, or --debug-file)
 function debugLine($: any, text: string) {
   try {
@@ -663,7 +668,7 @@ async function refresh($: any) {
   const after = shown.map(f => f.sessionId)
   if (focused && currentFocus?.startsWith('s:') && before.some(id => !after.includes(id))) {
     const id = currentFocus.slice(2)
-    void focusSession($, after.includes(id) ? id : remainingNeighbor(before, id, after))
+    bg(focusSession($, after.includes(id) ? id : remainingNeighbor(before, id, after)))
   }
   await update($, notice, () => '')
   await paneState($)
@@ -1220,8 +1225,8 @@ async function toggleRename($: any) {
   }
   await update($, askingName, () => false)
   await update($, renaming, () => ({ sessionId: f.sessionId, title: f.title }))
-  void focusElement($, 'rename-input')
-  void watchField($)
+  bg(focusElement($, 'rename-input'))
+  bg(watchField($))
 }
 
 // The n key: opens the field for the new session's name and moves the focus to it
@@ -1230,8 +1235,8 @@ async function toggleNew($: any) {
   const open = !(await read($, askingName))
   await update($, askingName, () => open)
   if (open) {
-    void focusElement($, 'name')
-    void watchField($)
+    bg(focusElement($, 'name'))
+    bg(watchField($))
   }
 }
 
@@ -1242,7 +1247,7 @@ async function rename($: any, text: string) {
   const r = await read($, renaming)
   await update($, renaming, () => null)
   // The focus goes back to the renamed session's row (the field that had it is gone)
-  if (r && r.sessionId !== myId) void focusSession($, r.sessionId)
+  if (r && r.sessionId !== myId) bg(focusSession($, r.sessionId))
   const name = text.trim().replace(/\s+/g, ' ').slice(0, 80)
   if (!r || !name || name === r.title) return
   try {
@@ -1406,7 +1411,7 @@ async function rebind($: any) {
     await beat($)
   } catch {}
   await storeSet($, 'list', {})
-  void refresh($)
+  bg(refresh($))
 }
 
 // /sessions status: whether and how the mod started here, who this session is, which copy of the mod runs, and which
@@ -1488,7 +1493,7 @@ async function start($: any) {
     const restartedAt = Number(await storeGet($, `restarted:${myId}`)) || 0
     if (restartedAt) {
       await storeDelete($, `restarted:${myId}`)
-      if ((await $.clock.now()) - restartedAt < 120000) void notifyWhenBack($)
+      if ((await $.clock.now()) - restartedAt < 120000) bg(notifyWhenBack($))
     }
     // A New or Rename field left open before a reload or a restart would come back stuck in the pane: start closed
     await closeFields($)
@@ -1497,38 +1502,38 @@ async function start($: any) {
       await update($, usageView, () => ({ period: view.period, scope: view.scope }))
     }
     $.clock.every(500, () => {
-      void checkInbox($)
+      bg(checkInbox($))
     })
     $.clock.every(3000, () => {
-      void refresh($)
+      bg(refresh($))
     })
     $.clock.every(2000, () => {
-      void markSeenIfLooking($)
+      bg(markSeenIfLooking($))
     })
     $.clock.every(15000, () => {
       void (async () => {
         await rebind($)
         await beat($).catch(() => {})
         await publishUsage($)
-      })()
+      })().catch(() => {})
     })
     $.clock.every(60000, () => {
-      void readUsage($)
+      bg(readUsage($))
     })
     $.clock.every(20000, () => {
-      void pinRemoteSessions($)
-      void reopenRetiredSessions($)
+      bg(pinRemoteSessions($))
+      bg(reopenRetiredSessions($))
     })
     active = true
-    void refresh($)
+    bg(refresh($))
     void recordTitle($).catch(() => {})
-    void publishUsage($)
-    void pinRemoteSessions($)
+    bg(publishUsage($))
+    bg(pinRemoteSessions($))
   })
   await step('panel', async () => {
     if (!(await closedByYou($))) {
       await $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined })
-      void readUsage($)
+      bg(readUsage($))
     }
     await paneState($)
   })
@@ -1548,7 +1553,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     if (e.isInteractive) {
       sawSessionStart = true
-      void ensureStarted($, 'session.start')
+      bg(ensureStarted($, 'session.start'))
     }
     return next(e)
   })
@@ -1563,7 +1568,7 @@ export const register: Register = on => {
             if (String(await $.session.id()) === myId) return
             await $.clock.sleep(500)
           }
-        })()
+        })().catch(() => {})
       })
     }
     return next(e)
@@ -1578,7 +1583,7 @@ export const register: Register = on => {
   // panel are intercepted here: they aren't queued, aren't shown and the model doesn't read them
   on('session.receive', async ($, e, next) => {
     if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(NOTICE_MARKER)) {
-      void ensureStarted($, 'notice')
+      bg(ensureStarted($, 'notice'))
       const n = parseNotice(e.text)
       if (!n || n.format !== FORMAT) {
         $.ui.toast('A session running another version of the sessions mod sent this one a notice: restart them (u)')
@@ -1586,17 +1591,17 @@ export const register: Register = on => {
       }
       const d = n.data
       if (n.kind === 'focus') {
-        if (active) void focusPanel($)
+        if (active) bg(focusPanel($))
         return { consumed: 'sessions: focus the panel after a switch' }
       }
       if (n.kind === 'ask') {
         const from = String(d.from ?? '')
         const detail = typeof d.detail === 'string' ? d.detail.slice(0, 300) : ''
-        if (active && from) void answerQuestion($, from, d.topic === 'restart' ? 'restart' : 'stop', detail)
+        if (active && from) bg(answerQuestion($, from, d.topic === 'restart' ? 'restart' : 'stop', detail))
         return { consumed: 'sessions: ask here about stopping or restarting this session' }
       }
       if (n.kind === 'answer') {
-        if (active) void receiveAnswer($, d)
+        if (active) bg(receiveAnswer($, d))
         return { consumed: 'sessions: the answer to a stop question' }
       }
       if (n.kind === 'rename') {
@@ -1629,7 +1634,7 @@ export const register: Register = on => {
       }
       await storeSet($, `state:${myId}`, state)
       void recordTitle($).catch(() => {})
-      void publishUsage($)
+      bg(publishUsage($))
     }
     return r
   })
@@ -1637,7 +1642,7 @@ export const register: Register = on => {
   // Typing in the box (or from the phone) counts as having seen the session; a message from another session doesn't
   on('prompt.submit', async ($, e, next) => {
     if (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') {
-      void ensureStarted($, 'prompt')
+      bg(ensureStarted($, 'prompt'))
       if (active) await storeSet($, `seen:${myId}`, await $.clock.now())
     }
     return next(e)
@@ -1666,7 +1671,7 @@ export const register: Register = on => {
       return { text: '' }
     }
     await openByYou($)
-    void readUsage($)
+    bg(readUsage($))
     return { text: '' }
   })
 
@@ -1737,7 +1742,7 @@ export const register: Register = on => {
     if (!starting && !renderScheduled) {
       renderScheduled = true
       $.clock.after(0, () => {
-        void ensureStarted($, 'first draw')
+        bg(ensureStarted($, 'first draw'))
       })
     }
     const others = (await read($, rows)).filter(f => !f.current)
@@ -1766,7 +1771,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="row">
         {counts}
-        <Button key="show-panel" plain dimColor label={why} onPress={() => { void openByYou($) }} />
+        <Button key="show-panel" plain dimColor label={why} onPress={() => { bg(openByYou($)) }} />
         <Text dimColor>{`  ⟨${id}⟩`}</Text>
       </Box>
     )
@@ -1832,15 +1837,15 @@ export const register: Register = on => {
         {/* A single line of actions at the top: the letters are buttons (key or click), followed by the keyboard help */}
         {inTerminal && (
           <Box flexDirection="row" flexWrap="wrap">
-            <Button key="stop" plain dimColor hotkey="s" label="Stop" onPress={() => { void stopSelected($) }} />
+            <Button key="stop" plain dimColor hotkey="s" label="Stop" onPress={() => { bg(stopSelected($)) }} />
             <Text dimColor> · </Text>
-            <Button key="restart" plain dimColor hotkey="u" label="Restart" onPress={() => { void restartSelected($) }} />
+            <Button key="restart" plain dimColor hotkey="u" label="Restart" onPress={() => { bg(restartSelected($)) }} />
             <Text dimColor> · </Text>
-            <Button key="rename" plain dimColor hotkey="r" label="Rename" onPress={() => { void toggleRename($) }} />
+            <Button key="rename" plain dimColor hotkey="r" label="Rename" onPress={() => { bg(toggleRename($)) }} />
             <Text dimColor> · </Text>
             <Button key="new" plain dimColor hotkey="n" label="New" onPress={() => toggleNew($)} />
             <Text dimColor> · </Text>
-            <Button key="agents" plain dimColor hotkey="a" label="Agents" onPress={() => { void openAgentsView($) }} />
+            <Button key="agents" plain dimColor hotkey="a" label="Agents" onPress={() => { bg(openAgentsView($)) }} />
             <Text dimColor>{` · ${help}`}</Text>
           </Box>
         )}
@@ -1884,7 +1889,7 @@ export const register: Register = on => {
                   plain
                   autoFocus={f.sessionId === initial && !asking && !renamingRow ? true : undefined}
                   label={name(f)}
-                  onPress={() => { void jump($, f) }}
+                  onPress={() => { bg(jump($, f)) }}
                 />
               ) : (
                 <Text>{name(f)}</Text>
@@ -1907,7 +1912,7 @@ export const register: Register = on => {
             label={`Rename “${truncate(renamingRow.title, 24)}”`}
             placeholder="new name (Esc cancels)"
             autoFocus
-            onSubmit={(v: string) => { void rename($, v) }}
+            onSubmit={(v: string) => { bg(rename($, v)) }}
           />
         )}
         <Text> </Text>
@@ -1931,18 +1936,18 @@ export const register: Register = on => {
         {showUsage && <Box flexGrow={1} minHeight={1} />}
         {showUsage && (
           <Box flexDirection="row" flexWrap="wrap">
-            <Button key="usage-day" plain dimColor={view.period !== 'day' ? true : undefined} hotkey="d" label="Day" onPress={() => { void chooseUsageView($, { period: 'day' }) }} />
+            <Button key="usage-day" plain dimColor={view.period !== 'day' ? true : undefined} hotkey="d" label="Day" onPress={() => { bg(chooseUsageView($, { period: 'day' })) }} />
             <Text dimColor> · </Text>
-            <Button key="usage-week" plain dimColor={view.period !== 'week' ? true : undefined} hotkey="w" label="Week" onPress={() => { void chooseUsageView($, { period: 'week' }) }} />
+            <Button key="usage-week" plain dimColor={view.period !== 'week' ? true : undefined} hotkey="w" label="Week" onPress={() => { bg(chooseUsageView($, { period: 'week' })) }} />
             <Text dimColor> · </Text>
-            <Button key="usage-month" plain dimColor={view.period !== 'month' ? true : undefined} hotkey="m" label="Month" onPress={() => { void chooseUsageView($, { period: 'month' }) }} />
+            <Button key="usage-month" plain dimColor={view.period !== 'month' ? true : undefined} hotkey="m" label="Month" onPress={() => { bg(chooseUsageView($, { period: 'month' })) }} />
             <Text dimColor> · </Text>
             <Button
               key="usage-scope"
               plain
               hotkey="p"
               label={view.scope === 'all' ? 'All' : 'Project'}
-              onPress={() => { void chooseUsageView($, { scope: view.scope === 'all' ? 'project' : 'all' }) }}
+              onPress={() => { bg(chooseUsageView($, { scope: view.scope === 'all' ? 'project' : 'all' })) }}
             />
           </Box>
         )}

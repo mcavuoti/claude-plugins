@@ -268,3 +268,41 @@ test("New: Enter on an empty name creates a session named after the folder, unus
   expect(created?.[3]).toMatch(/^myapp-[0-9a-f]{2,3}$/)
   expect(created?.[3]).not.toBe('myapp-00')
 })
+
+for (const reason of ['clear', 'resume'] as const) {
+  test(`/${reason}: the session id changes and the mod follows it (record, heartbeat, short id), with no new start`, async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    w.store.set(`title:${SID}`, 'old first prompt')
+    w.store.set(`seen:${SID}`, 5)
+    const NEW = 'dddddddd-0000-0000-0000-000000000000'
+    await $.session.end({ reason, sessionId: SID, resume: { id: SID } } as any)
+    w.id.value = NEW
+    await w.clock.advance(1000)
+    expect(w.files.has(`${DATA}/alive/${SID}`)).toBe(false)
+    expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=1\n')
+    expect(w.store.get(`state:${SID}`)).toBe(undefined)
+    expect((w.store.get(`state:${NEW}`) as any)?.created).toBeDefined()
+    // The old conversation's title isn't the new one's; having seen the session carries over
+    expect(w.store.get(`title:${NEW}`)).toBe(undefined)
+    expect(w.store.get(`seen:${NEW}`)).toBe(5)
+    expect(w.registered).toEqual(['sessions'])
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(JSON.stringify(await ui.drawn())).toContain('"dddddddd"')
+    await ui.unmount()
+    // A request for the new id is heard
+    w.files.set(`${DATA}/inbox/${NEW}`, `format=1\naction=focus\nat=${w.clock.now()}\n`)
+    await w.clock.advance(600)
+    expect(w.files.has(`${DATA}/inbox/${NEW}`)).toBe(false)
+  })
+}
+
+test('an id change nobody announced (no session.end) is caught by the 15 s beat', async ($, on) => {
+  const w = world(on)
+  await startSession($, w)
+  const NEW = 'eeeeeeee-0000-0000-0000-000000000000'
+  w.id.value = NEW
+  await w.clock.advance(15500)
+  expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=1\n')
+  expect(w.files.has(`${DATA}/alive/${SID}`)).toBe(false)
+})
