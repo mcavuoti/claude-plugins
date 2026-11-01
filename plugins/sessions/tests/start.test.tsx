@@ -76,7 +76,6 @@ function world(on: On, options: { id?: string; list?: unknown[]; store?: Record<
   on('fs.list', (_, e) => ({
     value: [...files.keys()].filter(p => p.startsWith(`${e.path}/`)).map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
   }))
-  on('fs.ancestors', () => ({ value: [] }))
   on('fs.stat', () => ({ value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }))
   const runs: string[][] = []
   const cwds: (string | undefined)[] = []
@@ -366,7 +365,8 @@ test('a missing auto-pin record is rebuilt once, under the pins lock, from the p
   expect(w.files.get('/Users/x/jobs/pins.json')).toBe('[\n  "aaaaaaaa",\n  "bbbbbbbb"\n]')
 })
 
-// A session whose folder can be deleted: a worktree it left, for one
+// A session that changes folder: EnterWorktree and ExitWorktree move $.session.root() (and its row in the official
+// list), and the worktree can be deleted afterwards
 const WT = `${ROOT}/.claude/worktrees/w1`
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
 
@@ -376,6 +376,23 @@ function folderList(): any[] {
     { id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'two' },
     { id: 'cccccccc', sessionId: 'cccccccc-0000-0000-0000-000000000000', cwd: WT, kind: 'background', status: 'idle', pid: 4244, name: 'three' },
   ]
+}
+
+// The short ids in a project's order file (empty if there's none)
+function orderIds(w: World, root: string): string[] {
+  return (w.files.get(`${DATA}/order/${root.replace(/\//g, '_')}`) ?? '')
+    .split('\n')
+    .filter(l => l.startsWith('row='))
+    .map(l => l.split('\t')[2] ?? '')
+    .sort()
+}
+
+// Moves the session (and its row in the official list) to a folder, and lets a refresh run past the list's cache
+async function move(w: World, list: any[], root: string, cwd = root) {
+  w.root.value = root
+  w.cwd.value = cwd
+  list[0].cwd = cwd
+  await w.clock.advance(4000)
 }
 
 test("every command runs in a folder that exists, never the session's own, which can be gone", async ($, on) => {
@@ -390,6 +407,45 @@ test("every command runs in a folder that exists, never the session's own, which
   const drawn = JSON.stringify(await ui.drawn())
   expect(drawn).not.toContain("Couldn't read the session list")
   expect(drawn).toContain('one')
+  await ui.unmount()
+})
+
+test('the root follows the session into a worktree and back, and so do the list and the order file', async ($, on) => {
+  const list = folderList()
+  const w = world(on, { list })
+  w.files.set(`${ROOT}/CLAUDE.md`, '# myapp')
+  w.files.set(`${WT}/CLAUDE.md`, '# myapp')
+  w.dirs.add(WT)
+  await startSession($, w)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
+  // EnterWorktree: the worktree, a checkout with its own CLAUDE.md, is the project now
+  await move(w, list, WT)
+  expect(w.files.get(`${DATA}/order/${WT.replace(/\//g, '_')}`)).toContain(`root=${WT}\n`)
+  expect(orderIds(w, WT)).toEqual(['aaaaaaaa', 'cccccccc'])
+  // ExitWorktree, and the worktree is deleted: back to the main checkout, and the dead folder's order file goes
+  w.dirs.delete(WT)
+  w.files.delete(`${WT}/CLAUDE.md`)
+  list.splice(2, 1)
+  await move(w, list, ROOT)
+  expect(w.files.has(`${DATA}/order/${WT.replace(/\//g, '_')}`)).toBe(false)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
+  expect(r.text).toContain(`project: ${ROOT}`)
+})
+
+test("a root folder that's gone gives way to the session's current folder", async ($, on) => {
+  const list = folderList()
+  const w = world(on, { list })
+  w.dirs.add(WT)
+  await startSession($, w)
+  await move(w, list, WT)
+  expect(orderIds(w, WT)).toEqual(['aaaaaaaa', 'cccccccc'])
+  // The session's root still names the worktree, which was deleted; the session itself is back in the main checkout
+  w.dirs.delete(WT)
+  await move(w, list, WT, ROOT)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
+  const ui = await $.ui.mount(PANEL)
+  expect(JSON.stringify(await ui.drawn())).toContain('two')
   await ui.unmount()
 })
 

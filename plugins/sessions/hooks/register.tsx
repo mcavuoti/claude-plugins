@@ -51,6 +51,7 @@ import {
   fileKey,
   orderFileText,
   rootFrom,
+  rootCandidates,
   sortRows,
   windowTargetText,
   autoName,
@@ -81,6 +82,7 @@ const paneNote = atom({ plugin: 'sessions', key: 'paneNote' } as const, '' as Pa
 let claude = 'claude'
 let myId = ''
 let myPid = 0
+// The project root, which follows the session when its folder changes (followFolder)
 let myCwd = ''
 let home = ''
 // Where the mod keeps its files (heartbeats, the order file, the launcher's window files, requests, usage cache):
@@ -623,9 +625,11 @@ async function refresh($: any) {
   lastList = list
   const own = list.find(s => s.sessionId === myId)
   if (own?.pid) myPid = own.pid
+  await followFolder($)
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const now = await $.clock.now()
-  const project = list.filter(s => typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home) && typeof s.sessionId === 'string')
+  // The project's sessions, and this one always, wherever it is
+  const project = list.filter(s => typeof s.sessionId === 'string' && (s.sessionId === myId || (typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home))))
   const beats = await readHeartbeats($, project.map(s => s.sessionId))
   const plugin = await installedPlugin($)
   const fresh: Row[] = []
@@ -1176,7 +1180,8 @@ function hexDigit(): string {
 
 async function createSession($: any, name: string) {
   await update($, askingName, () => false)
-  // The new session starts in the project root, only if it's still there
+  // The new session starts in the project root: the current one, and only if it's still there
+  await followFolder($)
   if (!myCwd || !(await exists($, myCwd))) {
     $.ui.toast(`Can't create a session: this session's folder no longer exists${myCwd ? ` (${myCwd})` : ''}`)
     return
@@ -1322,14 +1327,50 @@ async function openAgentsView($: any) {
   }
 }
 
-// The project root (rootFrom): the nearest folder upwards with AGENTS.md or CLAUDE.md, else where the session started
-async function projectRoot($: any): Promise<string> {
-  const root = String(await $.session.root())
-  let markers: readonly any[] = []
+// The project root follows the session. Its folder is $.session.root(), which moves with /cd, a host's directory change
+// and a worktree (EnterWorktree, ExitWorktree): it's read on every refresh, and the root (rootFrom: the nearest folder
+// upwards with AGENTS.md or CLAUDE.md, else that folder) is worked out again when it moved or when the root folder is
+// gone. A folder that no longer exists gives way to the session's current folder, then to the one the official list
+// shows for it. The markers are looked for on disk from that folder: $.fs.ancestors walks from where the session
+// started, which it may have left. When the root changes, the order file moves with it
+let followedFrom = ''
+async function followFolder($: any) {
+  let folder = ''
   try {
-    markers = await $.fs.ancestors({ names: ['AGENTS.md', 'CLAUDE.md'] })
+    folder = String(await $.session.root())
   } catch {}
-  return rootFrom(root, markers.map(m => String(m.dir)))
+  if (folder && folder === followedFrom && myCwd && (await exists($, myCwd))) return
+  let current = ''
+  try {
+    current = String(await $.session.cwd())
+  } catch {}
+  const listed = lastList.find(s => s.sessionId === myId)?.cwd
+  let base = ''
+  for (const f of [folder, current, typeof listed === 'string' ? listed : '']) {
+    if (f.startsWith('/') && (await exists($, f))) {
+      base = f
+      break
+    }
+  }
+  // Nothing exists: keep the root there is (commands still run from the home folder)
+  if (!base) {
+    if (!myCwd) myCwd = folder || current
+    return
+  }
+  followedFrom = folder
+  const markers: string[] = []
+  for (const dir of rootCandidates(base)) {
+    if ((await exists($, `${dir}/AGENTS.md`)) || (await exists($, `${dir}/CLAUDE.md`))) markers.push(dir)
+  }
+  const root = rootFrom(base, markers)
+  if (root === myCwd) return
+  const previous = myCwd
+  myCwd = root
+  debugLine($, `project root: ${previous || '(none)'} → ${root}`)
+  // The launcher reads the order file of each project root: the new one is written on this refresh. The old one stays
+  // for the project's other sessions, unless its folder is gone
+  lastOrder = ''
+  if (previous && dataDir && !(await exists($, previous))) await runSafe($, ['rm', '-f', `${dataDir}/order/${fileKey(previous)}`])
 }
 
 function truncate(text: string, width: number): string {
@@ -1563,7 +1604,7 @@ async function start($: any) {
       const sub = ['alive', 'order', 'inbox', 'windows', 'replies', 'debug', 'usage'].map(d => `${dataDir}/${d}`)
       await runSafe($, ['mkdir', '-p', ...sub])
     }
-    myCwd = await projectRoot($)
+    await followFolder($)
   })
   await step('settings for the launcher', async () => {
     if (!dataDir) return

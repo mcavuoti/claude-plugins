@@ -45,6 +45,7 @@ import {
   HEARTBEAT_VERSION,
   parsePluginList,
   rootFrom,
+  rootCandidates,
   autoName,
   debugLogName,
   adoptAutoPins,
@@ -487,6 +488,13 @@ test('project root: the nearest folder with AGENTS.md or CLAUDE.md, below the to
   expect(rootFrom('/Users/x/myapp', ['/Users'])).toBe('/Users/x/myapp')
   // A marker on another branch doesn't count
   expect(rootFrom('/Users/x/myapp', ['/Users/x/other'])).toBe('/Users/x/myapp')
+})
+
+test('project root: the folders to look for a marker in, outermost first, below the top two levels', () => {
+  expect(rootCandidates('/Users/x/myapp/src')).toEqual(['/Users/x/myapp', '/Users/x/myapp/src'])
+  expect(rootCandidates('/Users/x/myapp/')).toEqual(['/Users/x/myapp'])
+  expect(rootCandidates('/Users/x')).toEqual([])
+  expect(rootCandidates('/')).toEqual([])
 })
 
 test('automatic names: the folder and two hex characters, never one the project already uses', () => {

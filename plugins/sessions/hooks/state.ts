@@ -250,6 +250,15 @@ export function rootFrom(start: string, markerDirs: readonly string[]): string {
   return dirs[dirs.length - 1] ?? start
 }
 
+// The folders rootFrom can pick for a start folder, outermost first: each one above it below the top two levels, and
+// the folder itself
+export function rootCandidates(start: string): string[] {
+  const parts = start.split('/').filter(Boolean)
+  const out: string[] = []
+  for (let n = 3; n <= parts.length; n++) out.push(`/${parts.slice(0, n).join('/')}`)
+  return out
+}
+
 // The pinned sessions (Ctrl+T in `claude agents`): ~/.claude/jobs/pins.json, a list of ids the background service
 // doesn't close for being idle. If the file changes shape, null: it isn't touched
 export function parsePins(text: string): string[] | null {

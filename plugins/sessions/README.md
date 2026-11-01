@@ -68,7 +68,7 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
 
 ## What it does
 
-- **Session list** for the project folder and its subfolders. The project is the nearest folder upwards with an `AGENTS.md` or `CLAUDE.md`, or else the folder the session started in. A session opened in your home folder (~) lists only that folder, not everything under it. Each row has a colored dot, the name, the model, the share of the context window used and how long ago:
+- **Session list** for the project folder and its subfolders. The project is the nearest folder upwards with an `AGENTS.md` or `CLAUDE.md`, or else the session's folder, and it follows the session when that folder changes (a worktree, `/cd`). A session opened in your home folder (~) lists only that folder, not everything under it. Each row has a colored dot, the name, the model, the share of the context window used and how long ago:
   - red: waiting for you (a permission, a question);
   - blue: working;
   - yellow: finished and you haven't looked yet;
@@ -244,6 +244,7 @@ Claude's background service keeps a pre-started Claude process ready (a "spare")
 - **`session.attach` doesn't fire for `claude attach`** clients (only for remote surfaces like the phone, desktop or VS Code).
 - **An Input's `value` isn't replaced by typing**: what you type is appended to it.
 - **`$.process.run` rejects** if the command doesn't exist or times out. Every call goes through `runSafe`, which turns that into an error code.
+- **A session can change folder, and the folder it left can be deleted**: EnterWorktree and ExitWorktree (and `/cd`) move it, a session restarted in a worktree starts there, and the worktree can be removed afterwards. A command left to run in that folder can't start (every command failed: "Couldn't read the session list"), and a project root worked out once at start goes stale (the session dropped out of its own list). So every command the mod runs gets a folder that exists (the home folder; the project root only for `claude --bg`, checked first), and the root follows `$.session.root()`, which moves with the session, on every refresh; when that folder is gone, `$.session.cwd()` or the session's row in `claude agents`. `$.fs.ancestors` walks from where the session started, so the `AGENTS.md`/`CLAUDE.md` markers are looked for on disk.
 - **The validator** wants the state types (`PluginState`) in `types/index.d.ts`, with no `import`.
 - **A `ui.render` hook's own `$` can start the mod**: from a timer it schedules (`$.clock.after(0, …)`, since a draw only draws), it can read the session's id, write the store and files, start more timers, open the panel and register commands. The line above the prompt is drawn even in a background session with no window attached, sometimes before `session.start`.
 - **Focus taken with no window attached holds**: `$.ui.open({ focus: true })` in a background session nobody is viewing gives the panel the keyboard, and it still has it when `claude attach` connects.
