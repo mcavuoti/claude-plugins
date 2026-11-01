@@ -1,0 +1,72 @@
+#!/bin/bash
+# Process launcher for Claude Code's background processes (CLAUDE_CODE_PROCESS_WRAPPER in ~/.claude/settings.json).
+# Optional, macOS only; `setup/setup.sh --macos-launcher` installs it.
+#
+# Why: macOS stores a standalone program's permission for protected folders (Desktop, Documents, Downloads) by its
+# path + code signature. Each Claude version lives at a new path (~/.local/share/claude/versions/X.Y.Z), so
+# background sessions ask for the permission again after every update, and one relaunched while nobody is at the Mac
+# can be killed waiting for the prompt ("SIGKILL before init" in the log). This launcher runs them from a copy at a fixed path
+# (~/.local/share/claude/stable/claude): the permission is granted once and holds for every version (same path, same
+# Anthropic signature).
+#
+# Launcher contract (https://code.claude.com/docs/en/corporate-launcher): ends in exec, doesn't change the arguments,
+# environment or working folder, prints nothing before the exec, doesn't read stdin, takes well under 3 s and calls
+# everything by absolute path. The only thing it changes is the program's path: the fixed copy instead of versions/X.
+set -u
+
+target="${1:-}"
+versions="$HOME/.local/share/claude/versions"
+bundle="$HOME/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude"
+stable_dir="$HOME/.local/share/claude/stable"
+stable="$stable_dir/claude"
+mark="$stable_dir/.synced-from"
+
+# The version of a program in versions/ ("2.1.307"); the one inside ClaudeCode.app is the same version under another name
+version_of() {
+  local path="$1" inode v
+  case "$path" in
+    "$versions"/*) printf '%s' "${path##*/}" ;;
+    "$bundle")
+      inode="$(/usr/bin/stat -f %i "$path" 2>/dev/null)" || return 1
+      for v in "$versions"/*; do
+        if [ "$(/usr/bin/stat -f %i "$v" 2>/dev/null)" = "$inode" ]; then printf '%s' "${v##*/}"; return 0; fi
+      done
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 0 if version $1 is newer than $2 (dot-separated numbers)
+newer() {
+  local IFS=. i
+  local -a a=($1) b=($2)
+  for i in 0 1 2 3; do
+    if [ "${a[i]:-0}" -gt "${b[i]:-0}" ] 2>/dev/null; then return 0; fi
+    if [ "${a[i]:-0}" -lt "${b[i]:-0}" ] 2>/dev/null; then return 1; fi
+  done
+  return 1
+}
+
+requested="$(version_of "$target")" || exec "$@"
+source="$versions/$requested"
+[ -x "$source" ] || exec "$@"
+
+copied="$(/bin/cat "$mark" 2>/dev/null || true)"
+if [ "$copied" != "$source" ] || [ ! -x "$stable" ]; then
+  # Forward only: if an older version than the copy is requested mid-update, run that one as is
+  if [ -x "$stable" ] && [ -n "$copied" ] && ! newer "$requested" "${copied##*/}"; then
+    exec "$@"
+  fi
+  /bin/mkdir -p "$stable_dir" || exec "$@"
+  # Copy to a temporary file and rename over the old one: overwriting a running binary in place makes macOS kill it
+  fresh="$stable.new.$$"
+  if /bin/cp -c -f "$source" "$fresh" 2>/dev/null || /bin/cp -f "$source" "$fresh" 2>/dev/null; then
+    /bin/mv -f "$fresh" "$stable" && /usr/bin/printf '%s' "$source" > "$mark"
+  else
+    /bin/rm -f "$fresh"
+    exec "$@"
+  fi
+fi
+
+shift
+exec "$stable" "$@"

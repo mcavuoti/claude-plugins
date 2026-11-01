@@ -1,0 +1,8 @@
+{
+  "name": "sessions",
+  "version": "0.9.2",
+  "description": "Side panel with this folder's sessions: status colors, one-window switching, stop, restart, rename, auto-pin and reopen with Remote Control, token usage and a status line",
+  "author": { "name": "mcavuoti" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

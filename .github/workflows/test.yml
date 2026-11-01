@@ -1,0 +1,58 @@
+# Validates and tests every plugin on macOS and on Linux, on every push and pull request. Some code can only be tried on
+# its own system (see CONTRIBUTING.md): this is the check that a change made on one system didn't break the other.
+# Nothing here is specific to one plugin: a plugin's own extra checks go in dev/<plugin>/ci.sh, run if it exists.
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Read-only token: the check only reads the code (it also runs for pull requests)
+permissions:
+  contents: read
+
+jobs:
+  plugins:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Validate the marketplace and each plugin
+        run: |
+          claude --version
+          claude plugin validate .
+          for plugin in plugins/*/; do claude plugin validate "$plugin"; done
+
+      - name: Run each plugin's tests
+        run: |
+          for plugin in plugins/*/; do
+            if [ -d "$plugin/tests" ]; then claude plugin test "$plugin"; fi
+          done
+
+      - name: Check the syntax of every shell and Python script
+        run: |
+          # Shell: *.sh, and any other tracked file whose first line is a sh/bash shebang
+          git ls-files | while read -r file; do
+            if [ "${file##*.}" = sh ] || head -n 1 "$file" 2>/dev/null | grep -Eq '^#!.*(bash|/sh)( |$)'; then
+              echo "bash -n $file"; bash -n "$file"
+            fi
+          done
+          git ls-files '*.py' | while read -r file; do echo "py_compile $file"; python3 -m py_compile "$file"; done
+
+      - name: Run each plugin's own checks (dev/<plugin>/ci.sh)
+        run: |
+          for plugin in plugins/*/; do
+            name="$(basename "$plugin")"
+            if [ -f "dev/$name/ci.sh" ]; then echo "== $name"; bash "dev/$name/ci.sh"; fi
+          done

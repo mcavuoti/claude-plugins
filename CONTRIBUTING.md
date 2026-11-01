@@ -1,0 +1,47 @@
+# Developing on macOS and Linux
+
+This repository is maintained by its owner and doesn't take outside pull requests.
+
+Some code only runs, and can only be tried, on its own operating system. The repository is laid out so that changes made
+on a Mac and on Linux don't step on each other, and a check on GitHub runs everything that can run on both.
+
+## Shared code and platform code
+
+In `plugins/sessions`:
+
+| Files | What | Edit from |
+|---|---|---|
+| `hooks/register.tsx`, `hooks/state.ts`, `hooks/visor.sh`, `hooks/uso.py`, `statusline/`, `setup/` | shared: the panel, its data and actions, the launcher, token usage, the status line, the setup | either |
+| `hooks/platform/types.ts` | the contract: what each system has to provide (windows, processes, memory) | either, together with both implementations |
+| `hooks/platform/macos.ts` | macOS: Terminal.app through AppleScript, `ioreg`, `lsof`, `sysctl` | a Mac |
+| `hooks/platform/linux.ts` | Linux: windows found by process and switched through the launcher, `wmctrl`/`xdotool`, terminal emulators, `/proc` | Linux |
+| `extras/macos/` | macOS only extras | a Mac |
+| `tests/panel.test.tsx` | shared logic and drawing | either |
+| `tests/macos.test.tsx`, `tests/linux.test.tsx` | each platform's pure parts (they run on both systems) | its system |
+
+Rules:
+
+1. **Edit a platform file only from its own system**, where you can try it. The shared code only talks to the platform through `platform.*` (see `types.ts`).
+2. **Changing the contract** (`types.ts`) updates both implementations in the same commit. The side you can't try gets the smallest change that keeps it working, and the commit message says `needs a check on <macOS|Linux>`; check it the next time you're on that system.
+3. **On the system you're on**, before pushing: `claude plugin validate plugins/sessions` and `claude plugin test plugins/sessions`, and try what you changed in a test session (`dev/sessions/hidden-terminal.py` drives one without touching your windows). From a Mac, much of the Linux code can be tried with `SESSIONS_PORTABLE=1` in a test session's `--settings` env; macOS code can't be tried from Linux.
+4. **The GitHub check must pass on both systems** (`.github/workflows/test.yml`: validation, every plugin's tests, a syntax check of every shell and Python script, and each plugin's own checks in `dev/<plugin>/ci.sh`, such as the `sessions` setup in throwaway home folders). It runs on every push. The workflow itself is generic: a new plugin gets validated and tested without touching it, and adds its own checks by adding its `dev/<plugin>/ci.sh`.
+5. **A real Linux desktop check** after window-related changes: `dev/sessions/linux-checklist.md`.
+
+## Rules Claude Code loads by itself
+
+`.claude/rules/` holds rules that Claude Code reads only when it works on matching files, so they apply on any computer without anyone opening this file:
+
+- `platform-code.md` (files in `plugins/*/hooks/platform/`): edit each platform file from its own system, and the rest of the rules above.
+- `sessions-wire-format.md` (the `sessions` mod's code): the stored keys, notices and launcher file lines that must stay as they are.
+
+A rule that should apply only to some files goes there, with `paths:` in its front matter; what applies to every task in the repository goes in a `CLAUDE.md`.
+
+## Git
+
+- Once per clone: `git config core.hooksPath .githooks` and `git config user.email <id>+<user>@users.noreply.github.com` (the address GitHub shows under Settings → Emails). The `commit-msg` hook in `.githooks/` refuses a commit with any other email and drops `Claude-Session:` lines, so nothing personal reaches the public history.
+- `git pull --rebase` before you start, keep commits small, push when done.
+- A release: bump `version` in the plugin's `.claude-plugin/plugin.json`, commit, push. Each machine that uses the plugins then runs `claude plugin marketplace update mcavuoti && claude plugin update <plugin>@mcavuoti` (or has auto-update on).
+
+## Wire formats
+
+Running sessions with different versions of the `sessions` mod talk to each other and share stored data. Keep these as they are, even though they're in Spanish: the stored keys and fields (`estado:`, `visto:`, `fijadoAuto`…), the notices between sessions and their fields, and the lines of the launcher's file (`comando=`, `id=`, `titulo=`, `carpeta=`). The comments in `register.tsx` and `visor.sh` list them.

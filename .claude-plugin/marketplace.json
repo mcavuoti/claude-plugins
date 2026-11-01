@@ -1,0 +1,16 @@
+{
+  "name": "mcavuoti",
+  "description": "Claude Code plugins by mcavuoti",
+  "owner": {
+    "name": "mcavuoti"
+  },
+  "plugins": [
+    {
+      "name": "sessions",
+      "source": "./plugins/sessions",
+      "description": "Side panel with this folder's Claude Code sessions: status colors, one-window switching, stop, restart, rename, auto-pin and reopen with Remote Control, token usage, and a status line",
+      "category": "productivity",
+      "tags": ["sessions", "background", "panel", "remote-control", "status-line"]
+    }
+  ]
+}

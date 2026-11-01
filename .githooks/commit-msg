@@ -1,0 +1,17 @@
+#!/bin/sh
+# Active once a clone runs `git config core.hooksPath .githooks` (see CONTRIBUTING.md). This repository is public:
+# 1. drops "Claude-Session:" lines (they link to a private Claude Code session);
+# 2. refuses the commit unless author and committer use a GitHub noreply address, so no personal email gets published.
+msg="$1"
+grep -v '^Claude-Session:' "$msg" > "$msg.tmp" || true
+mv "$msg.tmp" "$msg"
+for who in AUTHOR COMMITTER; do
+  email=$(git var "GIT_${who}_IDENT" | sed -n 's/.*<\(.*\)>.*/\1/p')
+  case "$email" in
+    *@users.noreply.github.com) ;;
+    *)
+      echo "commit-msg: the $who email isn't a GitHub noreply address; run" >&2
+      echo "  git config user.email <id>+<user>@users.noreply.github.com" >&2
+      exit 1 ;;
+  esac
+done
