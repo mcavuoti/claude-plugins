@@ -1052,7 +1052,6 @@ async function deliveredInTranscript($: any, ids: string[]): Promise<Set<string>
 }
 
 async function turnStarted($: any, text: string, turnId: string) {
-  await update($, busy, () => true)
   const ids = deliveredIds(text)
   if (!ids.length) return
   // The person's own words this turn carries, read from the answer files before they close: a taste recorded in it
@@ -7298,6 +7297,9 @@ export const register: Register = on => {
       await update($, personTurn, () => (his && p ? { turnId: e.turnId, quoted: cut(p.text, 300), text: cut(p.text, 4000) } : null))
       await update($, fleetTurn, () => null)
       await update($, turns, n => n + 1)
+      // Busy whatever the timers are: a hot reload mid-turn resets them (module state) while busy lives on in $.state,
+      // and the turn's end has to find it set to clear it. Only the closing work waits for the timers
+      await update($, busy, () => true)
       if (timersOn) bg(turnStarted($, e.text, e.turnId))
     }
     return next(e)
@@ -7310,7 +7312,9 @@ export const register: Register = on => {
       await update($, fleetTurn, () => null)
     }
     if (e.agentId === undefined && permissionWait) bg(promptAnswered($))
-    if (e.agentId === undefined && timersOn) {
+    // Idle again whatever the timers are (a copy reloaded mid-turn starts them only later): a busy left set would hold
+    // every delivery and nudge of this session
+    if (e.agentId === undefined) {
       bg(
         (async () => {
           await update($, busy, () => false)
