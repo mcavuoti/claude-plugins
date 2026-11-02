@@ -3817,11 +3817,26 @@ async function heartbeat($: any) {
     context: inst.context,
     outside: mark,
     intakeSeen: intakeSeen.at || null,
-    mode: permissionMode,
+    mode: permissionMode ?? (await configuredMode($)),
     waitingOn: permissionWait,
     remote: await remoteControl($),
   }
   await replace($, `${dir}/state.json`, json(beat))
+}
+
+/** The mode this session's settings give it, before a hook has told the one it runs in (classic.SessionStart may not
+ * carry it): the merged settings' permissions.defaultMode, read once */
+let settingsMode: string | null | undefined
+async function configuredMode($: any): Promise<string | null> {
+  if (settingsMode === undefined) {
+    try {
+      const p: any = await $.settings.read({ key: 'permissions' })
+      settingsMode = typeof p?.defaultMode === 'string' && p.defaultMode ? p.defaultMode : null
+    } catch {
+      settingsMode = null
+    }
+  }
+  return settingsMode ?? null
 }
 
 /** The permission prompt was answered (its tool ran or was refused, or the turn ended): the heartbeat says so at once */
@@ -6726,10 +6741,12 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
   // ... until its tool ran or was refused
   on('classic.PostToolUse', async ($, e, next) => {
+    if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (permissionWait) bg(promptAnswered($))
     return next(e)
   }).catch(($, e, next) => next(e))
   on('classic.PostToolUseFailure', async ($, e, next) => {
+    if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (permissionWait) bg(promptAnswered($))
     return next(e)
   }).catch(($, e, next) => next(e))
