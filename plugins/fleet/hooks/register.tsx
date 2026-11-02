@@ -84,7 +84,7 @@ let configProblem = ''
 // It stays across /clear and restarts, so it names the asker of a decision
 let jobRef: string | null = null
 let offered = false
-let whyNot = 'not decided yet'
+let whyNot = "session.start never came in this session (an old pre-started process?): restart it (u)"
 let started = false
 let startScheduled = false
 let timersOn = false
@@ -330,15 +330,16 @@ async function start($: any) {
   }
 }
 
+// Everything from timers: this can run from session.start, where sessions hasn't started yet (it runs after fleet)
 function timers($: any) {
   if (timersOn || !root) return
   timersOn = true
   if (jobRef) {
-    bg(rebuild($))
+    $.clock.after(0, () => bg(rebuild($)))
     $.clock.every(2000, () => bg(deliver($)))
   }
   $.clock.every(10000, () => bg(beat($)))
-  bg(beat($))
+  $.clock.after(1000, () => bg(beat($)))
 }
 
 // ---- The decisions' files ----
