@@ -398,6 +398,15 @@ export function statuteOf(files: readonly StatuteFile[]): { text: string; lines:
   return { text: `${out.join('\n')}\n`, lines }
 }
 
+/** Why a call could only hold, so code holds with no call: nothing the person answered, corrected or said no to in the
+ * question's area (a question with no area: in none), and no line of his in principles.md (fleet's own lines aren't in
+ * the statute). The kickstart interview is such a time. Exact repeats are found all the same; null when there's a record */
+export function nothingOnRecord(area: string | null, ps: readonly Precedent[], statute: ReadonlyMap<string, string>): string | null {
+  if (ps.some(p => (p.area ?? null) === area)) return null
+  if ([...statute.keys()].some(k => k.startsWith(`${statuteLabel(PRINCIPLES)}:`))) return null
+  return `nothing on record yet: no answer of yours ${area ? `in area ${area}` : 'to a question with no area'}, and no principle of yours in principles.md`
+}
+
 // ---- The call ----
 
 export const JUDGE_SYSTEM = [
@@ -688,8 +697,9 @@ export function proposalLine(f: JudgeFile | null, q: Question | undefined, n: nu
 
 export type AreaStats = {
   area: string
-  /** Decisions a judge proposed on (gated ones aren't) */
+  /** Decisions a judge proposed on (gated ones aren't), and their questions: what decided, sent back and held count */
   proposals: number
+  questions: number
   decided: number
   /** Of them, exact repeats found by code */
   repeats: number
@@ -703,8 +713,9 @@ export type AreaStats = {
   modelDisagreed: number
   sentBack: number
   held: number
-  /** Decisions no judge looked at, held by a gate */
+  /** Decisions no judge looked at, held by a gate, and their questions */
   gated: number
+  gatedQuestions: number
   /** Questions a judge answered in a live area (0.7.0); of them the ones the person reviewed (saw listed, or
    * overruled), and the ones he overruled */
   live: number
@@ -727,7 +738,7 @@ export const WINDOW = 10
 export const WINDOW_OVERRULES = 2
 
 export function emptyStats(area: string): AreaStats {
-  return { area, proposals: 0, decided: 0, repeats: 0, agreed: 0, disagreed: 0, repeatAgreed: 0, repeatDisagreed: 0, modelAgreed: 0, modelDisagreed: 0, sentBack: 0, held: 0, gated: 0, live: 0, reviewed: 0, overruled: 0, usd: 0, calls: 0 }
+  return { area, proposals: 0, questions: 0, decided: 0, repeats: 0, agreed: 0, disagreed: 0, repeatAgreed: 0, repeatDisagreed: 0, modelAgreed: 0, modelDisagreed: 0, sentBack: 0, held: 0, gated: 0, gatedQuestions: 0, live: 0, reviewed: 0, overruled: 0, usd: 0, calls: 0 }
 }
 
 function tally(s: AreaStats, repeat: boolean, a: boolean | null) {
@@ -752,11 +763,15 @@ export function statsOf(entries: readonly StatsInput[]): Map<string, AreaStats> 
     const s = out.get(key) ?? emptyStats(key)
     out.set(key, s)
     const j = e.judge
+    // Its questions: one agreement slot each (judgeEntryOf), one verdict each it judged
+    const questions = Math.max(j.agreed?.length ?? 0, j.verdicts.length)
     if (j.gated) {
       s.gated++
+      s.gatedQuestions += questions
       continue
     }
     s.proposals++
+    s.questions += questions
     s.usd += j.usd ?? 0
     if (j.model) s.calls++
     const over = new Set(e.overruled ?? [])
@@ -810,16 +825,21 @@ export function usdText(n: number): string {
   return n < 0.01 && n > 0 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`
 }
 
-/** One area's line for /fleet stats: the agreement in all, then apart on the exact repeats and the model's verdicts */
+function count(n: number, one: string): string {
+  return `${n} ${one}${n === 1 ? '' : 's'}`
+}
+
+/** One area's line for /fleet stats: the decisions judged and their questions (what was decided, sent back and held
+ * counts questions), the agreement in all, then apart on the exact repeats and the model's verdicts; the decisions a
+ * gate held, with their questions */
 export function statsLine(s: AreaStats): string {
   const r = agreementRate(s)
   const of = (a: number, d: number) => `${a} of ${a + d} (${pct(rate(a, d))})`
   return [
-    `${s.area}: ${s.proposals} proposal${s.proposals === 1 ? '' : 's'}`,
-    `${s.decided} decided (${s.repeats} exact repeat${s.repeats === 1 ? '' : 's'}), agreed ${s.agreed} of ${s.agreed + s.disagreed} (${pct(r)}): repeats ${of(s.repeatAgreed, s.repeatDisagreed)}, model verdicts ${of(s.modelAgreed, s.modelDisagreed)}`,
+    `${s.area}: ${count(s.proposals, 'decision')}, ${count(s.questions, 'question')}: ${s.decided} decided (${count(s.repeats, 'exact repeat')}), agreed ${s.agreed} of ${s.agreed + s.disagreed} (${pct(r)}): repeats ${of(s.repeatAgreed, s.repeatDisagreed)}, model verdicts ${of(s.modelAgreed, s.modelDisagreed)}`,
     `${s.sentBack} sent back`,
     `${s.held} held`,
-    `${s.gated} held by a gate`,
+    s.gated ? `${count(s.gated, 'decision')} (${count(s.gatedQuestions, 'question')}) held by a gate` : '0 held by a gate',
     ...(s.live || s.overruled ? [`${s.live} answered live (${s.reviewed} reviewed), ${s.overruled} overruled`] : []),
     `${usdText(s.usd)} in ${s.calls} call${s.calls === 1 ? '' : 's'}`,
   ].join(' · ')

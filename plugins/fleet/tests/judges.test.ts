@@ -34,6 +34,7 @@ import {
   judgePrompt,
   judgesOf,
   labelToken,
+  nothingOnRecord,
   lineSpeaksTo,
   nextTasteNumber,
   norm,
@@ -268,6 +269,15 @@ test('citations, checked by code: shown to the judge, a precedent with that very
   expect(checkVerdict(v('SQLite', ['principles.md:3', 'D-1']), DB, shown, rules, true).outcome).toBe('decided')
 })
 
+test('nothing on record: no precedent in the area and no principle of his, or a call is made', () => {
+  const ps = precedentsOf([{ id: 'D-1', source: 'decide', at: AT, area: 'storage', questions: [DB], answers: [{ label: 'SQLite', origin: 'composer' }] }])
+  const none = statuteOf([{ label: 'principles.md', text: PRINCIPLES_TEXT }, { label: 'charter.md', text: '# Charter\n\nA tool.\n' }]).lines
+  expect(nothingOnRecord('ui', ps, none)).toBe('nothing on record yet: no answer of yours in area ui, and no principle of yours in principles.md')
+  expect(nothingOnRecord(null, ps, none)).toContain('no answer of yours to a question with no area')
+  expect(nothingOnRecord('storage', ps, none)).toBe(null)
+  expect(nothingOnRecord('ui', ps, statuteOf([{ label: 'principles.md', text: `${PRINCIPLES_TEXT}Warnings are amber.\n` }]).lines)).toBe(null)
+})
+
 test('agreement, the register’s entry and /fleet’s line; the stats per area', () => {
   const f: JudgeFile = { format: 1, id: 'D-5', at: AT, area: 'storage', model: 'haiku', usd: 0.0003, verdicts: [{ q: 1, outcome: 'decided', option: 'SQLite', cites: ['D-1'], why: '', repeat: true }, { q: 2, outcome: 'hold', cites: [], why: 'it needs the person' }] }
   expect(agreementOf(f.verdicts[0], { label: 'SQLite', origin: 'composer' })).toBe(true)
@@ -287,13 +297,13 @@ test('agreement, the register’s entry and /fleet’s line; the stats per area'
   const stats = statsOf([
     { area: 'storage', judge: e },
     { area: 'storage', judge: judgeEntryOf({ ...f, verdicts: [f.verdicts[0]!] }, [{ label: 'Redis' }]) },
-    { area: 'storage', judge: { ...judgeEntryOf({ ...f, gated: 'it touches money', verdicts: [] }, []) } },
+    { area: 'storage', judge: { ...judgeEntryOf({ ...f, gated: 'it touches money', verdicts: [] }, [null, null]) } },
     { area: null, judge: judgeEntryOf({ ...f, area: null, verdicts: [{ q: 1, outcome: 'send-back', cites: [], why: 'x' }] }, [{ label: 'A' }]) },
   ])
   const s = stats.get('storage')!
-  expect([s.proposals, s.decided, s.repeats, s.agreed, s.disagreed, s.held, s.gated, s.calls]).toEqual([2, 2, 2, 1, 1, 1, 1, 2])
+  expect([s.proposals, s.questions, s.decided, s.repeats, s.agreed, s.disagreed, s.held, s.gated, s.gatedQuestions, s.calls]).toEqual([2, 3, 2, 2, 1, 1, 1, 1, 2, 2])
   expect([s.repeatAgreed, s.repeatDisagreed, s.modelAgreed, s.modelDisagreed]).toEqual([1, 1, 0, 0])
-  expect(statsLine(s)).toBe('storage: 2 proposals · 2 decided (2 exact repeats), agreed 1 of 2 (50%): repeats 1 of 2 (50%), model verdicts 0 of 0 (—) · 0 sent back · 1 held · 1 held by a gate · $0.0006 in 2 calls')
+  expect(statsLine(s)).toBe('storage: 2 decisions, 3 questions: 2 decided (2 exact repeats), agreed 1 of 2 (50%): repeats 1 of 2 (50%), model verdicts 0 of 0 (—) · 0 sent back · 1 held · 1 decision (2 questions) held by a gate · $0.0006 in 2 calls')
   expect(stats.get('(no area)')?.sentBack).toBe(1)
   const c = judgesOf(null).judges
   expect(promoteCheck(s, c)).toEqual({ ok: false, why: 'it has 2 proposals (it needs 30 proposals and 90% agreement on what the judge decided)' })

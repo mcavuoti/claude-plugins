@@ -155,6 +155,7 @@ import {
   liveWords,
   markSeen,
   modelCheck,
+  nothingOnRecord,
   reviewedBy,
   newJudgesState,
   overruleText,
@@ -5809,13 +5810,17 @@ async function judgeDecision($: any, rec: QueueRecord) {
     // A verdict checked again as a live answer would be: no text answer as support, statute only from charter.md and
     // principles.md
     let recheck: (v: Verdict) => Verdict = v => v
+    let empty: string | null = null
     if (asked.length) {
       const spent = await judgeLedger($, now)
-      if (spent.usd >= c.usdDay) {
+      const statute = spent.usd >= c.usdDay ? null : await statuteNow($, c)
+      // Nothing to read in its area and no principle of his: a call would only hold (the kickstart's interview)
+      empty = statute ? nothingOnRecord(rec.area ?? null, ps, statute.lines) : null
+      if (!statute) {
         file.problem = `today's judge budget is used up (${usdText(spent.usd)} of ${usdText(c.usdDay)})`
         holdAll(file.problem)
-      } else {
-        const statute = await statuteNow($, c)
+      } else if (empty) holdAll(empty)
+      else {
         const shown = relevantOf(ps, { area: rec.area ?? null, text }, c.precedents)
         let r: any = null
         try {
@@ -5845,7 +5850,7 @@ async function judgeDecision($: any, rec: QueueRecord) {
     const live = await liveAction($, rec, file, now, recheck)
     await publish($, judgeFile(rec.id), json(file))
     const u = file.usage
-    log($, `${rec.id} judged: ${verdicts.map(verdictWords).join('; ')}${u ? `; usage in ${u.input} out ${u.output} cache read ${u.cacheRead} write ${u.cacheWrite}, ${usdText(file.usd ?? 0)}` : asked.length ? '' : '; no model call'}${file.problem ? ` (${file.problem})` : ''}${file.live ? `; live area ${rec.area}${file.liveWhy ? `, but ${file.liveWhy}` : ''}` : ''}`)
+    log($, `${rec.id} judged: ${verdicts.map(verdictWords).join('; ')}${u ? `; usage in ${u.input} out ${u.output} cache read ${u.cacheRead} write ${u.cacheWrite}, ${usdText(file.usd ?? 0)}` : asked.length && !empty ? '' : `; no model call${empty ? ' (nothing on record yet)' : ''}`}${file.problem ? ` (${file.problem})` : ''}${file.live ? `; live area ${rec.area}${file.liveWhy ? `, but ${file.liveWhy}` : ''}` : ''}`)
     if (live.sendBack !== null) {
       const drop: DropFile = { format: FORMAT, id: rec.id, why: live.sendBack, origin: 'judge', session: 'the judge', at: now, sentBack: true }
       // Only while the person hasn't answered any of it himself

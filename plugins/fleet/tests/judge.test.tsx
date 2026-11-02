@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { JUDGE_SYSTEM } from '../hooks/judges'
+import { JUDGE_SYSTEM, PRINCIPLES_TEXT } from '../hooks/judges'
 import { DEC, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // The judges from the mod's side, in shadow: the asking session's fleet judges each choice once its ticket is out (the
@@ -101,13 +101,34 @@ test('shadow: gates and exact repeats with no model, one call for the rest, the 
   expect(under(w, `${DEC}/judge`)).toEqual([])
   const stats = await fleet($, 'stats')
   expect(stats).toContain('Judges: on, in shadow (they propose under each question in /fleet; you answer as always) · model haiku · today 1 call, $0.')
-  expect(stats).toContain('storage: 1 proposal · 1 decided (1 exact repeat), agreed 1 of 1 (100%): repeats 1 of 1 (100%), model verdicts 0 of 0 (—) · 0 sent back · 0 held · 0 held by a gate · $0.00 in 0 calls')
-  expect(stats).toContain('ui: 1 proposal · 1 decided (0 exact repeats), agreed 0 of 1 (0%): repeats 0 of 0 (—), model verdicts 0 of 1 (0%)')
-  expect(stats).toContain('(no area): 0 proposals · 0 decided (0 exact repeats), agreed 0 of 0 (—): repeats 0 of 0 (—), model verdicts 0 of 0 (—) · 0 sent back · 0 held · 1 held by a gate')
+  expect(stats).toContain('storage: 1 decision, 1 question: 1 decided (1 exact repeat), agreed 1 of 1 (100%): repeats 1 of 1 (100%), model verdicts 0 of 0 (—) · 0 sent back · 0 held · 0 held by a gate · $0.00 in 0 calls')
+  expect(stats).toContain('ui: 1 decision, 1 question: 1 decided (0 exact repeats), agreed 0 of 1 (0%): repeats 0 of 0 (—), model verdicts 0 of 1 (0%)')
+  expect(stats).toContain('(no area): 0 decisions, 0 questions: 0 decided (0 exact repeats), agreed 0 of 0 (—): repeats 0 of 0 (—), model verdicts 0 of 0 (—) · 0 sent back · 0 held · 1 decision (1 question) held by a gate')
   const ui = await fleet($, 'stats ui')
   expect(ui).toContain('   D-3 · ')
   expect(ui).toContain('1) a) Amber citing principles.md:3: you answered b) Red')
   expect(await fleet($, 'status')).toContain('judges: on (haiku), in shadow: today 1 call, $0.')
+})
+
+test('nothing on record yet (no answer in the area, no principle of his): code holds with no call; exact repeats all the same', WITH_SESSIONS, async ($, on) => {
+  const asked = model(on, () => '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}')
+  const w = project(on, { files: { [`${FLEET}/principles.md`]: PRINCIPLES_TEXT } })
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
+  await startSession($, w)
+  // The kickstart's interview: an area nobody answered in yet, and principles.md as fleet wrote it
+  await decide($, { questions: [COLOR, { ...COLOR, question: 'Which color for the info band?' }], area: 'ui' })
+  await tick(w)
+  expect(asked.length).toBe(0)
+  expect(json(w, `${DEC}/judge/D-2.json`).verdicts).toEqual([1, 2].map(q => ({ q, outcome: 'hold', cites: [], why: 'nothing on record yet: no answer of yours in area ui, and no principle of yours in principles.md' })))
+  expect(await fleet($, '')).toContain('judge: hold, needs your call: nothing on record yet: no answer of yours in area ui, and no principle of yours in principles.md')
+  expect(w.logs.some(l => l.includes('D-2 judged: 1 hold; 2 hold; no model call (nothing on record yet)'))).toBe(true)
+  // An exact repeat is found by code all the same; a new question in an area with an answer on record gets its call
+  await decide($, { questions: [DB], area: 'storage' })
+  await decide($, { questions: [{ ...DB, question: 'Which database for the logs?' }], area: 'storage' })
+  await tick(w)
+  expect(json(w, `${DEC}/judge/D-3.json`).verdicts[0]).toMatchObject({ outcome: 'decided', repeat: true, cites: ['D-1'] })
+  expect(asked.length).toBe(1)
+  expect(json(w, `${DEC}/judge/D-4.json`)).toMatchObject({ model: 'haiku', verdicts: [{ outcome: 'hold', why: 'taste' }] })
 })
 
 test('a citation code can’t check makes the proposal a hold; outside content and world.json’s judges gate it', WITH_SESSIONS, async ($, on) => {

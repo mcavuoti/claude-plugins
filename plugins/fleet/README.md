@@ -516,11 +516,11 @@ Most questions a fleet asks you were answered before ("too complicated", "fine t
 1: Which database for the cache? → a) SQLite (the judge proposed a) SQLite: agreed)
 ```
 
-The delivery doesn't change. When the decision closes, the register keeps the proposal and, per question, whether you agreed. **`/fleet stats`** counts them per area (with an area, its last ten decisions), the exact repeats and the model's own verdicts apart (a repeat is your own answer, so it says little about the model):
+The delivery doesn't change. When the decision closes, the register keeps the proposal and, per question, whether you agreed. **`/fleet stats`** counts them per area (with an area, its last ten decisions): the decisions judged and their questions (decided, sent back and held count questions), and the exact repeats and the model's own verdicts apart (a repeat is your own answer, so it says little about the model):
 
 ```
 Judges: on, in shadow (they propose under each question in /fleet; you answer as always) · model haiku · today 4 calls, $0.0011 of $1.00
-storage: 12 proposals · 9 decided (5 exact repeats), agreed 8 of 9 (89%): repeats 5 of 5 (100%), model verdicts 3 of 4 (75%) · 1 sent back · 2 held · 1 held by a gate · $0.0031 in 7 calls
+storage: 10 decisions, 12 questions: 9 decided (5 exact repeats), agreed 8 of 9 (89%): repeats 5 of 5 (100%), model verdicts 3 of 4 (75%) · 1 sent back · 2 held · 1 decision (2 questions) held by a gate · $0.0031 in 7 calls
 ```
 
 ### Live areas
@@ -571,7 +571,7 @@ The richest signal isn't an answer to a question: it's "no stand-ins", "revert i
 
 `"judges": false` turns them off; a `world.json` from a newer `fleet` turns them off in that session. `hold` holds patterns (regular expressions, any case): domain words belong there, never in `fleet`'s code. Past `usdDay` (dollars at list price, the project's, today), questions go unjudged but for exact repeats, which cost nothing; past `perDay`, a live area only proposes until tomorrow. The live areas, and the live answers you saw listed, are in `<project>/.claude/fleet/state/judges.json` (yours and `fleet`'s; a newer format has none).
 
-**Cost.** An exact repeat costs nothing. Otherwise one call on haiku: in the TEST, about 300 to 500 tokens in, 80 out, and a statute of about 900 tokens written to the cache on the first call and read from it on the next (within five minutes, from any session of the project): $0.0002 the first time, $0.0001 after. The call is billed to the asking session's credentials and left out of its cost totals, so `fleet` counts it from the call's usage, per session, in `<project>/.claude/fleet/state/judges/<day>/`, and `/fleet stats` and `/fleet status` show the day's.
+**Cost.** An exact repeat costs nothing, and so does a question with nothing on record yet (no answer of yours in its area and no line of yours in `principles.md`, as during the kickstart's interview): a call could only hold it, so code holds it with no call (`judge: hold, needs your call: nothing on record yet …`). Otherwise one call on haiku: in the TEST, about 300 to 500 tokens in, 80 out, and a statute of about 900 tokens written to the cache on the first call and read from it on the next (within five minutes, from any session of the project): $0.0002 the first time, $0.0001 after. The call is billed to the asking session's credentials and left out of its cost totals, so `fleet` counts it from the call's usage, per session, in `<project>/.claude/fleet/state/judges/<day>/`, and `/fleet stats` and `/fleet status` show the day's.
 
 ## Shared files: changed since you read it
 
