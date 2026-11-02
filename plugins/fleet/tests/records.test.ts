@@ -189,6 +189,9 @@ test('a check run: exit 0 passes all; lines naming a file fail it; no file named
     ['board/B-2.md', 'schema error'],
   ])
   expect(checkOutcome(paths, { exitCode: 127, stdout: '', stderr: 'not found' })).toBe(null)
+  // A long message is cut for the model, never through an emoji (a lone surrogate the API would refuse)
+  const long = checkOutcome(paths, { exitCode: 1, stdout: `${'x'.repeat(299)}😀 and more\n`, stderr: '' })?.get('board/B-1.md') ?? ''
+  expect(long).toBe(`${'x'.repeat(299)}…`)
   const c = recs({ checks: [{ glob: 'board/**', argv: ['checks/board.sh'] }] }).checks[0]!
   expect(needsCheck(undefined, c, 'h1')).toBe(true)
   const file = { format: 1, path: 'board/B-1.md', hash: 'h1', owner: null, results: { 'board.sh': { key: c.key, ok: false, message: 'x', at: AT } } }

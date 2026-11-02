@@ -10,7 +10,7 @@
 // re-read. Coordination, not security, as the rest of the world (changes.ts).
 
 import { checkGlob, clock, globRegex, hashText, type Me, type Via, type Who, type WorldConfig } from './changes'
-import { FORMAT } from './decisions'
+import { FORMAT, cut } from './decisions'
 import type { DerivedStale } from './derived'
 
 /** An id: capitals (and digits after the first), a dash, digits. world.json's idPattern replaces it */
@@ -124,7 +124,7 @@ function parseCheck(raw: any, i: number, insensitive: boolean): { check: Check }
   const when = raw.when === 'sweep' ? 'sweep' : raw.when === undefined || raw.when === 'land' ? 'land' : null
   if (!when) return { problem: `${where}: when is "land" or "sweep"` }
   const script = [...argv].reverse().find((a: string) => /[/.]/.test(a)) ?? argv[0]
-  const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 40) : String(script).split('/').pop() || `check ${i + 1}`
+  const name = typeof raw.name === 'string' && raw.name.trim() ? cut(raw.name.trim(), 40) : String(script).split('/').pop() || `check ${i + 1}`
   return {
     check: {
       name,
@@ -454,16 +454,17 @@ export function checkOutcome(paths: readonly string[], r: { exitCode: number; st
     .split('\n')
     .map(l => l.trim())
     .filter(Boolean)
-  const cut = (s: string) => (s.length > 300 ? `${s.slice(0, 300)}…` : s)
+  // A script's output goes to the model as the failure's message: never ending on half a character
+  const short = (s: string) => (s.length > 300 ? `${cut(s, 300)}…` : s)
   let named = false
   for (const p of paths) {
     const mine = lines.filter(l => l === p || l.startsWith(`${p}:`) || l.startsWith(`${p} `) || l.startsWith(`./${p}:`) || l.startsWith(`./${p} `))
     if (!mine.length) continue
     named = true
-    out.set(p, cut(mine.map(l => l.replace(/^\.\//, '').slice(p.length).replace(/^[:\s]+/, '') || 'failed').slice(0, 2).join('; ')))
+    out.set(p, short(mine.map(l => l.replace(/^\.\//, '').slice(p.length).replace(/^[:\s]+/, '') || 'failed').slice(0, 2).join('; ')))
   }
   if (!named) {
-    const msg = cut(lines.slice(0, 2).join('; ') || `exit ${r.exitCode}`)
+    const msg = short(lines.slice(0, 2).join('; ') || `exit ${r.exitCode}`)
     for (const p of paths) out.set(p, msg)
   }
   return out

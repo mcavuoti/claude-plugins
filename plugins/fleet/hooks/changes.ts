@@ -9,7 +9,7 @@
 // next step. Coordination, not security: fleet fails open, and never carries a file's content, only path, who and when.
 
 import type { FleetRead } from '../types'
-import { FORMAT } from './decisions'
+import { FORMAT, cut } from './decisions'
 import type { IntakeMeta } from './intake'
 
 /** Project data: world.json. It only gains fields, and a write keeps the fields it doesn't know */
@@ -374,7 +374,7 @@ export function digestText(items: readonly DigestItem[], me: Me): string {
   const rest = items.slice(DIGEST_LINES)
   if (rest.length) {
     const names = rest.map(i => i.path).join(', ')
-    lines.push(`- and ${rest.length} more: ${names.length > 300 ? `${names.slice(0, 300)}…` : names}`)
+    lines.push(`- and ${rest.length} more: ${names.length > 300 ? `${cut(names, 300)}…` : names}`)
   }
   return lines.join('\n')
 }
