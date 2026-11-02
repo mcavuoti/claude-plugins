@@ -1031,3 +1031,71 @@ export function drawPlan<T extends { section: string; sectionTitle: string; colo
 export function ringKeys(rows: readonly { sessionId: string; section: string; sectionTitle: string; color: Color; folded?: boolean }[]): string[] {
   return drawPlan(rows).flatMap(it => (it.kind === 'row' ? [`s:${it.row.sessionId}`] : it.kind === 'fold' ? [`h:${it.section}`] : []))
 }
+
+// ---- Telling the person ----
+// The mod never stops anything for what follows: it marks rows, and notifies the person at most once for each thing
+// (PushNotification, which reaches the phone with Remote Control, else $.ui.notify, their own channel), keeping to the
+// plugin's options: quiet hours, and a cap a day for all of its notifications together
+
+// Quiet hours, as written in the plugin's options: "22-7" or "22:30-07:00", local time, the end excluded; a span that
+// ends before it starts runs past midnight. null: none ('' or not understood)
+export type QuietHours = { from: number; to: number }
+export function parseQuietHours(text: unknown): QuietHours | null {
+  const m = String(text ?? '')
+    .trim()
+    .match(/^(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?$/)
+  if (!m) return null
+  const minutes = (h: string | undefined, mm: string | undefined) => (Number(mm ?? 0) < 60 ? Number(h) * 60 + Number(mm ?? 0) : NaN)
+  const from = minutes(m[1], m[2])
+  const to = minutes(m[3], m[4])
+  if (!(from < 1440) || !(to <= 1440) || from === to) return null
+  return { from, to }
+}
+
+export function inQuietHours(q: QuietHours | null, at: Date): boolean {
+  if (!q) return false
+  const t = at.getHours() * 60 + at.getMinutes()
+  return q.from < q.to ? t >= q.from && t < q.to : t >= q.from || t < q.to
+}
+
+// The local day, for the cap a day ("2026-11-02")
+export function dayOf(at: Date): string {
+  const two = (x: number) => String(x).padStart(2, '0')
+  return `${at.getFullYear()}-${two(at.getMonth() + 1)}-${two(at.getDate())}`
+}
+
+// How many notifications the mod sent today, from the store's pushCount ({ day, count }): another day's count is 0
+export function sentToday(stored: unknown, day: string): number {
+  const s = stored as { day?: unknown; count?: unknown } | null | undefined
+  return s && s.day === day && Number.isFinite(Number(s.count)) ? Number(s.count) : 0
+}
+
+// A session of the project waiting for the person: red (its question or permission), or marked by another plugin as
+// needing them. since: when a panel first saw it so (the store's waiting:<sessionId>, or needsSince:<sessionId>)
+export type Wait = { sessionId: string; title: string; since: number }
+// A session that can reach the phone (it has Remote Control) pushes as soon as a wait is due; the others give it this
+// long more, so the push comes from one that can
+export const PUSH_GRACE_MS = 60000
+// The waits due a push: waiting at least the threshold (0: never), and not pushed for this wait yet (pushed: by
+// sessionId, the since of the wait already pushed, by any session). first: this session goes first (see PUSH_GRACE_MS)
+export function dueWaits(waits: readonly Wait[], pushed: Readonly<Record<string, number>>, now: number, threshold: number, first: boolean): Wait[] {
+  if (!(threshold > 0)) return []
+  return waits.filter(w => pushed[w.sessionId] !== w.since && now - w.since >= threshold + (first ? 0 : PUSH_GRACE_MS))
+}
+
+// 12 min, 3 h
+export function howLong(ms: number): string {
+  const min = Math.max(1, Math.floor(ms / 60000))
+  return min < 120 ? `${min} min` : `${Math.floor(min / 60)} h`
+}
+
+// What the push says: the sessions' names only, never what they're doing (it can land on a locked phone)
+export function waitText(waits: readonly Wait[], now: number): string {
+  const sorted = [...waits].sort((a, b) => a.since - b.since)
+  const oldest = sorted[0]
+  if (!oldest) return ''
+  const name = `“${Array.from(oldest.title).slice(0, 60).join('')}”`
+  const others = sorted.length - 1
+  if (others === 0) return `${name} has been waiting for you for ${howLong(now - oldest.since)}`
+  return `${name} and ${others === 1 ? '1 other session' : `${others} other sessions`} are waiting for you, the longest for ${howLong(now - oldest.since)}`
+}

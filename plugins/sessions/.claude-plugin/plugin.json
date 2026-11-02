@@ -11,6 +11,24 @@
       "title": "Debug logs for new sessions",
       "description": "Sessions the panel (n) or ccc create write Claude's debug log to ~/.claude/mods/sessions-data/debug/<name>.log, and the mod logs each step of its start there",
       "default": false
+    },
+    "waitPushMinutes": {
+      "type": "number",
+      "title": "Notify me when a session has waited this many minutes",
+      "description": "Once a session of the project has waited this long for you (a question or a permission, or marked as needing you), you're notified once for that wait: on your phone with Remote Control, else through your notification channel. 0: never",
+      "default": 10
+    },
+    "quietHours": {
+      "type": "string",
+      "title": "Quiet hours",
+      "description": "No notifications in these local hours, written as 22-7 or 22:30-07:00. Empty: none",
+      "default": ""
+    },
+    "notificationsPerDay": {
+      "type": "number",
+      "title": "Notifications a day, at most",
+      "description": "For all of the panel's notifications together. 0: none",
+      "default": 5
     }
   }
 }

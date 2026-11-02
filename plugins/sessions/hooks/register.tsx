@@ -113,6 +113,15 @@ import {
   tellPrompt,
   tellIdIn,
   type TellState,
+  dayOf,
+  dueWaits,
+  howLong,
+  inQuietHours,
+  parseQuietHours,
+  sentToday,
+  waitText,
+  type QuietHours,
+  type Wait,
   FORMAT,
   NOTICE_MARKER,
 } from './state'
@@ -221,6 +230,12 @@ let lastBeat = 0
 // the mod logs its start steps to the debug log. The mod mirrors it to <data>/config for the launcher, which can't read
 // plugin options
 let debugLogs = false
+// The plugin's options for telling the person (see "Telling the person" in state.ts): a push once a session has waited
+// waitPushMinutes (0: never), none in quietHours, and at most notificationsPerDay notifications of any kind a day
+let waitPushMs = 600000
+let quietHours: QuietHours | null = null
+let quietHoursText = ''
+let notificationsPerDay = 5
 // The installed version this session's mod already tried to update itself to (once per version)
 let reloadTriedFor = ''
 const startProblems: string[] = []
@@ -296,7 +311,10 @@ function debugLine($: any, text: string) {
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
 // session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
 // marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts), collapsed (the
-// sections the person folded, by id).
+// sections the person folded, by id), needsSince:<id> (since when a plugin's mark says it needs the person: since, and
+// at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), pushCount
+// (the notifications sent today: day, count), lastPush (the last one: at, text, from, and what the phone and the
+// notification channel answered).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
@@ -456,7 +474,7 @@ async function prune($: any) {
     keys = await $.store.keys()
   } catch {}
   for (const k of keys) {
-    const m = k.match(/^(state|seen|title|waiting|restarted|reopened):(.+)$/)
+    const m = k.match(/^(state|seen|title|waiting|restarted|reopened|needsSince|pushed):(.+)$/)
     if (m?.[2] && !alive.has(m[2])) ids.add(m[2])
   }
   let files: string[] = []
@@ -872,6 +890,102 @@ async function readMarks($: any, now: number) {
   markSources = sources
 }
 
+// ---- Telling the person ("Telling the person" in state.ts) ----
+
+// Notifies the person: PushNotification first (Claude sends it to the phone when the session has Remote Control and
+// the person isn't at the computer, and says why not otherwise), else $.ui.notify, their own notification channel
+// (their Notification hooks run too). Only from this mod's timers: the tool's result comes back to this call, and no
+// row of it reaches the conversation (checked in a test session: the model never sees it). What each answered
+async function tellPerson($: any, text: string): Promise<{ phone: string; notification: string }> {
+  let phone: string
+  try {
+    const r: any = await Promise.race([$.tool.call({ tool: 'PushNotification', message: text, status: 'proactive' }), $.clock.sleep(10000).then(() => null)])
+    if (!r) phone = 'no answer in 10 s'
+    else if (r.deny) phone = `refused: ${String(r.deny).slice(0, 100)}`
+    else if (r.result?.pushSent === true) phone = 'sent'
+    else if (r.result?.localSent === true) phone = 'shown on this computer'
+    else phone = `not sent (${String(r.result?.disabledReason ?? (r.isError ? r.text : 'no reason given')).slice(0, 100)})`
+  } catch (err) {
+    phone = `unavailable (${String(err).slice(0, 100)})`
+  }
+  if (phone === 'sent' || phone === 'shown on this computer') return { phone, notification: '' }
+  let notification: string
+  try {
+    const n: any = await $.ui.notify(text, { title: 'Sessions' })
+    notification = n?.isSent ? `sent (${n.channel})` : `not sent (${n?.reason ?? 'no reason given'})`
+  } catch (err) {
+    notification = `refused (${String(err).slice(0, 100)})`
+  }
+  return { phone, notification }
+}
+
+// One notification, when the quiet hours and the cap a day allow it. claim runs under the push lock (<data>/push.lock,
+// which every session takes) and says whether it's still to be sent, recording it as sent so that no other session
+// sends it too; the day's count (the store's pushCount, { day, count }) goes up with it. What it said and what each
+// channel answered is kept in lastPush, for /sessions status. Whether it was sent
+async function notifyOnce($: any, claim: () => Promise<boolean>, text: () => string): Promise<boolean> {
+  if (!dataDir || notificationsPerDay <= 0) return false
+  const now = await $.clock.now()
+  if (inQuietHours(quietHours, new Date(now))) return false
+  const day = dayOf(new Date(now))
+  let go = false
+  await withLock(
+    $,
+    `${dataDir}/push`,
+    async () => {
+      const count = sentToday(await storeGet($, 'pushCount'), day)
+      if (count >= notificationsPerDay || !(await claim())) return
+      await storeSet($, 'pushCount', { day, count: count + 1 })
+      go = true
+    },
+    10,
+  )
+  if (!go) return false
+  const message = text()
+  const r = await tellPerson($, message)
+  await storeSet($, 'lastPush', { at: now, text: message, from: myShortId(), ...r })
+  debugLine($, `notified “${message}”: phone ${r.phone}${r.notification ? `, notification ${r.notification}` : ''}`)
+  return true
+}
+
+// The project's sessions waiting for the person, as the last refresh found them
+let waitsNow: Wait[] = []
+
+// A push once a session of the project has waited for the person waitPushMinutes, once per wait (pushed:<sessionId>
+// holds the since of the wait pushed), whichever session of the project gets there first: one with Remote Control right
+// away (its push can reach the phone), the others a minute later (PUSH_GRACE_MS). Several due at once go in one push
+let pushingWaits = false
+async function pushWaits($: any) {
+  if (pushingWaits || !(waitPushMs > 0) || waitsNow.length === 0) return
+  pushingWaits = true
+  try {
+    const now = await $.clock.now()
+    const waits = waitsNow
+    const pushed = async () => {
+      const out: Record<string, number> = {}
+      for (const w of waits) out[w.sessionId] = Number(await storeGet($, `pushed:${w.sessionId}`)) || 0
+      return out
+    }
+    const before = await pushed()
+    if (dueWaits(waits, before, now, waitPushMs, true).length === 0) return
+    const own = lastList.find(s => s.sessionId === myId)
+    const first = own?.kind === 'background' && typeof own.id === 'string' && (await hasRemoteControl($, own.id)) === true
+    if (dueWaits(waits, before, now, waitPushMs, first).length === 0) return
+    let due: Wait[] = []
+    await notifyOnce(
+      $,
+      async () => {
+        due = dueWaits(waits, await pushed(), now, waitPushMs, first)
+        for (const w of due) await storeSet($, `pushed:${w.sessionId}`, w.since)
+        return due.length > 0
+      },
+      () => waitText(due, now),
+    )
+  } finally {
+    pushingWaits = false
+  }
+}
+
 async function refresh($: any) {
   const list = await officialList($)
   if (typeof list === 'string') {
@@ -892,6 +1006,7 @@ async function refresh($: any) {
   const beats = await readHeartbeats($, project.map(s => s.sessionId))
   const plugin = await installedPlugin($)
   const fresh: Row[] = []
+  const waits: Wait[] = []
   // Each session's version, to mark afterwards the ones with an older one than the installed version
   const versions: Record<string, string> = {}
   let newest = await readInstalledVersion($)
@@ -922,10 +1037,23 @@ async function refresh($: any) {
     // What a running background session has going on beside its turn: its subagents and background tasks, as the
     // background service counts them (artifact watches aside)
     const helpers = s.kind === 'background' && s.pid && typeof s.id === 'string' ? ((await backgroundTasks($, s.id))?.count ?? 0) : 0
+    const title = unnamed ? ownTitle || s.id || s.sessionId.slice(0, 8) : s.name
+    // Since when it waits for the person (red, or marked as needing them), for the push when that runs long. A mark has
+    // no start of its own: the panels record it as needsSince:<sessionId>, { since, at }, and a record no panel kept
+    // fresh for a minute is a wait that ended
+    let needsSince: number | undefined
+    if (marked.needsPerson && color !== 'gray') {
+      const n = await storeGet($, `needsSince:${s.sessionId}`)
+      const kept = n && now - Number(n.at) < 60000 && Number(n.since) > 0 ? Number(n.since) : undefined
+      needsSince = kept ?? now
+      if (!kept || now - Number(n.at) > 20000) await storeSet($, `needsSince:${s.sessionId}`, { since: needsSince, at: now })
+    }
+    const waitFrom = Math.min(color === 'red' && waitingSince ? waitingSince : Infinity, needsSince ?? Infinity)
+    if (Number.isFinite(waitFrom)) waits.push({ sessionId: s.sessionId, title, since: waitFrom })
     fresh.push({
       sessionId: s.sessionId,
       id: s.id ?? null,
-      title: unnamed ? ownTitle || s.id || s.sessionId.slice(0, 8) : s.name,
+      title,
       color,
       time: since ? timeSince(since, now) : '',
       model: e?.model ?? '',
@@ -948,6 +1076,7 @@ async function refresh($: any) {
       helpers,
     })
   }
+  waitsNow = waits
   installedVersion = newest
   // ↑ also when a session runs an older version of this mod than the installed one (its heartbeat says which)
   const modInstalled = plugin?.version ?? ''
@@ -2043,7 +2172,7 @@ async function rebind($: any) {
   await storeSet($, `state:${id}`, existing ?? { created: previous?.created ?? now, model: previous?.model, context: undefined, version: previous?.version, agent: previous?.agent, root: previous?.root })
   const seen = await storeGet($, `seen:${old}`)
   if (seen && !(await storeGet($, `seen:${id}`))) await storeSet($, `seen:${id}`, seen)
-  for (const k of ['state', 'seen', 'title', 'waiting', 'restarted']) await storeDelete($, `${k}:${old}`)
+  for (const k of ['state', 'seen', 'title', 'waiting', 'restarted', 'needsSince', 'pushed']) await storeDelete($, `${k}:${old}`)
   await runSafe($, ['rm', '-f', `${dataDir}/alive/${old}`, `${dataDir}/inbox/${old}`])
   // A regular session is named by its session id in sections.json (sid:<id>): its section moves to the new id. A
   // background one keeps its short id, and its section
@@ -2110,6 +2239,21 @@ async function announceUpdate($: any) {
   $.ui.toast(`Panel updated to ${modVersion}`)
 }
 
+// /sessions status, about telling the person: the options as they apply, today's count, the last notification any
+// session sent and what each channel answered
+async function notificationsText($: any, now: number): Promise<string> {
+  const when = waitPushMs > 0 ? `a push once a session waits ${howLong(waitPushMs)}` : 'no push for waiting sessions (waitPushMinutes 0)'
+  const quiet = quietHours ? `, none ${quietHoursText}` : quietHoursText ? `, quiet hours “${quietHoursText}” not understood (write them as 22-7)` : ''
+  const count = `${sentToday(await storeGet($, 'pushCount'), dayOf(new Date(now)))} of ${notificationsPerDay} today`
+  const last = await storeGet($, 'lastPush')
+  const lastText =
+    last && typeof last === 'object'
+      ? ` · last, ${howLong(now - Number(last.at))} ago from ${String(last.from)}: “${String(last.text)}” (phone: ${String(last.phone)}${last.notification ? `; notification: ${String(last.notification)}` : ''})`
+      : ''
+  const lines = [`Notifications: ${when}${quiet}, ${count}${lastText}`]
+  return lines.join('\n')
+}
+
 // /sessions status: whether and how the mod started here, who this session is, which copy of the mod runs, and which
 // sessions of the project have no running panel
 async function statusText($: any): Promise<string> {
@@ -2131,6 +2275,7 @@ async function statusText($: any): Promise<string> {
     markSources.length
       ? `Marks: ${markSources.map(m => `${m.source} (${m.rows === 1 ? '1 row' : `${m.rows} rows`}, ${Math.max(0, Math.ceil((m.until - now) / 60000))} min left)`).join(', ')}`
       : 'Marks: none',
+    await notificationsText($, now),
   ]
   if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)
   return lines.join('\n')
@@ -2409,8 +2554,9 @@ async function start($: any) {
       bg(runWakes($))
       bg(checkTells($))
     })
+    // The person is told (pushWaits) from this timer only, never from a hook of a turn
     $.clock.every(3000, () => {
-      bg(refresh($))
+      bg(refresh($).then(() => pushWaits($)))
     })
     $.clock.every(2000, () => {
       bg(markSeenIfLooking($))
@@ -2457,6 +2603,11 @@ async function start($: any) {
 
 export const register: Register = (on, options) => {
   debugLogs = options?.debugLogs === true
+  const minutes = (value: unknown, fallback: number) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value * 60000 : fallback)
+  waitPushMs = minutes(options?.waitPushMinutes, 600000)
+  quietHoursText = typeof options?.quietHours === 'string' ? options.quietHours.trim() : ''
+  quietHours = parseQuietHours(quietHoursText)
+  notificationsPerDay = typeof options?.notificationsPerDay === 'number' && Number.isFinite(options.notificationsPerDay) ? Math.max(0, Math.floor(options.notificationsPerDay)) : 5
   // $.sessions for other plugins (sessionsApi). Nothing else happens here: a throw at this step unloads the whole mod.
   // Claude doesn't let the $ built here be handed to a function, so the methods get the few calls they make (files,
   // commands, the clock, the environment, the store) through closures over it

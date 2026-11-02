@@ -39,6 +39,12 @@ export type World = {
   bgError: { value: string }
   // macOS's memory pressure level (sysctl kern.memorystatus_vm_pressure_level): 1 normal, 4 critical
   memory: { value: string }
+  // What the mod asked to tell the person: the PushNotification calls' messages and $.ui.notify's texts, and what each
+  // answers (by default, what a session gets with nobody away from the computer and no notifying terminal)
+  pushes: string[]
+  notifies: string[]
+  pushAnswer: { value: any }
+  notifyAnswer: { value: any }
 }
 
 export type WorldOptions = {
@@ -194,7 +200,19 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: undefined }
   })
   on('ui.log', () => ({ value: undefined }))
-  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory }
+  const pushes: string[] = []
+  const notifies: string[] = []
+  const pushAnswer = { value: { pushSent: false, localSent: false, disabledReason: 'user_present' } as any }
+  const notifyAnswer = { value: { isSent: false, reason: 'no-channel' } as any }
+  on('tool.call', { tool: 'PushNotification' }, (_, e: any) => {
+    pushes.push(String(e.message))
+    return { result: { message: e.message, ...pushAnswer.value } } as any
+  })
+  on('ui.notify', (_, e) => {
+    notifies.push(String(e.text))
+    return { value: notifyAnswer.value }
+  })
+  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {
