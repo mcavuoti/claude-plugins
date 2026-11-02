@@ -1930,33 +1930,53 @@ function resultOf(e: any, current: string | null): string | null {
 // ---- Outbound (outbound.ts): the one hard line. In a background session of the project, a call that would send the
 // project's content to a third party is refused with how to draft it for the person; outbound.json is his allowlist ----
 
-let outboundCfg: { c: OutboundConfig; mtimeMs: number } | null = null
+let outboundCfg: { c: OutboundConfig; key: string } | null = null
 let outboundProblem = ''
+// outbound.json changed outside fleet since it was stamped: the gate goes on with it as it was stamped
+let outboundUnstamped = false
 
-/** outbound.json, read again when its time moves. None: nothing is allowed but this machine. One fleet can't read (a
- * newer one, or not JSON): the same, and /fleet status says why (the hard line never opens by itself) */
+/** outbound.json as the person stamped it (or fleet wrote it on his answer), read again when its time or the stamps'
+ * moves: an edit made another way isn't used until /fleet accept outbound.json, so it never widens what leaves
+ * unseen (with no stamps yet, what's there counts as stamped). None: nothing is allowed but this machine. One fleet
+ * can't read (a newer one, or not JSON; or stamps of another fleet): the same, and /fleet status says why (the hard
+ * line never opens by itself) */
 async function outboundConfig($: any): Promise<OutboundConfig> {
   if (!root) return newOutbound()
   const path = `${fleetDir()}/outbound.json`
-  let st: any
-  try {
-    st = await $.fs.stat(path)
-  } catch {
-    outboundCfg = null
-    outboundProblem = ''
-    return newOutbound()
+  const timeOf = async (p: string) => {
+    try {
+      return String((await $.fs.stat(p)).mtimeMs)
+    } catch {
+      return '-'
+    }
   }
-  if (outboundCfg && outboundCfg.mtimeMs === Number(st.mtimeMs)) return outboundCfg.c
-  const t = await readText($, path)
-  const p = t === null ? { problem: "outbound.json can't be read" } : parseOutbound(t)
-  if ('problem' in p) {
-    if (outboundProblem !== p.problem) log($, `${p.problem}: nothing but this machine is allowed`)
-    outboundProblem = p.problem
-    outboundCfg = { c: newOutbound(), mtimeMs: Number(st.mtimeMs) }
+  const key = `${await timeOf(path)} ${await timeOf(stateDir('stamps.json'))}`
+  if (outboundCfg && outboundCfg.key === key) return outboundCfg.c
+  const none = (problem: string) => {
+    if (problem && outboundProblem !== problem) log($, `${problem}: nothing but this machine is allowed`)
+    outboundProblem = problem
+    outboundCfg = { c: newOutbound(), key }
     return outboundCfg.c
   }
+  const now = await readText($, path)
+  const raw = await readText($, stateDir('stamps.json'))
+  const w = raw === null ? null : parseWire<Stamps>(raw)
+  if (w && 'otherFormat' in w) {
+    outboundUnstamped = false
+    return none(`the stamps (state/stamps.json) are from another fleet (format ${w.otherFormat}): restart this session (u)`)
+  }
+  const s = w ? w.value : null
+  const had = s?.files[OUTBOUND_JSON]
+  const v = now === null ? null : hashText(now)
+  const stamped = !s || (had === undefined ? v === null : had === v)
+  if (!stamped && !outboundUnstamped) log($, 'outbound.json changed outside fleet: the gate goes on with it as it was stamped, until /fleet accept outbound.json')
+  outboundUnstamped = !stamped
+  const t = stamped ? now : typeof s?.outbound === 'string' && hashText(s.outbound) === had ? s.outbound : null
+  if (t === null) return none('')
+  const p = parseOutbound(t)
+  if ('problem' in p) return none(p.problem)
   outboundProblem = ''
-  outboundCfg = { c: p.outbound, mtimeMs: Number(st.mtimeMs) }
+  outboundCfg = { c: p.outbound, key }
   return p.outbound
 }
 
@@ -3733,7 +3753,9 @@ type BudgetRow = { inst: Instance; usd: number; cap: number | null; own: BudgetS
 type ProjectBudget = { usd: number; cap: number | null; state: BudgetState }
 /** The sweeper's wakes today; cadenceFor: the period (its anchor) an instance was last woken for, past its cadence */
 type WakesFile = { format: number; day: string; instances: Record<string, WakeCount & { cadenceFor?: number; derivedFor?: string; slotFor?: string }> }
-type Stamps = { format: number; files: Record<string, string | null> }
+/** The config files' versions as fleet wrote them or the person stamped them; outbound: outbound.json's own text as
+ * stamped, which is what the gate uses (an edit made another way waits for /fleet accept) */
+type Stamps = { format: number; files: Record<string, string | null>; outbound?: string | null }
 const budgetCache = { at: 0, list: [] as BudgetRow[], project: { usd: 0, cap: null, state: 'ok' } as ProjectBudget }
 // The sweeper's view: since when a running instance shows no heartbeat (by ref), and the marks it set last
 const noFleetSince = new Map<string, number>()
@@ -4243,7 +4265,10 @@ async function writeStamps($: any, rels: readonly string[]) {
   for (const rel of had ? rels : [...new Set([...(await configFiles($)), ...rels])]) {
     const t = await readText($, `${root}/${rel}`)
     s.files[rel] = t === null ? null : hashText(t)
+    if (rel === OUTBOUND_JSON) s.outbound = t
   }
+  // The gate reads outbound.json again as stamped now (another session's stamps move the file's time)
+  outboundCfg = null
   if (!(await replace($, stateDir('stamps.json'), json(s)))) {
     await run($, ['mkdir', '-p', stateDir()])
     await replace($, stateDir('stamps.json'), json(s))
@@ -4359,7 +4384,8 @@ async function fileChange($: any, e: any) {
   // as it's filed: his direct command costs him no tap), or not (it waits for /fleet <n> apply)
   const mark = await read($, outside)
   const turn = await read($, personTurn)
-  const verdict = circular ? { ok: false as const, why: 'circular' as const } : preAnswer({ personTurn: !!turn, mark, mainThread: e.agentId === undefined })
+  // A change to outbound.json (what may leave without asking) always waits for his apply, which shows him the diff
+  const verdict = circular ? { ok: false as const, why: 'circular' as const } : rel === OUTBOUND_JSON ? { ok: false as const, why: 'allowlist' as const } : preAnswer({ personTurn: !!turn, mark, mainThread: e.agentId === undefined })
   const record = await allocate($, id => ({
     format: FORMAT,
     fleet: version,
@@ -4390,7 +4416,7 @@ async function fileChange($: any, e: any) {
     log($, `${record.id} not applied as filed: ${a.line}`)
   }
   bg(beat($))
-  const waits = !verdict.ok && verdict.why === 'outside' && turn && mark ? ` It waits for the person's apply although they typed this turn: this conversation read outside content (${markText(mark, (await meNow($)).offsetMin)}).` : ''
+  const waits = !verdict.ok && verdict.why === 'outside' && turn && mark ? ` It waits for the person's apply although they typed this turn: this conversation read outside content (${markText(mark, (await meNow($)).offsetMin)}).` : !verdict.ok && verdict.why === 'allowlist' && turn ? " It waits for the person's apply although they typed this turn: a change to outbound.json, what may leave without asking, always does, so they see its diff." : ''
   const flag = circular ? ` fleet flagged it for the person: ${circularWords(circular.via)}.` : ''
   return { result: `${changeTicket(record.id, spec)}${waits}${flag}` }
 }
@@ -6726,7 +6752,7 @@ async function statusCommand($: any): Promise<string> {
     const oc = await outboundConfig($)
     const allowed = [oc.hosts.length ? `hosts ${oc.hosts.join(', ')}` : '', oc.remotes.length ? `remotes ${oc.remotes.join(', ')}` : '', oc.recipients.length ? `recipients ${oc.recipients.join(', ')}` : ''].filter(Boolean)
     lines.push(
-      `outbound: ${jobRef ? 'a call that would send the project’s content outside is held here, for the person to approve as a draft (mcp__fleet__send)' : gateHolds() ? 'a call that would send the project’s content outside is held here: this session was started from a background session (it inherited CLAUDE_JOB_DIR or FLEET_INSTANCE), and the one that started it drafts it' : "not held in this session (you're at it: Claude's own permission prompts are yours); held in the project's background sessions"}; allowed without asking: ${allowed.length ? allowed.join('; ') : 'nothing but this machine'} (outbound.json${outboundProblem ? `: ${outboundProblem}` : ''})`,
+      `outbound: ${jobRef ? 'a call that would send the project’s content outside is held here, for the person to approve as a draft (mcp__fleet__send)' : gateHolds() ? 'a call that would send the project’s content outside is held here: this session was started from a background session (it inherited CLAUDE_JOB_DIR or FLEET_INSTANCE), and the one that started it drafts it' : "not held in this session (you're at it: Claude's own permission prompts are yours); held in the project's background sessions"}; allowed without asking: ${allowed.length ? allowed.join('; ') : 'nothing but this machine'} (outbound.json${outboundProblem ? `: ${outboundProblem}` : ''}${outboundUnstamped ? ` as it was last stamped: outbound.json changed outside fleet, /fleet accept outbound.json to use it` : ''})`,
     )
     const mark = await read($, outside)
     lines.push(mark ? `this conversation read outside content (${markText(mark, (await meNow($)).offsetMin)}): a change it files waits for /fleet <n> apply, until /clear` : 'this conversation read nothing from outside')

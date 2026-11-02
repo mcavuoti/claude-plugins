@@ -105,12 +105,48 @@ test('a session of the person’s own (no background) isn’t held: Claude’s p
   await startSession($, w)
   expect((await bash($, 'curl -d @notes/x.md https://example.invalid/upload')).deny).toBe(undefined)
   expect(await fleet($, 'status')).toContain("outbound: not held in this session (you're at it")
-  // His own edit of the allowlist is his, once he stamps it
+  // His own edit of the allowlist is his, once he stamps it: till then the gate goes on with it as it was stamped
   await fleet($, 'accept')
   w.touch(`${FLEET}/outbound.json`, JSON.stringify({ outboundFormat: 1, hosts: ['devbox', 'build'] }))
+  expect(await fleet($, 'status')).toContain('allowed without asking: hosts devbox; remotes origin; recipients me@example.com (outbound.json as it was last stamped: outbound.json changed outside fleet, /fleet accept outbound.json to use it)')
   expect(await fleet($, 'accept')).toContain('  .claude/fleet/outbound.json: changed outside fleet (not through a change you applied) · /fleet accept .claude/fleet/outbound.json')
   expect(await fleet($, 'accept outbound.json')).toBe('.claude/fleet/outbound.json: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).')
   expect(await fleet($, 'status')).toContain('allowed without asking: hosts devbox, build (outbound.json)')
+})
+
+test('outbound.json widened another way isn’t used until the person stamps it; a change to it always waits for his apply, with the diff', async ($, on) => {
+  const w = project(on)
+  await startSession($, w)
+  // No stamps yet: what's there counts as stamped
+  expect((await bash($, 'ssh devbox true')).deny).toBe(undefined)
+  expect((await bash($, 'ssh far.invalid true')).deny).toContain('(ssh running a command to far.invalid)')
+  // A Bash write widens it (its own tools are denied the file): the gate goes on with the stamped one
+  await fleet($, 'accept')
+  w.touch(`${FLEET}/outbound.json`, JSON.stringify({ outboundFormat: 1, hosts: ['*'] }))
+  expect((await bash($, 'ssh far.invalid true')).deny).toContain('(ssh running a command to far.invalid)')
+  expect((await bash($, 'ssh devbox true')).deny).toBe(undefined)
+  expect(w.logs.some(l => l.includes('outbound.json changed outside fleet: the gate goes on with it as it was stamped, until /fleet accept outbound.json'))).toBe(true)
+  // The person stamps it as his: it's used
+  expect(await fleet($, 'accept outbound.json')).toContain('stamped as yours')
+  expect((await bash($, 'ssh far.invalid true')).deny).toBe(undefined)
+  w.touch(`${FLEET}/outbound.json`, ALLOW)
+  await fleet($, 'accept outbound.json')
+  // A change to it, filed in a turn the person typed in a clean conversation, still waits for /fleet n apply
+  await $.prompt.submit({ text: 'Start', origin: { kind: 'composer' }, wait: false } as any)
+  await $.turn.start({ text: 'Start', turnId: 't-1' })
+  await $.turn.complete({ text: '' } as any)
+  await $.prompt.submit({ text: 'Allow the build machine', origin: { kind: 'composer' }, wait: false } as any)
+  await $.turn.start({ text: 'Allow the build machine', turnId: 't-2' })
+  const r = await decide($, { kind: 'change', path: '.claude/fleet/outbound.json', summary: 'allow build', content: JSON.stringify({ outboundFormat: 1, hosts: ['devbox', 'build.invalid'] }) })
+  expect(r.result).toContain('Queued as D-1 for the person')
+  expect(r.result).toContain("It waits for the person's apply although they typed this turn: a change to outbound.json, what may leave without asking, always does, so they see its diff.")
+  expect(json(w, `${FLEET}/outbound.json`).hosts).toEqual(['devbox'])
+  const list = await fleet($, '')
+  expect(list).toContain('1. Change .claude/fleet/outbound.json: "allow build"')
+  expect(list).toContain('+{"outboundFormat":1,"hosts":["devbox","build.invalid"]}')
+  expect(await fleet($, '1 apply')).toContain('1: applied D-1: fleet wrote .claude/fleet/outbound.json as drafted')
+  // Applied by his answer: stamped, and used
+  expect((await bash($, 'ssh build.invalid true')).deny).toBe(undefined)
 })
 
 test('mcp__fleet__send: drafted, shown exactly in /fleet, sent once by fleet as approved; a file changed since needs its new version', async ($, on) => {
