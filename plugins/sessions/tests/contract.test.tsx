@@ -20,6 +20,7 @@ const PROBE = {
         else if (m === 'assignSection') out = await $.sessions.assignSection(input)
         else if (m === 'start') out = await $.sessions.start(input)
         else if (m === 'wake') out = await $.sessions.wake(input)
+        else if (m === 'setMarks') out = await $.sessions.setMarks(input)
         return { text: JSON.stringify({ out }) }
       } catch (err) {
         return { text: JSON.stringify({ threw: String(err) }) }
@@ -55,7 +56,7 @@ test('contract: api 1 and its methods, also before the mod has started here', WI
   expect(c.api).toBe(1)
   expect(c.format).toBe(1)
   expect(typeof c.version).toBe('string')
-  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake'])
+  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks'])
 })
 
 test('current and status: not ready before the start, then this session and the others from the official list', WITH_PROBE, async ($, on) => {
@@ -272,4 +273,81 @@ test('wake: only a background session the service retired for being idle is rest
   expect(w.runs.slice(before).some(a => a[1] === 'respawn')).toBe(false)
   await w.clock.advance(600)
   expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['ffffffff', 'dddddddd'])
+})
+
+const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
+async function drawn($: any): Promise<string> {
+  const ui = await $.ui.mount(PANEL)
+  const text = JSON.stringify(await ui.drawn())
+  await ui.unmount()
+  return text
+}
+
+test('setMarks: checked, kept per source and session for ttlMs, drawn in the panel, and gone when they expire', WITH_PROBE, async ($, on) => {
+  const w = world(on, { list: list() })
+  const reason = async (input: unknown) => {
+    const r = await call($, 'setMarks', input)
+    return `${r.reason}: ${r.detail}`
+  }
+  const ok = { source: 'probe', rows: { aaaaaaaa: { badge: '?2' } }, ttlMs: 60000 }
+  expect(await reason({ ...ok, ttlMs: 600001 })).toBe('invalid: ttlMs is 1 to 600000 (10 minutes)')
+  expect(await reason({ ...ok, ttlMs: 0 })).toContain('invalid')
+  expect(await reason({ ...ok, source: 'me' })).toContain('refused')
+  expect(await reason({ ...ok, rows: { aaaaaaaa: { badge: 'four' } } })).toBe('invalid: a badge is up to 3 columns')
+  expect(await reason({ ...ok, rows: { aaaaaaaa: { tint: 'red' } } })).toContain('invalid: a tint is one of')
+  expect(await reason({ ...ok, rows: { aaaaaaaa: { line: 'x'.repeat(61) } } })).toContain('invalid: a status line')
+  expect(await reason({ ...ok, rows: { 'not a ref': {} } })).toContain('invalid')
+  expect(await reason({ ...ok, rows: [] })).toContain('invalid')
+  // Before the mod has started here too: the session's own id names them
+  expect(await call($, 'setMarks', ok)).toEqual({ ok: true })
+  expect(w.store.get(`marks:probe:${SID}`)).toEqual({ at: w.clock.now(), until: w.clock.now() + 60000, rows: { aaaaaaaa: { badge: '?2' } } })
+  await startSession($, w)
+  // A regular session of the project, marked as needing the person
+  expect(await call($, 'setMarks', { source: 'probe', rows: { aaaaaaaa: { badge: '?2', tint: 'warning' }, [`sid:${REGULAR}`]: { line: ' blocked on   D-3 ', needsPerson: true } }, ttlMs: 60000 })).toEqual({ ok: true })
+  await w.clock.advance(3000)
+  let text = await drawn($)
+  expect(text).toContain(' ?2')
+  expect(text).toContain('   blocked on D-3')
+  expect(text).toContain('"color":"warning"')
+  // /sessions status says whose marks are up
+  const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  expect(String(status.text)).toContain('Marks: probe (2 rows, 1 min left)')
+  // Expired: gone from the panel and from the store
+  await w.clock.advance(60000)
+  text = await drawn($)
+  expect(text).not.toContain('blocked on D-3')
+  expect(w.store.has(`marks:probe:${SID}`)).toBe(false)
+  // Empty rows clear them at once
+  expect(await call($, 'setMarks', ok)).toEqual({ ok: true })
+  expect(await call($, 'setMarks', { ...ok, rows: {} })).toEqual({ ok: true })
+  expect(w.store.has(`marks:probe:${SID}`)).toBe(false)
+})
+
+test('marks: the f filter shows the rows marked as needing the person, and a status line never appears or goes while focused', WITH_PROBE, async ($, on) => {
+  const w = world(on, { list: list() })
+  await startSession($, w)
+  await call($, 'setMarks', { source: 'probe', rows: { [`sid:${REGULAR}`]: { badge: '?1', needsPerson: true } }, ttlMs: 600000 })
+  await w.clock.advance(3000)
+  const pane = w.panes.find(p => p.id === 'sessions')
+  pane.isFocused = true
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  await ui.press({ key: 'waiting' })
+  let text = JSON.stringify(await ui.drawn())
+  // busy (blue), but marked as needing the person: in the filter
+  expect(text).toContain('Waiting for you · 1 of 2')
+  expect(text).toContain('myapp-1f')
+  await ui.press({ key: 'waiting' })
+  // While focused, a status line that's new waits until the panel loses the keyboard
+  await call($, 'setMarks', { source: 'probe', rows: { aaaaaaaa: { line: 'doing the release notes' } }, ttlMs: 600000 })
+  await w.clock.advance(3000)
+  text = JSON.stringify(await ui.drawn())
+  expect(text).not.toContain('doing the release notes')
+  pane.isFocused = false
+  await w.clock.advance(3000)
+  pane.isFocused = true
+  await call($, 'setMarks', { source: 'probe', rows: { aaaaaaaa: { line: 'doing the changelog' } }, ttlMs: 600000 })
+  await w.clock.advance(3000)
+  // Its text changes in place, focused or not
+  expect(JSON.stringify(await ui.drawn())).toContain('doing the changelog')
+  await ui.unmount()
 })

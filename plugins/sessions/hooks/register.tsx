@@ -41,6 +41,11 @@ import {
   checkSectionSpec,
   upsertSection,
   waitingMembers,
+  checkMarks,
+  mergeMarks,
+  NO_MARK,
+  type MarkSlot,
+  type RowMark,
   type SectionsFile,
   type SectionsView,
   type Action,
@@ -110,6 +115,12 @@ const PANE = 'sessions'
 const DOT: Record<Color, string> = { red: '🔴', blue: '🔵', yellow: '🟡', green: '🟢', gray: '⚫' }
 // The spend column's width, a space included ("$20.04")
 const SPEND_COLUMN = 7
+// Another plugin's badge after the name: a space and up to 3 columns
+const BADGE_COLUMN = 4
+// The columns the rows' marks take after the name, when any row has one: badges
+function markColumns(list: readonly Row[]): number {
+  return list.some(f => f.badge) ? BADGE_COLUMN : 0
+}
 // The colors for each state, from Claude's theme (they adapt to light, dark and colorblind modes)
 const TINT: Record<Color, string> = { red: 'error', blue: 'suggestion', yellow: 'warning', green: 'success', gray: 'inactive' }
 
@@ -268,7 +279,8 @@ function debugLine($: any, text: string) {
 // installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
 // autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
-// session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on).
+// session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
+// marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
@@ -813,6 +825,31 @@ async function writeOrder($: any, list: Row[], now: number) {
   } catch {}
 }
 
+// The marks other plugins set ($.sessions.setMarks, MarkSlot in state.ts), merged per row: read on every refresh, by
+// every session. An expired one is deleted by whichever session finds it
+let marksNow: Record<string, RowMark> = {}
+let markSources: { source: string; rows: number; until: number }[] = []
+async function readMarks($: any, now: number) {
+  let keys: string[] = []
+  try {
+    keys = (await $.store.keys()).filter((k: string) => k.startsWith('marks:'))
+  } catch {}
+  const slots: MarkSlot[] = []
+  const sources: typeof markSources = []
+  for (const k of keys) {
+    const v = await storeGet($, k)
+    if (!v || typeof v !== 'object' || !(Number(v.until) > now)) {
+      await storeDelete($, k)
+      continue
+    }
+    const marked = v.rows && typeof v.rows === 'object' ? v.rows : {}
+    slots.push({ at: Number(v.at) || 0, until: Number(v.until), rows: marked })
+    sources.push({ source: k.split(':')[1] ?? '', rows: Object.keys(marked).length, until: Number(v.until) })
+  }
+  marksNow = mergeMarks(slots, now)
+  markSources = sources
+}
+
 async function refresh($: any) {
   const list = await officialList($)
   if (typeof list === 'string') {
@@ -827,6 +864,7 @@ async function refresh($: any) {
   await followFolder($)
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const now = await $.clock.now()
+  await readMarks($, now)
   // The project's sessions, and this one always, wherever it is
   const project = list.filter(s => typeof s.sessionId === 'string' && (s.sessionId === myId || (typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home))))
   const beats = await readHeartbeats($, project.map(s => s.sessionId))
@@ -858,6 +896,7 @@ async function refresh($: any) {
     const current = s.sessionId === myId
     const hb = heartbeatStatus(beats[s.sessionId] ?? null, s.pid, now)
     const spend = spendOf(e)
+    const marked = marksNow[refOf(s)] ?? NO_MARK
     fresh.push({
       sessionId: s.sessionId,
       id: s.id ?? null,
@@ -878,6 +917,7 @@ async function refresh($: any) {
       sectionTitle: '',
       // What it spent so far, from what it published itself: only for a running session on an API account
       usd: color !== 'gray' && spend.mode === 'api' ? spend.usd : null,
+      ...marked,
     })
   }
   installedVersion = newest
@@ -982,7 +1022,7 @@ async function adjustWidth($: any) {
   }
   if (defaultWidth === 0) return
   const shown = await read($, rows)
-  const width = paneWidth(shown.map(f => f.title), defaultWidth, shown.some(f => f.usd !== null) ? SPEND_COLUMN : 0)
+  const width = paneWidth(shown.map(f => f.title), defaultWidth, (shown.some(f => f.usd !== null) ? SPEND_COLUMN : 0) + markColumns(shown))
   if (width === requestedWidth) return
   requestedWidth = width
   await $.ui.open({ id: PANE, title: 'Sessions', columns: width })
@@ -1877,6 +1917,9 @@ async function statusText($: any): Promise<string> {
     silent.length ? `No panel running in: ${silent.join(', ')}` : 'Every session of the project that should run a panel does',
     `For other plugins: $.sessions api ${SESSIONS_API} · ${Object.keys(METHODS).join(', ')} (${ready() ? 'ready' : 'not ready yet'})`,
     sectionsProblem ? `Sections: ${sectionsProblem}` : `Sections: ${sectionsNow.sections.length} (${dataDir}/sections.json)${myAgent ? ` · runs as agent ${myAgent}` : ''}`,
+    markSources.length
+      ? `Marks: ${markSources.map(m => `${m.source} (${m.rows === 1 ? '1 row' : `${m.rows} rows`}, ${Math.max(0, Math.ceil((m.until - now) / 60000))} min left)`).join(', ')}`
+      : 'Marks: none',
   ]
   if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)
   return lines.join('\n')
@@ -1929,7 +1972,7 @@ async function sectionsList($: any): Promise<string> {
 // here: current and status answer ready: false, and the section methods find the data folder from the environment
 const SESSIONS_API: SessionsApi = 1
 // The methods this copy serves: a key missing from Sessions, or one too many, fails the type check
-const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1 } satisfies Record<SessionsMethod, 1>
+const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1, setMarks: 1 } satisfies Record<SessionsMethod, 1>
 // How long another plugin's call waits for the sections lock before answering busy (6 × 50 ms)
 const CALL_LOCK_TRIES = 6
 
@@ -2048,6 +2091,24 @@ function sessionsApi($: any): Sessions {
       const reason = typeof input?.reason === 'string' ? input.reason.trim().replace(/\s+/g, ' ').slice(0, 120) : ''
       if (!wakes.some(w => w.id === v.id)) wakes.push({ id: v.id, name: v.name, reason })
       return { ok: true, state: 'queued' }
+    },
+    setMarks: async input => {
+      const v = checkMarks(input)
+      if (!v.ok) return v
+      let sid = myId
+      try {
+        sid ||= String(await $.session.id())
+      } catch {}
+      if (!sid) return { ok: false, reason: 'not-ready', detail: "this session's id isn't known yet: try again in a moment" }
+      const key = `marks:${v.source}:${sid}`
+      try {
+        const now = await $.clock.now()
+        if (Object.keys(v.rows).length === 0) await $.store.delete(key)
+        else await $.store.set(key, { at: now, until: now + v.ttlMs, rows: v.rows })
+      } catch (err) {
+        return { ok: false, reason: 'busy', detail: `couldn't write the marks: ${String(err).slice(0, 120)}` }
+      }
+      return { ok: true }
     },
   }
 }
@@ -2200,7 +2261,8 @@ export const register: Register = (on, options) => {
       },
       process: { run: (argv: string[], init?: { stdin?: string; timeoutMs?: number; cwd?: string }) => $.process.run(argv, init) },
       clock: { now: () => $.clock.now(), sleep: (ms: number) => $.clock.sleep(ms) },
-      store: { get: (key: string) => $.store.get(key) },
+      store: { get: (key: string) => $.store.get(key), set: (key: string, value: unknown) => $.store.set(key, value as any), delete: (key: string) => $.store.delete(key) },
+      session: { id: () => $.session.id() },
     }
     return { ...$, sessions: sessionsApi(calls) }
   })
@@ -2476,7 +2538,7 @@ export const register: Register = (on, options) => {
     // A section's title above its first row, when two or more groups have rows: plain Text, which the focus ring skips.
     // The f filter's line ("Waiting for you · 3 of 17") goes above the rows, as Text too
     const headers = sectionHeaders(list)
-    const lines = list.length + headers.filter(h => h !== null).length + (about.waitingOnly ? 1 : 0)
+    const lines = list.length + list.filter(f => f.line).length + headers.filter(h => h !== null).length + (about.waitingOnly ? 1 : 0)
     const overflows = lines + 6 + (note !== '' ? 1 : 0) > height
     // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
@@ -2494,10 +2556,12 @@ export const register: Register = (on, options) => {
     // Rows use only the width they need: in the box above the prompt (small windows or not fullscreen) the panel takes
     // the whole screen, and without this the model and time would end up far away from the name
     const spendWidth = spends ? SPEND_COLUMN : 0
-    const total = Math.min(e.props.bodyColumns ?? 48, paneWidth(list.map(f => f.title), e.props.bodyColumns ?? 48, spendWidth)) - 1
+    const marksWidth = markColumns(list)
+    const total = Math.min(e.props.bodyColumns ?? 48, paneWidth(list.map(f => f.title), e.props.bodyColumns ?? 48, spendWidth + marksWidth)) - 1
     const showModel = total >= 44
     const infoWidth = (showModel ? 20 : 10) + spendWidth
-    const nameWidth = Math.max(8, total - 4 - infoWidth)
+    const nameWidth = Math.max(8, total - 4 - infoWidth - marksWidth)
+    const badgeWidth = list.some(f => f.badge) ? BADGE_COLUMN : 0
     const padRight = (t: string, w: number) => t + ' '.repeat(Math.max(0, w - displayWidth(t)))
     const padLeft = (t: string, w: number) => ' '.repeat(Math.max(0, w - displayWidth(t))) + t
     const info = (f: Row) =>
@@ -2507,6 +2571,14 @@ export const register: Register = (on, options) => {
     // (u restarts it). Both take the first space after the name
     const mark = (f: Row) =>
       f.noPanel || f.otherFormat ? <Text color={TINT.yellow}>!</Text> : <Text color="claude">{f.outdated ? '↑' : ' '}</Text>
+    // Another plugin's badge (up to 3 columns), in its tint or dim; its status line goes under the row, indented to the name
+    const badge = (f: Row) => (badgeWidth ? <Text color={f.tint || undefined} dimColor={f.tint ? undefined : true}>{padRight(f.badge ? ` ${f.badge}` : '', badgeWidth)}</Text> : null)
+    const statusLine = (f: Row) =>
+      f.line ? (
+        <Text key={`l:${f.sessionId}`} color={f.tint || undefined} dimColor={f.tint ? undefined : true}>
+          {truncate(`   ${f.line}`, total)}
+        </Text>
+      ) : null
     // On entering the panel (ctrl+x tab) the focus goes to a session: the last selected one, or the first
     const jumpable = list.filter(f => !f.current)
     const initial = (list.find(f => `s:${f.sessionId}` === selectedRow) ?? jumpable[0] ?? list[0])?.sessionId
@@ -2559,8 +2631,10 @@ export const register: Register = (on, options) => {
                 )}
                 {mark(f)}
                 <Text>{f.pinned ? '◆' : ' '}</Text>
-                <Text dimColor>{padRight(info(f), total - 4 - nameWidth).slice(1)}</Text>
+                {badge(f)}
+                <Text dimColor>{padRight(info(f), total - 4 - nameWidth - marksWidth).slice(1)}</Text>
               </Box>,
+              statusLine(f),
             ]
           }
           return [
@@ -2583,8 +2657,10 @@ export const register: Register = (on, options) => {
               {/* ◆: pinned, the background service doesn't close it for being idle */}
               {mark(f)}
               <Text>{f.pinned ? '◆' : ' '}</Text>
+              {badge(f)}
               <Text dimColor>{info(f).slice(1)}</Text>
             </Box>,
+            statusLine(f),
           ]
         })}
         {/* The New and Rename fields go below the rows: above them, opening or closing shifted the rows by one, and since

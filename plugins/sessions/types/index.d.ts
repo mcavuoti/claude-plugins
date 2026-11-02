@@ -27,6 +27,12 @@ export type Row = {
   sectionTitle: string
   // What it has cost so far in US dollars at list price, on an API account (null on a subscription, or not known yet)
   usd: number | null
+  // The newest mark another plugin put on it ($.sessions.setMarks): a badge, its tint (a theme color, or ''), a status
+  // line drawn under the row, and whether it needs the person (the f filter shows it)
+  badge: string
+  tint: string
+  line: string
+  needsPerson: boolean
 }
 
 // One rate-limit window of the account, as a session's last response reported it (five_hour, seven_day, …)
@@ -117,6 +123,12 @@ export type SessionsSectionSpec = { id: string; title: string; order?: number }
 export type SessionsSection = { id: string; title: string; order: number; owner: string }
 /** by: 'person', or the plugin that assigned it */
 export type SessionsMember = { section: string; by: string }
+/** One of the theme's colors */
+export type SessionsTint = 'error' | 'warning' | 'suggestion' | 'success' | 'inactive'
+/** A plugin's mark on a row: a badge of up to 3 columns drawn after the name, its tint (it colors the line too), a
+ * status line of up to 60 characters drawn under the row ("doing X / blocked on Y"), and whether the session needs
+ * the person (the f filter shows it) */
+export type SessionsMark = { badge?: string; tint?: SessionsTint; line?: string; needsPerson?: boolean }
 export type Sessions = {
   contract: () => Promise<SessionsContract>
   current: () => Promise<SessionsCurrent>
@@ -141,6 +153,9 @@ export type Sessions = {
    * sessions' own timer): `running` (nothing to do), `queued`, or `refused` with why: a regular session, one the person
    * stopped, one closed for lack of memory while memory is still short. `reason` goes to the debug log */
   wake?: (input: { ref: SessionsRef; reason: string }) => Promise<SessionsResult & { state?: 'running' | 'queued' | 'refused' }>
+  /** 0.12.0. Marks rows in every session's panel for `ttlMs` (at most 600000, 10 minutes): call again to keep them.
+   * Each call replaces the marks this session of `source` set before; empty `rows` clears them */
+  setMarks?: (input: { source: string; rows: Record<SessionsRef, SessionsMark>; ttlMs: number }) => Promise<SessionsResult>
 }
 export type SessionsMethod = keyof Sessions
 

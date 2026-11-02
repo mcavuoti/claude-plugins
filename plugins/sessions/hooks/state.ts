@@ -1,4 +1,4 @@
-import type { Color, Period, RateLimit, SessionsMember, SessionsResult, SessionsSection, UsageSummary } from '../types'
+import type { Color, Period, RateLimit, SessionsMark, SessionsMember, SessionsResult, SessionsSection, SessionsTint, UsageSummary } from '../types'
 
 // The format of everything the mod shares outside one session: the files in its data folder (heartbeats, the panel
 // order, inbox requests, the launcher's window files, the mirrored settings) and the notices between sessions. Each one
@@ -759,7 +759,7 @@ export function slugOf(title: string): string {
 }
 
 // What another plugin may call itself (its plugin name): not the person's (me) nor this plugin's (sessions)
-function checkSource(source: unknown): SessionsResult {
+export function checkSource(source: unknown): SessionsResult {
   if (typeof source !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(source)) return { ok: false, reason: 'invalid', detail: 'source must be your plugin name' }
   if (source === 'me' || source === 'sessions') return { ok: false, reason: 'refused', detail: `"${source}" is reserved` }
   return { ok: true }
@@ -849,19 +849,69 @@ export function sectionHeaders(rows: readonly { section: string; sectionTitle: s
   return rows.map((r, i) => (many && r.section !== '' && (i === 0 || rows[i - 1]?.section !== r.section) ? r.sectionTitle : null))
 }
 
-// The f filter shows only the sessions waiting for you (red). Who's in it is a snapshot: taken when it's turned on and
-// whenever the pane doesn't have the keyboard, and kept while it has it (a row you answered stays, in its new color,
-// until you leave), so nothing moves under the focus. null: the filter is off
-export function waitingMembers(rows: readonly { sessionId: string; color: Color }[], previous: ReadonlySet<string> | null, on: boolean, frozen: boolean): Set<string> | null {
+// The f filter shows only the sessions waiting for you: red, or marked by a plugin as needing you (needsPerson). Who's
+// in it is a snapshot: taken when it's turned on and whenever the pane doesn't have the keyboard, and kept while it has
+// it (a row you answered stays, in its new color, until you leave), so nothing moves under the focus. null: the filter
+// is off
+export function waitingMembers(rows: readonly { sessionId: string; color: Color; needsPerson?: boolean }[], previous: ReadonlySet<string> | null, on: boolean, frozen: boolean): Set<string> | null {
   if (!on) return null
   if (previous && frozen) return new Set(previous)
-  return new Set(rows.filter(r => r.color === 'red').map(r => r.sessionId))
+  return new Set(rows.filter(r => r.color === 'red' || r.needsPerson).map(r => r.sessionId))
+}
+
+// Marks other plugins put on rows ($.sessions.setMarks): a badge of up to 3 columns, its tint, a status line of up to
+// 60 characters and whether the session needs the person. Each session of a plugin that sets them keeps its own in
+// the store, under marks:<source>:<sessionId>, as { at, until, rows } (rows by ref): a call replaces what that session
+// of that plugin set before. They go at `until`, at most 10 minutes later, so a plugin that stops leaves none behind
+export const MARK_TTL_MAX = 600000
+export type MarkSlot = { at: number; until: number; rows: Record<string, SessionsMark> }
+export type RowMark = { badge: string; tint: SessionsTint | ''; line: string; needsPerson: boolean }
+export const NO_MARK: RowMark = { badge: '', tint: '', line: '', needsPerson: false }
+const TINTS: readonly SessionsTint[] = ['error', 'warning', 'suggestion', 'success', 'inactive']
+
+export function checkMarks(input: any): { ok: true; source: string; rows: Record<string, SessionsMark>; ttlMs: number } | (SessionsResult & { ok: false }) {
+  const s = checkSource(input?.source)
+  if (!s.ok) return s
+  const invalid = (detail: string) => ({ ok: false as const, reason: 'invalid' as const, detail })
+  const ttlMs = input?.ttlMs
+  if (typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs < 1 || ttlMs > MARK_TTL_MAX) return invalid('ttlMs is 1 to 600000 (10 minutes)')
+  const given = input?.rows
+  if (!given || typeof given !== 'object' || Array.isArray(given)) return invalid('rows is an object of marks by ref')
+  const entries = Object.entries(given)
+  if (entries.length > 200) return invalid('at most 200 rows')
+  const rows: Record<string, SessionsMark> = {}
+  for (const [ref, m] of entries as [string, any][]) {
+    if (!isRef(ref)) return invalid(`${ref} isn't a ref (a short id or sid:<sessionId>)`)
+    if (!m || typeof m !== 'object') return invalid(`the mark of ${ref} is an object`)
+    const badge = typeof m.badge === 'string' ? m.badge.trim() : m.badge
+    if (badge !== undefined && (typeof badge !== 'string' || displayWidth(badge) > 3 || /\p{Cc}/u.test(badge))) return invalid('a badge is up to 3 columns')
+    if (m.tint !== undefined && !TINTS.includes(m.tint)) return invalid(`a tint is one of ${TINTS.join(', ')}`)
+    const line = typeof m.line === 'string' ? m.line.trim().replace(/\s+/g, ' ') : m.line
+    if (line !== undefined && (typeof line !== 'string' || Array.from(line).length > 60 || /\p{Cc}/u.test(line))) return invalid('a status line is up to 60 characters on one line')
+    if (m.needsPerson !== undefined && typeof m.needsPerson !== 'boolean') return invalid('needsPerson is true or false')
+    rows[ref] = { ...(badge ? { badge } : {}), ...(m.tint ? { tint: m.tint } : {}), ...(line ? { line } : {}), ...(m.needsPerson ? { needsPerson: true } : {}) }
+  }
+  return { ok: true, source: input.source, rows, ttlMs }
+}
+
+// What each row shows: the newest mark set on it wins, and it needs the person if any mark says so. Expired ones count
+// for nothing
+export function mergeMarks(slots: readonly MarkSlot[], now: number): Record<string, RowMark> {
+  const out: Record<string, RowMark> = {}
+  for (const slot of [...slots].filter(x => x.until > now).sort((a, b) => a.at - b.at)) {
+    for (const [ref, m] of Object.entries(slot.rows ?? {})) {
+      const needs = !!out[ref]?.needsPerson || m?.needsPerson === true
+      out[ref] = { badge: String(m?.badge ?? ''), tint: TINTS.includes(m?.tint as SessionsTint) ? (m.tint as SessionsTint) : '', line: String(m?.line ?? ''), needsPerson: needs }
+    }
+  }
+  return out
 }
 
 // While the pane has the keyboard nothing moves (Claude follows the focus by position): the rows that were shown keep
-// their places and their sections, and new ones go at the end. Otherwise (or on a reflow the person asked for), the
+// their places and their sections, and new ones go at the end. A status line under a row neither appears nor goes
+// (its text changes; one that expired keeps its last text). Otherwise (or on a reflow the person asked for), the
 // layout as computed
-export function keepPlaces<T extends { sessionId: string; section: string; sectionTitle: string }>(layout: readonly T[], shown: readonly T[], frozen: boolean): T[] {
+export function keepPlaces<T extends { sessionId: string; section: string; sectionTitle: string; line?: string }>(layout: readonly T[], shown: readonly T[], frozen: boolean): T[] {
   if (!frozen) return [...layout]
   const before = shown.map(f => f.sessionId)
   const previous = new Map(shown.map(f => [f.sessionId, f]))
@@ -872,7 +922,8 @@ export function keepPlaces<T extends { sessionId: string; section: string; secti
   return layout
     .map(f => {
       const p = previous.get(f.sessionId)
-      return p ? { ...f, section: p.section, sectionTitle: p.sectionTitle } : f
+      if (!p) return f
+      return { ...f, section: p.section, sectionTitle: p.sectionTitle, ...(f.line === undefined ? {} : { line: p.line ? f.line || p.line : '' }) }
     })
     .sort((a, b) => place(a) - place(b))
 }
