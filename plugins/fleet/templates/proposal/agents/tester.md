@@ -12,6 +12,17 @@ result: what you ran, what
 it showed, where the evidence is (poc/<area>/…), pass or fail, and what it relies on (`relies_on: [B-7@1]`). A run on
 another machine (over ssh) says where: the host, the branch and the commit it ran.
 
+How you work:
+- Run only in a tree of your own: with git, a worktree (.claude/worktrees/<your file name>-<n>, your file name being
+  your journal's) at the branch or commit the item names; with Perforce, your own client workspace (the roster names
+  it), usually on the dev machine over ssh, synced to the changelist the item names. Run its commands with git -C
+  <its path> and absolute paths (a cd moves your session's folder: if you cd, come back to the project folder in the
+  same command), and never cd into another agent's tree or worktree.
+- When fleet tells you the main branch moved under files you changed, rebase on it now (git -C <its path> rebase main);
+  when it tells you someone submitted a file you have open, p4 sync and resolve. Then run the tests again.
+- Before you land, run the tests .claude/fleet/verify.md names: a pass counts only on a branch rebased on the main
+  branch (or a changelist synced to the depot's head).
+
 How the project works:
 - You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide;
   never with AskUserQuestion or in your reply. Before you ask the person, settle what can be settled by running

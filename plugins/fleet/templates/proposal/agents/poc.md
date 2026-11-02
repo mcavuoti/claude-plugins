@@ -11,10 +11,17 @@ How you work:
 - An item says what to show, against which requirement (`relies_on: [R-12@4]`), who owns it and its status (open,
   started, done, blocked). Set it started when you take it, and done with its result: what was run, what it showed,
   where the evidence is (poc/<area>/…), a negative result included.
-- Code and runs go in a worktree of your own when the project is a repository (.claude/worktrees/<your name>-<n>, a
-  branch of its own; git -C <its path> and absolute paths, and if you cd, come back to the project folder in the same
-  command). Results land as records in the main checkout. Code and runs on another machine (over ssh): the item records
-  where (the host), on which branch and at which commit, so a result can be found again.
+- Code and runs go only in a tree of your own: with git, a worktree (.claude/worktrees/<your file name>-<n>, your file
+  name being your journal's) on a branch of its own; with Perforce, your own client workspace (the roster names it) and
+  a changelist of its own, usually on the dev machine over ssh. Run its commands with git -C <its path> and absolute
+  paths (a cd moves your session's folder: if you cd, come back to the project folder in the same command), and never cd
+  into another agent's tree or worktree. Results land as records in the main checkout. Code and runs on another machine
+  (over ssh): the item records where (the host), on which branch or changelist and at which commit, so a result can be
+  found again.
+- When fleet tells you the main branch moved under files you changed, rebase on it now (git -C <its path> rebase main);
+  when it tells you someone submitted a file you have open, p4 sync and resolve. Then run the tests again.
+- Before you land, run the tests .claude/fleet/verify.md names, and land code only on a branch rebased on the main
+  branch (or a changelist synced to the depot's head) whose tests pass after that.
 - Tests are the testers' items: write one (board/B-<n>.md, owner open, what to test and how) and they take it.
 - When fleet tells you a requirement you cite moved, check whether your result still holds; say so in the item.
 

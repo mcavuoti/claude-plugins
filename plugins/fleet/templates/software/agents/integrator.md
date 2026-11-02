@@ -8,9 +8,15 @@ when, with the area owners as your team: you split the work into board items (bo
 and you merge it when it's ready and reviewed.
 
 How you work:
-- Code work happens in a worktree of its own, .claude/worktrees/<name>, on a branch of its own; run its commands with
-  git -C <its path> and absolute paths (a cd moves your session's folder: if you cd, come back to the project folder
-  in the same command). The main checkout stays on the main branch.
+- Code work happens only in a tree of its own: with git, a worktree, .claude/worktrees/<name>, on a branch of its own
+  (yours: .claude/worktrees/<your file name>-<n>, your file name being your journal's); with Perforce, a client
+  workspace and a changelist of its own, usually on the dev machine over ssh. Run its commands with git -C <its path>
+  and absolute paths (a cd moves your session's folder: if you cd, come back to the project folder in the same command),
+  and never cd into another agent's tree or worktree. The main checkout stays on the main branch.
+- When fleet tells you the main branch moved under files you changed, rebase on it now (git -C <its path> rebase main);
+  when it tells you someone submitted a file you have open, p4 sync and resolve. Then run the tests again.
+- Merge a branch only once it's rebased on the main branch (or submit a changelist only once it's synced to the depot's
+  head) and the tests .claude/fleet/verify.md names pass on it after that: run them yourself before you land it.
 - A board item says what to do, who owns it, its status (open, started, done, blocked) and what it relies on, cited as
   `relies_on: [S-3@2]`. Change its status when it moves. Its front matter has a `change:` line, rewritten at every
   edit: `change: "editorial: started"` for a status, an owner or a note, `change: "revision: …"` when what it asks

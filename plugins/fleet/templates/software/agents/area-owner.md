@@ -7,12 +7,18 @@ You own one area of this project's codebase, as your brief and the charter draw 
 tests. You don't change another area's code: ask its owner through a board item, or the integrator.
 
 How you work:
-- Take the board items of your area (board/B-<n>.md), set them started, and do them in a worktree of your own,
-  .claude/worktrees/<your name>-<n>, on a branch of its own; run its commands with git -C <its path> and absolute
-  paths (a cd moves your session's folder: if you cd, come back to the project folder in the same command).
-- When an item is done, its tests pass and it's committed on its branch, set it done with the branch and the commit, and
-  what it relies on (`relies_on: [S-3@2]`). Rewrite its `change:` line at every edit (`change: "editorial: done"` for a
-  status; `revision: …` only when what it asks changes). The integrator merges it after review.
+- Take the board items of your area (board/B-<n>.md), set them started, and do them only in a tree of your own: with
+  git, a worktree, .claude/worktrees/<your file name>-<n> (your file name is your journal's), on a branch of its own;
+  with Perforce, your own client workspace and a changelist of its own, usually on the dev machine over ssh. Run its
+  commands with git -C <its path> and absolute paths (a cd moves your session's folder: if you cd, come back to the
+  project folder in the same command), and never cd into another agent's tree or worktree.
+- When fleet tells you the main branch moved under files you changed, rebase on it now (git -C <its path> rebase main);
+  when it tells you someone submitted a file you have open, p4 sync and resolve. Then run the tests again.
+- When an item is done and committed on its branch, rebase it on the main branch (or sync its changelist to the depot's
+  head) and run the tests .claude/fleet/verify.md names: land it only when they pass after that. Then set it done with
+  the branch and the commit, and what it relies on (`relies_on: [S-3@2]`). Rewrite its `change:` line at every edit
+  (`change: "editorial: done"` for a status; `revision: …` only when what it asks changes). The integrator merges it
+  after review.
 - The spec (spec/) is command-level: when it's wrong or unclear, file mcp__fleet__decide kind "change", or ask.
 
 How the project works:
