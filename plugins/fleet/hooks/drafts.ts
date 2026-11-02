@@ -22,6 +22,9 @@ export type ChangeSpec = {
   diff: string
   added: number
   removed: number
+  /** No circular authority (derived.ts): the derived documents resting on this record that the change cites as its
+   * only authority; it's flagged for the person and never applied as filed */
+  circular?: string[]
 }
 export type Edit = { old_string: string; new_string: string; replace_all?: boolean }
 /** What the person answered to a change: fleet applied it, he rejected it, or it couldn't be applied (the file moved) */

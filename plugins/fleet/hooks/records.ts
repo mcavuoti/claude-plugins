@@ -11,6 +11,7 @@
 
 import { checkGlob, clock, globRegex, hashText, type Me, type Via, type Who, type WorldConfig } from './changes'
 import { FORMAT } from './decisions'
+import type { DerivedStale } from './derived'
 
 /** An id: capitals (and digits after the first), a dash, digits. world.json's idPattern replaces it */
 export const DEFAULT_ID = '[A-Z][A-Z0-9]*-[0-9]+'
@@ -327,7 +328,8 @@ export type Reason = {
   moved?: Pick<Rev, 'rev' | 'kind' | 'at' | 'by' | 'hash'>
 }
 export type Suspect = { path: string; id: string | null; owner: Who | null; reasons: Reason[]; via?: string[] }
-export type SuspectsFile = { format: number; at: number; by: string; suspects: Suspect[] }
+/** derived: the derived documents among the suspects a revised record made stale (derived.ts), for their owners */
+export type SuspectsFile = { format: number; at: number; by: string; suspects: Suspect[]; derived?: DerivedStale[] }
 /** One world file as the sweeper sees it: its pins, and its last landing (a record's newest version, or the last event) */
 export type Facts = { path: string; id: string | null; pins: readonly string[]; owner: Who | null; blind?: readonly string[]; confirmed?: readonly string[] }
 
