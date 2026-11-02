@@ -2228,14 +2228,13 @@ async function gate($: any, e: any, next: any) {
   return withLines($, r, thread, extra)
 }
 
-// A write of a worktree's copy of a shared file: told once that the shared one is the main checkout's (a session
-// isolated in its worktree can't write that one: it keeps its change in the worktree, or reports it). Nothing lands
+// A write of a worktree's copy of a shared file: told once per thread and path that the shared one is the main
+// checkout's (a session isolated in its worktree can't write that one: it keeps its change in the worktree, or reports
+// it), not again at each new version of the copy its own writes make. Nothing lands
 async function copyGate($: any, e: any, next: any, w: Placed, thread: string) {
   const key = `copy:${w.rel}`
-  const cur = await versionOf($, w.abs)
-  const now = cur.v ?? 'new'
-  if ((await read($, warned))[thread]?.[key] !== now) {
-    await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [key]: now } }))
+  if ((await read($, warned))[thread]?.[key] !== 'told') {
+    await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [key]: 'told' } }))
     log($, `refused once: ${e.tool} of a worktree copy of ${w.rel} by ${thread} (${w.copy})`)
     return { deny: copyWriteText(String(e.file_path ?? e.notebook_path), w.rel, `${realRoot}/${w.rel}`) }
   }

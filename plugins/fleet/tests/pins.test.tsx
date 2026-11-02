@@ -354,6 +354,11 @@ test('worktree copies: a read of a copy that matches counts for the shared file;
   expect((await call($, write)).deny).toContain(`is a worktree's copy of the shared file notes/plan.md. The project's sessions share the main checkout's copy, ${PLAN}: write that one`)
   expect((await call($, write)).deny).toBe(undefined)
   expect(w.files.get(COPY)).toBe('plan in the branch\n')
+  // Once per thread and path: the copy's next version isn't refused again (R7); another thread is told on its own
+  expect((await call($, { ...write, content: 'plan in the branch, v2\n' })).deny).toBe(undefined)
+  expect((await call($, { ...write, content: 'plan in the branch, v3\n' })).deny).toBe(undefined)
+  expect((await call($, { ...write, content: 'from a helper\n', agentId: 'a1' })).deny).toContain("is a worktree's copy of the shared file notes/plan.md")
+  expect(w.files.get(COPY)).toBe('plan in the branch, v3\n')
   await tick(w, 10000)
   await tick(w, 10000)
   expect(events(w).map(e => e.path)).toEqual(['notes/plan.md'])
