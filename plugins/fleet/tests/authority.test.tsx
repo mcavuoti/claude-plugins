@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText } from '../hooks/changes'
-import { DEC, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, startSession, under, world, type World } from './world'
+import { DEC, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // The one hard line, from both sides: a background session's call that would send the project's content outside is
 // refused with how to draft it; the draft is shown to the person exactly; fleet runs it once, as approved. And who may
@@ -118,6 +118,40 @@ test('mcp__fleet__send: drafted, shown exactly in /fleet, sent once by fleet as 
   await tick(w)
   expect(json(w, `${DEC}/register/2026-11/D-1.json`)).toMatchObject({ state: 'delivered', kind: 'outbound', call: '{\n  "command": "curl -d @notes/x.md https://example.invalid/upload"\n}\n', answers: [{ label: 'sent' }] })
   expect(under(w, `${DEC}/drafts`)).toEqual([])
+})
+
+test('a folder an outbound sends is listed and versioned: its count and first paths shown, a file changed in it needs the new version; a pattern too', WITH_SESSIONS, async ($, on) => {
+  const files: Record<string, string> = { [`${ROOT}/code/area/sub/deep.py`]: 'x = 1\n', [`${ROOT}/dist/a.whl`]: 'a', [`${ROOT}/dist/b.whl`]: 'b', [`${ROOT}/dist/notes.txt`]: 'n' }
+  for (let i = 1; i <= 14; i++) files[`${ROOT}/code/area/f${String(i).padStart(2, '0')}.py`] = `print(${i})\n`
+  const w = project(on, { files })
+  const runs: string[][] = []
+  w.exec.value = argv => {
+    if (argv[0] !== '/bin/sh') return undefined
+    runs.push(argv)
+    return { exitCode: 0, stdout: 'sent\n' }
+  }
+  await startSession($, w)
+  const r: any = await $.tool.call({ tool: 'mcp__fleet__send', to: 'far.invalid', why: 'the CI machine runs the tests', command: 'rsync -az --exclude .git code/area/ ci@far.invalid:area/' } as any)
+  expect(r.result).toContain('Queued as D-1 for the person: rsync of code/area/ to far.invalid.')
+  const spec = json(w, `${DEC}/queue/D-1.json`).outbound
+  expect(spec.files.map((f: any) => f.path)).toEqual(['code/area/'])
+  const v = spec.files[0].v as string
+  expect(v).toMatch(/^h[0-9a-f]{14}$/)
+  const first12 = Array.from({ length: 12 }, (_, k) => `f${String(k + 1).padStart(2, '0')}.py`).join('\n')
+  expect(await fleet($, '')).toContain(`   code/area/ (a folder, 15 files, ${v.slice(0, 9)}):\n\`\`\`\n${first12}\n\`\`\`\n   and 3 more files in ${ROOT}/code/area/`)
+  // A file deep in it changes: what would go out isn't what was drafted
+  w.touch(`${ROOT}/code/area/sub/deep.py`, 'x = 2\n')
+  const moved = await fleet($, '1 send')
+  expect(moved).toContain("1: D-1 isn't as it was drafted (code/area/ changed since it was drafted). /fleet shows it as it would go out now; /fleet 1 send h")
+  expect(runs).toEqual([])
+  expect(await fleet($, '')).toContain('   code/area/ (a folder, 15 files, ')
+  const now = /\/fleet 1 send (h[0-9a-f]{8})/.exec(moved)?.[1] as string
+  expect(await fleet($, `1 send ${now}`)).toContain('1: sent D-1 (rsync of code/area/ to far.invalid), exactly as shown: it ran: sent.')
+  expect(runs.length).toBe(1)
+  // A pattern: the files it names now
+  await $.tool.call({ tool: 'mcp__fleet__send', to: 'far.invalid', why: 'the wheels for the CI machine', command: 'scp dist/*.whl far.invalid:wheels/' } as any)
+  expect(json(w, `${DEC}/queue/D-2.json`).outbound.files.map((f: any) => f.path)).toEqual(['dist/*.whl'])
+  expect(await fleet($, '')).toMatch(/ {3}dist\/\*\.whl \(a pattern, 2 files, h[0-9a-f]{8}\):\n```\na\.whl\nb\.whl\n```/)
 })
 
 test('an outbound MCP call, approved: fleet makes it with the server’s own connection; rejected: the asker hears it', async ($, on) => {

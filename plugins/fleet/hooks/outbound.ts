@@ -895,7 +895,7 @@ export const SEND_SCHEMA = {
     command: { type: 'string', maxLength: 20000, description: 'The exact Bash command to run once approved (instead of mcp_tool and input)' },
     mcp_tool: { type: 'string', description: 'The MCP tool to call once approved, by its full name (mcp__<server>__<tool>), with input' },
     input: { type: 'object', description: "The MCP tool's exact input" },
-    files: { type: 'array', items: { type: 'string' }, maxItems: 20, description: 'Optional: other files whose content it sends (fleet finds the ones a curl, scp or rsync names)' },
+    files: { type: 'array', items: { type: 'string' }, maxItems: 20, description: 'Optional: other files or folders whose content it sends (fleet finds the ones a curl, scp, rsync or tar names, and lists a folder’s files)' },
     blocks: { type: 'string', maxLength: 200, description: 'Optional: what waits on it' },
   },
 } as const
@@ -960,6 +960,21 @@ export function parseDraft(text: string): { command: string } | { tool: string; 
     return { tool: d.tool, input: d.input ?? {} }
   }
   return { problem: 'the draft holds neither a command nor an MCP tool and its input' }
+}
+
+/** A path an outbound sends whose last part is a pattern (dist/*.whl): its folder and the pattern; null for any other
+ * path (a pattern in a folder's name isn't listed) */
+export function patternOf(path: string): { dir: string; name: string } | null {
+  const i = path.lastIndexOf('/')
+  const dir = i < 0 ? '' : path.slice(0, i)
+  const name = path.slice(i + 1)
+  return /[*?[]/.test(name) && !/[*?[]/.test(dir) ? { dir, name } : null
+}
+
+/** A folder's version (or a pattern's): its files' paths and versions, in order, and whether there were more than
+ * fleet listed */
+export function treeVersion(rows: readonly { path: string; v: string | null }[], more: boolean, hash: (t: string) => string): string {
+  return hash([...rows.map(r => `${r.path}\t${r.v ?? 'missing'}`), ...(more ? ['…'] : [])].join('\n'))
 }
 
 /** The version the person approves: the draft's text and every file it sends, as they are */

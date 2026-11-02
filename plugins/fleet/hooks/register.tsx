@@ -12,6 +12,7 @@ import {
   classifyBash,
   classifyMcp,
   draftText,
+  matches,
   mcpParts,
   newOutbound,
   outboundDelivery,
@@ -21,8 +22,10 @@ import {
   outboundTicket,
   parseDraft,
   parseOutbound,
+  patternOf,
   remoteAllowed,
   sendWords,
+  treeVersion,
   type OutboundConfig,
   type OutboundSpec,
   type Send,
@@ -4240,7 +4243,8 @@ async function fileOutbound($: any, e: any) {
   for (const f of [...new Set([...found.flatMap(x => x.files), ...s.files])].slice(0, 20)) {
     const abs = f.startsWith('/') ? f : `${cwd}/${f}`
     const rel = relOf(abs, root as string, insensitive)
-    const v = (await versionOf($, abs)).v
+    // A folder (or a pattern) goes as its files: its version is theirs
+    const v = (await sourceOf($, abs)).v
     files.push({ path: rel ?? abs, v })
   }
   const draft = draftText(s)
@@ -4294,15 +4298,27 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
   }
   for (const f of o.files) {
     const abs = shownPath(f.path)
-    const t = await readText($, abs)
-    const v = t === null ? null : hashText(t)
-    const changed = v !== f.v ? ` (changed since it was drafted: ${v === null ? 'it is gone' : 'what is shown is what would go out'})` : ''
-    if (t === null) {
+    const s = await sourceOf($, abs)
+    const changed = s.v !== f.v ? ` (changed since it was drafted: ${s.v === null ? 'it is gone' : 'what is shown is what would go out'})` : ''
+    if (s.tree) {
+      // A folder or a pattern: how many files, and the first paths
+      const t = s.tree
+      const count = t.more ? `over ${TREE_MAX} files: fleet lists and versions the first ${TREE_MAX}` : `${t.files.length} file${t.files.length === 1 ? '' : 's'}`
+      lines.push(`   ${f.path} (${t.pattern ? 'a pattern' : 'a folder'}, ${count}, ${shortHash(s.v)})${changed}${t.files.length ? ':' : ''}`)
+      if (t.files.length) lines.push('```', ...t.files.slice(0, TREE_SHOWN), '```')
+      if (t.files.length > TREE_SHOWN) lines.push(`   and ${t.files.length - TREE_SHOWN}${t.more ? '+' : ''} more files in ${abs}`)
+      continue
+    }
+    if (s.v === null) {
       lines.push(`   ${f.path}: missing${changed}`)
       continue
     }
-    const body = t.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
-    lines.push(`   ${f.path} (${body.length} line${body.length === 1 ? '' : 's'}, ${shortHash(v)})${changed}:`, '```', ...body.slice(0, 12), '```')
+    if (s.text === null) {
+      lines.push(`   ${f.path} (over 4 MiB or unreadable, not shown here: ${abs}, ${shortHash(s.v)})${changed}`)
+      continue
+    }
+    const body = s.text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
+    lines.push(`   ${f.path} (${body.length} line${body.length === 1 ? '' : 's'}, ${shortHash(s.v)})${changed}:`, '```', ...body.slice(0, 12), '```')
     if (body.length > 12) lines.push(`   and ${body.length - 12} more lines in ${abs}`)
   }
   const hashNow = draft === null ? null : outboundHash(draft, await filesNow($, o), hashText)
@@ -4315,8 +4331,67 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
 /** An outbound's files as they are now */
 async function filesNow($: any, o: OutboundSpec): Promise<{ path: string; v: string | null }[]> {
   const out: { path: string; v: string | null }[] = []
-  for (const f of o.files) out.push({ path: f.path, v: (await versionOf($, shownPath(f.path))).v })
+  for (const f of o.files) out.push({ path: f.path, v: (await sourceOf($, shownPath(f.path))).v })
   return out
+}
+
+// A folder an outbound sends (rsync, scp -r, tar …) is listed, at most TREE_MAX files, and versioned by each one's
+// path and version; /fleet shows the count and the first TREE_SHOWN paths
+const TREE_MAX = 200
+const TREE_SHOWN = 12
+
+type Source = { v: string | null; text: string | null; tree: { files: string[]; more: boolean; pattern: boolean } | null }
+
+/** What an outbound sends from a path, as it is now: a file (its version and text), a folder or a pattern (dist/*.whl:
+ * its files, in order, and a version over them), or nothing (v null) */
+async function sourceOf($: any, abs: string): Promise<Source> {
+  const pattern = patternOf(abs)
+  let st: any = null
+  try {
+    st = await $.fs.stat(pattern ? pattern.dir || '/' : abs)
+  } catch {}
+  if (!st) return { v: null, text: null, tree: null }
+  if (!pattern && st.kind !== 'dir') {
+    const f = await versionOf($, abs)
+    return { v: f.v, text: f.text, tree: null }
+  }
+  if (st.kind !== 'dir') return { v: null, text: null, tree: null }
+  const base = (pattern ? pattern.dir : abs).replace(/\/+$/, '')
+  const rows: { path: string; v: string | null }[] = []
+  let more = false
+  const byName = (a: any, b: any) => (String(a.name) < String(b.name) ? -1 : String(a.name) > String(b.name) ? 1 : 0)
+  const walk = async (rel: string): Promise<void> => {
+    let entries: any[] = []
+    try {
+      entries = [...(await $.fs.list(rel ? `${base}/${rel}` : base || '/'))].sort(byName)
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const name = String(e.name)
+      if (pattern && !rel && !matches(name, pattern.name)) continue
+      const r = rel ? `${rel}/${name}` : name
+      if (e.kind === 'dir' && !e.isLink) {
+        await walk(r)
+        if (more) return
+        continue
+      }
+      if (rows.length >= TREE_MAX) {
+        more = true
+        return
+      }
+      if (e.isLink) {
+        // A link goes as a link (rsync -a, tar): where it leads is its version
+        let to = 'nowhere'
+        try {
+          to = String((await $.fs.stat(`${base}/${r}`, { resolve: true })).realPath ?? 'nowhere')
+        } catch {}
+        rows.push({ path: r, v: `link ${to}` })
+      } else rows.push({ path: r, v: (await versionOf($, `${base}/${r}`)).v })
+    }
+  }
+  await walk('')
+  return { v: treeVersion(rows, more, hashText), text: null, tree: { files: rows.map(x => x.path), more, pattern: !!pattern } }
 }
 
 /** A note typed with a verb (/fleet 3 reject "too broad") goes with the answer, as /fleet note would */

@@ -14,8 +14,10 @@ import {
   outboundRefusal,
   parseDraft,
   parseOutbound,
+  patternOf,
   recipientsOf,
   remoteAllowed,
+  treeVersion,
   type OutboundConfig,
 } from '../hooks/outbound'
 
@@ -197,6 +199,13 @@ test('mcp__fleet__send: its input, the draft fleet keeps and runs, the version t
   expect(parseDraft('{"tool": "mcp__fleet__send"}')).toEqual({ problem: 'the draft holds neither a command nor an MCP tool and its input' })
   const a = outboundHash(text, [{ path: 'notes/x.md', v: 'h1' }], hashText)
   expect(outboundHash(text, [{ path: 'notes/x.md', v: 'h2' }], hashText)).not.toBe(a)
+  // A folder's version is its files' paths and versions; a pattern in the last part of a path is listed
+  const tree = treeVersion([{ path: 'a.py', v: 'h1' }, { path: 'sub/b.py', v: 'h2' }], false, hashText)
+  expect(treeVersion([{ path: 'a.py', v: 'h1' }, { path: 'sub/b.py', v: 'h3' }], false, hashText)).not.toBe(tree)
+  expect(treeVersion([{ path: 'a.py', v: 'h1' }, { path: 'sub/b.py', v: 'h2' }], true, hashText)).not.toBe(tree)
+  expect(patternOf('/x/dist/*.whl')).toEqual({ dir: '/x/dist', name: '*.whl' })
+  expect(patternOf('/x/*/a.whl')).toBe(null)
+  expect(patternOf('/x/dist/')).toBe(null)
   expect(outboundRefusal([{ what: 'curl sending data (notes/x.md)', to: ['example.invalid'], files: ['notes/x.md'] }], 'command')).toContain(
     "fleet: this command would send the project's content outside it (curl sending data (notes/x.md) to example.invalid), which needs the person's approval, so it was not run. If it should go out, draft it with mcp__fleet__send",
   )
