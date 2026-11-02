@@ -56,6 +56,8 @@ import {
   type SectionsView,
   type Action,
   actionFromAnswer,
+  askRejection,
+  UNSHOWN,
   reconcilePins,
   adoptAutoPins,
   paneWidth,
@@ -105,6 +107,7 @@ import {
   orderFileText,
   rootFrom,
   rootCandidates,
+  worktreeBase,
   sortRows,
   windowTargetText,
   autoName,
@@ -224,7 +227,7 @@ let defaultWindowWidth = 0
 let remeasure = false
 // The session that was asked whether to stop: only its answer is accepted, and only for a while. fallback is the row
 // that stays selected if it leaves the list: its neighbor in the list you were looking at when you pressed Stop
-let pendingAsk: { sessionId: string; at: number; fallback?: string } | undefined
+let pendingAsk: { sessionId: string; at: number; fallback?: string; topic: Topic; detail: string } | undefined
 // How many times you moved the panel's focus yourself (arrows, Tab, click): so the focus isn't fought over when the
 // panel takes it on its own
 let personMoves = 0
@@ -1491,8 +1494,9 @@ async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
 // to other sessions (the topic field of the ask notice)
 type Topic = 'stop' | 'remove' | 'restart'
 
-// The question, with Claude's dialog. Cancel, Esc or hand-typed text do nothing
-async function askDialog($: any, title: string, topic: Topic, detail = ''): Promise<Action | null> {
+// The question, with Claude's dialog. Cancel, Esc or hand-typed text do nothing. unshown: the dialog never showed (a
+// session whose agent leaves AskUserQuestion out of its tools can't show one: askRejection)
+async function askQuestion($: any, title: string, topic: Topic, detail = ''): Promise<{ action: Action | null; unshown: boolean }> {
   const extra = detail ? ` ${detail}` : ''
   const question =
     topic === 'remove'
@@ -1502,10 +1506,18 @@ async function askDialog($: any, title: string, topic: Topic, detail = ''): Prom
         : `Stop “${title}”?${extra} The conversation is kept either way.`
   const options = topic === 'remove' ? REMOVE_OPTIONS : topic === 'restart' ? RESTART_OPTIONS : STOP_OPTIONS
   try {
-    return actionFromAnswer(await $.ui.ask(question, { options, header: 'Sessions' }))
-  } catch {
-    return null
+    return { action: actionFromAnswer(await $.ui.ask(question, { options, header: 'Sessions' })), unshown: false }
+  } catch (err) {
+    return { action: null, unshown: askRejection(err) === 'unshown' }
   }
+}
+
+// The question asked in this session's own window: when it can't be shown here either, you're told, so a key never
+// does nothing silently
+async function askDialog($: any, title: string, topic: Topic, detail = ''): Promise<Action | null> {
+  const r = await askQuestion($, title, topic, detail)
+  if (r.unshown) $.ui.toast(`Couldn't show the question in this session (its agent may have no AskUserQuestion): nothing was changed`)
+  return r.action
 }
 
 // Does what was chosen to another session. Stop and Remove: stops it and/or removes it from the list, and closes the
@@ -1609,7 +1621,7 @@ async function decide($: any, f: Row, topic: Topic) {
   // First go there, then send the question: if going failed, no question is left waiting where nobody sees it
   const askThere = topic !== 'remove' && f.color !== 'red' && f.reachable
   if (askThere && (await frontWindowShowingMe($)) && (await jump($, f, false))) {
-    pendingAsk = { sessionId: f.sessionId, at: await $.clock.now(), fallback }
+    pendingAsk = { sessionId: f.sessionId, at: await $.clock.now(), fallback, topic, detail }
     if (!(await sendNotice($, f, 'ask', { from: myId, topic, detail }))) {
       pendingAsk = undefined
       $.ui.toast(`Couldn't ask “${f.title}”; nothing was changed`)
@@ -1622,23 +1634,26 @@ async function decide($: any, f: Row, topic: Topic) {
 }
 
 // In the session being acted on: the question shows up here; once answered, the window goes back to the session it was
-// asked from and the answer is handed to it so it does it
+// asked from and the answer is handed to it so it does it. If it can't be shown here (unshown), the window goes back
+// all the same and that session asks in its own window
 async function answerQuestion($: any, from: string, topic: Topic, detail: string) {
   const own = (await read($, rows)).find(f => f.current)
-  const action = await askDialog($, own?.title ?? 'this session', topic, detail)
+  const asked = await askQuestion($, own?.title ?? 'this session', topic, detail)
   const origin = (await read($, rows)).find(f => f.sessionId === from)
   const cameBack = origin ? await jump($, origin, false) : false
-  if (origin) await sendNotice($, origin, 'answer', { sessionId: myId, action: action ?? 'cancel', cameBack })
+  if (asked.unshown && origin && !cameBack) $.ui.toast(`Couldn't show the question here: go back to “${origin.title}”, which asks it`)
+  if (origin) await sendNotice($, origin, 'answer', { sessionId: myId, action: asked.unshown ? UNSHOWN : (asked.action ?? 'cancel'), cameBack })
 }
 
-// Back in this session: do what was chosen over there (only if it's the answer to the question that was sent)
+// Back in this session: do what was chosen over there (only if it's the answer to the question that was sent). If the
+// question couldn't be shown there, it's asked here
 async function receiveAnswer($: any, data: Record<string, unknown>) {
   const now = await $.clock.now()
   if (!pendingAsk || pendingAsk.sessionId !== data.sessionId || now - pendingAsk.at > 600000) return
-  const { fallback } = pendingAsk
+  const { fallback, topic, detail } = pendingAsk
   pendingAsk = undefined
   const f = (await read($, rows)).find(x => x.sessionId === data.sessionId)
-  const action = data.action
+  const action = data.action === UNSHOWN && f ? await askDialog($, f.title, topic, detail) : data.action
   // If the window couldn't come back here, it still shows that session: it isn't closed
   if (f && (action === 'stop' || action === 'stop-rm' || action === 'restart')) await perform($, f, action, data.cameBack === true)
   await focusRow($, String(data.sessionId), fallback)
@@ -2061,10 +2076,11 @@ async function followFolder($: any) {
   if (previous && dataDir && !(await exists($, previous))) await runSafe($, ['rm', '-f', `${dataDir}/order/${fileKey(previous)}`])
 }
 
-// The project root of a folder (rootFrom), with the AGENTS.md and CLAUDE.md markers looked for on disk
+// The project root of a folder (rootFrom), with the AGENTS.md and CLAUDE.md markers looked for on disk (from the
+// project a worktree belongs to: worktreeBase)
 async function rootOf($: any, folder: string): Promise<string> {
   const markers: string[] = []
-  for (const dir of rootCandidates(folder)) {
+  for (const dir of rootCandidates(worktreeBase(folder))) {
     if ((await exists($, `${dir}/AGENTS.md`)) || (await exists($, `${dir}/CLAUDE.md`))) markers.push(dir)
   }
   return rootFrom(folder, markers)

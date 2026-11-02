@@ -35,7 +35,7 @@ import sys
 import time
 import unicodedata
 
-FORMAT = 2
+FORMAT = 3
 SECTIONS_FORMAT = 1
 TELL_MAX_BYTES = 4096
 HEARTBEAT_VERSION = (0, 10, 0)
@@ -96,15 +96,22 @@ def parse_version(text):
 
 
 # The project root, as the mod computes it (rootFrom in state.ts): the nearest folder upwards with AGENTS.md or
-# CLAUDE.md, below the top two levels; else this folder
+# CLAUDE.md, below the top two levels; else this folder. A folder inside <x>/.claude/worktrees/ walks from <x>
+# (worktreeBase in state.ts)
+def worktree_base(cwd):
+    i = cwd.find('/.claude/worktrees/')
+    return cwd[:i] if i > 0 else cwd
+
+
 def project_root(cwd):
-    d = cwd
+    base = worktree_base(cwd)
+    d = base
     while True:
         if len([p for p in d.split('/') if p]) > 2 and any(os.path.isfile(os.path.join(d, n)) for n in ('AGENTS.md', 'CLAUDE.md')):
             return d
         parent = os.path.dirname(d)
         if parent == d:
-            return cwd
+            return base
         d = parent
 
 

@@ -74,6 +74,9 @@ import {
   limitsText,
   waitingMembers,
   shellQuote,
+  askRejection,
+  UNSHOWN,
+  worktreeBase,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -229,9 +232,19 @@ test('Stop: Stop & Remove is the second option, and only the dialog options do a
   expect(actionFromAnswer('Stop it please')).toBe(null)
 })
 
+test("a dialog that didn't show is told apart from one the person dismissed", () => {
+  expect(askRejection(new Error('HooksError: sessions: $.ui.ask: no answer (The user doesn\'t want to proceed with this tool use.)'))).toBe('dismissed')
+  expect(askRejection(new Error('HooksError: sessions: $.tool.call: no tool named "AskUserQuestion" in this session'))).toBe('unshown')
+  // Anything else (no one to ask, a value that isn't an error) counts as not shown: the question is asked elsewhere
+  expect(askRejection(new Error('no surface to ask on'))).toBe('unshown')
+  expect(askRejection('no answer')).toBe('dismissed')
+  expect(askRejection(undefined)).toBe('unshown')
+  expect(UNSHOWN).toBe('unshown')
+})
+
 test("notices between sessions: round trip with format and kind, and nothing if the text isn't a notice", () => {
   const m = buildNotice('ask', { from: 'abc', topic: 'stop' })
-  expect(parseNotice(m)).toEqual({ format: 2, kind: 'ask', data: { format: 2, kind: 'ask', from: 'abc', topic: 'stop' } })
+  expect(parseNotice(m)).toEqual({ format: 3, kind: 'ask', data: { format: 3, kind: 'ask', from: 'abc', topic: 'stop' } })
   // Even if Claude wraps something around it when delivering it
   expect(parseNotice(`<from peer>${m}</from peer>`)?.kind).toBe('ask')
   expect(parseNotice('sessions-notice:7f3a no data')).toBe(null)
@@ -450,7 +463,7 @@ test('order: the panel order (waiting, done, working, idle, stopped, then title)
   expect(sorted.map(r => r.sessionId)).toEqual(['s2', 's5', 's4', 's1', 's3'])
   const text = orderFileText('/Users/x/myapp', sorted, 1234)
   const back = parseOrderFile(text)
-  expect(back?.format).toBe(2)
+  expect(back?.format).toBe(3)
   expect(back?.at).toBe(1234)
   expect(back?.root).toBe('/Users/x/myapp')
   expect(back?.rows.map(r => r.sessionId)).toEqual(['s2', 's5', 's4', 's1', 's3'])
@@ -469,8 +482,8 @@ test("a new window's command: each word in single quotes, so nothing in a folder
 test('shared files: key=value lines, one value per key, line breaks flattened', () => {
   expect(keyLines({ format: 1, title: 'a\nb', none: undefined })).toBe('format=1\ntitle=a b\n')
   expect(parseKeyLines('format=1\ntitle=x=y\nformat=2\njunk\n')).toEqual({ format: '1', title: 'x=y' })
-  expect(windowTargetText({ command: 'attach', id: 'aaaaaaaa', title: 'One' })).toBe('format=2\ncommand=attach\nid=aaaaaaaa\ntitle=One\n')
-  expect(windowTargetText({ command: 'agents', title: 'Agents', folder: '/Users/x/myapp' })).toBe('format=2\ncommand=agents\ntitle=Agents\nfolder=/Users/x/myapp\n')
+  expect(windowTargetText({ command: 'attach', id: 'aaaaaaaa', title: 'One' })).toBe('format=3\ncommand=attach\nid=aaaaaaaa\ntitle=One\n')
+  expect(windowTargetText({ command: 'agents', title: 'Agents', folder: '/Users/x/myapp' })).toBe('format=3\ncommand=agents\ntitle=Agents\nfolder=/Users/x/myapp\n')
   expect(parseInbox('format=1\naction=bring\nat=5\ntty=/dev/ttys001\nreply=/r\n')).toEqual({ format: 1, action: 'bring', at: 5, tty: '/dev/ttys001', title: '', reply: '/r', ref: '' })
   expect(parseInbox('action=focus\n')).toBe(null)
 })
@@ -478,7 +491,7 @@ test('shared files: key=value lines, one value per key, line breaks flattened', 
 test('heartbeat: fresh, same format and same process is ok; old, missing or another process is missing', () => {
   const now = 1_000_000
   const h = parseHeartbeat(heartbeatText({ pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' }))
-  expect(h).toEqual({ format: 2, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' })
+  expect(h).toEqual({ format: 3, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' })
   expect(heartbeatStatus(h, 42, now)).toBe('ok')
   expect(heartbeatStatus(h, 43, now)).toBe('missing')
   expect(heartbeatStatus(h, undefined, now)).toBe('ok')
@@ -526,6 +539,21 @@ test('project root: the nearest folder with AGENTS.md or CLAUDE.md, below the to
   expect(rootFrom('/Users/x/myapp', ['/Users'])).toBe('/Users/x/myapp')
   // A marker on another branch doesn't count
   expect(rootFrom('/Users/x/myapp', ['/Users/x/other'])).toBe('/Users/x/myapp')
+})
+
+test("project root: a worktree under <x>/.claude/worktrees/ is <x>'s project, its own copy of CLAUDE.md aside", () => {
+  expect(worktreeBase('/Users/x/myapp/.claude/worktrees/area-a')).toBe('/Users/x/myapp')
+  expect(worktreeBase('/Users/x/myapp/.claude/worktrees/area-a/src/deep')).toBe('/Users/x/myapp')
+  // A worktree made from inside another one belongs to the outermost project
+  expect(worktreeBase('/Users/x/myapp/.claude/worktrees/a/.claude/worktrees/b')).toBe('/Users/x/myapp')
+  expect(worktreeBase('/Users/x/myapp/src')).toBe('/Users/x/myapp/src')
+  expect(worktreeBase('/Users/x/myapp/.claude/worktrees')).toBe('/Users/x/myapp/.claude/worktrees')
+  // No marker: the main checkout's folder, not the worktree's
+  expect(rootFrom('/Users/x/myapp/.claude/worktrees/area-a', [])).toBe('/Users/x/myapp')
+  // A CLAUDE.md the repository checks in has a copy in each worktree: the main checkout's counts, the copy doesn't
+  expect(rootFrom('/Users/x/myapp/.claude/worktrees/area-a', ['/Users/x/myapp', '/Users/x/myapp/.claude/worktrees/area-a'])).toBe('/Users/x/myapp')
+  // A marker above the repository still wins, as for the main checkout
+  expect(rootFrom('/Users/x/work/myapp/.claude/worktrees/area-a/src', ['/Users/x/work'])).toBe('/Users/x/work')
 })
 
 test('project root: the folders to look for a marker in, outermost first, below the top two levels', () => {

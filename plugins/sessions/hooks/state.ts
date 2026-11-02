@@ -5,7 +5,7 @@ import type { Color, Period, RateLimit, SessionsMark, SessionsMember, SessionsRe
 // carries `format=<n>`. A reader that finds another format leaves it alone and says the sessions need a restart (u, or
 // claude respawn): sessions running another version of the mod never act on each other's data by mistake.
 // The launcher (hooks/launcher.py, hooks/visor.sh) reads and writes the same formats: change them together.
-export const FORMAT = 2
+export const FORMAT = 3
 
 // Where a session keeps its keys in the shared store: '' for the sessions you use, and @<hash>/ for one started with any
 // SESSIONS_* override (a test session: SESSIONS_DATA_DIR, SESSIONS_JOBS_DIR, SESSIONS_DAEMON_LOG, SESSIONS_CLAUDE,
@@ -153,6 +153,18 @@ export function actionFromAnswer(answer: string): Action | null {
   return null
 }
 
+// Why $.ui.ask rejected: the person dismissed the dialog (Esc, "Chat about this": "$.ui.ask: no answer (…)"), or it was
+// never shown, as in a session whose agent leaves AskUserQuestion out of its tools ("$.tool.call: no tool named
+// "AskUserQuestion" in this session") or a run with nobody to ask. Anything that isn't the dismissal counts as unshown
+export function askRejection(err: unknown): 'dismissed' | 'unshown' {
+  const text = err instanceof Error ? err.message : String(err ?? '')
+  return /\bno answer\b/.test(text) ? 'dismissed' : 'unshown'
+}
+
+// The answer notice's action when the asked session couldn't show the question: the session that asked asks in its
+// own window instead
+export const UNSHOWN = 'unshown'
+
 // Claude versions ("2.1.291"). parseVersion extracts the version from what `claude --version` prints ("2.1.291 (Claude Code)")
 export function parseVersion(text: string): string | null {
   const m = text.trim().match(/^(\d+)\.(\d+)\.(\d+)(?=$|[\s(-])/)
@@ -193,8 +205,9 @@ export function compareVersions(a: string, b: string): number {
 
 // Notices between the mod's sessions: a fixed marker, a space and the data as JSON, with the format and the kind.
 // focus: you arrived here from the panel; ask: ask here whether to stop or restart this session (from: who asks,
-// topic, detail); answer: the answer to that (sessionId: who answers, action, cameBack: whether the window came back);
-// rename: rename yourself (name). The receiver consumes every notice with the marker (none reaches the model) and acts
+// topic, detail); answer: the answer to that (sessionId: who answers, action: stop, stop-rm, restart, cancel, or
+// unshown when the question couldn't be shown there and the asker asks in its own window; cameBack: whether the window
+// came back); rename: rename yourself (name). The receiver consumes every notice with the marker (none reaches the model) and acts
 // only on its own format. Senders only send to sessions whose heartbeat says they run the same format
 export const NOTICE_MARKER = 'sessions-notice:7f3a'
 export type NoticeKind = 'focus' | 'ask' | 'answer' | 'rename'
@@ -303,12 +316,21 @@ export function inProject(cwd: string, root: string, home: string): boolean {
   return cwd.startsWith(`${root}/`)
 }
 
+// A folder inside a worktree under <x>/.claude/worktrees/<name> (at any depth, the outermost such folder) belongs to
+// <x>'s project: the walk starts from <x>, so a worktree's own copy of AGENTS.md or CLAUDE.md doesn't make it a
+// project of its own. Any other folder starts from itself
+export function worktreeBase(start: string): string {
+  const i = start.indexOf('/.claude/worktrees/')
+  return i > 0 ? start.slice(0, i) : start
+}
+
 // The project root: the nearest folder upwards with AGENTS.md or CLAUDE.md (the folders that have one, outermost
-// first), skipping the top two levels (/, /Users); if there's none, where the session started. The launcher walks up
-// from its folder the same way
+// first), skipping the top two levels (/, /Users); if there's none, where the session started. A worktree under
+// <x>/.claude/worktrees/ walks from <x> (worktreeBase). The launcher walks up from its folder the same way
 export function rootFrom(start: string, markerDirs: readonly string[]): string {
-  const dirs = markerDirs.filter(d => d.split('/').filter(Boolean).length > 2 && (start === d || start.startsWith(`${d}/`)))
-  return dirs[dirs.length - 1] ?? start
+  const base = worktreeBase(start)
+  const dirs = markerDirs.filter(d => d.split('/').filter(Boolean).length > 2 && (base === d || base.startsWith(`${d}/`)))
+  return dirs[dirs.length - 1] ?? base
 }
 
 // The folders rootFrom can pick for a start folder, outermost first: each one above it below the top two levels, and

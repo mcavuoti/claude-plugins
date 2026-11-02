@@ -70,11 +70,11 @@ for i, spec in enumerate(sys.argv[1:]):
 print(json.dumps(rows))
 PY
 }
-beat() { mkdir -p "$data/alive"; printf 'format=%s\npid=%s\nat=%s\nversion=0.10.0\nvia=session.start\n' "${3:-2}" "$2" "$(now_ms)" > "$data/alive/$1-0000-0000-0000-000000000000"; }
+beat() { mkdir -p "$data/alive"; printf 'format=%s\npid=%s\nat=%s\nversion=0.10.0\nvia=session.start\n' "${3:-3}" "$2" "$(now_ms)" > "$data/alive/$1-0000-0000-0000-000000000000"; }
 order() {
   mkdir -p "$data/order"
   local file="$data/order/${proj//\//_}"
-  printf 'format=2\nat=%s\nroot=%s\n' "${ORDER_AT:-$(now_ms)}" "$proj" > "$file"
+  printf 'format=3\nat=%s\nroot=%s\n' "${ORDER_AT:-$(now_ms)}" "$proj" > "$file"
   for id in "$@"; do printf 'row=%s-0000-0000-0000-000000000000\tgreen\t%s\tx\n' "$id" "$id" >> "$file"; done
 }
 reset() { rm -rf "$data" "${fix:?}"/*; mkdir -p "$fix"; : > "$fix/calls.log"; : > "$fix/ps.txt"; }
@@ -91,7 +91,11 @@ expect "$(field "$(pick)" session)" aaaaaaaa "a fresh order file is used"
 ORDER_AT=1000 order aaaaaaaa bbbbbbbb cccccccc
 expect "$(field "$(pick)" session)" cccccccc "a stale order file is ignored"
 PICK_IN="$proj/src" expect "$(field "$(PICK_IN="$proj/src" pick)" session)" cccccccc "a subfolder belongs to the project"
-pass "order: fresh file, stale file, fallback, subfolder"
+# A worktree under the project's .claude/worktrees/, with its own copy of CLAUDE.md, is still the project
+mkdir -p "$proj/.claude/worktrees/w1/src"
+touch "$proj/.claude/worktrees/w1/CLAUDE.md"
+expect "$(field "$(PICK_IN="$proj/.claude/worktrees/w1/src" pick)" session)" cccccccc "a worktree belongs to the project"
+pass "order: fresh file, stale file, fallback, subfolder, worktree"
 
 # 2. Sessions of other folders don't count; stopped ones and an empty folder lead to the Name prompt
 reset
@@ -159,7 +163,7 @@ pass "empty folder: name, create, one restart, open, focus request"
 # 5b. With the debug-logs option on (the mod mirrors it to <data>/config), a session ccc creates writes its debug log
 reset
 sessions
-mkdir -p "$data"; printf 'format=2\ndebug=1\n' > "$data/config"
+mkdir -p "$data"; printf 'format=3\ndebug=1\n' > "$data/config"
 printf 'TEST one\n' | (cd "$proj" && /bin/bash "$hooks/visor.sh" start) > /dev/null 2>&1 || true
 grep -q "^--bg -n TEST one --debug-file $data/debug/TEST_one.log" "$fix/calls.log" || fail "debug" "no --debug-file: $(cat "$fix/calls.log")"
 pass "debug logs option: --debug-file for new sessions"
@@ -215,7 +219,7 @@ printf '  501 ttys901  bash /x/hooks/visor.sh start\n  %s ttys901  claude attach
 beat aaaaaaaa 1000
 inbox="$data/inbox/aaaaaaaa-0000-0000-0000-000000000000"
 ( for _ in $(seq 1 50); do
-    if [ -f "$inbox" ]; then reply=$(sed -n 's/^reply=//p' "$inbox"); rm -f "$inbox"; printf 'format=2\nresult=ok\n' > "$reply"; break; fi
+    if [ -f "$inbox" ]; then reply=$(sed -n 's/^reply=//p' "$inbox"); rm -f "$inbox"; printf 'format=3\nresult=ok\n' > "$reply"; break; fi
     sleep 0.1
   done ) &
 (cd "$proj" && /bin/bash "$hooks/visor.sh" start beta) > "$work/out.txt" 2>&1 || true
@@ -252,7 +256,7 @@ pass "ccc: finds the enabled plugin"
 # 11. ccc tell: needs no terminal and no project folder; refused without the session's opt-in, over 4 KB, for a regular
 #     session, for an ambiguous name and for a session whose panel isn't running; otherwise a request and its status
 tell() { (cd / && env -u SESSIONS_TTY /bin/bash "$hooks/visor.sh" start tell "$@" < /dev/null); }
-allow() { mkdir -p "$data/tell/$1"; printf 'format=2\nat=1\n' > "$data/tell/$1/allow"; }
+allow() { mkdir -p "$data/tell/$1"; printf 'format=3\nat=1\n' > "$data/tell/$1/allow"; }
 reset
 sessions aaaaaaaa:alpha:idle:600
 beat aaaaaaaa 1000
@@ -264,7 +268,7 @@ tell alpha "New mail, id 42" > "$work/out.txt" || fail "tell" "refused: $(cat "$
 # shellcheck disable=SC1111 # the curly quotes are what the launcher prints
 grep -q "^queued: it goes as a turn of its own when “alpha” is idle" "$work/out.txt" || fail "tell" "not queued: $(cat "$work/out.txt")"
 req=$(ls "$data/tell/aaaaaaaa/"*.req)
-grep -q '^format=2$' "$req" || fail "tell" "the request has no format"
+grep -q '^format=3$' "$req" || fail "tell" "the request has no format"
 expect "$(cat "${req%.req}.txt")" "New mail, id 42" "the text is in its own file"
 grep -q "^status file: ${req%.req}.status$" "$work/out.txt" || fail "tell" "no status file named: $(cat "$work/out.txt")"
 rm -f "$data/tell/aaaaaaaa/"*.req
@@ -296,7 +300,7 @@ inbox="$data/inbox/bbbbbbbb-0000-0000-0000-000000000000"
 ( for _ in $(seq 1 50); do
     if [ -f "$inbox" ]; then
       if ! grep -q '^ref=aaaaaaaa$' "$inbox" || ! grep -q '^action=wake$' "$inbox"; then break; fi
-      reply=$(sed -n 's/^reply=//p' "$inbox"); rm -f "$inbox"; printf 'format=2\nresult=ok\nstate=queued\nreason=woke “alpha”\n' > "$reply"; break
+      reply=$(sed -n 's/^reply=//p' "$inbox"); rm -f "$inbox"; printf 'format=3\nresult=ok\nstate=queued\nreason=woke “alpha”\n' > "$reply"; break
     fi
     sleep 0.1
   done ) &
@@ -316,7 +320,7 @@ pass "tell: wakes a stopped session through a running one, refused when none ans
 answer_after() {
   ( for _ in $(seq 1 50); do
       f=$(find "$data/tell/aaaaaaaa" -name '*.req' | head -n 1)
-      if [ -n "$f" ]; then sleep "$1"; printf 'format=2\nstate=%s\nreason=%s\nat=1\n' "$2" "${3:-}" > "${f%.req}.status"; rm -f "$f"; break; fi
+      if [ -n "$f" ]; then sleep "$1"; printf 'format=3\nstate=%s\nreason=%s\nat=1\n' "$2" "${3:-}" > "${f%.req}.status"; rm -f "$f"; break; fi
       sleep 0.1
     done ) &
 }
@@ -343,13 +347,13 @@ grep -q '(still queued after 1 s)$' "$work/out.txt" || fail "tell --wait" "no ti
 rm -f "$data/tell/aaaaaaaa/"*
 allow aaaaaaaa
 now=$(now_ms)
-for i in 1 2 3 4 5 6; do printf 'format=2\nstate=delivered\nreason=\nat=1\n' > "$data/tell/aaaaaaaa/$((now - i * 1000))-$i.status"; done
+for i in 1 2 3 4 5 6; do printf 'format=3\nstate=delivered\nreason=\nat=1\n' > "$data/tell/aaaaaaaa/$((now - i * 1000))-$i.status"; done
 out="$(tell alpha "ping" || true)"
 # shellcheck disable=SC1111 # the curly quotes are what the launcher prints
 grep -q "^refused: “alpha” was handed 6 requests in the last minute, the most ccc tell gives one session (6 a minute, 60 an hour): try again in [0-9]* s$" <<<"$out" || fail "tell rate" "no refusal: $out"
 [ -z "$(find "$data/tell/aaaaaaaa" -name '*.req')" ] || fail "tell rate" "a request was written past the limit"
 rm -f "$data/tell/aaaaaaaa/"*.status
-for i in $(seq 1 60); do printf 'format=2\nstate=delivered\nreason=\nat=1\n' > "$data/tell/aaaaaaaa/$((now - 120000 - i * 1000))-$i.status"; done
+for i in $(seq 1 60); do printf 'format=3\nstate=delivered\nreason=\nat=1\n' > "$data/tell/aaaaaaaa/$((now - 120000 - i * 1000))-$i.status"; done
 grep -q "was handed 60 requests in the last hour" <<<"$(tell alpha "ping" || true)" || fail "tell rate" "no hourly limit"
 pass "tell --wait: delivered, held, timed out; at most 6 a minute and 60 an hour"
 
