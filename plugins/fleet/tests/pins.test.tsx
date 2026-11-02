@@ -237,7 +237,8 @@ test('check scripts: run only once the person stamps them; a failure reaches the
   await tick(w, 61000)
   expect(ran).toEqual([[ROOT, 'bash', 'checks/board.sh', 'board/B-1.md']])
   const step = (await call($, { tool: 'Bash', command: 'ls' })).context.join('\n')
-  expect(step).toContain('- board/B-1.md failed the check board.sh: no status line')
+  expect(step).toContain("fleet: shared files you wrote last fail the project's checks (nothing is held; fix them so the check passes, or say why it's wrong):\n- board/B-1.md failed the check board.sh: no status line")
+  expect(step).not.toContain('read what they cite')
   expect(await fleet($, 'status')).toContain('failing a check:\n  board/B-1.md: board.sh: no status line')
   expect(await band($)).toContain('!! 1 flagged')
   // Unchanged: not checked again

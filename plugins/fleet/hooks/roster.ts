@@ -439,23 +439,30 @@ export function familyOf(model: string | null): Family | null {
   return m.includes('mythos') ? 'fable' : null
 }
 
-/** What a day of wakes costs an instance: each reopens about WAKE_CONTEXT tokens at the cache-write price */
-export function wakeUsd(model: string | null, perDay: number): number | null {
+/** What a day of wakes costs an instance: each reopens its context (tokens; about WAKE_CONTEXT for one not started)
+ * at the cache-write price */
+export function wakeUsd(model: string | null, perDay: number, tokens: number = WAKE_CONTEXT): number | null {
   const f = familyOf(model)
-  return f ? (perDay * WAKE_CONTEXT * PRICES[f].write) / 1e6 : null
+  return f ? (perDay * tokens * PRICES[f].write) / 1e6 : null
 }
 
-export function forecastOf(instances: readonly Instance[], wakes: { perDay: number }): { caps: number; wakesUsd: number; unpriced: string[] } {
+/** sizes: a running instance's own context, by slug, from its heartbeat; WAKE_CONTEXT for the others */
+export function forecastOf(instances: readonly Instance[], wakes: { perDay: number }, sizes: Readonly<Record<string, number>> = {}): { caps: number; wakesUsd: number; unpriced: string[] } {
   let caps = 0
   let wakesUsd = 0
   const unpriced: string[] = []
   for (const i of instances) {
     caps += i.usdDay ?? 0
-    const w = wakeUsd(i.model, wakes.perDay)
+    const w = wakeUsd(i.model, wakes.perDay, sizes[i.slug] ?? WAKE_CONTEXT)
     if (w === null) unpriced.push(i.name)
     else wakesUsd += w
   }
   return { caps, wakesUsd, unpriced }
+}
+
+/** Tokens as the person reads them: 41k, 1.2M */
+export function tokensText(n: number): string {
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1).replace(/\.0$/, '')}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
 }
 
 /** Dollars as the person reads them, one format everywhere: cents, never rounded away (a sum compared with a cap

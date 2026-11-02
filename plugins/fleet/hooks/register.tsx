@@ -258,6 +258,7 @@ import {
   redundantSessionsKeys,
   settingsFor,
   settingsText,
+  tokensText,
   usd,
   usdOf,
   wakeUsd,
@@ -2587,6 +2588,7 @@ async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   const me = { sessionId: String(await $.session.id()), ref: myRef ?? jobRef }
   const told = await read($, ownTold)
   const items: { key: string; line: string }[] = []
+  const checks: { key: string; line: string }[] = []
   const words = await meNow($)
   for (const s of directSuspects()) {
     if (!ownedBy(s.owner, me) || (derivedKinds.length && derivedKindOf(s.path, derivedKinds))) continue
@@ -2596,25 +2598,21 @@ async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   for (const f of failing()) {
     if (!ownedBy(f.owner, me)) continue
     const key = `c|${f.path}|${f.check}|${f.hash}`
-    if (!told[key]) items.push({ key, line: `- ${f.path} failed the check ${f.check}: ${f.message}` })
+    if (!told[key]) checks.push({ key, line: `- ${f.path} failed the check ${f.check}: ${f.message}` })
   }
   const now = await $.clock.now()
   const inst = myInstance
   const derived = inst ? (flagged.suspects?.derived ?? []).filter(d => ownsKind(d, inst) && quietEnough(d, now) && !told[`d|${d.key}`]) : []
-  if (!items.length && !derived.length) return { lines: [], keys: [] }
+  if (!items.length && !checks.length && !derived.length) return { lines: [], keys: [] }
   const lines: string[] = []
-  if (items.length) {
-    const shown = items.slice(0, MAX_LINES)
-    lines.push(
-      [
-        `fleet: shared files you wrote last are flagged (nothing is held; fix them when you can: read what they cite, then update them, or say why they still hold):`,
-        ...shown.map(i => i.line),
-        ...(items.length > shown.length ? [`- and ${items.length - shown.length} more: /fleet status in any session lists them`] : []),
-      ].join('\n'),
-    )
+  const group = (lead: string, all: { line: string }[]) => {
+    const shown = all.slice(0, MAX_LINES)
+    lines.push([lead, ...shown.map(i => i.line), ...(all.length > shown.length ? [`- and ${all.length - shown.length} more: /fleet status in any session lists them`] : [])].join('\n'))
   }
+  if (items.length) group('fleet: shared files you wrote last are flagged (nothing is held; fix them when you can: read what they cite, then update them, or say why they still hold):', items)
+  if (checks.length) group("fleet: shared files you wrote last fail the project's checks (nothing is held; fix them so the check passes, or say why it's wrong):", checks)
   if (derived.length) lines.push(derivedText(derived.slice(0, MAX_LINES), words))
-  return { lines, keys: [...items.map(i => i.key), ...derived.map(d => `d|${d.key}`)] }
+  return { lines, keys: [...items.map(i => i.key), ...checks.map(i => i.key), ...derived.map(d => `d|${d.key}`)] }
 }
 
 // ---- Intake: items from outside, read by the sweeper with one model call each, routed to who subscribes (intake.ts) ----
@@ -2728,6 +2726,9 @@ async function intakeTick($: any) {
     if (r === 'stop') break
     if (st.calls > calls) done++
   }
+  let left = 0
+  for (const f of files) if (await exists($, f.path)) left++
+  intakeRun.inbox = left
   if (JSON.stringify(st) !== before && !(await replace($, stateDir('intake.json'), json(st)))) {
     await run($, ['mkdir', '-p', stateDir()])
     await replace($, stateDir('intake.json'), json(st))
@@ -3629,7 +3630,8 @@ let instDirMade = ''
  * landing); lastLanding: its last landing in the shared world or its journal; conversationAt: when its conversation
  * started (a fresh period starts a new one); outside: what outside content its conversation read; fleet: the version
  * of fleet it runs; mode: the permission mode it runs in (classic.SessionStart's permission_mode); waitingOn: a
- * permission prompt it waits on, with nobody at it; remote: whether it has Remote Control (null: not known) */
+ * permission prompt it waits on, with nobody at it; remote: whether it has Remote Control (null: not known);
+ * contextTokens: the tokens its last answer was read over, what a wake reopens (null: not known yet) */
 type Heartbeat = {
   format: number
   instance: string
@@ -3653,6 +3655,7 @@ type Heartbeat = {
   mode?: string | null
   waitingOn?: { kind: 'permission'; tool: string; at: number } | null
   remote?: boolean | null
+  contextTokens?: number | null
 }
 // The permission mode this session runs in (classic.SessionStart, again with each permission request), and the
 // permission prompt it waits on now (classic.PermissionRequest, until its tool ran or was refused, or the turn ended)
@@ -3769,9 +3772,11 @@ async function heartbeat($: any) {
   }
   const sessionId = String(await $.session.id())
   let cost: number | null = null
+  let contextTokens: number | null = null
   try {
     const u = await $.session.usage()
     cost = typeof u?.cost?.usd === 'number' ? u.cost.usd : null
+    contextTokens = typeof u?.context?.tokens === 'number' ? u.context.tokens : null
   } catch {}
   if (cost !== null) {
     const spend = await readWire<SpendFile>($, `${dir}/spend.json`)
@@ -3825,6 +3830,7 @@ async function heartbeat($: any) {
     mode: permissionMode ?? (await configuredMode($)),
     waitingOn: permissionWait,
     remote: await remoteControl($),
+    contextTokens,
   }
   await replace($, `${dir}/state.json`, json(beat))
 }
@@ -3876,6 +3882,18 @@ async function mtimeOf($: any, path: string): Promise<number | null> {
 
 async function heartbeatOf($: any, slug: string): Promise<Heartbeat | null> {
   return readWire<Heartbeat>($, `${instDir(slug)}/state.json`)
+}
+
+/** What a wake of each instance reopens, by slug: the context its fresh heartbeat says (the others, not running or not
+ * known yet, count as WAKE_CONTEXT in the forecast) */
+async function contextSizes($: any, instances: readonly Instance[]): Promise<Record<string, number>> {
+  const now = await $.clock.now()
+  const out: Record<string, number> = {}
+  for (const i of instances) {
+    const hb = await heartbeatOf($, i.slug)
+    if (hb && now - hb.at < HEARTBEAT_STALE_MS && typeof hb.contextTokens === 'number' && hb.contextTokens > 0) out[i.slug] = hb.contextTokens
+  }
+  return out
 }
 
 // Today's spend and cap of every instance (instances/<slug>/spend.json, state/lifts.json) and of the project; an
@@ -4719,7 +4737,7 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   if (it.verb === 'reject') {
     await saveNote($, rec.id, it.note, origin)
     const r = await say('rejected')
-    return r === 'ok' ? { line: `${n}: rejected ${rec.id} (the change to ${spec.path})`, done: true } : { line: `${n}: ${r === 'exists' ? `${rec.id} was answered meanwhile` : "couldn't save the answer"}`, done: false }
+    return r === 'ok' ? { line: `${n}: rejected ${rec.id} (the change to ${spec.path}). ${(await askerViews($, [rec]))(rec).name} hears it.`, done: true } : { line: `${n}: ${r === 'exists' ? `${rec.id} was answered meanwhile` : "couldn't save the answer"}`, done: false }
   }
   const target = `${root}/${spec.path}`
   const cur = await readText($, target)
@@ -5104,8 +5122,19 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     return { inst, action, ref: (running ?? retired)?.ref ?? null, state: (running ?? retired)?.state ?? null }
   })
   const wakes = wakesOf(r.r)
-  const f = forecastOf(chosen, wakes)
+  const sizes = await contextSizes($, plan.filter(p => p.action === 'running').map(p => p.inst))
+  const f = forecastOf(chosen, wakes, sizes)
   const cap = projectCap(r.r)
+  // By the project's path and, when a link leads there, by its real one too
+  const level = await commandLevelNow($)
+  const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
+  // A running instance whose settings this writes anew takes them only when restarted
+  const rewritten = new Set<string>()
+  for (const p of plan) {
+    if (p.action !== 'running') continue
+    const hb = await heartbeatOf($, p.inst.slug)
+    if (hb?.settingsHash && hb.settingsHash !== hashText(settingsText(settingsFor(p.inst, root as string, deny)))) rewritten.add(p.inst.slug)
+  }
   // Unattended: each instance's permission mode (a mode that asks waits for nobody) and, in a git repository, whether
   // a background session that edits would move into a worktree copy before its first edit. Marks, never a refusal
   const layers = await settingsLayers($)
@@ -5136,15 +5165,22 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     const i = p.inst
     const where = `${i.section ? i.section.title : 'no section'}${i.parent ? `, under ${i.parent}` : ''}`
     const runs = `${i.model ?? 'the default model'}${i.effort ? ` (${i.effort})` : ''}`
-    const w = wakeUsd(i.model, wakes.perDay)
-    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day` : ''}`
+    const size = sizes[i.slug]
+    const w = wakeUsd(i.model, wakes.perDay, size)
+    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day${size !== undefined ? ` (its context: ${tokensText(size)})` : ''}` : ''}`
     const now =
-      p.action === 'start' ? 'to start' : p.action === 'running' ? `running (${p.state}): placed, not started again` : p.action === 'wake' ? 'stopped: to wake' : 'down: skipped (/fleet up <name> brings it back)'
+      p.action === 'start'
+        ? 'to start'
+        : p.action === 'running'
+          ? `running (${p.state}): placed, not started again${rewritten.has(i.slug) ? `; ${c.dryRun ? 'its settings would be rewritten' : 'settings rewritten'}: u restarts it with them` : ''}`
+          : p.action === 'wake'
+            ? 'stopped: to wake'
+            : 'down: skipped (/fleet up <name> brings it back)'
     const m = modes.get(i)
     out.push(`  ${i.name} · ${i.role} (.claude/agents/${i.agent}.md) · ${where} · wave ${i.wave} · ${runs} · ${cost} · ${m ? `mode ${m.mode} · ` : ''}${now}`)
   }
   out.push(
-    `Cost, estimated at list price: the budgets add up to ${usd(f.caps)} a day${cap !== null ? ` (the project's cap: ${usd(cap)})` : ''}; wakes about ${usd(f.wakesUsd)} a day (each instance at most ${wakes.perDay} a day, one every ${wakes.everyMin} min, each reopening a ~40k-token context at the cache-write price)${f.unpriced.length ? `; not priced: ${f.unpriced.join(', ')}` : ''}. On a subscription it counts against your plan's limits instead.`,
+    `Cost, estimated at list price: the budgets add up to ${usd(f.caps)} a day${cap !== null ? ` (the project's cap: ${usd(cap)})` : ''}; wakes about ${usd(f.wakesUsd)} a day (each instance at most ${wakes.perDay} a day, one every ${wakes.everyMin} min, each reopening its context at the cache-write price: a running one's own size, ~40k tokens for one not started)${f.unpriced.length ? `; not priced: ${f.unpriced.join(', ')}` : ''}. On a subscription it counts against your plan's limits instead.`,
   )
   if (lint.errors.length) out.push('Errors (fix roster.json or the role files):', ...lint.errors.map(x => `  ✗ ${x}`))
   if (lint.warnings.length) out.push('Warnings:', ...lint.warnings.map(x => `  ! ${x}`))
@@ -5152,9 +5188,6 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (loose.length) out.push(`Changed outside fleet (not through a change you applied): ${loose.join(', ')}. /fleet accept <path> stamps your own edit as yours.`)
   if (c.dryRun) return [...out, 'Nothing was started (--dry-run).'].join('\n')
   if (lint.errors.length) return [...out, 'Nothing was started: fix the errors, then /fleet up again.'].join('\n')
-  // By the project's path and, when a link leads there, by its real one too
-  const level = await commandLevelNow($)
-  const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
   await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
   for (const p of plan) if (p.action !== 'down') await $.fs.write(settingsPath(p.inst.slug), settingsText(settingsFor(p.inst, root as string, deny)))
   if (c.names.length) await setDown($, plan.map(p => p.inst.slug), false)
@@ -5319,8 +5352,8 @@ async function rosterStatus($: any): Promise<string[]> {
   const list = await budgets($)
   const p = budgetCache.project
   const wakes = wakesOf(roster.r)
-  const f = forecastOf(all, wakes)
-  lines.push(`budget today: ${usdOf(p.usd, p.cap)}${p.cap !== null ? " (the project's cap)" : ' (no project cap)'}; wakes forecast ~${usd(f.wakesUsd)} a day; at most ${wakes.perDay} wakes a day each, one every ${wakes.everyMin} min`)
+  const f = forecastOf(all, wakes, await contextSizes($, all))
+  lines.push(`budget today: ${usdOf(p.usd, p.cap)}${p.cap !== null ? " (the project's cap)" : ' (no project cap)'}; wakes forecast ~${usd(f.wakesUsd)} a day (each running instance at its own context, ~40k tokens for the others); at most ${wakes.perDay} wakes a day each, one every ${wakes.everyMin} min`)
   const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
   const down = await downSet($)
   const now = await $.clock.now()
@@ -5342,6 +5375,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (hb.mode) parts.push(`mode ${hb.mode}${modeWaits(hb.mode) ? ' (it asks: a mode that doesn’t lets it work unattended)' : ''}`)
         if (hb.waitingOn?.kind === 'permission' && running.state === 'waiting') parts.push(`waiting on a permission prompt (${hb.waitingOn.tool}) since ${ago(now - hb.waitingOn.at)}: Enter in the panel answers it`)
         if (hb.remote) parts.push('Remote Control')
+        if (typeof hb.contextTokens === 'number' && hb.contextTokens > 0) parts.push(`context ${tokensText(hb.contextTokens)}`)
         const t = await readText($, settingsPath(inst.slug))
         if (hb.settingsHash !== null && t !== null && hb.settingsHash !== hashText(t)) parts.push('its settings changed since it started: u restarts it with them')
         if (hb.ref && (await exists($, `${instDir(inst.slug)}/seed-${hb.ref}.json`))) parts.push('seeded')
@@ -6442,7 +6476,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     spend: {
       project: roster ? { usd: budgetCache.project.usd, cap: budgetCache.project.cap } : null,
       instances: list.map(b => ({ name: b.inst.name, usd: b.usd, cap: b.cap, state: b.state })),
-      forecast: roster ? forecastOf(instances, wakesOf(roster.r)) : null,
+      forecast: roster ? forecastOf(instances, wakesOf(roster.r), await contextSizes($, instances)) : null,
       windows,
     },
     intake: events

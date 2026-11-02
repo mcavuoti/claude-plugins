@@ -118,6 +118,12 @@ test('/fleet up --dry-run: the plan, the cost and the lints, and nothing started
   expect(again).toContain('  Owner C: starting')
   expect(calls(w, 'wake')).toEqual([{ ref: 'aaaaaaa2', reason: 'fleet up' }])
   expect(calls(w, 'start').map(c => c.name)).toEqual(['Owner A', 'Owner B', 'Owner C'])
+  // A running one that started with other settings, and its own context in the forecast (8 wakes of 400k at haiku's
+  // cache-write price), in the plan and in /fleet status
+  w.files.set(`${FLEET}/instances/owner-a/state.json`, JSON.stringify({ format: 1, instance: 'Owner A', slug: 'owner-a', ref: 'aaaaaaa1', sessionId: 'aaaaaaa1-0000-0000-0000-000000000000', at: w.clock.now(), cwd: ROOT, bound: true, settingsHash: 'h0000000', agentType: 'owner', cost: 0, contextTokens: 400000 }))
+  const plan = await fleet($, 'up --dry-run')
+  expect(plan).toContain('$1.00/day, wakes ~$0.40/day (its context: 400k) · mode default · running (idle): placed, not started again; its settings would be rewritten: u restarts it with them')
+  expect(await fleet($, 'status')).toContain('context 400k')
 })
 
 test('/fleet up stops at a lint: a role file that hides fleet’s tools, a missing one, an unknown parent', WITH_SESSIONS, async ($, on) => {

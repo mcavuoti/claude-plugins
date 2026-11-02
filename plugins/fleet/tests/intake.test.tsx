@@ -121,6 +121,8 @@ test('the sweeper reads each item once with one model call, writes the record it
   expect(json(w, `${FLEET}/state/intake.json`).usd).toBeGreaterThan(0)
   const status = await fleet($, 'status')
   expect(status).toContain('intake: on, records in inputs/intake/ (haiku, at most 30 items a source an hour and $1.00 a day); today 4 record(s), 0 noise, 0 unreadable, 4 call(s)')
+  // What's left in the inbox once the sweep read it: nothing
+  expect(status).toContain('; inbox: 0 waiting')
   expect(status).toContain('  I-3 command-claim from me@example.invalid → Requirements (drafter Requirements)')
   const brief = await fleet($, 'brief')
   expect(brief).toContain('5. Inputs and ideas: 4 (4 from outside, intake ')

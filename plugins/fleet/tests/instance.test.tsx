@@ -198,7 +198,7 @@ test('a change refused: its file moved since (stale, told), its draft swapped (u
   expect(await fleet($, `2 apply ${h}`)).toContain('2: applied D-4: fleet wrote req/R-1.md with your edits to the draft')
   expect(w.files.get(`${ROOT}/req/R-1.md`)).toBe('R-1: the target is 6\n')
   expect(await fleet($, '1 edit')).toContain(`1: edit the draft in your editor: ${FLEET}/decisions/drafts/D-3.md`)
-  expect(await fleet($, '1 reject')).toBe('1: rejected D-3 (the change to req/R-1.md)')
+  expect(await fleet($, '1 reject')).toBe('1: rejected D-3 (the change to req/R-1.md). Owner A hears it.')
   await tick(w)
   const told = w.submits.join('\n\n')
   expect(told).toContain('[D-2] The person couldn\'t apply your change to req/R-1.md ("the target becomes 9"): req/R-1.md changed at')
