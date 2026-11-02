@@ -246,3 +246,17 @@ test('⚙n: what a running background session has going on in the background, as
   expect(JSON.stringify(await again.drawn())).not.toContain('⚙')
   await again.unmount()
 })
+
+test('with the f filter, a child whose parent waits for nobody is drawn as any row, not indented under nothing', async ($, on) => {
+  const sessionsList = list()
+  sessionsList[2].status = 'waiting'
+  const w = world(on, { list: sessionsList })
+  w.files.set(SECTIONS, DESK({ cccccccc: { section: 'probe:desk', by: 'probe', parent: 'bbbbbbbb' }, bbbbbbbb: { section: 'probe:desk', by: 'probe' } }))
+  await startSession($, w)
+  setFocused(w, true)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  expect((await ui.find({ key: 'row:cccccccc-0000-0000-0000-000000000000' }))?.text).toMatch(/^ {3}● charlie/)
+  await ui.press({ key: 'waiting' })
+  expect((await ui.find({ key: 'row:cccccccc-0000-0000-0000-000000000000' }))?.text).toMatch(/^ ● charlie/)
+  await ui.unmount()
+})

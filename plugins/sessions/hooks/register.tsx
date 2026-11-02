@@ -986,8 +986,9 @@ async function layout($: any, focused: boolean, reflow = false) {
   const frozen = focused && !reflow
   waitingSnapshot = waitingMembers(projectRows, waitingSnapshot, waitingOnly, frozen)
   const members = waitingSnapshot
-  const grouped = groupRows(projectRows, sectionsNow)
-  const shown = keepPlaces(foldRows(members ? grouped.filter(f => members.has(f.sessionId)) : grouped, collapsed, !!members), shownBefore, frozen)
+  // Filtered first: a child whose parent isn't shown is drawn as any row
+  const grouped = groupRows(members ? projectRows.filter(f => members.has(f.sessionId)) : projectRows, sectionsNow)
+  const shown = keepPlaces(foldRows(grouped, collapsed, !!members), shownBefore, frozen)
   await update($, rows, () => shown)
   const spends = projectRows.filter(f => f.usd !== null)
   const others = projectRows.filter(f => !f.current)
