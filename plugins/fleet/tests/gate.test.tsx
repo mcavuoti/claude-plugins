@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { hashText, hourFolder } from '../hooks/changes'
+import { clock, hashText, hourFolder } from '../hooks/changes'
 import { FLEET, REF, ROOT, SID, fleet, json, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // The shared files (the world) in one session, with the engine's file tools and shell standing in beneath fleet.
@@ -172,6 +172,23 @@ test('a change made outside fleet is found by the scan, recorded once and heard;
   await tick(w)
   expect(await fleet($, 'accept notes/todo.md')).toMatch(/notes\/todo\.md: its current version is from TEST B \(Edit\) at \d\d:\d\d: nothing to stamp/)
   expect(await fleet($, 'accept src/x.ts')).toContain("isn't a shared file of this project")
+})
+
+test('R5: an outside change that keeps an older time (rsync -a, cp -p) is recorded when found, and heard by a thread that read the file since', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n' } })
+  await begin($, w)
+  const readAt = w.clock.now()
+  await call($, { tool: 'Read', file_path: PLAN })
+  await tick(w, 60000)
+  w.touch(PLAN, 'synced from elsewhere\n', readAt - 30000)
+  await tick(w, 10000)
+  await tick(w, 10000)
+  const ev = mine(w)
+  expect(ev).toEqual([expect.objectContaining({ path: 'notes/plan.md', via: 'outside', changedAt: readAt - 30000 })])
+  expect(ev[0].at).toBeGreaterThan(readAt)
+  // The words say when the file changed; the digest carries it all the same
+  const step = await call($, { tool: 'Bash', command: 'ls' })
+  expect(step.context.join('\n')).toContain(`- notes/plan.md: changed at ${clock(readAt - 30000, -new Date(readAt).getTimezoneOffset())} outside fleet (an editor, a script, or a session without fleet)`)
 })
 
 test('a prompt that starts a turn carries the main thread’s digest, once; nothing when nothing it read changed', WITH_SESSIONS, async ($, on) => {

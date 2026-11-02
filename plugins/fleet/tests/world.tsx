@@ -120,8 +120,9 @@ export type World = {
   bash: { value: (command: string) => void }
   // Runs as the engine's Write or Edit starts, after fleet's gate (another session landing just then)
   beforeTool: { value: (tool: string) => void }
-  // Writes a file as another program would (an editor, a script, another session): bumps its time
-  touch: (path: string, text: string) => void
+  // Writes a file as another program would (an editor, a script, another session): bumps its time, or sets the one
+  // given (a copy that keeps its source's time: rsync -a, cp -p)
+  touch: (path: string, text: string, mtimeMs?: number) => void
   // Any other command fleet runs (git, a check script, the person's channel): its answer, or undefined for "unknown
   // command"; stdin: what fleet wrote to it
   exec: { value: (argv: string[], cwd: string, stdin?: string) => { exitCode: number; stdout?: string; stderr?: string } | undefined }
@@ -312,9 +313,9 @@ export function world(on: On, options: WorldOptions = {}): World {
   const beforeTool = { value: (_tool: string): void => {} }
   // A write's time: the clock's, a little later than the write before it (two writes in one test tick still differ)
   let bump = 0
-  const touch = (path: string, text: string) => {
+  const touch = (path: string, text: string, mtimeMs?: number) => {
     addFile(path, text)
-    mtimes.set(path, clock.now() + ++bump / 1000)
+    mtimes.set(path, mtimeMs ?? clock.now() + ++bump / 1000)
   }
   on('tool.call', { tool: 'Read' }, (_, e) => {
     const text = files.get(real(e.file_path) ?? e.file_path)

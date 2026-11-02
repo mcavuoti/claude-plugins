@@ -31,8 +31,12 @@ export type Who = { sessionId: string | null; agentId: string | null; ref: strin
 export type Via = 'tool' | 'bash' | 'outside' | 'accept' | 'answer' | 'intake'
 export type ChangeEvent = {
   format: number
-  /** When it changed (for an outside change, the file's modification time) */
+  /** When fleet recorded it: the landing, or for an outside change when a scan found it. What orders the events and
+   * what a thread's read is compared with */
   at: number
+  /** An outside change: the file's modification time, which may be older than the read it changes (rsync -a, cp -p,
+   * unzip, a sync client keep the source's). Only the words use it */
+  changedAt?: number
   /** Relative to the project folder, as placed (§ placement below) */
   path: string
   /** The versions before and after; null: the file wasn't there, or was removed */
@@ -290,7 +294,7 @@ const OUTSIDE = 'outside fleet (an editor, a script, or a session without fleet)
 /** "changed at 14:02 by TEST B (Edit)", "was removed at 14:05 outside fleet (…)"; a record's adds its new version,
  * ", now R-12@5", with the kind when it's not a revision */
 export function changeLine(e: ChangeEvent, me: Me): string {
-  const what = `${e.to === null ? 'was removed' : 'changed'} at ${clock(e.at, me.offsetMin)}`
+  const what = `${e.to === null ? 'was removed' : 'changed'} at ${clock(e.changedAt ?? e.at, me.offsetMin)}`
   const rev = e.id && e.rev && e.to !== null ? `, now ${e.id}@${e.rev}${e.kind && e.kind !== 'revision' ? ` (${e.kind})` : ''}` : ''
   return `${e.via === 'intake' ? `${what} by ${whoText(e, me)}` : e.via === 'outside' || !e.by ? `${what} ${OUTSIDE}` : `${what} by ${whoText(e, me)}`}${rev}`
 }

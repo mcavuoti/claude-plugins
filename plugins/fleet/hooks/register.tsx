@@ -2428,13 +2428,14 @@ async function scanWorld($: any) {
       continue
     }
     if (now - u.since < 4000) continue
-    const at = Math.floor(s?.mtimeMs ?? now)
     const claim = `${eventsDir('claims')}/${hashText(`${rel}\n${v ?? 'removed'}\n${Math.floor(s?.mtimeMs ?? k?.mtimeMs ?? 0)}`).slice(1)}`
     if ((await publish($, claim, json({ format: FORMAT, path: rel, at: now }))) === 'ok') {
       const id = records ? idOf(rel, records) : null
       if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
       const fields = await landRecord($, rel, f, 'outside', null)
-      await writeEvent($, { at: s ? at : now, path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'outside', blind: true, by: null, ...fields })
+      // Recorded now: a copy that kept an older time (rsync -a, cp -p) is still news to a thread that read the file
+      // since. Its own time only says when it changed
+      await writeEvent($, { ...(s ? { changedAt: Math.floor(s.mtimeMs) } : {}), path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'outside', blind: true, by: null, ...fields })
     }
     settle()
   }
