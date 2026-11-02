@@ -15,7 +15,7 @@
     {
       "name": "fleet",
       "source": "./plugins/fleet",
-      "description": "Per project: a roster of permanent background sessions started with /fleet up from a template, each seeded, budgeted, paced and placed in the panel; they ask you without stopping and you answer from any session with /fleet, at no token cost; nothing leaves to a third party without your approval of the exact draft; the charter, roster and requirements change only when you apply a drafted change or ask for it yourself in a clean session; a stale write of a shared file is refused once; records cited by version turn their citers suspect when revised; /fleet brief. Needs sessions",
+      "description": "Per project: a roster of permanent background sessions started with /fleet up from a template, each seeded, budgeted, paced and placed in the panel; they ask you without stopping and you answer from any session with /fleet, at no token cost; nothing leaves to a third party without your approval of the exact draft; the charter, roster and requirements change only when you apply a drafted change or ask for it yourself in a clean session; a stale write of a shared file is refused once; records cited by version turn their citers suspect when revised; mail and chat read once each as data and routed by tags; alerts by push, a mail to yourself or a script; derived documents kept current; scarce resources taken in turn; /fleet brief. Needs sessions",
       "category": "productivity",
       "tags": ["agents", "decisions", "background", "coordination"]
     }
