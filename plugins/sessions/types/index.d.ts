@@ -33,6 +33,10 @@ export type Row = {
   tint: string
   line: string
   needsPerson: boolean
+  // 1 for a child drawn indented under its parent (assignSection's parent), else 0
+  depth: number
+  // In a section the person folded (c): drawn as that section's one line, not as a row
+  folded: boolean
 }
 
 // One rate-limit window of the account, as a session's last response reported it (five_hour, seven_day, …)
@@ -121,8 +125,8 @@ export type SessionsStatus = {
 export type SessionsSectionSpec = { id: string; title: string; order?: number }
 /** owner: 'person' for the person's own (`me:<slug>`), else the plugin that defined it */
 export type SessionsSection = { id: string; title: string; order: number; owner: string }
-/** by: 'person', or the plugin that assigned it */
-export type SessionsMember = { section: string; by: string }
+/** by: 'person', or the plugin that assigned it; parent (0.12.0): the session it's drawn under, when its plugin gave one */
+export type SessionsMember = { section: string; by: string; parent?: SessionsRef }
 /** One of the theme's colors */
 export type SessionsTint = 'error' | 'warning' | 'suggestion' | 'success' | 'inactive'
 /** A plugin's mark on a row: a badge of up to 3 columns drawn after the name, its tint (it colors the line too), a
@@ -140,8 +144,9 @@ export type Sessions = {
   /** Creates or updates one of the caller's own sections (`<source>:<name>`) */
   defineSection: (input: { source: string; spec: SessionsSectionSpec }) => Promise<SessionsResult>
   /** Puts a session in one of the caller's own sections, or takes it out of one (null). Never over the person's choice,
-   * nor another plugin's */
-  assignSection: (input: { source: string; ref: SessionsRef; section: string | null }) => Promise<SessionsResult>
+   * nor another plugin's. parent (0.12.0): another session it's drawn under, indented, in the parent's section while
+   * the parent is in the list (one level); absent or null, none */
+  assignSection: (input: { source: string; ref: SessionsRef; section: string | null; parent?: SessionsRef | null }) => Promise<SessionsResult>
   // Methods added within api 1 after its first release (0.11.0) are optional: a copy older than the method lacks it.
   // contract().methods says whether this one has it
   /** 0.12.0. Starts a background session named `name` in the folder `cwd` (claude --bg -n, with `--agent` and

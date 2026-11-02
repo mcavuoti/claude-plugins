@@ -709,7 +709,7 @@ export function sectionsView(file: SectionsFile): SectionsView {
   }
   const members: Record<string, SessionsMember> = {}
   for (const [ref, m] of Object.entries(file.members)) {
-    if (typeof m?.section === 'string' && typeof m.by === 'string') members[ref] = { section: m.section, by: m.by }
+    if (typeof m?.section === 'string' && typeof m.by === 'string') members[ref] = { section: m.section, by: m.by, ...(isRef(m.parent) && m.parent !== ref ? { parent: m.parent } : {}) }
   }
   return { sections, members }
 }
@@ -722,10 +722,14 @@ export function upsertSection(file: SectionsFile, s: SessionsSection): SectionsF
   return { ...file, sections }
 }
 
+// A member's record is replaced but for the fields this version doesn't know, which are kept; its parent goes unless
+// the new record has one
 export function setMember(file: SectionsFile, ref: string, m: SessionsMember | null): SectionsFile {
   const members = { ...file.members }
-  if (m) members[ref] = { ...(members[ref] ?? {}), ...m }
-  else delete members[ref]
+  if (m) {
+    const { parent: _, ...kept } = members[ref] ?? {}
+    members[ref] = { ...kept, ...m }
+  } else delete members[ref]
   return { ...file, members }
 }
 
@@ -786,12 +790,15 @@ export function isRef(ref: unknown): ref is string {
   return typeof ref === 'string' && /^(sid:)?[A-Za-z0-9_-]{1,80}$/.test(ref)
 }
 
-// A plugin putting a session in one of its own sections (or taking it out: null). Never over the person's choice nor
-// another plugin's. The answer is the file to write, or why not (ok: true when there's nothing to change)
-export function assignChange(file: SectionsFile, source: unknown, ref: unknown, section: unknown): { file: SectionsFile } | { result: SessionsResult } {
+// A plugin putting a session in one of its own sections (or taking it out: null), under a parent session if it gives
+// one (drawn indented under it, in the parent's section, while the parent is in the list). Never over the person's
+// choice nor another plugin's. The answer is the file to write, or why not (ok: true when there's nothing to change)
+export function assignChange(file: SectionsFile, source: unknown, ref: unknown, section: unknown, parent?: unknown): { file: SectionsFile } | { result: SessionsResult } {
   const s = checkSource(source)
   if (!s.ok) return { result: s }
   if (!isRef(ref)) return { result: { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' } }
+  if (parent !== undefined && parent !== null && (!isRef(parent) || parent === ref)) return { result: { ok: false, reason: 'invalid', detail: "parent is another session's ref, or null" } }
+  if (parent && section === null) return { result: { ok: false, reason: 'invalid', detail: 'a session with a parent is in one of your sections' } }
   if (section !== null && typeof section !== 'string') return { result: { ok: false, reason: 'invalid', detail: 'section is a section id or null' } }
   if (section !== null && !section.startsWith(`${source}:`)) return { result: { ok: false, reason: 'refused', detail: `a plugin assigns only to its own sections ("${source}:<name>")` } }
   const view = sectionsView(file)
@@ -803,8 +810,9 @@ export function assignChange(file: SectionsFile, source: unknown, ref: unknown, 
   }
   if (m && m.by !== source) return { result: { ok: false, reason: 'refused', detail: `${m.by} put this session in its section` } }
   if (section === null) return m ? { file: setMember(file, ref, null) } : { result: { ok: true } }
-  if (m?.section === section) return { result: { ok: true } }
-  return { file: setMember(file, ref, { section, by: source as string }) }
+  const under = typeof parent === 'string' ? parent : undefined
+  if (m?.section === section && m.parent === under) return { result: { ok: true } }
+  return { file: setMember(file, ref, { section, by: source as string, ...(under ? { parent: under } : {}) }) }
 }
 
 // The person putting a session in a section of theirs, by title (/sessions section <title>): the section me:<slug> is
@@ -823,11 +831,27 @@ export function personAssign(file: SectionsFile, ref: string, title: string | nu
 }
 
 // The rows in display order: this project's sessions in no section first, then each section by order and then title;
-// inside each, the usual order (sortRows). Each row learns its section ('' for none) and that section's title
-export function groupRows<T extends { ref: string; color: Color; title: string }>(rows: readonly T[], view: SectionsView): (T & { section: string; sectionTitle: string })[] {
+// inside each, the usual order (sortRows). A session with a parent in the list goes right under it, in the parent's
+// section, indented (depth 1), among its siblings in the usual order. One level: a parent that has a parent in the list
+// itself makes no children (they're drawn as any other row). Each row learns its section ('' for none), that section's
+// title and its depth
+export function groupRows<T extends { ref: string; color: Color; title: string }>(rows: readonly T[], view: SectionsView): (T & { section: string; sectionTitle: string; depth: number })[] {
   const byId = new Map(view.sections.map(s => [s.id, s]))
+  const listed = new Set(rows.map(r => r.ref))
+  const parentOf = (ref: string): string => {
+    const p = view.members[ref]?.parent
+    if (!p || p === ref || !listed.has(p)) return ''
+    const grand = view.members[p]?.parent
+    return grand && grand !== p && listed.has(grand) ? '' : p
+  }
   const groups = new Map<string, T[]>()
+  const children = new Map<string, T[]>()
   for (const r of rows) {
+    const p = parentOf(r.ref)
+    if (p) {
+      children.set(p, [...(children.get(p) ?? []), r])
+      continue
+    }
     const m = view.members[r.ref]
     const id = m && byId.has(m.section) ? m.section : ''
     groups.set(id, [...(groups.get(id) ?? []), r])
@@ -839,7 +863,13 @@ export function groupRows<T extends { ref: string; color: Color; title: string }
       const y = byId.get(b) as SessionsSection
       return x.order - y.order || x.title.localeCompare(y.title) || a.localeCompare(b)
     })
-  return ['', ...ids].flatMap(id => sortRows(groups.get(id) ?? []).map(r => ({ ...r, section: id, sectionTitle: id ? (byId.get(id)?.title ?? '') : '' })))
+  const title = (id: string) => (id ? (byId.get(id)?.title ?? '') : '')
+  return ['', ...ids].flatMap(id =>
+    sortRows(groups.get(id) ?? []).flatMap(r => [
+      { ...r, section: id, sectionTitle: title(id), depth: 0 },
+      ...sortRows(children.get(r.ref) ?? []).map(c => ({ ...c, section: id, sectionTitle: title(id), depth: 1 })),
+    ]),
+  )
 }
 
 // The header to draw above each row: a section's title where a section starts, only when two or more groups have rows
@@ -908,10 +938,10 @@ export function mergeMarks(slots: readonly MarkSlot[], now: number): Record<stri
 }
 
 // While the pane has the keyboard nothing moves (Claude follows the focus by position): the rows that were shown keep
-// their places and their sections, and new ones go at the end. A status line under a row neither appears nor goes
+// their places, sections, indents and folds, and new ones go at the end. A status line under a row neither appears nor goes
 // (its text changes; one that expired keeps its last text). Otherwise (or on a reflow the person asked for), the
 // layout as computed
-export function keepPlaces<T extends { sessionId: string; section: string; sectionTitle: string; line?: string }>(layout: readonly T[], shown: readonly T[], frozen: boolean): T[] {
+export function keepPlaces<T extends { sessionId: string; section: string; sectionTitle: string; line?: string; depth?: number; folded?: boolean }>(layout: readonly T[], shown: readonly T[], frozen: boolean): T[] {
   if (!frozen) return [...layout]
   const before = shown.map(f => f.sessionId)
   const previous = new Map(shown.map(f => [f.sessionId, f]))
@@ -922,8 +952,51 @@ export function keepPlaces<T extends { sessionId: string; section: string; secti
   return layout
     .map(f => {
       const p = previous.get(f.sessionId)
-      if (!p) return f
-      return { ...f, section: p.section, sectionTitle: p.sectionTitle, ...(f.line === undefined ? {} : { line: p.line ? f.line || p.line : '' }) }
+      // A new row goes at the end, so it isn't drawn under its parent nor folded away
+      if (!p) return { ...f, ...(f.depth === undefined ? {} : { depth: 0 }), ...(f.folded === undefined ? {} : { folded: false }) }
+      return {
+        ...f,
+        section: p.section,
+        sectionTitle: p.sectionTitle,
+        ...(f.depth === undefined ? {} : { depth: p.depth ?? 0 }),
+        ...(f.folded === undefined ? {} : { folded: p.folded ?? false }),
+        ...(f.line === undefined ? {} : { line: p.line ? f.line || p.line : '' }),
+      }
     })
     .sort((a, b) => place(a) - place(b))
+}
+
+// Folded sections (c in the panel): the person's choice, kept for every session in the store (collapsed). A folded
+// section draws one line, a button that unfolds it, instead of its rows. Only sections that have a header fold (two or
+// more groups have rows), and nothing folds with the f filter on (what waits for you would hide)
+export function foldRows<T extends { section: string }>(rows: readonly T[], collapsed: ReadonlySet<string>, filterOn: boolean): (T & { folded: boolean })[] {
+  const many = new Set(rows.map(r => r.section)).size >= 2
+  return rows.map(r => ({ ...r, folded: !filterOn && many && r.section !== '' && collapsed.has(r.section) }))
+}
+
+// What the panel draws, top to bottom: a section's header above its first row, a folded section's one line (with how
+// many sessions it holds and how many of them wait for you) instead of its rows, and the rows
+export type PlanItem<T> = { kind: 'header'; section: string; title: string } | { kind: 'fold'; section: string; title: string; count: number; waiting: number } | { kind: 'row'; row: T }
+export function drawPlan<T extends { section: string; sectionTitle: string; color: Color; folded?: boolean; needsPerson?: boolean }>(rows: readonly T[]): PlanItem<T>[] {
+  const headers = sectionHeaders(rows)
+  const out: PlanItem<T>[] = []
+  const folds = new Set<string>()
+  rows.forEach((r, i) => {
+    if (r.folded) {
+      if (folds.has(r.section)) return
+      folds.add(r.section)
+      const all = rows.filter(x => x.folded && x.section === r.section)
+      out.push({ kind: 'fold', section: r.section, title: r.sectionTitle, count: all.length, waiting: all.filter(x => x.color === 'red' || x.needsPerson).length })
+      return
+    }
+    const h = headers[i]
+    if (h !== null && h !== undefined) out.push({ kind: 'header', section: r.section, title: h })
+    out.push({ kind: 'row', row: r })
+  })
+  return out
+}
+
+// What the arrows go through, in order: the rows (s:<sessionId>) and the folded sections' lines (h:<section>)
+export function ringKeys(rows: readonly { sessionId: string; section: string; sectionTitle: string; color: Color; folded?: boolean }[]): string[] {
+  return drawPlan(rows).flatMap(it => (it.kind === 'row' ? [`s:${it.row.sessionId}`] : it.kind === 'fold' ? [`h:${it.section}`] : []))
 }

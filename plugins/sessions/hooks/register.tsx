@@ -34,7 +34,9 @@ import {
   personAssign,
   pruneMembers,
   refOf,
-  sectionHeaders,
+  drawPlan,
+  foldRows,
+  ringKeys,
   sectionsFileText,
   sectionsView,
   setMember,
@@ -117,9 +119,11 @@ const DOT: Record<Color, string> = { red: '🔴', blue: '🔵', yellow: '🟡', 
 const SPEND_COLUMN = 7
 // Another plugin's badge after the name: a space and up to 3 columns
 const BADGE_COLUMN = 4
-// The columns the rows' marks take after the name, when any row has one: badges
+// A child session is drawn this many columns in, under its parent
+const INDENT = 2
+// The columns taken beside the names when any row needs them: children's indent and badges
 function markColumns(list: readonly Row[]): number {
-  return list.some(f => f.badge) ? BADGE_COLUMN : 0
+  return (list.some(f => f.depth > 0) ? INDENT : 0) + (list.some(f => f.badge) ? BADGE_COLUMN : 0)
 }
 // The colors for each state, from Claude's theme (they adapt to light, dark and colorblind modes)
 const TINT: Record<Color, string> = { red: 'error', blue: 'suggestion', yellow: 'warning', green: 'success', gray: 'inactive' }
@@ -280,7 +284,8 @@ function debugLine($: any, text: string) {
 // autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
 // session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
-// marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts).
+// marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts), collapsed (the
+// sections the person folded, by id).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
@@ -918,6 +923,8 @@ async function refresh($: any) {
       // What it spent so far, from what it published itself: only for a running session on an API account
       usd: color !== 'gray' && spend.mode === 'api' ? spend.usd : null,
       ...marked,
+      depth: 0,
+      folded: false,
     })
   }
   installedVersion = newest
@@ -935,8 +942,11 @@ async function refresh($: any) {
   sectionsNow = 'problem' in sections ? NO_SECTIONS : sectionsView(sections.file)
   sectionsProblem = 'problem' in sections ? sections.problem : ''
   const focused = !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
-  // The filter turned on or off in another session applies here too, once the panel doesn't have the keyboard
-  if (!focused) waitingOnly = (await storeGet($, 'waitingOnly')) === true
+  // The filter and the folds changed in another session apply here too, once the panel doesn't have the keyboard
+  if (!focused) {
+    waitingOnly = (await storeGet($, 'waitingOnly')) === true
+    collapsed = await readCollapsed($)
+  }
   await layout($, focused)
   await update($, notice, () => sectionsProblem)
   await paneState($)
@@ -944,19 +954,19 @@ async function refresh($: any) {
   await prune($)
 }
 
-// The rows as the panel shows them: grouped in sections (groupRows), and only the ones waiting for you with the f filter
-// on. Claude tracks the panel's focus by position, not by session: if rows move while you're in the panel, the
-// highlight would jump to another session. So with the keyboard in the panel nothing moves, sections, their members and
-// the filter's included (keepPlaces: new rows go at the end); on leaving, the layout is applied. reflow: the person
-// asked for a new layout right now (f). If a row left the list, the focus goes back to its session (or the one next to
-// it)
+// The rows as the panel shows them: grouped in sections, children under their parents (groupRows), only the ones
+// waiting for you with the f filter on, and the folded sections' rows hidden behind one line (foldRows). Claude tracks
+// the panel's focus by position, not by session: if rows move while you're in the panel, the highlight would jump to
+// another session. So with the keyboard in the panel nothing moves, sections, their members, parents, folds and the
+// filter's included (keepPlaces: new rows go at the end); on leaving, the layout is applied. reflow: the person asked
+// for a new layout right now (f, c). If a row left the list, the focus goes back to its session (or the one next to it)
 async function layout($: any, focused: boolean, reflow = false) {
   const shownBefore = await read($, rows)
   const frozen = focused && !reflow
   waitingSnapshot = waitingMembers(projectRows, waitingSnapshot, waitingOnly, frozen)
   const members = waitingSnapshot
   const grouped = groupRows(projectRows, sectionsNow)
-  const shown = keepPlaces(members ? grouped.filter(f => members.has(f.sessionId)) : grouped, shownBefore, frozen)
+  const shown = keepPlaces(foldRows(members ? grouped.filter(f => members.has(f.sessionId)) : grouped, collapsed, !!members), shownBefore, frozen)
   await update($, rows, () => shown)
   const spends = projectRows.filter(f => f.usd !== null)
   const others = projectRows.filter(f => !f.current)
@@ -968,8 +978,8 @@ async function layout($: any, focused: boolean, reflow = false) {
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
   if (JSON.stringify(next) !== JSON.stringify(await read($, summary))) await update($, summary, () => next)
-  const before = shownBefore.map(f => f.sessionId)
-  const after = shown.map(f => f.sessionId)
+  const before = shownBefore.filter(f => !f.folded).map(f => f.sessionId)
+  const after = shown.filter(f => !f.folded).map(f => f.sessionId)
   if (focused && currentFocus?.startsWith('s:') && before.some(id => !after.includes(id))) {
     const id = currentFocus.slice(2)
     bg(focusSession($, after.includes(id) ? id : remainingNeighbor(before, id, after)))
@@ -1033,7 +1043,7 @@ async function adjustWidth($: any) {
 async function focusPanel($: any) {
   // A panel you closed stays closed: you land on the prompt, and the line above it says how to open it
   if (await closedByYou($)) return
-  const list = await read($, rows)
+  const list = (await read($, rows)).filter(f => !f.folded)
   const i = list.findIndex(f => f.current)
   const find = (from: number, step: number) => {
     for (let k = from; k >= 0 && k < list.length; k += step) if (!list[k]?.current) return list[k]
@@ -1082,7 +1092,7 @@ async function focusElement($: any, key: string) {
       if (personMoves !== moves) return
       if (!r?.deny) {
         currentFocus = key
-        if (key.startsWith('s:')) selectedRow = key
+        if (key.startsWith('s:') || key.startsWith('h:')) selectedRow = key
         return
       }
     }
@@ -1238,7 +1248,7 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
 // After an action from the panel, the keyboard goes back to the panel, on the same row (or the one next to it if it
 // left the list)
 async function focusRow($: any, sessionId: string, fallback: string | undefined) {
-  const ids = (await read($, rows)).map(f => f.sessionId)
+  const ids = (await read($, rows)).filter(f => !f.folded).map(f => f.sessionId)
   await takeKeyboard($, ids.includes(sessionId) ? sessionId : fallback && ids.includes(fallback) ? fallback : ids[0])
 }
 
@@ -1592,6 +1602,53 @@ async function toggleWaiting($: any) {
   const list = await read($, rows)
   const keep = list.find(f => `s:${f.sessionId}` === selectedRow) ?? list.find(f => !f.current) ?? list[0]
   if (keep) bg(focusSession($, keep.sessionId))
+}
+
+// Folded sections (foldRows): the person's choice, remembered for every session in the store (collapsed)
+let collapsed = new Set<string>()
+async function readCollapsed($: any): Promise<Set<string>> {
+  const stored = await storeGet($, 'collapsed')
+  return new Set(Array.isArray(stored) ? stored.filter((x: unknown): x is string => typeof x === 'string') : [])
+}
+
+async function setFolded($: any, section: string, folded: boolean) {
+  if (folded) collapsed.add(section)
+  else collapsed.delete(section)
+  await storeSet($, 'collapsed', [...collapsed])
+  await layout($, true, true)
+}
+
+// The c key: folds the selected session's section into one line (a button: Enter unfolds it), or unfolds the folded
+// section selected. It's laid out again right away, the person asked for it, and the focus goes to that line or to the
+// section's first session. Other sessions' panels take it when they don't have the keyboard
+async function toggleFold($: any) {
+  const key = selectedRow
+  if (key?.startsWith('h:')) {
+    await unfold($, key.slice(2))
+    return
+  }
+  const list = await read($, rows)
+  const f = list.find(x => `s:${x.sessionId}` === key)
+  if (!f) {
+    $.ui.toast('Select a session with ↑↓ first')
+    return
+  }
+  if (waitingOnly) {
+    $.ui.toast('Nothing folds while f shows only the sessions waiting for you')
+    return
+  }
+  if (!drawPlan(list).some(it => it.kind === 'header' && it.section === f.section)) {
+    $.ui.toast(`“${f.title}” isn't in a section with a title: only those fold`)
+    return
+  }
+  await setFolded($, f.section, true)
+  bg(focusElement($, `h:${f.section}`))
+}
+
+async function unfold($: any, section: string) {
+  await setFolded($, section, false)
+  const first = (await read($, rows)).find(f => f.section === section && !f.folded)
+  if (first) bg(focusSession($, first.sessionId))
 }
 
 // With Enter in the field, the session is renamed with its own /rename, the official one: it changes the name in every
@@ -2062,7 +2119,7 @@ function sessionsApi($: any): Sessions {
         CALL_LOCK_TRIES,
       )
     },
-    assignSection: async input => changeSections($, file => assignChange(file, input?.source, input?.ref, input?.section), CALL_LOCK_TRIES),
+    assignSection: async input => changeSections($, file => assignChange(file, input?.source, input?.ref, input?.section, input?.parent), CALL_LOCK_TRIES),
     start: async input => {
       const v = checkStart(input)
       if (!v.ok) return v
@@ -2187,6 +2244,7 @@ async function start($: any) {
     // A New or Rename field left open before a reload or a restart would come back stuck in the pane: start closed
     await closeFields($)
     waitingOnly = (await storeGet($, 'waitingOnly')) === true
+    collapsed = await readCollapsed($)
     const view = await storeGet($, 'usageView')
     if (view && ['day', 'week', 'month'].includes(view.period) && ['all', 'project'].includes(view.scope)) {
       await update($, usageView, () => ({ period: view.period, scope: view.scope }))
@@ -2406,8 +2464,8 @@ export const register: Register = (on, options) => {
     return r
   })
 
-  // The arrows (and Tab) only go through the sessions: they skip the [stop] buttons and don't leave the list towards the
-  // buttons below or the panel's markers; those are reached with their key (n, a, s) or with the mouse
+  // The arrows (and Tab) only go through the sessions and the folded sections' lines: they don't leave the list towards
+  // the buttons above and below or the panel's markers; those are reached with their key (n, a, s) or with the mouse
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
     if (e.origin.kind !== 'person') {
       const r = await next(e)
@@ -2424,31 +2482,23 @@ export const register: Register = (on, options) => {
     // With the New or Rename field open, Tab and the arrows stay in it (Enter or Esc get you out)
     const field = (await read($, askingName)) ? 'name' : (await read($, renaming)) ? 'rename-input' : null
     if (field) return e.element === field ? next(e) : next({ ...e, element: field })
-    const list = await read($, rows)
-    const sessions = list.map(f => `s:${f.sessionId}`)
-    if (sessions.length === 0) return next(e)
+    // The sessions and the folded sections' lines, in the order they're drawn
+    const ring = ringKeys(await read($, rows))
+    if (ring.length === 0) return next(e)
     let target = e.element
-    if (!target?.startsWith('s:')) {
-      const k = currentFocus ? sessions.indexOf(currentFocus) : -1
-      if (k < 0) {
-        // You just entered the panel (or came from a button below): the first arrow goes to the first session
-        target = sessions[0]
-      } else if (target?.startsWith('x:')) {
-        // The selected session's [stop] comes after it (going down); the one above's, before it (going up)
-        const down = target.slice(2) === (currentFocus as string).slice(2)
-        target = sessions[Math.max(0, Math.min(sessions.length - 1, k + (down ? 1 : -1)))]
-      } else {
-        // The buttons below, the name field or a panel marker (also when Claude wraps around): don't leave the list.
-        // Put the focus back on the selected session instead of doing nothing: if it ended up somewhere else (a field
-        // that closed and shifted the positions), the arrows bring it back instead of getting stuck
-        return next({ ...e, element: currentFocus as string })
-      }
+    if (!target || !ring.includes(target)) {
+      // You just entered the panel (or came from a button below): the first arrow goes to the first session
+      if (!currentFocus || !ring.includes(currentFocus)) target = ring[0]
+      // The buttons above and below, the name field or a panel marker (also when Claude wraps around): don't leave the
+      // list. Put the focus back on the selected session instead of doing nothing: if it ended up somewhere else (a
+      // field that closed and shifted the positions), the arrows bring it back instead of getting stuck
+      else return next({ ...e, element: currentFocus })
     }
     if (target === currentFocus) return {}
     const r = target === e.element ? await next(e) : await next({ ...e, element: target })
     if (!r.deny && target) {
       currentFocus = target
-      if (target.startsWith('s:')) selectedRow = target
+      selectedRow = target
     }
     return r
   })
@@ -2535,10 +2585,13 @@ export const register: Register = (on, options) => {
     const about = await read($, summary)
     // On an API account each row says what its session cost so far, and a line the project's total (list price)
     const spends = about.spent !== null
-    // A section's title above its first row, when two or more groups have rows: plain Text, which the focus ring skips.
-    // The f filter's line ("Waiting for you · 3 of 17") goes above the rows, as Text too
-    const headers = sectionHeaders(list)
-    const lines = list.length + list.filter(f => f.line).length + headers.filter(h => h !== null).length + (about.waitingOnly ? 1 : 0)
+    // What's drawn, top to bottom (drawPlan): a section's title above its first row, when two or more groups have rows
+    // (plain Text, which the focus ring skips), a folded section's one line (a button that unfolds it) instead of its
+    // rows, and the rows, each with its status line under it. The f filter's line ("Waiting for you · 3 of 17") goes
+    // above them, as Text too
+    const plan = drawPlan(list)
+    const shownRows = list.filter(f => !f.folded)
+    const lines = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0)
     const overflows = lines + 6 + (note !== '' ? 1 : 0) > height
     // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
@@ -2562,11 +2615,16 @@ export const register: Register = (on, options) => {
     const infoWidth = (showModel ? 20 : 10) + spendWidth
     const nameWidth = Math.max(8, total - 4 - infoWidth - marksWidth)
     const badgeWidth = list.some(f => f.badge) ? BADGE_COLUMN : 0
+    const indentWidth = list.some(f => f.depth > 0) ? INDENT : 0
     const padRight = (t: string, w: number) => t + ' '.repeat(Math.max(0, w - displayWidth(t)))
     const padLeft = (t: string, w: number) => ' '.repeat(Math.max(0, w - displayWidth(t))) + t
     const info = (f: Row) =>
       `${showModel ? `  ${padRight(f.model, 9)}` : ''} ${padLeft(f.context, 4)} ${padLeft(f.time, 4)}${spends ? ` ${padLeft(f.usd === null ? '' : formatUsd(f.usd), SPEND_COLUMN - 1)}` : ''}`
-    const name = (f: Row) => padRight(truncate(f.title, nameWidth), nameWidth)
+    // A child's name starts INDENT columns in; the others take those columns
+    const name = (f: Row) => {
+      const width = nameWidth + (f.depth > 0 ? 0 : indentWidth)
+      return padRight(truncate(f.title, width), width)
+    }
     // ↑: runs an older Claude version than the installed one; !: its panel isn't running there, or runs another version
     // (u restarts it). Both take the first space after the name
     const mark = (f: Row) =>
@@ -2576,12 +2634,56 @@ export const register: Register = (on, options) => {
     const statusLine = (f: Row) =>
       f.line ? (
         <Text key={`l:${f.sessionId}`} color={f.tint || undefined} dimColor={f.tint ? undefined : true}>
-          {truncate(`   ${f.line}`, total)}
+          {truncate(`${' '.repeat(3 + (f.depth > 0 ? INDENT : 0))}${f.line}`, total)}
         </Text>
       ) : null
-    // On entering the panel (ctrl+x tab) the focus goes to a session: the last selected one, or the first
-    const jumpable = list.filter(f => !f.current)
-    const initial = (list.find(f => `s:${f.sessionId}` === selectedRow) ?? jumpable[0] ?? list[0])?.sessionId
+    // On entering the panel (ctrl+x tab) the focus goes to a session, or a folded section's line: the last selected one,
+    // or the first session
+    const fields = asking || !!renamingRow
+    const foldSelected = plan.some(it => it.kind === 'fold' && `h:${it.section}` === selectedRow)
+    const jumpable = shownRows.filter(f => !f.current)
+    const initial = foldSelected ? undefined : (shownRows.find(f => `s:${f.sessionId}` === selectedRow) ?? jumpable[0] ?? shownRows[0])?.sessionId
+    // A row: [▌ or space][indent][●][ ][name][↑ or !][◆][badge][model ctx time][spend]. The session you're in: the theme's
+    // soft background and a bar in Claude's color. It's selected with the arrows like the others (for u and r, even if
+    // it's the only one in the list); Enter there doesn't jump anywhere
+    const row = (f: Row) => [
+      <Box key={`row:${f.sessionId}`} flexDirection="row" backgroundColor={f.current ? 'userMessageBackground' : undefined}>
+        {f.current ? <Text color="claude">▌</Text> : <Text> </Text>}
+        {f.depth > 0 && <Text>{' '.repeat(INDENT)}</Text>}
+        <Text color={TINT[f.color]}>●</Text>
+        <Text> </Text>
+        {inTerminal ? (
+          <Button
+            key={`s:${f.sessionId}`}
+            plain
+            autoFocus={f.sessionId === initial && !fields ? true : undefined}
+            label={name(f)}
+            onPress={() => (f.current ? $.ui.toast("You're in this session") : bg(jump($, f)))}
+          />
+        ) : (
+          <Text bold={f.current ? true : undefined}>{name(f)}</Text>
+        )}
+        {/* ◆: pinned, the background service doesn't close it for being idle */}
+        {mark(f)}
+        <Text>{f.pinned ? '◆' : ' '}</Text>
+        {badge(f)}
+        <Text dimColor>{f.current ? padRight(info(f), total - 4 - nameWidth - marksWidth).slice(1) : info(f).slice(1)}</Text>
+      </Box>,
+      statusLine(f),
+    ]
+    // A folded section: one line with its title, how many sessions it holds and how many wait for you. In the terminal
+    // it's a button (Enter, or c, unfolds it)
+    const fold = (it: { section: string; title: string; count: number; waiting: number }) => {
+      const label = truncate(`▸ ${it.title} · ${it.count}${it.waiting ? ` · ${it.waiting} waiting for you` : ''}`, total - 1)
+      return inTerminal ? (
+        <Box key={`fold:${it.section}`} flexDirection="row">
+          <Text> </Text>
+          <Button key={`h:${it.section}`} plain dimColor autoFocus={foldSelected && selectedRow === `h:${it.section}` && !fields ? true : undefined} label={label} onPress={() => { bg(unfold($, it.section)) }} />
+        </Box>
+      ) : (
+        <Text key={`h:${it.section}`} dimColor>{` ${label}`}</Text>
+      )
+    }
     return (
       <Box flexDirection="column" height={showUsage && bodyRows ? bodyRows : undefined}>
         {/* A single line of actions at the top: the letters are buttons (key or click), followed by the keyboard help */}
@@ -2599,6 +2701,9 @@ export const register: Register = (on, options) => {
             <Text dimColor> · </Text>
             {/* f: only the sessions waiting for you (drawn bright while it's on) */}
             <Button key="waiting" plain dimColor={about.waitingOnly ? undefined : true} hotkey="f" label="Waiting" onPress={() => { bg(toggleWaiting($)) }} />
+            <Text dimColor> · </Text>
+            {/* c: fold the selected session's section into one line, or unfold the one selected */}
+            <Button key="fold" plain dimColor hotkey="c" label="Collapse" onPress={() => { bg(toggleFold($)) }} />
             <Text dimColor>{` · ${help}`}</Text>
           </Box>
         )}
@@ -2606,63 +2711,9 @@ export const register: Register = (on, options) => {
         {note !== '' && <Text color="warning">{note}</Text>}
         {about.waitingOnly && <Text dimColor>{truncate(`Waiting for you · ${list.length} of ${about.sessions}${inTerminal ? ' · f: all' : ''}`, total)}</Text>}
         {list.length === 0 && <Text dimColor>{about.waitingOnly ? 'Nobody is waiting for you.' : 'No other sessions in this folder.'}</Text>}
-        {list.flatMap((f, i) => {
-          const header = headers[i]
-          const title = header ? [<Text key={`h:${f.section}`} dimColor>{` ${truncate(header, total - 1)}`}</Text>] : []
-          // The session you're in: the theme's soft background and a bar in Claude's color. It's selected with the
-          // arrows like the others (for u and r, even if it's the only one in the list); Enter there doesn't jump anywhere
-          if (f.current) {
-            return [
-              ...title,
-              <Box key={`row:${f.sessionId}`} flexDirection="row" backgroundColor="userMessageBackground">
-                <Text color="claude">▌</Text>
-                <Text color={TINT[f.color]}>●</Text>
-                <Text> </Text>
-                {inTerminal ? (
-                  <Button
-                    key={`s:${f.sessionId}`}
-                    plain
-                    autoFocus={f.sessionId === initial && !asking && !renamingRow ? true : undefined}
-                    label={name(f)}
-                    onPress={() => $.ui.toast("You're in this session")}
-                  />
-                ) : (
-                  <Text bold>{name(f)}</Text>
-                )}
-                {mark(f)}
-                <Text>{f.pinned ? '◆' : ' '}</Text>
-                {badge(f)}
-                <Text dimColor>{padRight(info(f), total - 4 - nameWidth - marksWidth).slice(1)}</Text>
-              </Box>,
-              statusLine(f),
-            ]
-          }
-          return [
-            ...title,
-            <Box key={`row:${f.sessionId}`} flexDirection="row">
-              <Text> </Text>
-              <Text color={TINT[f.color]}>●</Text>
-              <Text> </Text>
-              {inTerminal ? (
-                <Button
-                  key={`s:${f.sessionId}`}
-                  plain
-                  autoFocus={f.sessionId === initial && !asking && !renamingRow ? true : undefined}
-                  label={name(f)}
-                  onPress={() => { bg(jump($, f)) }}
-                />
-              ) : (
-                <Text>{name(f)}</Text>
-              )}
-              {/* ◆: pinned, the background service doesn't close it for being idle */}
-              {mark(f)}
-              <Text>{f.pinned ? '◆' : ' '}</Text>
-              {badge(f)}
-              <Text dimColor>{info(f).slice(1)}</Text>
-            </Box>,
-            statusLine(f),
-          ]
-        })}
+        {plan.flatMap(it =>
+          it.kind === 'header' ? [<Text key={`t:${it.section}`} dimColor>{` ${truncate(it.title, total - 1)}`}</Text>] : it.kind === 'fold' ? [fold(it)] : row(it.row),
+        )}
         {/* The New and Rename fields go below the rows: above them, opening or closing shifted the rows by one, and since
             Claude tracks the focus by position, what you typed landed on another row or the focus ended up on d: Day */}
         {inTerminal && Input && asking && (

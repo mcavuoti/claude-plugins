@@ -161,3 +161,69 @@ test('spend on an API account: each row its cost so far, and the project total, 
   expect(JSON.stringify(await band.drawn())).not.toContain('7d')
   await band.unmount()
 })
+
+const DESK = (members: Record<string, unknown>) => JSON.stringify({ sectionsFormat: 1, sections: [{ id: 'probe:desk', title: 'Desk', order: 10, owner: 'probe' }], members })
+
+// The person moves the panel's focus (the arrows) onto an element
+async function focusOn($: any, key: string) {
+  await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: key, origin: { kind: 'person' } } as any)
+}
+
+test('children: indented under their parent, in its section; moved there only when the panel leaves the keyboard', async ($, on) => {
+  const w = world(on, { list: list() })
+  w.files.set(SECTIONS, DESK({ cccccccc: { section: 'probe:desk', by: 'probe' } }))
+  await startSession($, w)
+  const words = ['alpha', 'bravo', 'charlie', 'Desk']
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'bravo', 'Desk', 'charlie'])
+  setFocused(w, true)
+  w.files.set(SECTIONS, DESK({ cccccccc: { section: 'probe:desk', by: 'probe' }, aaaaaaaa: { section: 'probe:desk', by: 'probe', parent: 'cccccccc' } }))
+  await w.clock.advance(3000)
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'bravo', 'Desk', 'charlie'])
+  setFocused(w, false)
+  await w.clock.advance(3000)
+  expect(await drawnOrder($, words)).toEqual(['bravo', 'Desk', 'charlie', 'alpha'])
+  const ui = await $.ui.mount(PANEL)
+  expect((await ui.find({ key: `row:${SID}` }))?.text).toMatch(/^▌  ● alpha/)
+  expect((await ui.find({ key: 'row:cccccccc-0000-0000-0000-000000000000' }))?.text).toMatch(/^ ● charlie  /)
+  await ui.unmount()
+})
+
+test('c folds the selected session\'s section into one line, Enter on it unfolds it, and the focus follows', async ($, on) => {
+  const sessionsList = list()
+  sessionsList[2].status = 'waiting'
+  const w = world(on, { list: sessionsList })
+  w.files.set(SECTIONS, DESK({ bbbbbbbb: { section: 'probe:desk', by: 'probe' }, cccccccc: { section: 'probe:desk', by: 'probe' } }))
+  await startSession($, w)
+  setFocused(w, true)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  const text = async () => JSON.stringify(await ui.drawn())
+  // Not in a section with a title: nothing folds
+  await focusOn($, `s:${SID}`)
+  await ui.press({ key: 'fold' })
+  expect(w.toasts.at(-1)).toContain("isn't in a section with a title")
+  await focusOn($, 's:bbbbbbbb-0000-0000-0000-000000000000')
+  await ui.press({ key: 'fold' })
+  expect(await text()).toContain('▸ Desk · 2 · 1 waiting for you')
+  expect(await text()).not.toContain('charlie')
+  expect(w.store.get('collapsed')).toEqual(['probe:desk'])
+  // The keyboard goes to the folded section's line; its Enter unfolds it, and the focus goes to its first session
+  await w.clock.advance(200)
+  expect(w.opens.length).toBeGreaterThan(0)
+  await ui.press({ key: 'h:probe:desk' })
+  expect(await text()).toContain('charlie')
+  expect(w.store.get('collapsed')).toEqual([])
+  await ui.unmount()
+})
+
+test('folds made in another session apply here once the panel doesn\'t have the keyboard', async ($, on) => {
+  const w = world(on, { list: list() })
+  w.files.set(SECTIONS, DESK({ cccccccc: { section: 'probe:desk', by: 'probe' } }))
+  await startSession($, w)
+  setFocused(w, true)
+  w.store.set('collapsed', ['probe:desk'])
+  await w.clock.advance(3000)
+  expect(await drawnOrder($, ['charlie', '▸ Desk'])).toEqual(['charlie'])
+  setFocused(w, false)
+  await w.clock.advance(3000)
+  expect(await drawnOrder($, ['charlie', '▸ Desk'])).toEqual(['▸ Desk'])
+})

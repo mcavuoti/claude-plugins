@@ -6,7 +6,7 @@ Tested on macOS (Terminal.app) with Claude Code 2.1.289 to 2.1.316. On Linux it 
 
 ```
 s: Stop · u: Restart · r: Rename · n: New · a: Agents · f: Waiting
- · ↑↓ Select · Enter Switch · ← Back
+ · c: Collapse · ↑↓ Select · Enter Switch · ← Back
 
  ● Data pipeline       ↑◆ Opus 5.5   43%   1m
  Renders
@@ -77,7 +77,9 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
   - gray: stopped.
 - **Sections**: `/sessions section <title>` in a session puts it in a section of yours (made the first time; `Renders` and `renders` are the same one), `/sessions section -` takes it out (a section of yours with nobody left in it goes), `/sessions section` says which one it's in and `/sessions sections` lists them all. Other plugins can make sections of their own (`<plugin>:<name>`) and put sessions in them, but never move one you placed. The panel shows the sessions in no section first, then each section under its title (dim, and the arrows skip it), only when two or more groups have rows: a project that uses no sections looks as it always did. Sections are kept in `~/.claude/mods/sessions-data/sections.json` and apply to the session in every project; a session that's gone from the list leaves its section.
 - **Marks from other plugins**: a short badge after a session's name (`?2`) and a status line under it ("doing X / blocked on Y"), which another plugin sets and refreshes; they go by themselves within 10 minutes once it stops. `/sessions status` says whose they are.
-- **Nothing moves while you're in the panel**: new sessions go at the end, and sorting, a session's new section and the filter below apply when you leave it (Claude follows the focus by position, so a row moving under it would put the highlight on another session).
+- **Under their parent**: another plugin can put a session under another one (a helper under the session it works for): it's drawn right under it, two columns in, in the parent's section, while the parent is in the list.
+- **Folding a section** (`c`): `c` on a session folds its section into one line, `▸ Renders · 4 · 1 waiting for you`; Enter (or `c`) on that line unfolds it. Only sections with a title fold, and nothing folds while `f` shows only who's waiting. Which sections are folded is remembered for every session.
+- **Nothing moves while you're in the panel**: new sessions go at the end, and sorting, a session's new section or parent, folds made in another session and the filter below apply when you leave it (Claude follows the focus by position, so a row moving under it would put the highlight on another session).
 - **Waiting for you** (`f`): only the sessions waiting for you (red, or marked by another plugin as needing you), with a line above them, `Waiting for you · 3 of 17`; `f` again shows them all. It's remembered for every session, so you can hop through them with Enter. Who's in the list is taken when you turn it on and whenever you're not in the panel: one you answered stays, in its new color, until you leave; `f` twice takes it again without leaving.
 - **Spend**, read from each session (never assumed): on a subscription, the line above the prompt shows each of the account's windows that it reports, once (`7d 43%`; the 5-hour one too when there's one); on an API account (no windows), each row shows what its session has cost so far, as `/cost` says, and a line under the legend the project's total, `$4.80 est. spent here so far (list price)`. A session that hasn't answered yet shows neither.
 - **The session you're in** is highlighted with a bar on the left. You can select it with the arrows like the others (even when it's the only one), to restart or rename it; Enter there does nothing, and `s` won't stop it (that would leave you without a window).
@@ -110,6 +112,7 @@ With the panel focused (`shift+→` after the setup, `ctrl+x Tab`, or `/sessions
 | `n` | New: ask for a name (or Enter for an automatic one) and create a session |
 | `a` | Agents: Claude's agent view |
 | `f` | only the sessions waiting for you, or all of them again |
+| `c` | fold the selected session's section into one line, or unfold the folded section selected (Enter on it does too) |
 | `d` `w` `m` | tokens for today, 7 days, 30 days |
 | `p` | tokens for all of Claude or just this project |
 | ← or Esc | back to the prompt |

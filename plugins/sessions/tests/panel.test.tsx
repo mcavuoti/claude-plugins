@@ -53,6 +53,10 @@ import {
   refOf,
   agentFromTranscript,
   groupRows,
+  foldRows,
+  drawPlan,
+  ringKeys,
+  assignChange,
   sectionHeaders,
   keepPlaces,
   parseSectionsFile,
@@ -715,4 +719,65 @@ test('the f filter: a snapshot of who waits for you, taken at the toggle and whe
   expect([...(kept ?? [])]).toEqual(['aaaaaaaa-0000', 'cccccccc-0000'])
   // Without the keyboard: taken again
   expect([...(waitingMembers(later, kept, true, false) ?? [])]).toEqual(['bbbbbbbb-0000', 'cccccccc-0000'])
+})
+
+test('children: under their parent, in its section, one level; a parent not in the list leaves them as any row', () => {
+  const view: SectionsView = {
+    sections: [
+      { id: 'probe:work', title: 'Work', order: 10, owner: 'probe' },
+      { id: 'probe:test', title: 'Test', order: 20, owner: 'probe' },
+    ],
+    members: {
+      aaaaaaaa: { section: 'probe:work', by: 'probe' },
+      // In another section than its parent: drawn under the parent, in the parent's section
+      bbbbbbbb: { section: 'probe:test', by: 'probe', parent: 'aaaaaaaa' },
+      cccccccc: { section: 'probe:work', by: 'probe', parent: 'aaaaaaaa' },
+      // A child of a child: one level only, so drawn as any row of its section
+      dddddddd: { section: 'probe:work', by: 'probe', parent: 'cccccccc' },
+      // Its parent isn't in the list: in its own section
+      eeeeeeee: { section: 'probe:test', by: 'probe', parent: 'zzzzzzzz' },
+    },
+  }
+  const rows = [row('aaaaaaaa', 'green', 'lead'), row('bbbbbbbb', 'green', 'tester'), row('cccccccc', 'red', 'sme'), row('dddddddd', 'green', 'deep'), row('eeeeeeee', 'green', 'orphan'), row('ffffffff', 'green', 'loose')]
+  const g = groupRows(rows, view)
+  expect(g.map(r => `${r.section}/${'  '.repeat(r.depth)}${r.title}`)).toEqual(['/loose', 'probe:work/deep', 'probe:work/lead', 'probe:work/  sme', 'probe:work/  tester', 'probe:test/orphan'])
+  // Two sessions that name each other: neither is a child
+  const loop = groupRows([row('aaaaaaaa', 'green', 'a'), row('bbbbbbbb', 'green', 'b')], { sections: view.sections, members: { aaaaaaaa: { section: 'probe:work', by: 'probe', parent: 'bbbbbbbb' }, bbbbbbbb: { section: 'probe:work', by: 'probe', parent: 'aaaaaaaa' } } })
+  expect(loop.map(r => r.depth)).toEqual([0, 0])
+})
+
+test('children and folds stay put while focused: a row keeps its indent and fold, a new one goes at the end as any row', () => {
+  const view: SectionsView = { sections: [{ id: 'probe:work', title: 'Work', order: 10, owner: 'probe' }], members: { bbbbbbbb: { section: 'probe:work', by: 'probe', parent: 'aaaaaaaa' } } }
+  const before = groupRows([row('aaaaaaaa', 'green', 'lead'), row('bbbbbbbb', 'green', 'sme')], { sections: [], members: {} }).map(r => ({ ...r, folded: false }))
+  const now = foldRows(groupRows([row('aaaaaaaa', 'green', 'lead'), row('bbbbbbbb', 'green', 'sme'), row('cccccccc', 'green', 'new')], { ...view, members: { ...view.members, cccccccc: { section: 'probe:work', by: 'probe', parent: 'aaaaaaaa' } } }), new Set(['probe:work']), false)
+  const frozen = keepPlaces(now, before, true)
+  expect(frozen.map(r => [r.title, r.depth, r.folded])).toEqual([['lead', 0, false], ['sme', 0, false], ['new', 0, false]])
+  expect(keepPlaces(now, before, false).map(r => [r.title, r.depth])).toEqual([['lead', 0], ['new', 1], ['sme', 1]])
+})
+
+test('folds: a folded section draws one line with its count and who waits, the arrows go through it, and f unfolds everything', () => {
+  const rows = groupRows([row('aaaaaaaa', 'green', 'one'), row('bbbbbbbb', 'red', 'two'), row('cccccccc', 'green', 'three'), row('eeeeeeee', 'green', 'five')], VIEW)
+  const folded = foldRows(rows, new Set(['me:renders']), false)
+  const plan = drawPlan(folded)
+  expect(plan.map(it => (it.kind === 'row' ? it.row.title : it.kind === 'fold' ? `fold ${it.title} ${it.count} ${it.waiting}` : `header ${it.title}`))).toEqual(['one', 'header Desk', 'three', 'fold Renders 2 1'])
+  expect(ringKeys(folded)).toEqual(['s:aaaaaaaa-0000', 's:cccccccc-0000', 'h:me:renders'])
+  // With the f filter on nothing folds; nor does a section with no header (the only group)
+  expect(foldRows(rows, new Set(['me:renders']), true).some(r => r.folded)).toBe(false)
+  expect(foldRows(rows.filter(r => r.section === 'me:renders'), new Set(['me:renders']), false).some(r => r.folded)).toBe(false)
+})
+
+test('assignSection with a parent: kept with the member, cleared without one, refused for itself; the person moving it drops it', () => {
+  const file = { sectionsFormat: 1, sections: [{ id: 'probe:work', title: 'Work', order: 10, owner: 'probe' }], members: {} }
+  const a = assignChange(file, 'probe', 'bbbbbbbb', 'probe:work', 'aaaaaaaa')
+  if (!('file' in a)) throw new Error('should assign')
+  expect(sectionsView(a.file).members.bbbbbbbb).toEqual({ section: 'probe:work', by: 'probe', parent: 'aaaaaaaa' })
+  expect(assignChange(a.file, 'probe', 'bbbbbbbb', 'probe:work', 'aaaaaaaa')).toEqual({ result: { ok: true } })
+  const b = assignChange(a.file, 'probe', 'bbbbbbbb', 'probe:work')
+  if (!('file' in b)) throw new Error('should assign')
+  expect(sectionsView(b.file).members.bbbbbbbb).toEqual({ section: 'probe:work', by: 'probe' })
+  expect((assignChange(file, 'probe', 'bbbbbbbb', 'probe:work', 'bbbbbbbb') as any).result.reason).toBe('invalid')
+  expect((assignChange(file, 'probe', 'bbbbbbbb', null, 'aaaaaaaa') as any).result.reason).toBe('invalid')
+  const p = personAssign(a.file, 'bbbbbbbb', 'Mine')
+  if (!('file' in p)) throw new Error('should assign')
+  expect(sectionsView(p.file).members.bbbbbbbb).toEqual({ section: 'me:mine', by: 'person' })
 })

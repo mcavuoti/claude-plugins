@@ -112,6 +112,11 @@ test('sections: defined and assigned before the start, from a session whose fold
     members: { bbbbbbbb: { section: 'probe:desk', by: 'probe' } },
   })
   expect(JSON.parse(w.files.get(SECTIONS) ?? '{}').sectionsFormat).toBe(1)
+  // Under a parent session: kept with the member, and dropped by an assignment without one
+  expect(await call($, 'assignSection', { source: 'probe', ref: 'bbbbbbbb', section: 'probe:desk', parent: 'aaaaaaaa' })).toEqual({ ok: true })
+  expect((await call($, 'sections')).members).toEqual({ bbbbbbbb: { section: 'probe:desk', by: 'probe', parent: 'aaaaaaaa' } })
+  expect(await call($, 'assignSection', { source: 'probe', ref: 'bbbbbbbb', section: 'probe:desk', parent: null })).toEqual({ ok: true })
+  expect((await call($, 'sections')).members).toEqual({ bbbbbbbb: { section: 'probe:desk', by: 'probe' } })
   // Defining it again changes the title and order in place; null takes the session out
   expect(await call($, 'defineSection', { source: 'probe', spec: { id: 'probe:desk', title: 'Desk', order: 5 } })).toEqual({ ok: true })
   expect((await call($, 'sections')).sections).toEqual([{ id: 'probe:desk', title: 'Desk', order: 5, owner: 'probe' }])
