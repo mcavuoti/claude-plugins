@@ -39,6 +39,7 @@ import {
   nextTasteNumber,
   norm,
   parseVerdicts,
+  reaskOf,
   precedentsOf,
   promoteCheck,
   proposalLine,
@@ -212,6 +213,36 @@ test('the verdicts: one per question asked; an option by letter or label; what i
     ['hold', "the judge's answer couldn't be read"],
   ])
   expect(parseVerdicts('{"answers": [{"q": 2, "outcome": "hold", "why": "taste"}]}', qs, [1, 2]).map(v => v.why)).toEqual(['the judge said nothing on it', 'taste'])
+})
+
+test('a send-back: malformed is the model’s word; "the statute answers it" needs statute lines that speak to an option', () => {
+  const statute = statuteOf([
+    { label: 'principles.md', text: '# Principles\n\nPrefer SQLite for anything local.\n' },
+    { label: 'CLAUDE.md', text: '# Project\n\nPrefer SQLite for anything local.\n' },
+  ]).lines
+  const back = (why: string, cites: string[] = [], because?: 'malformed' | 'statute') => ({ q: 1, outcome: 'send-back' as const, cites, why, ...(because ? { because } : {}) })
+  expect(parseVerdicts('{"answers": [{"q": 1, "outcome": "send-back", "because": "statute", "cites": ["principles.md:3"], "why": "the principles settle it"}]}', [DB], [1])).toEqual([back('the principles settle it', ['principles.md:3'], 'statute')])
+  expect(checkVerdict(back('the options overlap', [], 'malformed'), DB, new Map(), statute)).toEqual(back('the options overlap', [], 'malformed'))
+  expect(checkVerdict(back('the statute already answers it'), DB, new Map(), statute).unchecked?.problem).toBe('it says the statute answers it, and cites no line')
+  expect(checkVerdict(back('settled', ['principles.md line 3'], 'statute'), DB, new Map(), statute, true)).toEqual(back('settled', ['principles.md:3'], 'statute'))
+  expect(checkVerdict(back('settled', ['CLAUDE.md:3'], 'statute'), DB, new Map(), statute).unchecked).toBe(undefined)
+  expect(checkVerdict(back('settled', ['CLAUDE.md:3'], 'statute'), DB, new Map(), statute, true).unchecked?.problem).toBe('CLAUDE.md:3 is in CLAUDE.md, which sessions write too: a live send-back cites only charter.md or principles.md')
+  expect(checkVerdict(back('settled', ['principles.md:3'], 'statute'), COLOR, new Map(), statute).unchecked?.problem).toBe('principles.md:3 speaks to none of its options')
+  expect(checkVerdict(back('as before', ['D-1']), DB, new Map(), statute).unchecked?.problem).toBe('D-1 is a past answer: what the record settles is decided, not sent back')
+  // Shown, with why code didn't take it; still a send-back, never a hold
+  const f: JudgeFile = { format: 1, id: 'D-6', at: AT, area: 'storage', verdicts: [checkVerdict(back('the statute already answers it'), DB, new Map(), statute)] }
+  expect(proposalLine(f, DB, 1)).toBe("judge: send back: the statute already answers it (which code didn't take: it says the statute answers it, and cites no line)")
+})
+
+test('a re-ask: what the judge sent back to the same asker within a day is the person’s', () => {
+  const asker = { ref: 'aaaaaaaa', sessionId: 'aaaaaaaa-0' }
+  const sent = { id: 'D-6', source: 'decide', at: AT, closedAt: AT, asker, questions: [{ question: 'Which cache, the fast one or the quick one?' }], judge: { sentBack: true as const } }
+  const again = { asker, questions: [{ question: 'Which cache: the fast one or the quick one?' }] }
+  expect(reaskOf(again, [sent], AT + 3600000)).toBe('it asks again what the judge sent back as D-6: yours to answer')
+  expect(reaskOf({ ...again, asker: { ref: 'bbbbbbbb', sessionId: 'b' } }, [sent], AT + 3600000)).toBe(null)
+  expect(reaskOf(again, [sent], AT + 25 * 3600000)).toBe(null)
+  expect(reaskOf(again, [{ ...sent, judge: {} }], AT + 3600000)).toBe(null)
+  expect(reaskOf({ asker, questions: [{ question: 'Which color for the warning band?' }] }, [sent], AT + 3600000)).toBe(null)
 })
 
 test('citations, checked by code: shown to the judge, a precedent with that very option, a statute line that speaks to it', () => {

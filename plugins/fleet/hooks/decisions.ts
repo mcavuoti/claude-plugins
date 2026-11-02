@@ -99,17 +99,20 @@ export type QueueRecord = {
 }
 /** origin: how the person typed it (composer: a terminal); session: the session it was typed in. pre: a change applied
  * as it was filed, because the person typed the turn that filed it (quoted: the start of what he typed); hash: the
- * version of an outbound the person approved; allowed: the hosts and remotes his send --allow added to outbound.json */
-export type AnswerFile = { format: number; id: string; q: number; label?: string; text?: string; origin: string; session: string; at: number; pre?: true; quoted?: string; hash?: string; allowed?: string[]; judge?: JudgeCite }
+ * version of an outbound the person approved; allowed: the hosts and remotes his send --allow added to outbound.json;
+ * replacedJudge: the judge's answer his /fleet overrule replaced before its asker had it */
+export type AnswerFile = { format: number; id: string; q: number; label?: string; text?: string; origin: string; session: string; at: number; pre?: true; quoted?: string; hash?: string; allowed?: string[]; judge?: JudgeCite; replacedJudge?: ReplacedJudge }
 export type NoteFile = { format: number; id: string; q: number; text: string; origin: string; at: number }
 /** A drop by the judge (origin judge, 0.7.0) sends the decision back to its asker, with why */
 export type DropFile = { format: number; id: string; why?: string; origin: string; session: string; at: number; sentBack?: true }
 /** What a judge's own answer rests on (origin judge): the precedents or statute lines it cites; repeat: an exact repeat */
 export type JudgeCite = { cites: string[]; repeat?: true }
+/** A judge's answer the person's own replaced while it was on its way to its asker (an overrule before delivery) */
+export type ReplacedJudge = { label?: string; text?: string; cites: string[]; repeat?: true; at: number }
 /** One question's outcome in the register: the option picked or the text typed, and any note (allowed: an outbound's
  * hosts and remotes the person allowed as he sent it; labels: the options he picked in a dialog's multi-select, text
  * then only what matched none) */
-export type Outcome = { label?: string; labels?: string[]; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true; allowed?: string[]; judge?: JudgeCite }
+export type Outcome = { label?: string; labels?: string[]; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true; allowed?: string[]; judge?: JudgeCite; replacedJudge?: ReplacedJudge }
 export type RegisterState = 'delivered' | 'dropped' | 'abandoned' | 'answered' | 'not answered'
 export type RegisterRecord = {
   registerFormat: number

@@ -541,7 +541,7 @@ In a live area, a choice that passes every gate above, and whose asker gave its 
   ```
 
   A question it holds waits for you, and the decision is delivered once you answer it, the judge's lines labelled;
-- **send back** (once the model's verdicts earned it): the question goes back to its asker with why, and you're never asked (`[D-6] The judge sent this question back without asking the person: …  Fix it … and ask again with mcp__fleet__decide`);
+- **send back** (once the model's verdicts earned it): the question goes back to its asker with why, and you're never asked (`[D-6] The judge sent this question back without asking the person: …  Fix it … and ask again with mcp__fleet__decide`). A send-back that says the statute answers the question is checked as a live answer is: it acts only when it cites lines of `charter.md` or `principles.md` that speak to one of its options; otherwise it's shown under the question and waits for you. A question its asker asks again within a day after the judge sent it back is yours, never sent back twice (`judge: held by a gate (it asks again what the judge sent back as D-6: yours to answer)`);
 - **hold**: it waits for you, as in shadow.
 
 `/fleet` lists what the judge answered under "Answered, not delivered yet" (`answered by the judge`) until it's delivered, and the brief's "what changed" says what it answered and sent back.
@@ -552,9 +552,10 @@ In a live area, a choice that passes every gate above, and whose asker gave its 
 
 - the correction goes into the register beside the decision (`D-5.overrule.json`): from then on the judges read your answer there, as a correction of the judge, and an exact repeat of that question takes yours, never the judge's;
 - the asker hears it once, as a prompt of `fleet`'s own: `[D-5] The person overruled the judge on D-5: 1) Which database for the cache? → b) Redis, not a) SQLite. Why: "…" Undo what you built on the judge's answer, and go on with theirs.`;
+- **before its asker has it** (`/fleet` lists it under "Answered, not delivered yet", answered by the judge), your overrule replaces the judge's answer: each one is claimed (moved aside, so nothing delivers it meanwhile) and your answer takes its place, keeping what the judge had said; the asker gets yours, as yours, and hears no overrule. In the register and the stats it's an overrule like any other. Only if the judge's answer was on its way that very moment does its asker hear it as an overrule;
 - it counts against the area. A live answer counts once you've reviewed it: one you overruled counts as not agreed; one you saw listed (in `/fleet brief` or `/fleet stats <area>`) and let stand for an hour counts as agreed; one you never saw counts neither way. **An area goes back to shadow by itself** (forced or not) when you overrule 2 of the last 10 live answers you reviewed, and the brief and `/fleet judges` say so.
 
-**A reviewer** (optional): `world.json`'s `judges.reviewer` names an instance or a role (the chief, in the `software` and `proposal` templates). It hears each overrule once, at its next step or as a nudge, and may propose one short, general line for `principles.md` as a change, which you apply or not. It never answers a question for you.
+**A reviewer** (optional): `world.json`'s `judges.reviewer` names an instance or a role (the chief, in the `software` and `proposal` templates). It hears each overrule once, at its next step or as a nudge, or woken when retired (one wake for the overrules waiting, within the wakes' caps); `/fleet status` counts the overrules that waited a day or more for it (a reviewer down or renamed). It may propose one short, general line for `principles.md` as a change, which you apply or not. It never answers a question for you.
 
 ### Taste: the "no"s you say
 
@@ -721,7 +722,7 @@ What it writes, all in the project (`fleet` keeps no store and nothing in your h
 | `charter.md`, `interview.md`, `seeds/<role>.md` | the project's charter (command-level), the chief's interview, each role's first prompt | the template's |
 | `principles.md` | your principles, the judges' statute with the charter (command-level) | yours |
 | `<project>/.claude/fleet/decisions/queue/D-<n>.json` | an open decision (a choice; a `change` with its path, summary and versions; a `resource`; an `outbound` with where, why, its files' versions and the version you approve; with what outside content its asker had read), written once by the session that asked | `format` |
-| `<project>/.claude/fleet/decisions/answers/D-<n>.<q>.json`, `….note.json`, `D-<n>.drop.json` | answers (no-clobber: the first wins), notes, drops | `format` |
+| `<project>/.claude/fleet/decisions/answers/D-<n>.<q>.json`, `….note.json`, `D-<n>.drop.json` | answers (no-clobber: the first wins; a judge's, until its asker has it, replaced by your overrule: claimed by `mv`), notes, drops | `format` |
 | `<project>/.claude/fleet/decisions/drafts/D-<n>.<ext>`, `D-<n>.diff`, `D-<n>.json`, `<project>/.claude/fleet/decisions/applied/D-<n>.json` | a change's draft and its diff, an outbound's exact call, written once; the claim when you apply or send it (no-clobber: once) | `format` (the claim) |
 | `<project>/.claude/fleet/decisions/register/<YYYY-MM>/<id>.json` | closed decisions (an outbound's call with them, a choice's proposal and whether you agreed), recorded dialogs, and your taste (`T-<n>`) | `registerFormat` (person data) |
 | `<project>/.claude/fleet/decisions/register/<YYYY-MM>/D-<n>.overrule.json` | your correction of a judge's answer: per question, your answer and the judge's; written once | `registerFormat` (person data) |

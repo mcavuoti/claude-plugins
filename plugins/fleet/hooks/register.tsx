@@ -156,6 +156,7 @@ import {
   markSeen,
   modelCheck,
   nothingOnRecord,
+  reaskOf,
   reviewedBy,
   newJudgesState,
   overruleText,
@@ -748,7 +749,7 @@ async function outcomesOf($: any, r: QueueRecord, present: ReadonlySet<string>) 
       if (p && 'value' in p) {
         const a = p.value
         // A choice has a label or a text; a change's answer may have both (applied, and how; stale, and why)
-        o = { ...(a.label !== undefined ? { label: a.label } : { text: a.text ?? '' }), ...(a.label !== undefined && a.text !== undefined ? { text: a.text } : {}), origin: a.origin, session: a.session, at: a.at, ...(a.pre ? { pre: true as const } : {}), ...(a.allowed?.length ? { allowed: a.allowed } : {}), ...(a.judge ? { judge: a.judge } : {}) }
+        o = { ...(a.label !== undefined ? { label: a.label } : { text: a.text ?? '' }), ...(a.label !== undefined && a.text !== undefined ? { text: a.text } : {}), origin: a.origin, session: a.session, at: a.at, ...(a.pre ? { pre: true as const } : {}), ...(a.allowed?.length ? { allowed: a.allowed } : {}), ...(a.judge ? { judge: a.judge } : {}), ...(a.replacedJudge ? { replacedJudge: a.replacedJudge } : {}) }
       } else skew = true
     }
     if (o && present.has(noteName(r.id, q))) {
@@ -840,7 +841,7 @@ async function askerNow($: any): Promise<Asker> {
 
 // Closes a decision: its register record first (written once), then its queue and answer files. A crash between the
 // steps leaves the register, and whoever finds the leftovers removes them
-type CloseHow = { state: 'delivered' | 'abandoned'; turnId?: string; why?: string; how?: 'submit' | 'result' }
+type CloseHow = { state: 'delivered' | 'abandoned'; turnId?: string; why?: string; how?: 'submit' | 'result'; sentAt?: number }
 
 async function close($: any, id: string, how: CloseHow) {
   // One close at a time per decision in this module (the turn's start and the submit's answer come together)
@@ -860,6 +861,15 @@ async function closeNow($: any, id: string, how: CloseHow) {
     const { outcomes, drop } = await outcomesOf($, rec, present)
     const now = await $.clock.now()
     const delivered = how.state === 'delivered'
+    // The person's answer replaced the judge's after this session had read it to deliver (/fleet overrule, just then):
+    // its model got the judge's, so it hears the overrule as any other
+    const sentAt = how.sentAt ?? (await read($, inflight))[id]?.at
+    const late = delivered && sentAt !== undefined && rec.asker.ref === jobRef ? outcomes.map(o => (o?.replacedJudge && (o.at ?? 0) >= sentAt ? o : null)) : []
+    if (late.some(Boolean)) {
+      const notice: OverruleNotice = { format: FORMAT, id, at: now, asker: rec.asker, questions: rec.questions.map(q => ({ question: q.question, options: q.options })), judged: late.map(o => o?.replacedJudge?.label ?? o?.replacedJudge?.text ?? null), answers: late.map(o => (o ? { ...(o.label !== undefined ? { label: o.label } : { text: o.text ?? '' }), origin: o.origin, session: o.session, at: o.at } : null)), ...(rec.area ? { area: rec.area } : {}) }
+      await publish($, dec(`overrules/${id}.json`), json(notice))
+      log($, `${id}: the person's overrule came as the judge's answer was on its way: told as an overrule`)
+    }
     const why = drop?.why || how.why
     // What the judge proposed, and whether the person agreed: the case law and the stats read it there
     const jf = rec.kind === undefined ? await readJudge($, id) : null
@@ -1056,7 +1066,7 @@ async function turnStarted($: any, text: string, turnId: string) {
   const closing = ids.filter(id => mine[id] !== undefined || pending[id])
   if (!closing.length) return
   await update($, inflight, m => omit(m, closing))
-  for (const id of closing) await close($, id, { state: 'delivered', turnId })
+  for (const id of closing) await close($, id, { state: 'delivered', turnId, ...(pending[id] ? { sentAt: pending[id].at } : {}) })
 }
 
 /** What the person typed that these decisions carry to their asker: his text answers (origin composer), his notes and
@@ -3753,7 +3763,7 @@ const carried = { done: false, startedAt: 0, lastLanding: 0 }
 type BudgetRow = { inst: Instance; usd: number; cap: number | null; own: BudgetState; state: BudgetState }
 type ProjectBudget = { usd: number; cap: number | null; state: BudgetState }
 /** The sweeper's wakes today; cadenceFor: the period (its anchor) an instance was last woken for, past its cadence */
-type WakesFile = { format: number; day: string; instances: Record<string, WakeCount & { cadenceFor?: number; derivedFor?: string; slotFor?: string }> }
+type WakesFile = { format: number; day: string; instances: Record<string, WakeCount & { cadenceFor?: number; derivedFor?: string; slotFor?: string; reviewFor?: string }> }
 /** The config files' versions as fleet wrote them or the person stamped them; outbound: outbound.json's own text as
  * stamped, which is what the gate uses (an edit made another way waits for /fleet accept) */
 type Stamps = { format: number; files: Record<string, string | null>; outbound?: string | null }
@@ -5058,6 +5068,9 @@ async function rosterTick($: any) {
   const derived = flagged.suspects?.derived ?? []
   const granted: Lease[] = []
   for (const spec of await loadSlots($)) for (const x of await leasesOf($, spec.name)) if (x.lease.granted && x.lease.until > now) granted.push(x.lease)
+  // The person's overrules of a judge its reviewer hasn't heard yet (the newest names them, for the wakes' count)
+  const reviews = judgesCfg.reviewer ? (await names($, dec('overrules'))).filter(n => /^D-\d+\.review\.json$/.test(n)).sort((a, b) => idNumber(a.split('.')[0] as string) - idNumber(b.split('.')[0] as string)) : []
+  const reviewer = judgesCfg.reviewer?.toLowerCase() ?? ''
   const named = new Set<string>()
   for (const inst of roster.instances) {
     const { running, stopped: retired } = rowsOf(inst, st.rows)
@@ -5106,7 +5119,9 @@ async function rosterTick($: any) {
     const slot = granted.find(l => l.holder.ref === retired.ref && leaseKey(l) !== had?.slotFor)
     const stale = derived.find(d => ownsKind(d, inst) && quietEnough(d, now) && d.key !== had?.derivedFor)
     const pointed = [...intakeEvents.values()].some(e => e.intake?.to.includes(inst.name) && e.at > Number((hb as Record<string, unknown>).intakeSeen ?? 0))
-    if (!answered && !quiet && !slot && !stale && !pointed && !(worldOn() && baselined && (await isBehind($, hb.sessionId)))) continue
+    // The reviewer of the judges, with overrules to review it hasn't been woken for (within the wakes' caps)
+    const review = reviews.length && (inst.name.toLowerCase() === reviewer || inst.role.toLowerCase() === reviewer) && reviews[reviews.length - 1] !== had?.reviewFor ? (reviews[reviews.length - 1] as string) : null
+    if (!answered && !quiet && !slot && !stale && !pointed && !review && !(worldOn() && baselined && (await isBehind($, hb.sessionId)))) continue
     const nudges = await readWire<WakeCount>($, `${instDir(inst.slug)}/nudges.json`)
     const others = nudges && nudges.day === day ? nudges.count : 0
     if (wakeVerdict(had ?? null, others, now, day, wakes, answered || !!slot) !== 'ok' || !(await has($, 'wake'))) continue
@@ -5120,7 +5135,9 @@ async function rosterTick($: any) {
             ? `fleet: ${stale.path}, which it owns, is stale`
             : pointed
               ? 'fleet: an item from outside reached it'
-              : 'fleet: shared files it read changed'
+              : review
+                ? 'fleet: an overrule of the judge to review'
+                : 'fleet: shared files it read changed'
     const r = await race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: retired.ref, reason }))
     if (r?.ok) {
       swept.instances[inst.slug] = {
@@ -5128,6 +5145,7 @@ async function rosterTick($: any) {
         ...(quiet && cad ? { cadenceFor: cad.anchor } : had?.cadenceFor !== undefined ? { cadenceFor: had.cadenceFor } : {}),
         ...(stale ? { derivedFor: stale.key } : had?.derivedFor !== undefined ? { derivedFor: had.derivedFor } : {}),
         ...(slot ? { slotFor: leaseKey(slot) } : had?.slotFor !== undefined ? { slotFor: had.slotFor } : {}),
+        ...(review ? { reviewFor: review } : had?.reviewFor !== undefined ? { reviewFor: had.reviewFor } : {}),
       }
       woke = true
       log($, `woke ${inst.name} (${reason})`)
@@ -5794,6 +5812,13 @@ async function judgeDecision($: any, rec: QueueRecord) {
       return
     }
     const reg = await registerAll($)
+    // An asker that asks again what the judge sent back to it: the person's, never round again
+    const again = reaskOf(rec, reg.records, now)
+    if (again) {
+      await publish($, judgeFile(rec.id), json({ ...base, gated: again, verdicts: [] } satisfies JudgeFile))
+      log($, `${rec.id}: no judge looks at it (${again})`)
+      return
+    }
     // The person's corrections of a judge are case law too, ahead of what they correct
     const ps = precedentsOf(reg.records, reg.overrules)
     const verdicts: Verdict[] = []
@@ -5899,10 +5924,13 @@ async function liveAction($: any, rec: QueueRecord, file: JudgeFile, now: number
   }
   const model = modelCheck(statsOf(await judgedEntries($)).get(rec.area), judgesCfg)
   const back = file.verdicts.find(v => v.outcome === 'send-back')
-  if (back && model.ok) return { sendBack: back.why, answer: [] }
+  // A send-back acts only when it checks as a live answer would (one saying the statute answers it cites charter.md or
+  // principles.md lines that speak to an option); one that doesn't is shown, never acted on
+  const backCheck = back ? (back.unchecked ?? recheck(back).unchecked) : undefined
+  if (back && model.ok && !backCheck) return { sendBack: back.why, answer: [] }
   const answer: Verdict[] = []
-  const left: string[] = []
-  let waiting = !!back
+  const left: string[] = back && backCheck ? [`the send-back of ${back.q}) ${backCheck.problem}`] : []
+  let waiting = !!back && !backCheck
   for (const v of file.verdicts) {
     if (v.outcome !== 'decided' || v.option === undefined || v.unchecked) continue
     if (v.repeat) answer.push(v)
@@ -6098,10 +6126,13 @@ async function overruleCommand($: any, c: Extract<Command, { kind: 'overrule' }>
     if (open && !('otherFormat' in open)) {
       const present = await answerNames($)
       const p = progress(c.id, slots(open), present)
+      // The judge's answers, on their way: his replace them, and its asker gets his first
+      if (open.kind === undefined && !p.dropped && p.answered.some(Boolean)) return overruleOpen($, c, open, origin)
       return p.complete ? `${c.id} is on its way to its asker: overrule it once it's delivered (/fleet shows it under "Answered, not delivered yet" until then).` : `${c.id} is still open: answer it with /fleet.`
     }
     return `${c.id} isn't in the register: /fleet stats <area> lists what the judges answered.`
   }
+  if (rec.answers.some(a => a?.replacedJudge)) return `${c.id} was overruled already: the judges read that correction`
   const j = rec.judge
   const judged = (j?.answered ?? []).length > 0 || !!j?.sentBack
   if (!j || !judged) return `${c.id} wasn't answered by a judge: there's nothing to overrule (what you answered stands).`
@@ -6156,6 +6187,84 @@ async function overruleCommand($: any, c: Extract<Command, { kind: 'overrule' }>
   if (area) {
     const st = await judgesStateNow($)
     const d = demoteCheck(liveActs(await judgedEntries($), area))
+    if (st.live[area] && d.demote) {
+      delete st.live[area]
+      st.back[area] = { at: now, why: `${d.words} when you overruled ${c.id}` }
+      await writeJudgesState($, st)
+      log($, `judges: ${area} back to shadow (${st.back[area]?.why})`)
+      lines.push(`Area ${area}: ${d.words}: back to shadow (the judges only propose there now; /fleet judges live ${area} turns it on again).`)
+    } else lines.push(`Area ${area}: ${d.words}${st.live[area] ? `, still live (${WINDOW_OVERRULES} of the last ${WINDOW} bring it back to shadow)` : ''}.`)
+  }
+  bg(beat($))
+  return lines.join('\n')
+}
+
+/** /fleet overrule of a decision whose judge's answers haven't reached its asker yet: each one claimed (moved aside, so
+ * nothing delivers it meanwhile) and replaced by his, which keeps what the judge had said; the correction goes into the
+ * register (case law, and counted against the area) and to the reviewer, never to the asker, who gets his answers first */
+async function overruleOpen($: any, c: Extract<Command, { kind: 'overrule' }>, rec: QueueRecord, origin: string): Promise<string> {
+  const questions = rec.questions
+  const now = await $.clock.now()
+  const here = await sessionName($)
+  const answers: (Outcome | null)[] = questions.map(() => null)
+  const judged: (string | null)[] = questions.map(() => null)
+  const claims: { q: number; path: string; judge: AnswerFile }[] = []
+  for (const a of c.answers) {
+    const q = questions[a.q - 1]
+    if (!q) return `${c.id} has no question ${a.q} (it has ${questions.length})`
+    const path = dec(`answers/${answerName(c.id, a.q)}`)
+    const before = await readWire<AnswerFile>($, path)
+    if (!before) return `${a.q}: "${q.question}" of ${c.id} waits for you: answer it with /fleet`
+    if (before.origin !== 'judge') return `question ${a.q} of ${c.id} was answered by you, not the judge: nothing to overrule there`
+    let o: Outcome
+    if (a.letter !== undefined) {
+      const opt = q.options['abcd'.indexOf(a.letter)]
+      if (!opt) return `${a.q}: "${q.question}" has no option ${a.letter}`
+      if (before.label === opt.label) return `${a.q}: the judge answered ${optionWords(q, opt.label)} already: nothing to overrule`
+      o = { label: opt.label }
+    } else o = { text: a.text ?? '' }
+    answers[a.q - 1] = { ...o, origin, session: here, at: now }
+    judged[a.q - 1] = before.label ?? before.text ?? null
+    claims.push({ q: a.q, path, judge: before })
+  }
+  // Claimed by mv: while his answer isn't there, the decision isn't complete, so its asker delivers nothing
+  const moved: { path: string; tmp: string }[] = []
+  const undo = async () => {
+    for (const m of moved) await run($, ['mv', m.tmp, m.path])
+  }
+  for (const x of claims) {
+    const tmp = dec(`tmp/${now}-${EPOCH}-${++tmpCount}`)
+    if ((await run($, ['mv', x.path, tmp])).exitCode !== 0) {
+      await undo()
+      return `${c.id} reached its asker just now: /fleet overrule ${c.id} again, and its asker hears it`
+    }
+    moved.push({ path: x.path, tmp })
+  }
+  for (const x of claims) {
+    const o = answers[x.q - 1] as Outcome
+    const file: AnswerFile = { format: FORMAT, id: c.id, q: x.q, ...(o.label !== undefined ? { label: o.label } : { text: o.text ?? '' }), origin, session: here, at: now, replacedJudge: { ...(x.judge.label !== undefined ? { label: x.judge.label } : { text: x.judge.text ?? '' }), cites: x.judge.judge?.cites ?? [], ...(x.judge.judge?.repeat ? { repeat: true as const } : {}), at: x.judge.at } }
+    if ((await publish($, x.path, json(file))) !== 'ok') {
+      await remove($, claims.slice(0, claims.indexOf(x)).map(y => y.path))
+      await undo()
+      return `couldn't write your answer to ${c.id} (${x.path}): the judge's stands; /fleet overrule ${c.id} again`
+    }
+  }
+  await remove($, moved.map(m => m.tmp))
+  const record: OverruleRecord = { registerFormat: REGISTER_FORMAT, id: c.id, overrules: c.id, at: now, origin, session: here, answers, judged, ...(c.why ? { why: c.why } : {}), ...(rec.area ? { area: rec.area } : {}), asker: rec.asker }
+  await publish($, dec(`register/${monthOf(rec.at)}/${c.id}.overrule.json`), json(record))
+  const notice: OverruleNotice = { format: FORMAT, id: c.id, at: now, asker: rec.asker, questions: questions.map(q => ({ question: q.question, options: q.options })), judged, answers, ...(c.why ? { why: c.why } : {}), ...(rec.area ? { area: rec.area } : {}) }
+  if (judgesCfg.reviewer) await publish($, dec(`overrules/${c.id}.review.json`), json(notice))
+  const lines = [`Overruled ${c.id} before its asker had it:`]
+  for (const [i, a] of answers.entries()) if (a) lines.push(`  ${i + 1}) ${questions[i]?.question} → ${a.label !== undefined ? optionWords(questions[i], a.label) : `"${a.text}"`}${judged[i] ? ` (the judge had ${optionWords(questions[i], judged[i] as string)})` : ''}`)
+  const v = (await askerViews($, [rec]))(rec)
+  lines.push(`${v.name} gets your answer instead of the judge's, as yours, when it's idle. The correction is in the register: the judges read it from now on, ahead of their own answers.${judgesCfg.reviewer ? ` ${judgesCfg.reviewer} is told, to propose a principle.` : ''}`)
+  log($, `${c.id} overruled by the person before delivery (in ${here})`)
+  // The window, with this correction counted (its decision isn't in the register yet)
+  const area = rec.area ?? null
+  if (area) {
+    const st = await judgesStateNow($)
+    const acts = [...liveActs(await judgedEntries($), area), { id: c.id, at: now, overruled: true, reviewed: true }]
+    const d = demoteCheck(acts)
     if (st.live[area] && d.demote) {
       delete st.live[area]
       st.back[area] = { at: now, why: `${d.words} when you overruled ${c.id}` }
@@ -6781,6 +6890,13 @@ async function statusCommand($: any): Promise<string> {
         ? `judges: on (${judgesCfg.model}), ${liveAreas.length ? `live in ${liveAreas.join(', ')}, in shadow elsewhere` : 'in shadow'}: today ${spent.calls} call${spent.calls === 1 ? '' : 's'}, ${usdText(spent.usd)} of ${usdText(judgesCfg.usdDay)}${liveAreas.length ? `, ${spent.live} live answer${spent.live === 1 ? '' : 's'} of ${judgesCfg.perDay}` : ''}; /fleet stats, /fleet judges${judgesProblems.length ? ` (${judgesProblems.join('; ')})` : ''}`
         : 'judges: off (world.json)',
     )
+    // Overrules their reviewer hasn't heard for a day: it's down, renamed, or world.json names nobody now
+    const reviews: OverruleNotice[] = []
+    for (const n of (await names($, dec('overrules'))).filter(x => /^D-\d+\.review\.json$/.test(x))) {
+      const x = await readWire<OverruleNotice>($, dec(`overrules/${n}`))
+      if (x && (await $.clock.now()) - x.at >= 24 * HOUR) reviews.push(x)
+    }
+    if (reviews.length) lines.push(`  ${reviews.length} overrule${reviews.length === 1 ? '' : 's'} of the judge (${reviews.map(x => x.id).join(', ')}) ${reviews.length === 1 ? 'has' : 'have'} waited a day or more for ${judgesCfg.reviewer ? `the reviewer, ${judgesCfg.reviewer} (it hears them at its next step, or woken)` : 'a reviewer world.json no longer names (remove them from .claude/fleet/decisions/overrules/)'}`)
     if (jobRef) {
       const mine = Object.keys(await read($, open))
       const pending = Object.keys(await read($, inflight))
