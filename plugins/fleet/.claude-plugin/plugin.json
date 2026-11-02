@@ -1,7 +1,7 @@
 {
   "name": "fleet",
-  "version": "0.1.0",
-  "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost",
+  "version": "0.2.0",
+  "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost; a write of a shared file that changed since the session read it is refused once with who changed it, and the session hears of such changes at its next step",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
   "types": "./types/index.d.ts",
