@@ -1,7 +1,7 @@
 {
   "name": "fleet",
-  "version": "0.3.0",
-  "description": "Per project: a roster of permanent background sessions started with /fleet up from a template, each seeded, budgeted and placed in the panel; they ask you without stopping and you answer from any session with /fleet, at no token cost; a stale write of a shared file is refused once and changes are told at the next step; records cited by version turn their citers suspect when revised; command-level files (charter, roster, requirements) change only when you apply a drafted change",
+  "version": "0.4.0",
+  "description": "Per project: a roster of permanent background sessions started with /fleet up from a template, each seeded, budgeted, paced by a cadence and placed in the panel; they ask you without stopping and you answer from any session with /fleet, at no token cost; nothing of the project leaves to a third party without your approval of the exact draft; a session that read outside content is marked, and command-level files change only when you apply a drafted change or ask for it yourself; a stale write of a shared file is refused once; records cited by version turn their citers suspect when revised; /fleet brief shows the project at a glance",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
   "types": "./types/index.d.ts",
