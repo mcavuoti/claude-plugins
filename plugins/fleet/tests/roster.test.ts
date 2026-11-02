@@ -37,6 +37,14 @@ import {
   wakeUsd,
   wakeVerdict,
   wakesOf,
+  BLOCKS_KEPT,
+  addBlock,
+  blockFix,
+  blockGroups,
+  blockOf,
+  blocksLines,
+  blocksMark,
+  blocksToday,
   type Roster,
 } from '../hooks/roster'
 
@@ -284,6 +292,70 @@ test('the permission mode an instance runs in: managed, its own, the project\'s,
   expect(compareVersions('0.6.0', '0.7.0')).toBe(-1)
   expect(compareVersions('0.10.0', '0.9.2')).toBe(1)
   expect(compareVersions('0.7.1', '0.7.1')).toBe(0)
+})
+
+test("auto mode's blocks: a cut of each call kept, today's only; by kind, each with the line of roster.json that would allow it; a mark once they pile up", () => {
+  const AT = Date.UTC(2026, 10, 2, 12, 0, 0)
+  // What is kept of a call: a cut of its command, path or address, never its whole input
+  expect(blockOf('Bash', { command: 'ssh dev uptime', description: 'check the box' }, '[Remote Shell]', AT, ROOT)).toEqual({ at: AT, tool: 'Bash', what: 'ssh dev uptime', reason: '[Remote Shell]' })
+  expect(blockOf('Write', { file_path: `${ROOT}/notes/a.md`, content: 'secret' }, 'Blocked by classifier', AT, ROOT).what).toBe('notes/a.md')
+  expect(blockOf('WebFetch', { url: 'https://example.invalid/a?token=1', prompt: 'x' }, '', AT, ROOT).what).toBe('https://example.invalid/a')
+  expect(blockOf('Bash', { command: `echo ${'x'.repeat(200)}` }, 'r'.repeat(300), AT, ROOT)).toMatchObject({ what: expect.stringMatching(/^echo x+…$/), reason: expect.stringMatching(/^r+…$/) })
+  expect(blockOf(undefined, null, undefined, AT, ROOT)).toEqual({ at: AT, tool: 'a tool', what: '', reason: '' })
+  // Today's: a new day starts over; the last 20 kept, all counted
+  const b = (what: string, reason = '[Remote Shell]', at = AT, tool = 'Bash') => blockOf(tool, tool === 'Bash' ? { command: what } : { file_path: what }, reason, at, ROOT)
+  let f = addBlock(null, b('ssh dev uptime'), 'owner-a', '2026-11-02', 1)
+  expect(f).toEqual({ format: 1, slug: 'owner-a', day: '2026-11-02', count: 1, last: [b('ssh dev uptime')] })
+  for (let i = 0; i < 24; i++) f = addBlock(f, b(`ssh dev make test${i}`), 'owner-a', '2026-11-02', 1)
+  expect([f.count, f.last.length, f.last[0]?.what]).toEqual([25, BLOCKS_KEPT, 'ssh dev make test4'])
+  expect(addBlock(f, b('true'), 'owner-a', '2026-11-03', 1).count).toBe(1)
+  expect(blocksToday(f, '2026-11-02')).toBe(f)
+  expect(blocksToday(f, '2026-11-03')).toBe(null)
+  expect(blocksToday(null, '2026-11-02')).toBe(null)
+  // By kind: a command's program and the host it reaches (trusted infrastructure: autoMode.environment)
+  const groups = blockGroups([b('ssh dev uptime', '[Remote Shell]', AT), b('ssh dev make test', '[Remote Shell]', AT + 60000), b('make deploy-staging', '[Production Deploy]', AT + 120000), b(`curl -fsS https://api.example.invalid/x`, '[Data Exfiltration]', AT + 30000)])
+  expect(groups.map(g => [g.key, g.n, g.rule, g.hosts, g.exact])).toEqual([
+    ['ssh dev…', 2, 'Remote Shell', ['dev'], null],
+    ['make deploy-staging', 1, 'Production Deploy', [], 'make deploy-staging'],
+    ['curl api.example.invalid…', 1, 'Data Exfiltration', ['api.example.invalid'], 'curl -fsS https://api.example.invalid/x'],
+  ])
+  expect(blockFix(groups[0]!)).toBe('a host it needs throughout, trusted infrastructure: "settings": { "autoMode": { "environment": ["$defaults", "Trusted internal domains: dev"] } }')
+  // A routine pattern: autoMode.allow; exactly one command: a narrow permissions.allow rule too, which skips the check
+  expect(blockFix(groups[1]!)).toBe(
+    'a routine pattern: "settings": { "autoMode": { "allow": ["$defaults", "Running make deploy-staging is allowed: routine work in this project"] } }; or, for exactly this command and nothing else, "permissions": { "allow": ["Bash(make deploy-staging)"] } (it skips auto mode\'s check)',
+  )
+  const pattern = blockGroups([b('rm -rf build/out', 'Blocked by classifier'), b('rm -rf build/tmp && ls', 'Blocked by classifier')])
+  expect(pattern.map(g => [g.key, g.n, g.rule, g.exact])).toEqual([
+    ['rm build/out…', 1, null, 'rm -rf build/out'],
+    ['rm build/tmp…', 1, null, null],
+  ])
+  expect(blockFix(blockGroups([b('rm -rf build/tmp && ls', 'Blocked by classifier')])[0]!)).toBe('a routine pattern: "settings": { "autoMode": { "allow": ["$defaults", "Running rm build/tmp … is allowed: routine work in this project"] } }')
+  // An MCP tool: its own name is the narrow rule; a check that gave no verdict has nothing to allow
+  const mcp = blockGroups([blockOf('mcp__files__upload', { name: 'a.txt' }, '[Data Exfiltration]', AT, ROOT), blockOf('Bash', { command: 'make' }, 'Auto mode could not evaluate this action and is blocking it for safety', AT, ROOT)])
+  expect(mcp.map(g => [g.key, g.exact, g.noVerdict])).toEqual([
+    ['make', 'make', true],
+    ['mcp__files__upload', 'mcp__files__upload', false],
+  ])
+  expect(blockFix(mcp[1]!)).toContain('or, for exactly this tool and nothing else, "permissions": { "allow": ["mcp__files__upload"] }')
+  expect(blockFix(mcp[0]!)).toBe("auto mode's check gave no verdict: no rule allows it, and it runs once the check answers")
+  // The lines the brief and /fleet status show: what, then what allows each kind, then where it goes
+  const file = { format: 1, slug: 'owner-a', day: '2026-11-02', count: 3, last: [b('ssh dev uptime', '[Remote Shell]', AT), b('ssh dev make test', '[Remote Shell]', AT + 60000), b('make deploy-staging', '[Production Deploy]', AT + 120000)] }
+  expect(blocksLines('Owner A', file, 0)).toEqual([
+    'Owner A: 3 blocked by auto mode today, the last at 12:02: ssh dev… ×2, make deploy-staging',
+    'ssh dev… [Remote Shell]: a host it needs throughout, trusted infrastructure: "settings": { "autoMode": { "environment": ["$defaults", "Trusted internal domains: dev"] } }',
+    `make deploy-staging [Production Deploy]: ${blockFix(groups[1]!)}`,
+    'it goes in Owner A\'s entry in roster.json (yours: edit it, then /fleet accept roster.json; /fleet up "Owner A" rewrites its settings and u restarts it with them). A list without "$defaults" replaces auto mode\'s own rules',
+  ])
+  expect(blocksLines('Owner A', f, 0)[0]).toBe('Owner A: 25 blocked by auto mode today, the last at 12:00: of the last 20, ssh dev… ×20')
+  // Only what auto mode couldn't check: nothing to allow, so nothing to put in roster.json
+  expect(blocksLines('Owner A', { ...file, count: 1, last: [blockOf('Bash', { command: 'make' }, 'Classifier unavailable', AT, ROOT)] }, 0)).toEqual([
+    'Owner A: 1 blocked by auto mode today, the last at 12:00: make',
+    "make: auto mode's check gave no verdict: no rule allows it, and it runs once the check answers",
+  ])
+  // A mark once they pile up: 3 today; never one that needs the person
+  expect(blocksMark(2)).toBe(null)
+  expect(blocksMark(3)).toEqual({ badge: '⊘3', tint: 'warning', line: 'auto mode blocked 3 today: /fleet brief says how to allow' })
+  expect(markRow(blocksMark(250)!)).toEqual({ badge: '⊘99', tint: 'warning', line: 'auto mode blocked 250 today: /fleet brief says how to allow' })
 })
 
 test('plan B: the sessions key settings.local.json repeats from the user settings, and a local record of it', () => {

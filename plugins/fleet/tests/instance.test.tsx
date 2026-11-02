@@ -335,3 +335,42 @@ test('an instance at a permission prompt: its heartbeat says so, with its mode; 
   await tick(w, 100)
   expect(json(w, `${HB}/state.json`).waitingOn).toBe(null)
 })
+
+test('auto mode’s blocks: the instance’s fleet keeps today’s, the brief and /fleet status say what would allow each, and its row is marked once they pile up; nothing is held', WITH_SESSIONS, async ($, on) => {
+  on('classic.PermissionDenied', () => ({}))
+  const w = await instance($, on)
+  await $.classic.SessionStart({ source: 'startup', agent_type: 'owner', permission_mode: 'auto' } as any)
+  await tick(w)
+  // The denial goes on as Claude's (no retry asked), and fleet keeps a cut of it
+  const said = await $.classic.PermissionDenied({ tool_name: 'Bash', tool_input: { command: 'ssh dev uptime', description: 'check the box' }, tool_use_id: 'toolu_1', reason: '[Remote Shell]', permission_mode: 'auto' } as any)
+  expect(said).toEqual({})
+  await tick(w, 100)
+  expect(json(w, `${HB}/blocks.json`)).toEqual({ format: 1, slug: 'owner-a', day: '2026-11-02', count: 1, last: [{ at: expect.any(Number), tool: 'Bash', what: 'ssh dev uptime', reason: '[Remote Shell]' }] })
+  // One block: listed, no mark yet
+  sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
+  for (let i = 0; i < 3; i++) await tick(w, 30000)
+  expect(calls(w, 'setMarks').some(m => m.rows?.[REF])).toBe(false)
+  expect(await fleet($, 'brief')).toContain('   - Owner A: 1 blocked by auto mode today, the last at ')
+  // Two more at once (parallel calls are refused together): both kept, and the row is marked
+  await Promise.all([
+    $.classic.PermissionDenied({ tool_name: 'Bash', tool_input: { command: 'ssh dev make test' }, tool_use_id: 'toolu_2', reason: '[Remote Shell]' } as any),
+    $.classic.PermissionDenied({ tool_name: 'mcp__files__upload', tool_input: { name: 'a.txt', content: 'the notes' }, tool_use_id: 'toolu_3', reason: '[Data Exfiltration]' } as any),
+  ])
+  await tick(w, 100)
+  const kept = json(w, `${HB}/blocks.json`)
+  expect([kept.count, kept.last.map((b: any) => b.what)]).toEqual([3, ['ssh dev uptime', 'ssh dev make test', '']])
+  for (let i = 0; i < 3; i++) await tick(w, 30000)
+  const marks = calls(w, 'setMarks')
+  expect(marks[marks.length - 1].rows[REF]).toEqual({ badge: '⊘3', tint: 'warning', line: 'auto mode blocked 3 today: /fleet brief says how to allow' })
+  const brief = await fleet($, 'brief')
+  expect(brief).toContain('3. Blocked and stale:\n   - Owner A: 3 blocked by auto mode today, the last at ')
+  expect(brief).toContain(': ssh dev… ×2, mcp__files__upload\n     ssh dev… [Remote Shell]: a host it needs throughout, trusted infrastructure: "settings": { "autoMode": { "environment": ["$defaults", "Trusted internal domains: dev"] } }\n')
+  expect(brief).toContain('     mcp__files__upload [Data Exfiltration]: a routine pattern: "settings": { "autoMode": { "allow": ["$defaults", "mcp__files__upload is allowed: routine work in this project"] } }; or, for exactly this tool and nothing else, "permissions": { "allow": ["mcp__files__upload"] }')
+  expect(brief).toContain('     it goes in Owner A\'s entry in roster.json (yours: edit it, then /fleet accept roster.json; /fleet up "Owner A" rewrites its settings and u restarts it with them)')
+  expect(brief).not.toContain('the notes')
+  const status = await fleet($, 'status')
+  expect(status).toContain('\n    Owner A: 3 blocked by auto mode today, the last at ')
+  expect(status).toContain('\n      ssh dev… [Remote Shell]: a host it needs throughout')
+  // Nothing of it reached the model, and nothing was held
+  expect(w.submits.filter(s => s.includes('auto mode'))).toEqual([])
+})

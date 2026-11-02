@@ -232,9 +232,14 @@ import { SLOTS_FORMAT, SLOT_DESCRIPTION, SLOT_SCHEMA, holderKey, leaseMinutes, n
 import {
   HEARTBEAT_STALE_MS,
   ROSTER_FORMAT,
+  addBlock,
   addSpend,
   askBadge,
   bgIsolationOf,
+  blockOf,
+  blocksLines,
+  blocksMark,
+  blocksToday,
   budgetState,
   cadenceNudgeText,
   cadenceOf,
@@ -276,6 +281,7 @@ import {
   wakesOf,
   withoutPlugins,
   writesFiles,
+  type BlocksFile,
   type BudgetState,
   type Instance,
   type LiftsFile,
@@ -4448,6 +4454,33 @@ async function promptAnswered($: any) {
   await heartbeat($)
 }
 
+// What auto mode blocked, today's (instances/<slug>/blocks.json, written only by this instance's fleet): Claude lists
+// it only in this session's /permissions, so the brief and /fleet status say it with what would allow it. One write at
+// a time (parallel calls are refused together)
+let blocksWriting: Promise<unknown> = Promise.resolve()
+async function noteBlock($: any, e: any) {
+  const inst = myInstance
+  if (!inst || !root) return
+  const now = await $.clock.now()
+  const b = blockOf(e?.tool_name, e?.tool_input, e?.reason, now, root)
+  const write = async () => {
+    const dir = instDir(inst.slug)
+    if (instDirMade !== dir) {
+      await run($, ['mkdir', '-p', dir])
+      instDirMade = dir
+    }
+    const next = addBlock(await readWire<BlocksFile>($, `${dir}/blocks.json`), b, inst.slug, today(now), FORMAT)
+    await replace($, `${dir}/blocks.json`, json(next))
+    log($, `auto mode blocked ${b.tool}${b.what ? ` (${b.what.slice(0, 60)})` : ''}: ${b.reason || 'no reason given'} (${next.count} today)`)
+  }
+  blocksWriting = blocksWriting.then(write, write)
+  await blocksWriting
+}
+
+async function blocksOf($: any, slug: string, now: number): Promise<BlocksFile | null> {
+  return blocksToday(await readWire<BlocksFile>($, `${instDir(slug)}/blocks.json`), today(now))
+}
+
 /** Whether this background session has Remote Control on: Claude's background service keeps its connection in the
  * job's state.json (bridgeSessionId) while it's on. null: not a background session, or it can't be read */
 async function remoteControl($: any): Promise<boolean | null> {
@@ -5533,8 +5566,8 @@ function askMark(n: number): RowMark {
 
 // Every full sweep: each session that asks the person marked (?n); each instance's row marked when its fleet isn't
 // running (✗), it waits on a permission prompt (!), it's over or near its budget ($), it's down (↓), it runs an older
-// fleet (u) or it landed nothing in its cadence (◷); a retired instance with answers waiting (at once) or shared files
-// it read changed (coalesced) woken
+// fleet (u), auto mode blocked BLOCKS_MARK or more of its calls today (⊘) or it landed nothing in its cadence (◷); a
+// retired instance with answers waiting (at once) or shared files it read changed (coalesced) woken
 async function rosterTick($: any) {
   await loadRoster($)
   const now = await $.clock.now()
@@ -5584,6 +5617,8 @@ async function rosterTick($: any) {
       const prompt = fresh && running.state === 'waiting' && hb?.waitingOn?.kind === 'permission'
       const old = fresh && typeof hb?.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0 ? hb.fleet : ''
       const asks = asking.get(running.ref) ?? 0
+      // Auto mode's blocks piling up today (a mark, never a hold: the brief says what would allow them)
+      const blocked = fresh ? blocksMark((await blocksOf($, inst.slug, now))?.count ?? 0) : null
       const m: RowMark | null = noFleet
         ? { badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true }
         : prompt
@@ -5596,11 +5631,13 @@ async function rosterTick($: any) {
                 ? { badge: '↓', tint: 'inactive', line: 'down (/fleet down): s in the panel stops it' }
                 : old
                   ? { badge: 'u', tint: 'warning', line: `runs fleet ${old}, installed ${version}: u restarts it` }
-                  : fresh && cad?.due
-                    ? { badge: '◷', tint: 'warning', line: `nothing landed in ${hoursText(cad.hours)} (cadence ${hoursText(inst.cadenceH ?? 0)})` }
-                    : b?.state === 'warn'
-                      ? { badge: '$', tint: 'warning', line: `budget: ${usdOf(b.usd, b.cap ?? budgetCache.project.cap)} today` }
-                      : null
+                  : blocked
+                    ? blocked
+                    : fresh && cad?.due
+                      ? { badge: '◷', tint: 'warning', line: `nothing landed in ${hoursText(cad.hours)} (cadence ${hoursText(inst.cadenceH ?? 0)})` }
+                      : b?.state === 'warn'
+                        ? { badge: '$', tint: 'warning', line: `budget: ${usdOf(b.usd, b.cap ?? budgetCache.project.cap)} today` }
+                        : null
       if (m) marks[running.ref] = m
       continue
     }
@@ -6080,6 +6117,9 @@ async function rosterStatus($: any): Promise<string[]> {
     if (w) parts.push(`${w} wake(s) today`)
     if (down.has(inst.slug)) parts.push('down')
     lines.push(`  ${parts.join(' · ')}`)
+    // What auto mode blocked it today, which only its own /permissions lists, and what would allow it
+    const blocks = await blocksOf($, inst.slug, now)
+    if (blocks) lines.push(...blocksLines(inst.name, blocks, -new Date(now).getTimezoneOffset()).map((l, i) => `${i ? '      ' : '    '}${l}`))
   }
   if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
   const loose = await unstamped($)
@@ -7271,6 +7311,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
   const noFleet: string[] = []
   const prompts: NonNullable<BriefFacts['prompts']> = []
   const stale: BriefFacts['blocked']['stale'] = []
+  const autoMode: NonNullable<BriefFacts['blocked']['autoMode']> = []
   let downNames: string[] = []
   await loadRoster($)
   const instances = roster?.instances ?? []
@@ -7279,6 +7320,9 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     downNames = instances.filter(i => down.has(i.slug)).map(i => i.name)
     const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: instances.map(i => i.name) })) : null
     for (const inst of instances) {
+      // What auto mode blocked it today (only its own /permissions lists it), down or not
+      const blocks = await blocksOf($, inst.slug, now)
+      if (blocks) autoMode.push({ name: inst.name, blocks })
       const hb = await heartbeatOf($, inst.slug)
       if (!hb || down.has(inst.slug)) continue
       const c = cadenceOf({ cadenceH: inst.cadenceH, lastLanding: hb.lastLanding ?? null, startedAt: hb.startedAt ?? hb.at, now })
@@ -7322,6 +7366,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
       noFleet,
       down: downNames,
       stale,
+      autoMode,
     },
     spend: {
       project: roster ? { usd: budgetCache.project.usd, cap: budgetCache.project.cap } : null,
@@ -7748,8 +7793,10 @@ export const register: Register = on => {
     if (permissionWait) bg(promptAnswered($))
     return next(e)
   }).catch(($, e, next) => next(e))
+  // Auto mode refused a call (it fires only in auto mode): an instance's fleet keeps it, for the brief; nothing is held
   on('classic.PermissionDenied', async ($, e, next) => {
     if (permissionWait) bg(promptAnswered($))
+    if (jobRef && myInstance) bg(noteBlock($, e))
     return next(e)
   }).catch(($, e, next) => next(e))
 

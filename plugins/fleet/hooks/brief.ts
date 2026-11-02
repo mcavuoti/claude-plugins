@@ -1,12 +1,13 @@
 // Pure logic of /fleet brief (tested in tests/brief.test.ts): what the person reads when he comes by, computed from the
 // project's files at no token cost, always in the same order: what needs him; what changed in the world and who
-// changed it; what's blocked, stale, suspect, quiet past its cadence or without fleet; the spend and its forecast; the
-// inputs and ideas. The chief may add up to five lines of its own (/fleet brief --chief). No `$` here.
+// changed it; what's blocked (what auto mode refused an instance too), stale, suspect, quiet past its cadence or
+// without fleet; the spend and its forecast; the inputs and ideas. The chief may add up to five lines of its own
+// (/fleet brief --chief). No `$` here.
 
 import type { Level } from './authority'
 import { changeLine, clock, type ChangeEvent, type Me } from './changes'
 import { ago, shown } from './decisions'
-import { hoursText, usd, usdOf } from './roster'
+import { blocksLines, hoursText, usd, usdOf, type BlocksFile } from './roster'
 
 /** judge: what the judge proposed on a choice, in a few words ("a) SQLite, citing D-3") */
 export type BriefNeed = { id: string; kind: 'choice' | 'change' | 'resource' | 'outbound'; what: string; who: string; at: number; blocks?: string; outside?: string; judge?: string }
@@ -34,6 +35,8 @@ export type BriefFacts = {
     noFleet: string[]
     down: string[]
     stale: { name: string; files: number }[]
+    /** What auto mode blocked each instance today, which only that session's /permissions lists */
+    autoMode?: { name: string; blocks: BlocksFile }[]
   }
   spend: {
     project: { usd: number; cap: number | null } | null
@@ -132,6 +135,7 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
     ...b.failing.map(x => `   - ${x.path} fails the check ${x.check}: ${x.message}${x.who ? ` (written last by ${x.who})` : ''}`),
     ...b.cadence.map(x => `   - ${x.name}: nothing landed in ${hoursText(x.hours)} (its cadence is ${hoursText(x.cadenceH)})`),
     ...b.stale.map(x => `   - ${x.name} read ${x.files} shared file${x.files === 1 ? '' : 's'} that changed since`),
+    ...(b.autoMode ?? []).flatMap(x => blocksLines(x.name, x.blocks, f.me.offsetMin).map((l, i) => `${i ? '     ' : '   - '}${l}`)),
     ...b.noFleet.map(x => `   - ${x}: running with no fleet (u in the panel restarts it)`),
     ...b.down.map(x => `   - ${x}: down (/fleet up "${x}" brings it back)`),
     ...(f.derived ?? []).map(d => `   - stale: ${d.path} (${d.kind}, owned by ${d.owner}): ${d.pins.join(', ')} moved since it cited them`),

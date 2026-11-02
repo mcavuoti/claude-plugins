@@ -112,6 +112,13 @@ test('the brief: the five sections in order, provenance, levels, the window; and
   expect(t).toContain('   - suspect: board/B-7.md (B-7) cites R-1@1, and R-1 is at v2 (written last by Owner B)')
   expect(t).toContain('   - Owner C: nothing landed in 7 h (its cadence is 6 h)')
   expect(t).toContain('   - Tester: running with no fleet (u in the panel restarts it)')
+  // What auto mode blocked an instance today, which only its own /permissions lists: each kind with what allows it
+  const blocks = { format: 1, slug: 'owner-b', day: '2026-11-02', count: 2, last: [1, 2].map(n => ({ at: NOW - n * HOUR, tool: 'Bash', what: `ssh dev make test${n}`, reason: '[Remote Shell]' })) }
+  const blockedNow = briefText({ ...facts, blocked: { ...facts.blocked, autoMode: [{ name: 'Owner B', blocks }] } })
+  expect(blockedNow).toContain(
+    '   - Owner B: 2 blocked by auto mode today, the last at 11:00: ssh dev… ×2\n     ssh dev… [Remote Shell]: a host it needs throughout, trusted infrastructure: "settings": { "autoMode": { "environment": ["$defaults", "Trusted internal domains: dev"] } }\n     it goes in Owner B\'s entry in roster.json',
+  )
+  expect(t).not.toContain('blocked by auto mode')
   expect(t).toContain("4. Spend: $1.50 of $20.00 today (the project's cap), estimated at list price; budgets $10.00 a day, wakes ~$0.40 a day; this account's windows: 7d 12%")
   expect(t).toContain('5. Inputs and ideas: 1\n   - proposals/P-1.md (proposal): changed at 11:00 by Owner B (Edit)')
   expect(chiefLines('one\n\n two \nthree\nfour\nfive\nsix')).toEqual(['one', 'two', 'three', 'four', 'five'])

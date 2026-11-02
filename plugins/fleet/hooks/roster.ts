@@ -8,7 +8,8 @@
 // project to third parties blocks; budgets, wakes and the rest mark and flag. The settings deny one thing: the agent's
 // own tools writing a command-level file (decision 1a: those change through an applied `change`).
 
-import { checkGlob, globRegex, type WorldConfig } from './changes'
+import { checkGlob, clock, globRegex, type WorldConfig } from './changes'
+import { classifyBash, commandsOf, hostOf, isLocalHost, newOutbound, stripPrefixes } from './outbound'
 
 /** Project data: roster.json. It only gains fields, and a write keeps the fields it doesn't know */
 export const ROSTER_FORMAT = 1
@@ -748,6 +749,148 @@ export function modeWaits(mode: string): string | null {
   if (mode === 'default' || mode === 'plan') return 'the first write or command waits for you, with nobody to answer'
   if (mode === 'acceptEdits') return 'the first Bash command waits for you, with nobody to answer'
   return null
+}
+
+// ---- Auto mode's blocks: a call its classifier refused isn't run, the model gets the reason, and Claude lists it only
+// in that session's /permissions (Recently blocked), where nobody looks. The instance's fleet keeps today's, and the
+// brief and /fleet status say them with the line of roster.json that would allow each. A mark at most: never a hold ----
+
+/** One block: its tool, a short cut of what it was called on (a command, a path, an address), the reason auto mode
+ * gave (classic.PermissionDenied's reason: a rule's name in brackets, "Blocked by classifier", or a check that gave no
+ * verdict), and when */
+export type Block = { at: number; tool: string; what: string; reason: string }
+/** <project>/.claude/fleet/instances/<slug>/blocks.json, written only by the instance's own fleet: how many blocks
+ * today, and the last BLOCKS_KEPT of them */
+export type BlocksFile = { format: number; slug: string; day: string; count: number; last: Block[] }
+export const BLOCKS_KEPT = 20
+/** So many blocks in a day mark the instance's row */
+export const BLOCKS_MARK = 3
+/** The kinds of block a brief line lists, the rest counted */
+const BLOCKS_SHOWN = 5
+
+function shortText(s: string, n: number): string {
+  const t = oneLine(s)
+  return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t
+}
+
+/** What fleet keeps of a denied call: never its whole input, only a cut of the command, path or address it names */
+export function blockOf(tool: unknown, input: unknown, reason: unknown, at: number, root: string): Block {
+  const i = isObject(input) ? input : {}
+  const str = (k: string) => (typeof i[k] === 'string' ? (i[k] as string) : '')
+  const path = str('file_path') || str('notebook_path') || str('path')
+  const what = str('command') || (path ? (root && path.startsWith(`${root}/`) ? path.slice(root.length + 1) : path) : '') || str('url').split(/[?#]/)[0] || str('description')
+  return { at, tool: shortText(String(tool ?? ''), 80) || 'a tool', what: shortText(what, 120), reason: shortText(String(reason ?? ''), 160) }
+}
+
+/** Today's file with one more block (a new day starts over) */
+export function addBlock(had: BlocksFile | null, b: Block, slug: string, day: string, format: number): BlocksFile {
+  const same = had && had.day === day ? had : null
+  return { format, slug, day, count: (same?.count ?? 0) + 1, last: [...(same?.last ?? []), b].slice(-BLOCKS_KEPT) }
+}
+
+/** The blocks of today, or null */
+export function blocksToday(f: BlocksFile | null, day: string): BlocksFile | null {
+  return f && f.day === day && f.count > 0 && Array.isArray(f.last) ? f : null
+}
+
+/** The row's mark once blocks pile up: never one that needs the person (nothing waits on him), and never a hold */
+export function blocksMark(n: number): RowMark | null {
+  return n >= BLOCKS_MARK ? { badge: `⊘${Math.min(99, n)}`, tint: 'warning', line: `auto mode blocked ${n} today: /fleet brief says how to allow` } : null
+}
+
+/** Blocks of one kind: the same tool on the same pattern (a command's program and the host or first word it names, a
+ * path, a tool). hosts: where it goes, when it reaches one (what autoMode.environment trusts); exact: the one command or
+ * tool all of them were, when a narrow permissions.allow rule could name it; noVerdict: auto mode's check gave none
+ * (nothing to allow) */
+export type BlockGroup = { key: string; tool: string; n: number; rule: string | null; hosts: string[]; exact: string | null; noVerdict: boolean; last: number; prose: string }
+
+const SETUP = new Set(['cd', 'pushd', 'popd', 'export', 'set', 'true', ':', 'source', '.'])
+
+function bashShape(cmd: string): { key: string; prose: string; hosts: string[]; simple: boolean } {
+  let cmds: string[][] = []
+  let hosts: string[] = []
+  try {
+    cmds = commandsOf(cmd)
+      .map(w => stripPrefixes(w))
+      .filter(w => w.length)
+    const { sends, reads } = classifyBash(cmd, newOutbound())
+    hosts = [...new Set([...sends.flatMap(s => s.hosts ?? []), ...reads])].filter(h => !isLocalHost(h))
+  } catch {}
+  const main = cmds.find(w => !SETUP.has(String(w[0]).split('/').pop() as string)) ?? cmds[0]
+  if (!main) return { key: `${shortText(cmd, 30)}…`, prose: `Running ${shortText(cmd, 60)}`, hosts, simple: false }
+  const prog = String(main[0]).split('/').pop() as string
+  const arg = hosts[0] ?? main.slice(1).find(x => !x.startsWith('-')) ?? ''
+  const head = shortText(arg ? `${prog} ${arg}` : prog, 40)
+  const more = cmds.length > 1 || main.length > (arg ? 2 : 1)
+  const simple = cmds.length === 1 && cmd.trim().length <= 100 && !/[;&|<>$`(){}\n\\]/.test(cmd)
+  return { key: more ? `${head}…` : head, prose: `Running ${head}${more ? ' …' : ''}`, hosts, simple }
+}
+
+const NO_VERDICT = /could not evaluate|classifier unavailable|no (?:safety )?verdict/i
+
+/** The blocks of today by kind, the most frequent first */
+export function blockGroups(blocks: readonly Block[]): BlockGroup[] {
+  const by = new Map<string, BlockGroup & { exacts: Set<string | null> }>()
+  for (const b of blocks) {
+    const noVerdict = NO_VERDICT.test(b.reason)
+    const bash = b.tool === 'Bash' || b.tool === 'PowerShell'
+    const shape = bash && b.what ? bashShape(b.what) : null
+    const host = b.tool === 'WebFetch' && b.what ? hostOf(b.what) : null
+    const key = shape ? shape.key : `${b.tool}${b.what ? ` ${shortText(b.what, 40)}` : ''}`
+    const id = `${b.tool}\u0000${key}\u0000${noVerdict}`
+    const rule = /\[([^\]]{1,60})\]/.exec(b.reason)?.[1] ?? null
+    const g = by.get(id) ?? {
+      key,
+      tool: b.tool,
+      n: 0,
+      rule: null,
+      hosts: [],
+      exact: null,
+      noVerdict,
+      last: 0,
+      prose: shape ? shape.prose : `${b.tool}${b.what ? ` on ${shortText(b.what, 60)}` : ''}`,
+      exacts: new Set<string | null>(),
+    }
+    g.n++
+    if (b.at >= g.last) {
+      g.last = b.at
+      g.rule = rule ?? g.rule
+    }
+    for (const h of shape?.hosts ?? (host && !isLocalHost(host) ? [host] : [])) if (!g.hosts.includes(h)) g.hosts.push(h)
+    // What a narrow permissions.allow rule could name: one simple command, or an MCP tool (null: nothing narrow)
+    g.exacts.add(shape ? (shape.simple ? b.what.trim() : null) : b.tool.startsWith('mcp__') ? b.tool : null)
+    by.set(id, g)
+  }
+  return [...by.values()]
+    .map(({ exacts, ...g }) => ({ ...g, exact: exacts.size === 1 ? ([...exacts][0] ?? null) : null }))
+    .sort((a, b) => b.n - a.n || b.last - a.last || a.key.localeCompare(b.key))
+}
+
+/** The line of roster.json that would allow one kind of block, and which setting it is: a host it needs throughout is
+ * trusted infrastructure (autoMode.environment), a routine pattern an autoMode.allow rule, and exactly one command or
+ * tool may instead get a narrow permissions.allow rule, which skips auto mode's check. Each list keeps "$defaults" */
+export function blockFix(g: BlockGroup): string {
+  if (g.noVerdict) return "auto mode's check gave no verdict: no rule allows it, and it runs once the check answers"
+  if (g.hosts.length) return `a host it needs throughout, trusted infrastructure: "settings": { "autoMode": { "environment": ["$defaults", ${JSON.stringify(`Trusted internal domains: ${g.hosts.join(', ')}`)}] } }`
+  const allow = `a routine pattern: "settings": { "autoMode": { "allow": ["$defaults", ${JSON.stringify(`${g.prose} is allowed: routine work in this project`)}] } }`
+  if (!g.exact) return allow
+  const rule = g.tool.startsWith('mcp__') ? g.exact : `${g.tool}(${g.exact})`
+  return `${allow}; or, for exactly ${g.tool.startsWith('mcp__') ? 'this tool' : 'this command'} and nothing else, "permissions": { "allow": [${JSON.stringify(rule)}] } (it skips auto mode's check)`
+}
+
+/** An instance's blocks today, for the brief and /fleet status: a line of what was blocked, then one per kind with
+ * what would allow it, then where that goes (unindented: the caller indents) */
+export function blocksLines(name: string, f: BlocksFile, offsetMin: number): string[] {
+  const groups = blockGroups(f.last)
+  const shown = groups.slice(0, BLOCKS_SHOWN)
+  const lastAt = Math.max(0, ...f.last.map(b => b.at))
+  const kinds = `${shown.map(g => `${g.key}${g.n > 1 ? ` ×${g.n}` : ''}`).join(', ')}${groups.length > shown.length ? `, ${groups.length - shown.length} more kind${groups.length - shown.length === 1 ? '' : 's'}` : ''}`
+  const head = `${name}: ${f.count} blocked by auto mode today${lastAt ? `, the last at ${clock(lastAt, offsetMin)}` : ''}: ${f.count > f.last.length ? `of the last ${f.last.length}, ` : ''}${kinds}`
+  const fixes = shown.map(g => `${g.key}${g.rule ? ` [${g.rule}]` : ''}: ${blockFix(g)}`)
+  const where = shown.some(g => !g.noVerdict)
+    ? [`it goes in ${name}'s entry in roster.json (yours: edit it, then /fleet accept roster.json; /fleet up "${name}" rewrites its settings and u restarts it with them). A list without "$defaults" replaces auto mode's own rules`]
+    : []
+  return [head, ...fixes, ...where]
 }
 
 // ---- Versions: an instance still running an older fleet ----
