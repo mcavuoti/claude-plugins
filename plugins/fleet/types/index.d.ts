@@ -52,8 +52,12 @@ declare module 'claude-code' {
       /** This conversation read outside content (until /clear; kept through compaction and a restart): it can still do
        * everything, but a change it files waits for the person's apply */
       outside: FleetMark | null
-      /** The person typed the prompt of the main thread's running turn, or into it: the turn, and the start of his words */
-      personTurn: { turnId: string; quoted: string } | null
+      /** The person typed the prompt of the main thread's running turn, or into it: the turn, the start of his words,
+       * and his words (up to 4,000 characters: what a taste recorded in the turn must be found in) */
+      personTurn: { turnId: string; quoted: string; text?: string } | null
+      /** Fleet's own prompt started the main thread's running turn to deliver the person's answers: the words of his it
+       * carries (text answers, notes, reject reasons, why he dropped or overruled), which a taste may quote */
+      fleetTurn: { turnId: string; words: string } | null
       /** The person's prompt that is about to start a turn (prompt.submit comes before turn.start) */
       pendingPerson: { text: string; at: number } | null
       /** Main-thread turns started in this process (a background session's first prompt can be its launch prompt) */

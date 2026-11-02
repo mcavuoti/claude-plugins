@@ -242,15 +242,19 @@ export type RegisterLike = {
   answers: (Outcome | null)[]
   blocks?: string
   taste?: TasteSpec
+  /** A change or an outbound: what it was (a rejection with the person's reason is case law) */
+  change?: { path?: string; summary?: string }
+  outbound?: { what?: string; to?: string }
 }
 
 /** One past answer the judges may cite: the questions the person settled in it (his answer, never a judge's), a taste
- * he expressed, or (from 0.7.0) a correction of a judge */
+ * he expressed, (from 0.7.0) a correction of a judge, or a change or outbound he rejected saying why (his "no", like a
+ * taste: taste holds what he said, what it was about, and the principle, empty for a rejection) */
 export type Precedent = {
   id: string
   at: number
   area: string | null
-  kind: 'answer' | 'correction' | 'taste'
+  kind: 'answer' | 'correction' | 'taste' | 'rejection'
   questions: { question: string; options: Option[]; label?: string; text?: string; note?: string; judged?: string }[]
   blocks?: string
   why?: string
@@ -261,8 +265,9 @@ export type Precedent = {
 export type CorrectionLike = { id: string; at: number; answers: (Outcome | null)[]; why?: string }
 
 /** The precedents, oldest first: the choices and dialogs the person answered (only his answers, never a judge's own:
- * a judge doesn't anchor on itself), the corrections, and the taste he expressed in a turn he typed in a conversation
- * that read nothing from outside */
+ * a judge doesn't anchor on itself), the corrections, the taste he expressed in a turn he typed (or in his words fleet
+ * delivered) in a conversation that read nothing from outside, and the changes and outbounds he rejected with a reason
+ * he typed (the answer's own note, copied by code) */
 export function precedentsOf(records: readonly RegisterLike[], corrections: readonly CorrectionLike[] = []): Precedent[] {
   const fixed = new Map(corrections.map(c => [c.id, c]))
   const out: Precedent[] = []
@@ -270,6 +275,12 @@ export function precedentsOf(records: readonly RegisterLike[], corrections: read
     if (r.source === 'taste') {
       const t = r.taste
       if (t && t.person && !t.outside) out.push({ id: r.id, at: r.at, area: r.area ?? null, kind: 'taste', questions: [], taste: { said: t.said, about: t.about, principle: t.principle } })
+      continue
+    }
+    if (r.source === 'decide' && (r.kind === 'change' || r.kind === 'outbound')) {
+      const a = r.answers?.[0]
+      const what = r.kind === 'change' ? `the change to ${r.change?.path ?? '?'} ("${r.change?.summary ?? ''}")` : `the outbound ${r.outbound?.what ?? '?'} to ${r.outbound?.to ?? '?'}`
+      if (a && a.label === 'rejected' && a.origin === 'composer' && a.note?.trim()) out.push({ id: r.id, at: r.closedAt ?? r.at, area: r.area ?? null, kind: 'rejection', questions: [], taste: { said: line(a.note, 300), about: line(what, 300), principle: '' } })
       continue
     }
     if ((r.source !== 'decide' && r.source !== 'dialog') || r.kind !== undefined || !Array.isArray(r.questions)) continue
@@ -416,6 +427,7 @@ function optionsText(options: readonly Option[]): string {
 /** One precedent, one line (or a few): what was asked, and what the person said */
 export function precedentText(p: Precedent): string {
   const head = `${p.id} (${day(p.at)}${p.area ? `, area ${p.area}` : ''})`
+  if (p.kind === 'rejection' && p.taste) return `${head}, the person rejected ${p.taste.about}, saying: "${p.taste.said}"`
   if (p.taste) return `${head}, the person said no: "${p.taste.said}" about ${p.taste.about}; the principle it suggests: ${p.taste.principle}`
   const qs = p.questions.map(q => {
     const said = q.label !== undefined ? `${letter(q.options.findIndex(o => norm(o.label) === norm(q.label as string)))}) ${q.label}` : `in his words: "${q.text ?? ''}"`
@@ -845,10 +857,23 @@ export function demoteCheck(acts: readonly LiveAct[]): { demote: boolean; overru
 
 // ---- Taste: the person's "no", recorded by the session that heard it (mcp__fleet__taste) ----
 
-/** What a taste record keeps: what the person said, what about, the principle it suggests; and code's provenance: the
- * person typed the turn it was recorded in (quoted: the start of his words), and whether the conversation had read
- * outside content */
+/** What a taste record keeps: what the person said, what about, the principle it suggests; and code's provenance:
+ * person, what it says is in words he typed, either his prompt of this turn or his answer, note or reject reason fleet
+ * delivered in this turn (heardIn; quoted: the start of those words), and whether the conversation had read outside
+ * content */
 export type TasteSpec = { said: string; about: string; principle: string; person: boolean; quoted?: string; outside?: OutsideMark }
+
+/** How much of what a taste says must be in the person's words for it to count as his */
+export const HEARD = 0.6
+
+/** Whether the person's words carry what a taste says: 60% or more of the words that carry meaning in said are in them
+ * (a model can't put words in his mouth: one it read in a file, or made up, isn't his) */
+export function heardIn(said: string, words: string): boolean {
+  const mine = contentWords(said)
+  if (!mine.size || !words.trim()) return false
+  const there = wordSet(words)
+  return [...mine].filter(w => there.has(w)).length / mine.size >= HEARD
+}
 
 export const TASTE_SCHEMA = {
   type: 'object',
@@ -896,9 +921,10 @@ export function nextTasteNumber(names: readonly string[]): number {
   return n + 1
 }
 
-export function tasteResult(id: string, t: TasteSpec): string {
+/** What the session is told; notHeard: why it isn't the person's (default: he didn't type this turn) */
+export function tasteResult(id: string, t: TasteSpec, notHeard = "the person didn't type this turn"): string {
   if (t.person && !t.outside) return `Recorded as ${id} in the register: a principle candidate ("${t.principle}") the project's judges read from now on. The person can promote it into .claude/fleet/principles.md (they edit it, or you draft a change with mcp__fleet__decide kind "change").`
-  const why = t.outside ? `this conversation read outside content (${t.outside.what})` : "the person didn't type this turn"
+  const why = t.outside ? `this conversation read outside content (${t.outside.what})` : notHeard
   return `Recorded as ${id} in the register, marked as not heard from the person directly (${why}): the judges don't read it until the person promotes it into .claude/fleet/principles.md.`
 }
 

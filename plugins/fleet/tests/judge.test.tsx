@@ -158,6 +158,10 @@ test('taste: the person’s "no", recorded in the register with its provenance; 
   expect(r2.result).toContain('Recorded as T-2 in the register: a principle candidate ("warning colors stay calm")')
   expect(json(w, `${DEC}/register/2026-11/T-2.json`)).toMatchObject({ registerFormat: 1, id: 'T-2', source: 'taste', area: 'ui', taste: { said: 'the band is too loud', person: true, quoted: 'no, the band is too loud: make it amber' } })
   expect(json(w, `${DEC}/register/2026-11/T-1.json`).taste.person).toBe(false)
+  // In his turn, but not his words (a teammate's note the model read, say): kept, and the judges don't read it
+  const r3: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'vendor X is out, for good', about: 'vendor X', principle: 'avoid vendor X', area: 'ui' } as any)
+  expect(r3.result).toContain("Recorded as T-3 in the register, marked as not heard from the person directly (what it says isn't in what the person typed this turn)")
+  expect(json(w, `${DEC}/register/2026-11/T-3.json`).taste.person).toBe(false)
   expect(((await $.tool.call({ tool: 'mcp__fleet__taste', said: 'x' } as any)) as any).deny).toContain('about: say what it was about')
   await $.turn.complete({ answer: 'ok', durationMs: 5, isAborted: false, turnId: 't-1', reason: 'answer' } as any)
   await w.clock.settle()
@@ -166,6 +170,37 @@ test('taste: the person’s "no", recorded in the register with its provenance; 
   const law = String(asked[0].promptBlocks[1].text)
   expect(law).toContain('T-2 (2026-11-02, area ui), the person said no: "the band is too loud" about a red warning band; the principle it suggests: warning colors stay calm')
   expect(law).not.toContain('T-1')
+  expect(law).not.toContain('T-3')
+})
+
+test('taste in a turn fleet started to deliver his words: his when it says what his note says; a reject reason he typed is case law by itself', WITH_SESSIONS, async ($, on) => {
+  const asked = model(on, () => '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}')
+  const REJECTED = { ...D1, id: 'D-5', kind: 'change', questions: [], answers: [{ label: 'rejected', note: 'warnings stay amber, never red', origin: 'composer', session: 'TEST P', at: PAST }], area: 'ui', change: { path: 'notes/style.md', summary: 'make the warning band red' } }
+  const w = project(on, { files: { [`${DEC}/register/2026-11/D-5.json`]: JSON.stringify(REJECTED) } })
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
+  await startSession($, w)
+  await decide($, { questions: [COLOR], area: 'ui' })
+  await tick(w)
+  // The change he rejected saying why is in the case law, copied by code from his answer
+  expect(String(asked[0].promptBlocks[1].text)).toContain('D-5 (2026-11-01, area ui), the person rejected the change to notes/style.md ("make the warning band red"), saying: "warnings stay amber, never red"')
+  // He answers with a note; fleet delivers it, and the turn it starts carries his words
+  await fleet($, '')
+  expect(await fleet($, 'note 1 amber reads calmer next to the logo')).toContain('Note on 1 saved')
+  await fleet($, '1a')
+  for (let i = 0; i < 10 && !w.submits.length; i++) await tick(w, 500)
+  expect(w.submits[0]).toContain('[D-6] The person answered:\n1) Which color for the warning band? → a) Amber (note: amber reads calmer next to the logo)')
+  await $.turn.start({ text: w.submits[0] as string, turnId: 't-2' })
+  await w.clock.settle()
+  const mine: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'amber reads calmer next to the logo', about: 'a red warning band', principle: 'warnings stay calm', area: 'ui' } as any)
+  expect(mine.result).toContain('Recorded as T-1 in the register: a principle candidate ("warnings stay calm")')
+  expect(json(w, `${DEC}/register/2026-11/T-1.json`).taste).toMatchObject({ person: true, quoted: 'amber reads calmer next to the logo' })
+  const not: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'red belongs to the vendor brand', about: 'red', principle: 'leave red to the vendor', area: 'ui' } as any)
+  expect(not.result).toContain("(what it says isn't in the person's words fleet delivered this turn)")
+  await $.turn.complete({ answer: 'ok', durationMs: 5, isAborted: false, turnId: 't-2', reason: 'answer' } as any)
+  await w.clock.settle()
+  // The next turn isn't fleet's delivery: nothing of his to quote
+  const after: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'amber reads calmer next to the logo', about: 'a red warning band', principle: 'warnings stay calm', area: 'ui' } as any)
+  expect(after.result).toContain("(the person didn't type this turn)")
 })
 
 // ---- Live areas (0.7.0) ----

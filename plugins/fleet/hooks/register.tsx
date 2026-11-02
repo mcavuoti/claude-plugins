@@ -145,6 +145,7 @@ import {
   agreementOf,
   areaOf,
   demoteCheck,
+  heardIn,
   liveActs,
   liveGate,
   liveWords,
@@ -344,7 +345,10 @@ const seedSent = atom({ plugin: 'fleet', key: 'seedSent' } as const, '')
 const budgetTold = atom({ plugin: 'fleet', key: 'budgetTold' } as const, '')
 const nudgeAt = atom({ plugin: 'fleet', key: 'nudgeAt' } as const, 0)
 const outside = atom({ plugin: 'fleet', key: 'outside' } as const, null as FleetMark | null)
-const personTurn = atom({ plugin: 'fleet', key: 'personTurn' } as const, null as { turnId: string; quoted: string } | null)
+const personTurn = atom({ plugin: 'fleet', key: 'personTurn' } as const, null as { turnId: string; quoted: string; text?: string } | null)
+// A turn fleet's own prompt started to deliver the person's answers: the words of his it carries (text answers, notes,
+// reject reasons, why he dropped a decision or overruled a judge), which a taste recorded in it may quote
+const fleetTurn = atom({ plugin: 'fleet', key: 'fleetTurn' } as const, null as { turnId: string; words: string } | null)
 const pendingPerson = atom({ plugin: 'fleet', key: 'pendingPerson' } as const, null as { text: string; at: number } | null)
 const turns = atom({ plugin: 'fleet', key: 'turns' } as const, 0)
 const conversationAt = atom({ plugin: 'fleet', key: 'conversationAt' } as const, 0)
@@ -1023,6 +1027,10 @@ async function turnStarted($: any, text: string, turnId: string) {
   await update($, busy, () => true)
   const ids = deliveredIds(text)
   if (!ids.length) return
+  // The person's own words this turn carries, read from the answer files before they close: a taste recorded in it
+  // that says what they say is his (tasteCall)
+  const words = await personWords($, ids)
+  if (words) await update($, fleetTurn, () => ({ turnId, words }))
   // The person's overrules of a judge's answers, delivered in this turn
   const over = await read($, overruling)
   for (const id of ids) if (over[id] && text.includes(`[${id}] The person overruled`)) await overruleDelivered($, id, turnId)
@@ -1032,6 +1040,31 @@ async function turnStarted($: any, text: string, turnId: string) {
   if (!closing.length) return
   await update($, inflight, m => omit(m, closing))
   for (const id of closing) await close($, id, { state: 'delivered', turnId })
+}
+
+/** What the person typed that these decisions carry to their asker: his text answers (origin composer), his notes and
+ * reject reasons (a note is only ever his: /fleet note and a verb's note are typed at a terminal), why he dropped one,
+ * and his overrule of a judge (its words and why) */
+async function personWords($: any, ids: readonly string[]): Promise<string> {
+  const out: string[] = []
+  const present = await answerNames($)
+  for (const id of ids) {
+    const rec = await readQueue($, id)
+    if (rec && !('otherFormat' in rec)) {
+      const { outcomes, drop } = await outcomesOf($, rec, present)
+      for (const o of outcomes) {
+        if (o?.note) out.push(o.note)
+        if (o && o.origin === 'composer' && o.label === undefined && o.text) out.push(o.text)
+      }
+      if (drop?.origin === 'composer' && drop.why) out.push(drop.why)
+    }
+    const n = await readWire<OverruleNotice>($, dec(`overrules/${id}.json`))
+    if (n) {
+      for (const a of n.answers) if (a?.text) out.push(a.text)
+      if (n.why) out.push(n.why)
+    }
+  }
+  return out.join('\n')
 }
 
 // ---- Every 10 s, in every session of the project: the band's count, this session's section, the daily prune ----
@@ -5669,9 +5702,15 @@ async function tasteCall($: any, e: any) {
   if (!c.ok) return { deny: `${c.reason}. Nothing was recorded: call mcp__fleet__taste again with that fixed.` }
   await ensureWorld($)
   const area = areaOf(c.area, worldTags)
+  // His only when what it says is in his own words: his prompt of this turn, or what fleet delivered of his in it
   const turn = await read($, personTurn)
+  const delivered = await read($, fleetTurn)
+  const typed = !!turn && heardIn(c.said, turn.text ?? turn.quoted)
+  const fromAnswer = !typed && !!delivered && heardIn(c.said, delivered.words)
+  const quoted = typed ? turn?.quoted : fromAnswer ? cut((delivered?.words ?? '').replace(/\s+/g, ' ').trim(), 300) : turn?.quoted
   const mark = await read($, outside)
-  const spec: TasteSpec = { said: c.said, about: c.about, principle: c.principle, person: !!turn, ...(turn ? { quoted: turn.quoted } : {}), ...(mark ? { outside: mark } : {}) }
+  const spec: TasteSpec = { said: c.said, about: c.about, principle: c.principle, person: typed || fromAnswer, ...(quoted ? { quoted } : {}), ...(mark ? { outside: mark } : {}) }
+  const notHeard = turn ? "what it says isn't in what the person typed this turn" : delivered ? "what it says isn't in the person's words fleet delivered this turn" : "the person didn't type this turn"
   const now = await $.clock.now()
   const asker = await askerNow($)
   const all: string[] = []
@@ -5683,8 +5722,8 @@ async function tasteCall($: any, e: any) {
     const r = await publish($, registerPath(id, monthOf(now)), json(entry))
     if (r === 'exists') continue
     if (r === 'failed') break
-    log($, `taste ${id}: "${c.principle.slice(0, 80)}" (${spec.person ? 'the person typed this turn' : 'not his turn'}${mark ? ', after outside content' : ''})`)
-    return { result: `${tasteResult(id, spec)}${area.note ? ` (${area.note}.)` : ''}` }
+    log($, `taste ${id}: "${c.principle.slice(0, 80)}" (${typed ? 'in what the person typed this turn' : fromAnswer ? "in the person's words fleet delivered" : 'not his words'}${mark ? ', after outside content' : ''})`)
+    return { result: `${tasteResult(id, spec, notHeard)}${area.note ? ` (${area.note}.)` : ''}` }
   }
   return { result: "fleet couldn't record this in the register: say it in your journal or your reply instead" }
 }
@@ -6598,7 +6637,7 @@ async function personPrompt($: any, e: any) {
   const now = await $.clock.now()
   // Typed into a running turn: that turn is his; and the next, if the prompt waits for it (every other prompt that
   // starts a turn comes through here first and clears this)
-  if (e.turnId) await update($, personTurn, t => (t && t.turnId === e.turnId ? t : { turnId: e.turnId, quoted: text.slice(0, 300) }))
+  if (e.turnId) await update($, personTurn, t => (t && t.turnId === e.turnId ? t : { turnId: e.turnId, quoted: cut(text, 300), text: cut(text, 4000) }))
   await update($, pendingPerson, () => ({ text, at: now }))
 }
 
@@ -6730,7 +6769,8 @@ export const register: Register = on => {
       const now = await $.clock.now()
       const his = !!p && now - p.at < 60000 && !!p.text.trim() && String(e.text ?? '').includes(p.text.trim().slice(0, 200))
       if (his || (p && now - p.at >= 60000)) await update($, pendingPerson, () => null)
-      await update($, personTurn, () => (his && p ? { turnId: e.turnId, quoted: p.text.slice(0, 300) } : null))
+      await update($, personTurn, () => (his && p ? { turnId: e.turnId, quoted: cut(p.text, 300), text: cut(p.text, 4000) } : null))
+      await update($, fleetTurn, () => null)
       await update($, turns, n => n + 1)
       if (timersOn) bg(turnStarted($, e.text, e.turnId))
     }
@@ -6739,7 +6779,10 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if (e.agentId === undefined) await update($, personTurn, () => null)
+    if (e.agentId === undefined) {
+      await update($, personTurn, () => null)
+      await update($, fleetTurn, () => null)
+    }
     if (e.agentId === undefined && permissionWait) bg(promptAnswered($))
     if (e.agentId === undefined && timersOn) {
       bg(

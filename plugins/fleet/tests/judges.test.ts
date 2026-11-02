@@ -7,6 +7,7 @@ import {
   REVIEW_MS,
   demoteCheck,
   distinguishing,
+  heardIn,
   isGeneric,
   liveActs,
   markSeen,
@@ -93,13 +94,23 @@ test('the case law: only the person’s answers (never a judge’s own), dialogs
     { id: 'T-1', source: 'taste', at: AT, questions: [], answers: [], area: 'ui', taste: { said: 'no stand-ins', about: 'a placeholder chart', principle: 'never show placeholders', person: true } },
     { id: 'T-2', source: 'taste', at: AT, questions: [], answers: [], taste: { said: 'x', about: 'y', principle: 'z', person: false } },
     { id: 'T-3', source: 'taste', at: AT, questions: [], answers: [], taste: { said: 'x', about: 'y', principle: 'z', person: true, outside: { at: AT, what: 'WebSearch' } } },
+    // A change and an outbound he rejected: with a reason he typed, case law (the answer's own note, copied by code)
+    { id: 'D-6', source: 'decide', kind: 'change', at: AT, closedAt: AT + 120000, questions: [], answers: [{ label: 'rejected', note: 'not yet: after the merge', origin: 'composer' }], change: { path: 'plan.md', summary: 'add it now' } },
+    { id: 'D-7', source: 'decide', kind: 'outbound', at: AT, questions: [], answers: [{ label: 'rejected', origin: 'composer' }], outbound: { what: 'a mail', to: 'a@example.invalid' } },
+    { id: 'D-8', source: 'decide', kind: 'change', at: AT, questions: [], answers: [{ label: 'rejected', note: 'x', origin: 'plugin' }], change: { path: 'plan.md', summary: 's' } },
+    { id: 'D-9', source: 'decide', kind: 'outbound', at: AT, closedAt: AT + 180000, questions: [], answers: [{ label: 'rejected', note: 'too early', origin: 'composer' }], outbound: { what: 'a mail', to: 'a@example.invalid' } },
   ]
   const ps = precedentsOf(records)
   expect(ps.map(p => [p.id, p.kind])).toEqual([
     ['ask-x', 'answer'],
     ['T-1', 'taste'],
     ['D-1', 'answer'],
+    ['D-6', 'rejection'],
+    ['D-9', 'rejection'],
   ])
+  expect(caseLawText(ps.filter(p => p.kind === 'rejection'))).toContain(
+    'D-6 (2026-11-01), the person rejected the change to plan.md ("add it now"), saying: "not yet: after the merge"\nD-9 (2026-11-01), the person rejected the outbound a mail to a@example.invalid, saying: "too early"',
+  )
   // A correction (0.7.0) makes the judge's answer the person's
   const fixed = precedentsOf(records, [{ id: 'D-2', at: AT + 3600000, answers: [{ label: 'Amber' }], why: 'red is for errors' }])
   expect(fixed.find(p => p.id === 'D-2')).toMatchObject({ kind: 'correction', questions: [{ label: 'Amber', judged: 'Red' }], why: 'red is for errors' })
@@ -295,6 +306,13 @@ test('taste: its input, its number, and what the session is told by its provenan
   expect(nextTasteNumber(['D-3.json', 'T-2.json', 'T-10.json', 'ask-x.json'])).toBe(11)
   expect(tasteResult('T-3', { said: 'a', about: 'b', principle: 'c', person: true })).toContain("Recorded as T-3 in the register: a principle candidate (\"c\") the project's judges read from now on.")
   expect(tasteResult('T-3', { said: 'a', about: 'b', principle: 'c', person: false })).toContain("the person didn't type this turn): the judges don't read it until the person promotes it")
+  expect(tasteResult('T-3', { said: 'a', about: 'b', principle: 'c', person: false }, "what it says isn't in what the person typed this turn")).toContain("(what it says isn't in what the person typed this turn)")
+  // His, when what it says is in his words: 60% or more of its words that carry meaning
+  expect(heardIn('the band is too loud', 'no, the band is too loud: make it amber')).toBe(true)
+  expect(heardIn('vendor X is out, he said no to it', 'tidy up the notes')).toBe(false)
+  expect(heardIn('not yet: the integrator hands it over', 'not yet: the integrator hands it over after the merge')).toBe(true)
+  expect(heardIn('integrator merge quickly always', 'the integrator merges after the merge')).toBe(false)
+  expect(heardIn('no', 'no')).toBe(false)
   expect(areaOf('Storage', ['storage', 'ui'])).toEqual({ area: 'storage', note: null })
   expect(areaOf('db', ['storage', 'ui'])).toEqual({ area: null, note: 'area "db" isn\'t one of the project\'s tags (storage, ui), so it was kept without one' })
   expect(areaOf('Front End!', [])).toEqual({ area: 'front-end', note: null })
