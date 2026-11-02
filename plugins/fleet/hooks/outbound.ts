@@ -587,6 +587,7 @@ const FTP_VALUE = /^-[oPqrsTux]$/
 const LFTP_VALUE = /^-[eupcf]$/
 const SMB_VALUE = /^(-[UWcApIOmnsDTlRtdbLM]|--(user|workgroup|command|authentication-file|port|ip-address|socket-options|max-protocol|netbiosname|configfile|directory|tar|debuglevel|log-basename|list|message|name-resolve))$/
 const TAR_VALUE = /^(-[fCbTXgVKNLH]|--(file|directory|exclude|files-from|exclude-from|transform|xform|owner|group|mode|mtime|label|newer|after-date|newer-mtime|blocking-factor|use-compress-program|format|level|index-file|exclude-tag))$/
+const ZIP_VALUE = /^(-[btnPZOsxi]|--(temp-path|from-date|before-date|suffixes|password|compression-method|output-file|split-size|exclude|include|archive-comment|log-file))$/
 
 /** The value a command's environment gives a variable (the last one that matches), or undefined */
 function envValue(vars: readonly string[], name: RegExp): string | undefined {
@@ -977,6 +978,12 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       if (!opts.some(o => o.name === '-c' || o.name === '--create')) continue
       const dir = opts.find(o => o.name === '-C' || o.name === '--directory')?.value?.replace(/\/+$/, '')
       for (const f of locals(args)) archived.push(dir && !f.startsWith('/') ? (f === '.' ? dir : `${dir}/${f}`) : f)
+    }
+    // zip [options] archive [file…] (zip -r - notes | ssh …, zip out.zip -r notes && scp out.zip …): what follows the
+    // archive is what it holds
+    if (cmd === 'zip') {
+      const { args } = operands(rest, ZIP_VALUE)
+      for (const f of locals(args.slice(1))) archived.push(f)
     }
   }
   // A redirection to /dev/tcp/<host>/<port> (or /dev/udp/…): the shell opens the connection itself

