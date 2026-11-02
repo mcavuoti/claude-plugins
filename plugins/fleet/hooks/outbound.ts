@@ -962,6 +962,18 @@ export function parseDraft(text: string): { command: string } | { tool: string; 
   return { problem: 'the draft holds neither a command nor an MCP tool and its input' }
 }
 
+// How much of a draft's call /fleet shows: a command's first lines, an MCP call's input's first lines
+export const COMMAND_SHOWN = 30
+export const INPUT_SHOWN = 40
+
+/** What /fleet shows of a draft's call, and how many lines it leaves out. A call shown cut is sent only with its
+ * version typed (/fleet <n> send h…): the person read the rest in the draft */
+export function callShown(call: { command: string } | { tool: string; input: Record<string, unknown> }): { lines: string[]; more: number } {
+  const all = 'command' in call ? call.command.split('\n') : JSON.stringify(call.input, null, 2).split('\n')
+  const max = 'command' in call ? COMMAND_SHOWN : INPUT_SHOWN
+  return { lines: all.slice(0, max), more: Math.max(0, all.length - max) }
+}
+
 /** A path an outbound sends whose last part is a pattern (dist/*.whl): its folder and the pattern; null for any other
  * path (a pattern in a folder's name isn't listed) */
 export function patternOf(path: string): { dir: string; name: string } | null {

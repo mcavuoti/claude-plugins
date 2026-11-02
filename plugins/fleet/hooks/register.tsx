@@ -8,6 +8,7 @@ import {
   OUTBOUND_FORMAT,
   SEND_DESCRIPTION,
   SEND_SCHEMA,
+  callShown,
   checkSend,
   classifyBash,
   classifyMcp,
@@ -4282,23 +4283,31 @@ function resourceHeld(n: number, r: QueueRecord, asker: AskerView, now: number):
 }
 
 /** /fleet lists an outbound with what would go out, exactly: the call (the command, or the tool and its input) and the
- * first lines of each file it sends, with where the rest is */
+ * first lines of each file it sends, with where the rest is. A call shown cut says so, and sends only with its version
+ * typed */
 async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView, now: number): Promise<string> {
   const o = r.outbound as OutboundSpec
   const draftAbs = `${fleetDir()}/${o.draft}`
   const draft = await readText($, draftAbs)
+  const sources: Source[] = []
+  for (const f of o.files) sources.push(await sourceOf($, shownPath(f.path)))
+  const hashNow = draft === null ? null : outboundHash(draft, o.files.map((f, k) => ({ path: f.path, v: sources[k]?.v ?? null })), hashText)
   const lines = [`${n}. Send outside: ${o.what} to ${o.to}`, `   why: ${o.why}`]
   const call = draft === null ? null : parseDraft(draft)
+  let cut = false
   if (!call || 'problem' in call) lines.push(`   the draft can't be run (${call ? call.problem : 'it is gone'}): /fleet ${n} edit, or /fleet ${n} reject`)
-  else if ('command' in call) lines.push('```sh', ...call.command.split('\n').slice(0, 30), '```')
   else {
-    const body = JSON.stringify(call.input, null, 2).split('\n')
-    lines.push(`   ${call.tool}, with:`, '```json', ...body.slice(0, 40), '```')
-    if (body.length > 40) lines.push(`   and ${body.length - 40} more lines in ${draftAbs}`)
+    const shown = callShown(call)
+    if ('command' in call) lines.push('```sh', ...shown.lines, '```')
+    else lines.push(`   ${call.tool}, with:`, '```json', ...shown.lines, '```')
+    if (shown.more) {
+      cut = true
+      lines.push(`   and ${shown.more} more line${shown.more === 1 ? '' : 's'} in ${draftAbs}: read ${shown.more === 1 ? 'it' : 'them'} there, then /fleet ${n} send ${shortHash(hashNow)} sends it (a plain send doesn't, since this isn't all of it)`)
+    }
   }
-  for (const f of o.files) {
+  for (const [k, f] of o.files.entries()) {
     const abs = shownPath(f.path)
-    const s = await sourceOf($, abs)
+    const s = sources[k] as Source
     const changed = s.v !== f.v ? ` (changed since it was drafted: ${s.v === null ? 'it is gone' : 'what is shown is what would go out'})` : ''
     if (s.tree) {
       // A folder or a pattern: how many files, and the first paths
@@ -4321,8 +4330,8 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
     lines.push(`   ${f.path} (${body.length} line${body.length === 1 ? '' : 's'}, ${shortHash(s.v)})${changed}:`, '```', ...body.slice(0, 12), '```')
     if (body.length > 12) lines.push(`   and ${body.length - 12} more lines in ${abs}`)
   }
-  const hashNow = draft === null ? null : outboundHash(draft, await filesNow($, o), hashText)
-  lines.push(`   draft ${draftAbs} (${shortHash(hashNow)}) · /fleet ${n} send, /fleet ${n} reject, /fleet ${n} edit to change it first, or /fleet ${n} done if you sent it yourself`)
+  const send = cut ? `/fleet ${n} send ${shortHash(hashNow)}` : `/fleet ${n} send`
+  lines.push(`   draft ${draftAbs} (${shortHash(hashNow)}) · ${send}, /fleet ${n} reject, /fleet ${n} edit to change it first, or /fleet ${n} done if you sent it yourself`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
   lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin)})` : ''}`)
   return lines.join('\n')
@@ -4443,6 +4452,11 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   }
   const call = parseDraft(draft)
   if ('problem' in call) return `${n}: ${call.problem}: /fleet ${n} edit, or /fleet ${n} reject`
+  // A call /fleet showed cut goes only with its version typed: the person read the rest in the draft
+  const shown = callShown(call)
+  if (shown.more && !sameHash(it.hash, hashNow)) {
+    return `${n}: /fleet showed ${rec.id}'s ${'command' in call ? 'command' : 'input'} cut (${shown.more} more line${shown.more === 1 ? '' : 's'} in ${draftAbs}), so a plain send doesn't send it: read it whole there, then /fleet ${n} send ${shortHash(hashNow)} sends it.`
+  }
   // Once: the first claim wins
   const claimPath = dec(`applied/${rec.id}.json`)
   const claim = await publish($, claimPath, json({ format: FORMAT, id: rec.id, at: now, session: here, origin, hash: hashNow }))

