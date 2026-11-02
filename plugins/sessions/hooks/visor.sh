@@ -5,7 +5,8 @@
 # exited, the session ended), the launcher ends and the usual terminal is left.
 #
 # Usage: visor.sh start [--new | --agents | <name>]   what ccc runs: launcher.py decides what opens first
-#        visor.sh start tell [--in <folder>] <name|id> [text | -]   ccc tell: hand a session text (no terminal needed)
+#        visor.sh start tell [--in <folder>] [--wait[=<s>]] <name|id> [text | -]   ccc tell: hand a session text (no
+#                                                                                 terminal needed)
 #        visor.sh start section [--session <name|id>] [<title> | -]   ccc section: put a session in one of your sections
 #        visor.sh attach <id> | agents                  windows the panel opens
 #

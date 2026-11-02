@@ -311,6 +311,48 @@ grep -q "^refused: it is stopped, and no session with a running panel answered t
 expect "$(find "$data/tell/aaaaaaaa" -name '*.req' | wc -l | tr -d ' ')" 1 "the refused request is removed (the first one waits)"
 pass "tell: wakes a stopped session through a running one, refused when none answers"
 
+# 12b. ccc tell --wait: until the session's mod says delivered (0), held (3) or refused (1), or the time is up (4,
+#      still queued); and at most 6 requests a minute (60 an hour) reach one session, the rest refused with when to retry
+answer_after() {
+  ( for _ in $(seq 1 50); do
+      f=$(find "$data/tell/aaaaaaaa" -name '*.req' | head -n 1)
+      if [ -n "$f" ]; then sleep "$1"; printf 'format=2\nstate=%s\nreason=%s\nat=1\n' "$2" "${3:-}" > "${f%.req}.status"; rm -f "$f"; break; fi
+      sleep 0.1
+    done ) &
+}
+reset
+sessions aaaaaaaa:alpha:idle:600
+beat aaaaaaaa 1000
+allow aaaaaaaa
+answer_after 2.5 delivered
+began=$(date +%s)
+code=0; tell --wait=20 alpha "ping" > "$work/out.txt" || code=$?
+wait "$!" 2>/dev/null || true
+expect "$code" 0 "tell --wait: delivered"
+grep -q '^delivered$' "$work/out.txt" || fail "tell --wait" "not delivered: $(cat "$work/out.txt")"
+[ $(($(date +%s) - began)) -ge 2 ] || fail "tell --wait" "it didn't wait past the usual 2 s"
+answer_after 0.3 held 'the session was stopped: it goes once the person types in it'
+code=0; tell --wait alpha "ping" > "$work/out.txt" || code=$?
+wait "$!" 2>/dev/null || true
+expect "$code" 3 "tell --wait: held"
+grep -q '^held: the session was stopped' "$work/out.txt" || fail "tell --wait" "not held: $(cat "$work/out.txt")"
+beat aaaaaaaa 1000
+code=0; tell --wait=1 alpha "ping" > "$work/out.txt" || code=$?
+expect "$code" 4 "tell --wait: still queued at the timeout"
+grep -q '(still queued after 1 s)$' "$work/out.txt" || fail "tell --wait" "no timeout said: $(cat "$work/out.txt")"
+rm -f "$data/tell/aaaaaaaa/"*
+allow aaaaaaaa
+now=$(now_ms)
+for i in 1 2 3 4 5 6; do printf 'format=2\nstate=delivered\nreason=\nat=1\n' > "$data/tell/aaaaaaaa/$((now - i * 1000))-$i.status"; done
+out="$(tell alpha "ping" || true)"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+grep -q "^refused: “alpha” was handed 6 requests in the last minute, the most ccc tell gives one session (6 a minute, 60 an hour): try again in [0-9]* s$" <<<"$out" || fail "tell rate" "no refusal: $out"
+[ -z "$(find "$data/tell/aaaaaaaa" -name '*.req')" ] || fail "tell rate" "a request was written past the limit"
+rm -f "$data/tell/aaaaaaaa/"*.status
+for i in $(seq 1 60); do printf 'format=2\nstate=delivered\nreason=\nat=1\n' > "$data/tell/aaaaaaaa/$((now - 120000 - i * 1000))-$i.status"; done
+grep -q "was handed 60 requests in the last hour" <<<"$(tell alpha "ping" || true)" || fail "tell rate" "no hourly limit"
+pass "tell --wait: delivered, held, timed out; at most 6 a minute and 60 an hour"
+
 # 13. ccc section: the person's section for the session this project's window shows (or --session), written to
 #     sections.json as /sessions section does (made if needed, gone when empty, unknown fields kept, a parent dropped);
 #     refused with no window or several, and a newer sections.json is left untouched

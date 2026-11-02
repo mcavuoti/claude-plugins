@@ -3,7 +3,7 @@
 
     launcher.py start --tty TTY --file FILE [--new | --agents] [--exclude ID] [NAME...]
     launcher.py pick [--tty TTY] [--new] [NAME...]      the decision only, as JSON (tests and debugging)
-    launcher.py tell [--in DIR] NAME|ID [TEXT... | -]   ccc tell: hand a background session text (see tell() below)
+    launcher.py tell [--in DIR] [--wait[=S]] NAME|ID [TEXT... | -]   ccc tell: hand a background session text (tell())
     launcher.py section [--session NAME|ID] [TITLE | -]  ccc section: the person's section for a session (section())
 
 start decides and, when something should open in this window, writes it to FILE (the window's file, which visor.sh
@@ -593,7 +593,8 @@ def start(args, tty, path):
 # at most: send a pointer ("new mail, id ...") rather than outside text. A session the background service retired for
 # being idle is woken first, by a running session's mod and under the rules of $.sessions.wake. The request and its
 # status file live in <data>/tell/<id>/ (TELL in state.ts); it prints the state and the status file's path, and exits
-# 1 when it was refused.
+# 1 when it was refused. --wait[=S] waits (300 s by default) until the session's mod says delivered (exit 0), held (3)
+# or refused (1), or the time is up (4, still queued). At most 6 requests a minute and 60 an hour reach one session.
 
 def caller_name():
     # Who ran ccc tell: the parent of the launcher's shell, by its command's name
@@ -632,12 +633,42 @@ def tell_status(folder, rid, state, reason=''):
     write_key_lines(os.path.join(folder, rid + '.status'), [('format', FORMAT), ('state', state), ('reason', reason), ('at', now_ms())])
 
 
+# At most this many requests a minute and an hour reach one session, counted by their status files (<at>-<pid>.status,
+# kept a day), so that a script gone wrong can't flood it: the rest are refused, saying when to try again
+TELL_PER_MINUTE = 6
+TELL_PER_HOUR = 60
+# How long --wait waits by default, in seconds
+TELL_WAIT = 300
+
+
+def tell_too_many(here, name, now):
+    try:
+        times = [int(m.group(1)) for m in (re.match(r'^(\d+)-\d+\.status$', n) for n in os.listdir(here)) if m]
+    except OSError:
+        return None
+    for limit, span, words in ((TELL_PER_MINUTE, 60000, 'minute'), (TELL_PER_HOUR, 3600000, 'hour')):
+        recent = sorted(t for t in times if 0 <= now - t < span)
+        if len(recent) >= limit:
+            wait = max(1, -(-(recent[-limit] + span - now) // 1000))
+            return '“%s” was handed %d requests in the last %s, the most ccc tell gives one session (%d a minute, %d an hour): try again in %d s' % (
+                name, len(recent), words, TELL_PER_MINUTE, TELL_PER_HOUR, wait)
+    return None
+
+
 def tell(argv):
-    folder, words = os.getcwd(), list(argv)
-    if len(words) >= 2 and words[0] == '--in':
-        folder, words = words[1], words[2:]
+    folder, words, wait = os.getcwd(), list(argv), None
+    while words and words[0].startswith('--'):
+        flag = words.pop(0)
+        if flag == '--in' and words:
+            folder = words.pop(0)
+        elif flag == '--wait':
+            wait = TELL_WAIT
+        elif flag.startswith('--wait=') and re.match(r'^\d+(\.\d+)?$', flag[7:]):
+            wait = float(flag[7:])
+        else:
+            words = []
     if not words:
-        say('usage: ccc tell [--in <folder>] <name|id> "text"   (or - to read the text from stdin)')
+        say('usage: ccc tell [--in <folder>] [--wait[=<seconds>]] <name|id> "text"   (or - to read the text from stdin)')
         return 2
     target, text = words[0], ' '.join(words[1:])
     if text == '-' or (not text and not sys.stdin.isatty()):
@@ -665,6 +696,10 @@ def tell(argv):
     if is_live(s) and heartbeat_status(read_heartbeat(s['sessionId']), s.get('pid'), now) != 'ok':
         say("refused: “%s”'s panel isn't running, or runs another version of the sessions mod: restart it (u)" % name)
         return 1
+    too_many = tell_too_many(here, name, now)
+    if too_many:
+        say('refused: %s' % too_many)
+        return 1
     rid = '%d-%d' % (now, os.getpid())
     os.makedirs(here, exist_ok=True)
     temporary = os.path.join(here, '.%s.txt' % rid)
@@ -689,15 +724,20 @@ def tell(argv):
             tell_status(here, rid, 'refused', reason)
         elif parse_key_lines(read_text(status)).get('state') == 'queued':
             tell_status(here, rid, 'queued', '%s; it goes once its panel is up and it is idle' % (answer.get('reason') or 'it was woken'))
-    else:
-        # Running: what its mod says within 2 s (delivered, held), else still queued
-        deadline = time.time() + 2
-        while time.time() < deadline and parse_key_lines(read_text(status)).get('state') == 'queued':
-            time.sleep(0.1)
+    # What its mod says (delivered, held, refused): within 2 s, or with --wait until it says it or the time is up
+    deadline = time.time() + (wait if wait is not None else 0 if not is_live(s) else 2)
+    while time.time() < deadline and parse_key_lines(read_text(status)).get('state') == 'queued':
+        time.sleep(0.2 if wait is not None else 0.1)
     k = parse_key_lines(read_text(status))
-    say('%s%s' % (k.get('state') or 'queued', ': %s' % k['reason'] if k.get('reason') else ''))
+    state = k.get('state') or 'queued'
+    late = ' (still queued after %g s)' % wait if wait is not None and state == 'queued' else ''
+    say('%s%s%s' % (state, ': %s' % k['reason'] if k.get('reason') else '', late))
     say('status file: %s' % status)
-    return 1 if k.get('state') == 'refused' else 0
+    if state == 'refused':
+        return 1
+    if wait is None or state == 'delivered':
+        return 0
+    return 3 if state == 'held' else 4
 
 
 # --- ccc section ---------------------------------------------------------------------------------------------------
