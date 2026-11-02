@@ -3177,7 +3177,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   for (const p of plan) {
     if (p.action === 'start') {
       if (!canStart) {
-        results.push(`  ${p.inst.name}: this sessions can't start sessions (restart it, u); by hand: ${startLine(p.inst)}`)
+        results.push(`  ${p.inst.name}: the sessions plugin in this session can't start sessions (restart this session, u); by hand: ${startLine(p.inst)}`)
         continue
       }
       const s = await race<Result>($, () => $.sessions.start!({ name: p.inst.name, cwd: root as string, agent: p.inst.agent, settings: settingsPath(p.inst.slug) }))
