@@ -546,6 +546,33 @@ async function publish($: any, path: string, text: string): Promise<'ok' | 'exis
   return (await exists($, path)) ? 'exists' : 'failed'
 }
 
+// Several files published no-clobber at once (a Bash command's landings): their temporary files written here, then one
+// sh running every ln (a folder seen for the first time made first) instead of three processes a file. The paths are
+// fleet's own names (events, versions), passed as arguments. What each came to; one the shell didn't get to (it couldn't
+// start) is published on its own
+const LN_ALL = 'while [ "$#" -gt 1 ]; do t=$1; d=$2; shift 2; if ln "$t" "$d" 2>/dev/null || { [ ! -e "$d" ] && mkdir -p "${d%/*}" && ln "$t" "$d" 2>/dev/null; }; then echo "ok $d"; elif [ -e "$d" ]; then echo "exists $d"; else echo "failed $d"; fi; rm -f "$t"; done'
+
+async function publishAll($: any, items: readonly { path: string; text: string }[]): Promise<Map<string, 'ok' | 'exists' | 'failed'>> {
+  const out = new Map<string, 'ok' | 'exists' | 'failed'>()
+  if (items.length < 2) {
+    for (const x of items) out.set(x.path, await publish($, x.path, x.text))
+    return out
+  }
+  const pairs: string[] = []
+  for (const x of items) pairs.push(await tmpFile($, x.text), x.path)
+  const r = await run($, ['sh', '-c', LN_ALL, 'sh', ...pairs], { timeoutMs: 30000 })
+  for (const line of r.stdout.split('\n')) {
+    const m = /^(ok|exists|failed) (.+)$/.exec(line)
+    if (m) out.set(m[2] as string, m[1] as 'ok' | 'exists' | 'failed')
+  }
+  const left = items.filter(x => !out.has(x.path))
+  if (left.length) {
+    await remove($, pairs.filter((_, i) => i % 2 === 0 && !out.has(pairs[i + 1] as string)))
+    for (const x of left) out.set(x.path, await publish($, x.path, x.text))
+  }
+  return out
+}
+
 // The file appears whole, over any older one
 async function replace($: any, path: string, text: string): Promise<boolean> {
   const tmp = await tmpFile($, text)
@@ -1151,7 +1178,8 @@ async function beat($: any) {
   if ((await read($, overBudget)) !== o) await update($, overBudget, () => o)
   if (jobRef) await keepSection($, records, present)
   await refreshName($)
-  await scanWorld($).catch(err => log($, `world scan: ${String(err).slice(0, 200)}`))
+  // The outside scan is the sweeper's (claims dedupe it anyway); every session walks the world once, for its baseline
+  if (sweep.holding || !baselined) await scanWorld($).catch(err => log($, `world scan: ${String(err).slice(0, 200)}`))
   // What the band says besides the counts: nobody sweeps, the world too big to scan
   const notes = [...((await sweeperState($)).nobody ? ['nobody sweeps'] : []), ...(tooBig && worldOn() ? ['world too big: no scan'] : [])].join(' · ')
   if ((await read($, bandNote)) !== notes) await update($, bandNote, () => notes)
@@ -1261,6 +1289,8 @@ let baselined = false
 let worldStarted = false
 let tooBig = false
 let tooBigAt = 0
+// Why: 'files' (past MAX_WORLD_FILES) or 'entries' (past MAX_WALK)
+let tooBigWhy: 'files' | 'entries' = 'files'
 let bashRunning = 0
 let readsTimer = false
 // This session as other sessions' digests name it, from $.sessions every 10 s
@@ -1269,6 +1299,12 @@ let myRef: string | null = null
 // A world past this many files isn't scanned at all (neither every 10 s nor after a command): outside changes and
 // suspects are off, and the walk is tried again every 10 minutes or when world.json changes
 const MAX_WORLD_FILES = 5000
+// ... and past this many entries walked under the world's folders (files and folders, in the world or not): a glob like
+// **/*.md in a code repository walks everything
+const MAX_WALK = 20000
+// Folders a walk never enters unless a glob names them (its base is that folder, or below it): the repository, packages,
+// virtual environments, caches and build output
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', 'build', 'dist', 'target', '.tox', '.cache', '.next'])
 const MiB4 = 4 * 1024 * 1024
 // What world.json says of records (records.ts); null with nothing to say, or when it's wrong (recordsProblem says why,
 // and the rest of the world stays on)
@@ -1608,10 +1644,15 @@ function pullEvents($: any, hours = 2): Promise<void> {
         }
         if (newer(latest.get(v.path), v)) {
           latest.set(v.path, v)
-          // What this session knows of the file follows the landing at once (its scan settles the rest), so the suspects
-          // reckoned next see it
+          // What this session knows of the file follows the landing at once, so the suspects reckoned next see it: only
+          // the sweeper scans the world every 10 s, and the other sessions know it from the landings (a new file's time
+          // and size come with the sweeper's next scan, or a command's here)
           const k = known.get(v.path)
-          if (k && v.to !== null && k.v !== v.to) known.set(v.path, { ...k, v: v.to, pins: v.pins ?? (v.id ? [] : k.pins) })
+          if (v.to === null) {
+            if (k) dropKnown(v.path)
+          } else if (!k) {
+            if (baselined && world && inWorld(v.path, world.res)) setKnown(v.path, { mtimeMs: 0, size: -1, v: v.to, pins: v.pins ?? [] })
+          } else if (k.v !== v.to) known.set(v.path, { ...k, v: v.to, pins: v.pins ?? (v.id ? [] : k.pins) })
         }
         remember(v)
         sweep.dirty = true
@@ -1657,34 +1698,49 @@ async function eventsTick($: any) {
 // One landing: published once under a name of its own in the current hour's folder, then events/latest rewritten so
 // every session's watcher fires
 async function writeEvent($: any, ev: Omit<ChangeEvent, 'format' | 'at'> & { at?: number }): Promise<ChangeEvent | null> {
+  for (let tries = 0; tries < 5; tries++) {
+    const x = await eventFor($, ev)
+    const r = await publish($, x.path, json(x.e))
+    if (r === 'exists') continue
+    if (r === 'failed') {
+      log($, `couldn't write the event of ${x.e.path}`)
+      return null
+    }
+    eventLanded($, x)
+    await trigger($, x.name)
+    return x.e
+  }
+  return null
+}
+
+/** An event as this session writes it, its name of its own and where it goes */
+async function eventFor($: any, ev: Omit<ChangeEvent, 'format' | 'at'> & { at?: number }): Promise<{ e: ChangeEvent; name: string; path: string; now: number }> {
   const sessionId = String(await $.session.id())
-  const sid8 = sessionId.slice(0, 8)
   // This session's own landing: its cadence counts it, and the brief says when its writer had read outside content
   const own = !!ev.by && ev.by.sessionId === sessionId && !ev.by.person && (ev.via === 'tool' || ev.via === 'bash')
   const mark = own && (await read($, outside)) ? { outside: true as const } : {}
-  for (let tries = 0; tries < 5; tries++) {
-    const now = await $.clock.now()
-    const e: ChangeEvent = { format: FORMAT, ...ev, ...mark, at: ev.at ?? now }
-    if (own) await update($, landedAt, () => now)
-    const name = eventName(now, sid8, ++eventCount)
-    const r = await publish($, `${eventsDir(hourFolder(now))}/${name}`, json(e))
-    if (r === 'exists') continue
-    if (r === 'failed') {
-      log($, `couldn't write the event of ${e.path}`)
-      return null
-    }
-    seen.set(name, now)
-    if (newer(latest.get(e.path), e)) latest.set(e.path, e)
-    remember(e)
-    // The suspects (and derived documents) again soon: this landing may clear or raise some
-    sweep.dirty = true
-    try {
-      await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: name }))
-    } catch {}
-    log($, `${e.path}: ${e.via}${e.tool ? ` (${e.tool})` : ''}${e.blind ? ', landed blind' : ''}${e.overwrote ? ', over a change' : ''}`)
-    return e
-  }
-  return null
+  const now = await $.clock.now()
+  if (own) await update($, landedAt, () => now)
+  const name = eventName(now, sessionId.slice(0, 8), ++eventCount)
+  return { e: { format: FORMAT, ...ev, ...mark, at: ev.at ?? now }, name, path: `${eventsDir(hourFolder(now))}/${name}`, now }
+}
+
+/** A published event, as this session knows it at once */
+function eventLanded($: any, x: { e: ChangeEvent; name: string; now: number }) {
+  const e = x.e
+  seen.set(x.name, x.now)
+  if (newer(latest.get(e.path), e)) latest.set(e.path, e)
+  remember(e)
+  // The suspects (and derived documents) again soon: this landing may clear or raise some
+  sweep.dirty = true
+  log($, `${e.path}: ${e.via}${e.tool ? ` (${e.tool})` : ''}${e.blind ? ', landed blind' : ''}${e.overwrote ? ', over a change' : ''}`)
+}
+
+/** events/latest rewritten: every session's watcher fires */
+async function trigger($: any, name: string) {
+  try {
+    await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: name }))
+  } catch {}
 }
 
 // ---- What each thread read ----
@@ -1951,15 +2007,48 @@ async function revsFor($: any, id: string, have?: { rel: string; v: string | nul
 /** A landing of a world file: a record gets its next version (no-clobber: on a name taken, the one after), with the
  * kind its change line names; the event carries it, and the pins the file cites now */
 async function landRecord($: any, rel: string, after: { v: string | null; text: string | null }, via: ChangeEvent['via'], by: Who | null, marks: { suspect?: string[]; confirmed?: string[] } = {}): Promise<Partial<ChangeEvent>> {
+  const p = await planRecord($, rel, after, via, by, marks)
+  return p.entry ? publishRev($, p) : p.fields
+}
+
+/** What a landing makes of its record: the fields its event carries, and the version to publish (none: not a record,
+ * the same text as its last version, or a removed twin of a record still there) */
+type RevPlan = { fields: Partial<ChangeEvent>; entry?: Rev }
+
+function revPath(entry: Rev, n = entry.rev): string {
+  return `${revDir(entry.id)}/${n}.json`
+}
+
+/** A planned version, published no-clobber from its number on: on a name taken, the next one. first: what the first
+ * try at its own number already came to (a batch's) */
+async function publishRev($: any, p: RevPlan, first?: 'exists' | 'failed'): Promise<Partial<ChangeEvent>> {
+  const entry = p.entry as Rev
+  for (let n = entry.rev + (first ? 1 : 0), tries = 0; first !== 'failed' && tries < 20; tries++, n++) {
+    const r = await publish($, revPath(entry, n), json({ ...entry, rev: n }))
+    if (r === 'ok') return revLanded(p, n)
+    if (r === 'failed') break
+  }
+  log($, `${entry.path}: couldn't give ${entry.id} a version (${revDir(entry.id)})`)
+  return p.fields
+}
+
+function revLanded(p: RevPlan, n: number): Partial<ChangeEvent> {
+  const entry = p.entry as Rev
+  forget(entry.id)
+  sweep.dirty = true
+  return { ...p.fields, rev: n, kind: entry.kind }
+}
+
+async function planRecord($: any, rel: string, after: { v: string | null; text: string | null }, via: ChangeEvent['via'], by: Who | null, marks: { suspect?: string[]; confirmed?: string[] } = {}): Promise<RevPlan> {
   const pins = pinsFrom(after.text, rel)
   const suspect = marks.suspect ?? []
   const confirmed = marks.confirmed ?? []
   const extra: Partial<ChangeEvent> = { ...(pins.length ? { pins } : {}), ...(suspect.length ? { suspect } : {}), ...(confirmed.length ? { confirmed } : {}) }
   const id = records ? idOf(rel, records) : null
-  if (!records || !id) return extra
+  if (!records || !id) return { fields: extra }
   const revs = await revsOf($, id)
   const prev = revs[revs.length - 1] ?? null
-  if (prev && prev.hash === after.v) return { id, rev: prev.rev, ...extra }
+  if (prev && prev.hash === after.v) return { fields: { id, rev: prev.rev, ...extra } }
   // A file of the id went while another is there (a rename: R-12.md → R-12-max-rate.md, git mv; the scans take the
   // removals last): no retraction. The record's own file still there needs no version; one it moved to gets one at its
   // new path, editorial when the text is the same
@@ -1968,7 +2057,7 @@ async function landRecord($: any, rel: string, after: { v: string | null; text: 
   if (after.v === null && prev) {
     const recs = records
     const others = [...known].filter(([p, k]) => p !== rel && k.v !== null && idOf(p, recs) === id).map(([p]) => p).sort()
-    if (others.includes(prev.path)) return { id, rev: prev.rev, ...extra }
+    if (others.includes(prev.path)) return { fields: { id, rev: prev.rev, ...extra } }
     if (others.length) {
       path = others[0] as string
       landed = await versionOf($, `${realRoot}/${path}`)
@@ -1983,18 +2072,8 @@ async function landRecord($: any, rel: string, after: { v: string | null; text: 
   const revPins = path === rel ? pins : pinsFrom(landed.text, path)
   const at = await $.clock.now()
   if (path !== rel) log($, `${rel}: gone, and ${id} is at ${path} now (a rename): ${kind}, not a retraction`)
-  for (let n = (prev?.rev ?? 0) + 1, tries = 0; tries < 20; tries++, n++) {
-    const entry: Rev = { format: FORMAT, id, path, rev: n, hash: landed.v, kind, changeHash: change?.hash ?? null, at, by, via, pins: revPins, ...(suspect.length ? { suspect } : {}), ...(confirmed.length ? { confirmed } : {}) }
-    const r = await publish($, `${revDir(id)}/${n}.json`, json(entry))
-    if (r === 'ok') {
-      forget(id)
-      sweep.dirty = true
-      return { id, rev: n, kind, ...extra }
-    }
-    if (r === 'failed') break
-  }
-  log($, `${rel}: couldn't give ${id} a version (${revDir(id)})`)
-  return { id, ...extra }
+  const entry: Rev = { format: FORMAT, id, path, rev: (prev?.rev ?? 0) + 1, hash: landed.v, kind, changeHash: change?.hash ?? null, at, by, via, pins: revPins, ...(suspect.length ? { suspect } : {}), ...(confirmed.length ? { confirmed } : {}) }
+  return { fields: { id, ...extra }, entry }
 }
 
 type PinCheck = { problems: ReturnType<typeof pinProblems>; keys: string[]; states: PinState[]; confirmed: string[] }
@@ -2341,11 +2420,13 @@ async function snapshot($: any): Promise<Snapshot | undefined> {
   const deep = world.globs.some(g => globBase(g) === '' && g.includes('/'))
   const out: Snapshot = new Map()
   let count = 0
+  let visited = 0
   // Never into a linked worktree: what's there is a copy, not the world
   const inside = trees.linked.map(t => relOf(t, realRoot, insensitive)).filter((x): x is string => x !== null)
+  const named = (p: string) => bases.some(b => b !== '' && (p === b || b.startsWith(`${p}/`)))
   const descend = (p: string) => {
-    if (p === '.git' || p === '.claude/fleet' || p.endsWith('/.git') || p.endsWith('/node_modules') || p === 'node_modules') return false
-    if (p === '.claude/worktrees' || inside.includes(p)) return false
+    if (p === '.claude/fleet' || p === '.claude/worktrees' || inside.includes(p)) return false
+    if (SKIP_DIRS.has(p.slice(p.lastIndexOf('/') + 1)) && !named(p)) return false
     return deep || bases.some(b => b !== '' && (p === b || p.startsWith(`${b}/`) || b.startsWith(`${p}/`)))
   }
   const walk = async (rel: string, depth: number): Promise<boolean> => {
@@ -2357,24 +2438,36 @@ async function snapshot($: any): Promise<Snapshot | undefined> {
       return true
     }
     for (const x of entries) {
+      if (++visited > MAX_WALK) {
+        tooBigWhy = 'entries'
+        return false
+      }
       const p = rel ? `${rel}/${x.name}` : String(x.name)
       if (x.kind === 'dir') {
         if (descend(p) && !(await walk(p, depth + 1))) return false
       } else if (x.kind === 'file' && inWorld(p, res)) {
         out.set(p, { mtimeMs: Number(x.mtimeMs), size: Number(x.size) })
-        if (++count > MAX_WORLD_FILES) return false
+        if (++count > MAX_WORLD_FILES) {
+          tooBigWhy = 'files'
+          return false
+        }
       }
     }
     return true
   }
   if (!(await walk('', 0))) {
-    if (!tooBig) log($, `the world has more than ${MAX_WORLD_FILES} files: no scan at all, so outside changes and suspects are off (world.json can narrow it); tried again every 10 min`)
+    if (!tooBig) log($, `the world has ${tooBigText()}: no scan at all, so outside changes and suspects are off (world.json can narrow it); tried again every 10 min`)
     tooBig = true
     tooBigAt = await $.clock.now()
     return undefined
   }
   tooBig = false
   return out
+}
+
+/** Why the world is too big to scan, in words */
+function tooBigText(): string {
+  return tooBigWhy === 'entries' ? `more than ${MAX_WALK} entries under its folders` : `more than ${MAX_WORLD_FILES} files`
 }
 
 /** Changed paths with the removed ones last: a renamed record's new file is known before its old one's removal is
@@ -2399,20 +2492,22 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   const sessionId = String(await $.session.id())
   const out: string[] = []
   const landed: string[] = []
+  type Landing = { rel: string; s: { mtimeMs: number; size: number } | undefined; f: { v: string | null; text: string | null }; last?: ChangeEvent; k?: Known; mine?: FleetRead; pc: PinCheck | null; suspect: string[]; by: Who; fields: Partial<ChangeEvent> }
+  const settle = (x: Pick<Landing, 'rel' | 's' | 'f'>) => {
+    if (x.s) setKnown(x.rel, { ...x.s, v: x.f.v, pins: pinsFrom(x.f.text, x.rel) })
+    else dropKnown(x.rel)
+    unexplained.delete(x.rel)
+  }
+  const todo: (Landing & { plan: RevPlan | null })[] = []
   for (const rel of changed) {
     const s = after.get(rel)
     const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
     const v = f.v
     const last = latest.get(rel)
     const k = known.get(rel)
-    const settle = () => {
-      if (s) setKnown(rel, { ...s, v, pins: pinsFrom(f.text, rel) })
-      else dropKnown(rel)
-      unexplained.delete(rel)
-    }
     // Someone's landing during the command, or only its time moved
     if ((last && last.to === v && last.at >= startedAt - 1000) || (k && k.v === v && v !== null)) {
-      settle()
+      settle({ rel, s, f })
       continue
     }
     const mine = (await read($, reads))[thread]?.[rel]
@@ -2422,16 +2517,47 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     const id = records ? idOf(rel, records) : null
     if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
     const by = await whoAmI($, thread)
-    const fields = await landRecord($, rel, f, 'bash', by, { suspect, confirmed: pc?.confirmed ?? [] })
-    await writeEvent($, { path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'bash', tool: 'Bash', blind: true, by, ...fields })
-    settle()
-    await setRead($, thread, rel, v, fields.rev)
-    if (last && last.by?.sessionId !== sessionId && last.to !== mine?.v) out.push(overwroteText(rel, last, await meNow($), 'command'))
-    if (pc?.problems.length) {
-      out.push(blindText(rel, pc.problems, await meNow($)))
-      log($, `${rel}: landed blind citing ${suspect.join(', ')}: suspect`)
+    const x = { rel, s, f, ...(last ? { last } : {}), ...(k ? { k } : {}), ...(mine ? { mine } : {}), pc, suspect, by, fields: {} }
+    // A removal is reckoned once what came with it is known (a renamed record's new file): after the rest
+    todo.push({ ...x, plan: s ? await planRecord($, rel, f, 'bash', by, { suspect, confirmed: pc?.confirmed ?? [] }) : null })
+  }
+  // The new versions in one shell for the whole command (a checkout of 500 files is one process, not 1500)
+  const planned = todo.filter(x => x.plan?.entry)
+  const versions = await publishAll($, planned.map(x => ({ path: revPath(x.plan?.entry as Rev), text: json(x.plan?.entry) })))
+  for (const x of todo) {
+    if (!x.plan) continue
+    const r = x.plan.entry ? versions.get(revPath(x.plan.entry)) : undefined
+    x.fields = !x.plan.entry ? x.plan.fields : r === 'ok' ? revLanded(x.plan, x.plan.entry.rev) : await publishRev($, x.plan, r ?? 'exists')
+    settle(x)
+  }
+  for (const x of todo) {
+    if (x.plan) continue
+    x.fields = await landRecord($, x.rel, x.f, 'bash', x.by, { suspect: x.suspect, confirmed: x.pc?.confirmed ?? [] })
+    settle(x)
+  }
+  // Their events, in one shell too, and one trigger for them all
+  const evs = []
+  for (const x of todo) evs.push({ x, ev: await eventFor($, { path: x.rel, from: x.last && x.last.to !== x.f.v ? x.last.to : (x.k?.v ?? null), to: x.f.v, via: 'bash', tool: 'Bash', blind: true, by: x.by, ...x.fields }) })
+  const published = await publishAll($, evs.map(({ ev }) => ({ path: ev.path, text: json(ev.e) })))
+  let last = ''
+  for (const { x, ev } of evs) {
+    const r = published.get(ev.path)
+    if (r === 'ok') {
+      eventLanded($, ev)
+      last = ev.name
+    } else if (r === 'exists') await writeEvent($, { ...ev.e })
+    else log($, `couldn't write the event of ${x.rel}`)
+  }
+  if (last) await trigger($, last)
+  for (const x of todo) {
+    const v = x.f.v
+    await setRead($, thread, x.rel, v, x.fields.rev)
+    if (x.last && x.last.by?.sessionId !== sessionId && x.last.to !== x.mine?.v) out.push(overwroteText(x.rel, x.last, await meNow($), 'command'))
+    if (x.pc?.problems.length) {
+      out.push(blindText(x.rel, x.pc.problems, await meNow($)))
+      log($, `${x.rel}: landed blind citing ${x.suspect.join(', ')}: suspect`)
     }
-    if (v !== null) landed.push(rel)
+    if (v !== null) landed.push(x.rel)
   }
   scheduleChecks($, landed)
   return out
@@ -3880,7 +4006,7 @@ async function worldStatus($: any): Promise<string[]> {
   if (!started) return [`world: ${globList(world.globs)} (not followed in this session: it isn't interactive)`]
   await pullEvents($)
   const me = await meNow($)
-  const lines = [`world: ${globList(world.globs)} (world.json)${tooBig ? `; world too big (more than ${MAX_WORLD_FILES} files): no scan, so outside changes and suspects aren't seen (narrow world.json's paths)` : ''}`]
+  const lines = [`world: ${globList(world.globs)} (world.json)${tooBig ? `; world too big (${tooBigText()}): no scan, so outside changes and suspects aren't seen (narrow world.json's paths)` : ''}`]
   const last = recent.slice(-8).reverse()
   lines.push(last.length ? 'recent changes (newest first):' : 'recent changes: none in the last day')
   for (const e of last) lines.push(`  ${e.path}: ${changeLine(e, me)}${e.overwrote ? ', on top of a change it had not seen' : ''}`)

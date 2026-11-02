@@ -292,6 +292,25 @@ export function world(on: On, options: WorldOptions = {}): World {
       for (const p of args.filter(a => a !== '-p')) for (const d of [p, ...parentsOf(p)]) dirs.add(d)
       return ok
     }
+    // fleet's batch of no-clobber links (publishAll): sh -c '<loop>' sh tmp1 dest1 tmp2 dest2 …, each destination's
+    // folder made first, one line per pair
+    if (cmd === 'sh' && args[0] === '-c' && String(args[1]).includes('ln "$t" "$d"')) {
+      const pairs = args.slice(3)
+      const lines: string[] = []
+      for (let i = 0; i + 1 < pairs.length; i += 2) {
+        const t = pairs[i] as string
+        const d = pairs[i + 1] as string
+        const text = files.get(t)
+        if (files.has(d)) lines.push(`exists ${d}`)
+        else if (text === undefined) lines.push(`failed ${d}`)
+        else {
+          addFile(d, text)
+          lines.push(`ok ${d}`)
+        }
+        if (files.delete(t)) moved(t)
+      }
+      return { value: { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     return failed(`unknown command ${cmd}`)
   })
   on('tool.register', (_, e) => {

@@ -467,6 +467,24 @@ test('the sweeper is one session: a lease another session keeps is left alone; o
   expect(w.files.get(`${STATE}/.gitignore`)).toContain('*')
 })
 
+test('only the sweeper scans for outside changes: another session leaves them to it, and records them once it sweeps', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan\n' } })
+  const other = () => w.touch(`${STATE}/sweeper.json`, JSON.stringify({ format: 1, sessionId: R_SID, ref: 'bbbbbbbb', name: 'TEST R', at: w.clock.now() }))
+  other()
+  await begin($, w)
+  w.touch(PLAN, 'edited in an editor\n')
+  for (let i = 0; i < 3; i++) {
+    other()
+    await tick(w, 10000)
+  }
+  expect(events(w)).toEqual([])
+  // TEST R stops renewing it: this session takes the lease, and its scan records the change
+  await tick(w, 95000)
+  for (let i = 0; i < 12; i++) await tick(w)
+  expect(json(w, `${STATE}/sweeper.json`).sessionId).toBe(SID)
+  expect(events(w)).toEqual([expect.objectContaining({ path: 'notes/plan.md', via: 'outside', by: null, to: hashText('edited in an editor\n') })])
+})
+
 test('after a sleep the holder finds its own lease 90 s old: it holds nothing, takes it again like any taker, and backs off when another took it', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan\n' } })
   await begin($, w)

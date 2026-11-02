@@ -146,6 +146,45 @@ test('a Bash command that writes a world file lands blind: an event of its threa
   expect(mine(w).map(e => e.via)).toEqual(['bash', 'tool', 'tool'])
 })
 
+test('a command that writes many shared files lands them in a couple of processes, not several a file', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**', 'req/**'], files: { [PLAN]: 'plan v1\n', [`${ROOT}/req/R-1.md`]: 'R-1 v1\n', [`${ROOT}/req/R-2.md`]: 'R-2 v1\n' } })
+  await begin($, w)
+  await tick(w)
+  w.bash.value = () => {
+    for (let i = 0; i < 20; i++) w.touch(`${ROOT}/notes/n${i}.md`, `note ${i}\n`)
+    w.touch(`${ROOT}/req/R-1.md`, 'R-1 v2\n')
+    w.touch(`${ROOT}/req/R-2.md`, 'R-2 v2\n')
+  }
+  const before = w.runs.length
+  await call($, { tool: 'Bash', command: 'make notes' })
+  // One shell for the records' versions, one for the events
+  const spawned = w.runs.slice(before)
+  expect(spawned.map(a => a[0])).toEqual(['sh', 'sh'])
+  expect(mine(w).filter(e => e.via === 'bash').length).toBe(22)
+  expect(json(w, `${FLEET}/state/revs/R-1/2.json`)).toMatchObject({ rev: 2, via: 'bash', hash: hashText('R-1 v2\n') })
+  expect(json(w, `${FLEET}/state/revs/R-2/2.json`)).toMatchObject({ rev: 2, via: 'bash', hash: hashText('R-2 v2\n') })
+  expect(events(w).find(e => e.path === 'req/R-1.md' && e.via === 'bash')).toMatchObject({ id: 'R-1', rev: 2 })
+  expect(under(w, `${FLEET}/decisions/tmp`)).toEqual([])
+})
+
+test('the walk skips build folders and the like unless a glob names them; past 20000 entries the world is too big to scan', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['**/*.md', 'build/reports/**'], files: { [PLAN]: 'plan v1\n', [`${ROOT}/dist/b.md`]: 'b\n', [`${ROOT}/build/reports/r.md`]: 'r\n', [`${ROOT}/src/.venv/x.md`]: 'x\n' } })
+  await begin($, w)
+  await tick(w)
+  w.touch(PLAN, 'plan v2\n')
+  w.touch(`${ROOT}/dist/b.md`, 'b2\n')
+  w.touch(`${ROOT}/src/.venv/x.md`, 'x2\n')
+  w.touch(`${ROOT}/build/reports/r.md`, 'r2\n')
+  await tick(w, 10000)
+  await tick(w, 10000)
+  expect(mine(w).map(e => e.path).sort()).toEqual(['build/reports/r.md', 'notes/plan.md'])
+  // Every entry walked counts, in the world or not
+  for (let i = 0; i <= 20000; i++) w.files.set(`${ROOT}/src/f${i}.ts`, 'x\n')
+  w.dirs.add(`${ROOT}/src`)
+  await tick(w, 10000)
+  expect(await fleet($, 'status')).toContain("world too big (more than 20000 entries under its folders): no scan, so outside changes and suspects aren't seen")
+})
+
 test('a change made outside fleet is found by the scan, recorded once and heard; /fleet accept stamps it as the person’s', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [TODO]: 'todo v1\n' } })
   await begin($, w)
