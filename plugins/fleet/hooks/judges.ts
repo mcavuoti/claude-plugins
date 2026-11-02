@@ -562,11 +562,28 @@ export function containsOption(p: Precedent, option: Option, asked?: { question:
   return supportProblem(p, option, asked, live) === null
 }
 
+// Short words that are only the glue of a sentence (an article, a preposition): a label of them alone (A, I) is never
+// found in a line, since every line has them
+const GLUE = new Set('a an i o y e u to of in on at by or is it be as so we us if do de la el en un lo al se es le et'.split(' '))
+
+/** A short label with no word that sets it apart (Go, v2, CI): the label itself, as a token a line may name, when it's
+ * more than glue and no other option's label or description has it; null otherwise */
+export function labelToken(option: Option, options: readonly Option[]): string | null {
+  if (distinguishing(option, options).length) return null
+  const l = norm(option.label)
+  if (!l || l.split(' ').every(w => GLUE.has(w) || STOP.has(w))) return null
+  const others = options.filter(o => norm(o.label) !== l)
+  return others.some(o => ` ${norm(`${o.label} ${o.description ?? ''}`)} `.includes(` ${l} `)) ? null : l
+}
+
 /** Whether a statute line speaks to this option: it has one of the words that set it apart from the other options
- * (four letters or more, off the stop list, in its label or description and in no other option's) */
+ * (four letters or more, off the stop list, in its label or description and in no other option's), or, for a short
+ * label that has none, the label itself (labelToken) */
 export function lineSpeaksTo(text: string, option: Option, options: readonly Option[] = [option]): boolean {
   const there = wordSet(text)
-  return distinguishing(option, options).some(w => there.has(w))
+  if (distinguishing(option, options).some(w => there.has(w))) return true
+  const t = labelToken(option, options)
+  return !!t && ` ${norm(text)} `.includes(` ${t} `)
 }
 
 /** "D-12", "[D-12]", "principles.md:4", "principles.md line 4": the key a citation is looked up by */

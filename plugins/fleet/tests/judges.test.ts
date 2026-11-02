@@ -33,6 +33,7 @@ import {
   judgeEntryOf,
   judgePrompt,
   judgesOf,
+  labelToken,
   lineSpeaksTo,
   nextTasteNumber,
   norm,
@@ -245,6 +246,15 @@ test('citations, checked by code: shown to the judge, a precedent with that very
   expect(lineSpeaksTo('Keep it simple: one thing with another.', SESSIONS.options[1]!, SESSIONS.options)).toBe(false)
   expect(lineSpeaksTo('Prefer one file over a server', { label: 'SQLite', description: 'one file, no server' })).toBe(true)
   expect(lineSpeaksTo('A file per thing', DB.options[0]!, [DB.options[0]!, { label: 'Redis', description: 'a file in memory' }])).toBe(false)
+  // A short label with nothing else to set it apart (Go, v2): the label itself, when no other option has it; never glue
+  const SHIP: Question = { question: 'Ship it this week?', options: [{ label: 'Go' }, { label: 'Wait' }], recommended: 'Go', why: 'ready' }
+  expect(labelToken(SHIP.options[0]!, SHIP.options)).toBe('go')
+  expect(lineSpeaksTo('Go with what works today; polish later.', SHIP.options[0]!, SHIP.options)).toBe(true)
+  expect(lineSpeaksTo('Good enough ships.', SHIP.options[0]!, SHIP.options)).toBe(false)
+  const VERSION: Question = { question: 'Which API version?', options: [{ label: 'v1' }, { label: 'v2', description: 'the new one' }], recommended: 'v2', why: 'newer' }
+  expect(checkVerdict(v('v2', ['principles.md:3']), VERSION, shown, statuteOf([{ label: 'principles.md', text: '# Principles\n\nNew work targets v2 of any API.\n' }]).lines).outcome).toBe('decided')
+  expect(labelToken({ label: 'A' }, [{ label: 'A' }, { label: 'B' }])).toBe(null)
+  expect(labelToken({ label: 'Go' }, [{ label: 'Go' }, { label: 'Wait', description: 'go later' }])).toBe(null)
   // Fleet's own principles.md lines aren't there to cite
   const boiler = statuteOf([{ label: 'principles.md', text: PRINCIPLES_TEXT }]).lines
   expect(checkVerdict(v('Redis', ['principles.md:3']), SESSIONS, shown, boiler).unchecked?.problem).toBe("principles.md:3 isn't a precedent or a statute line it was shown")
