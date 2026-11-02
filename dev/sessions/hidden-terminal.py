@@ -4,9 +4,14 @@ Used to test the sessions mod end to end: open `claude`, `claude attach <id>`, `
 (`hooks/visor.sh`) in a hidden terminal, send keys, and dump the screen as text.
 
 Keys arrive through a FIFO, separated by `|`. Plain text is typed as is; these names send special keys:
-ENTER, ESC, UP, DOWN, SRIGHT (shift+right, the shortcut that focuses the panel), BS, CTRLU, CTRLT.
+ENTER, ESC, UP, DOWN, LEFT, RIGHT, TAB, SRIGHT (shift+right, the shortcut that focuses the panel), BS, CTRLU, CTRLT.
 DUMP writes the current screen to `<log>.screen`, with [brackets] around reverse-video cells (the focus ring).
-The process exits when the command ends, after 30 minutes, or on SIGHUP.
+Send several keys in one write, separated by `|` (`printf 'DOWN|DOWN|c'`): two writes in a row can be read as one
+chunk, and then `DOWNDOWN` arrives as text and is typed as is.
+The process exits when the command ends, after HT_SECONDS seconds (1800 by default: set it higher for a long run), or
+on SIGHUP. To end a viewer (`claude attach`), send it SIGHUP (`pkill -HUP -f 'hidden-terminal.py <fifo>'`) rather than
+typing /exit: /exit there only detaches, and the viewer drops into the agent view, which lists every session of the
+account with its new-session prompt focused (typing there starts a session).
 
 Needs pyte (`python3 -m venv venv && venv/bin/pip install pyte`).
 
@@ -45,9 +50,9 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS, 0, 0))
 screen = pyte.Screen(COLS, ROWS)
 stream = pyte.ByteStream(screen)
 keys_in = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
-deadline = time.time() + 1800
-special = {'ENTER': b'\r', 'ESC': b'\x1b', 'DOWN': b'\x1b[B', 'UP': b'\x1b[A', 'CTRLT': b'\x14',
-           'SRIGHT': b'\x1b[1;2C', 'BS': b'\x7f', 'CTRLU': b'\x15'}
+deadline = time.time() + int(os.environ.get('HT_SECONDS', '1800'))
+special = {'ENTER': b'\r', 'ESC': b'\x1b', 'DOWN': b'\x1b[B', 'UP': b'\x1b[A', 'LEFT': b'\x1b[D', 'RIGHT': b'\x1b[C',
+           'TAB': b'\t', 'CTRLT': b'\x14', 'SRIGHT': b'\x1b[1;2C', 'BS': b'\x7f', 'CTRLU': b'\x15'}
 
 
 def dump():

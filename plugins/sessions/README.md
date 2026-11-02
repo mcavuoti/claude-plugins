@@ -268,7 +268,7 @@ What the plugin creates at runtime, all in `~/.claude/mods/sessions-data/` (`SES
 - Use a folder only for tests, and clean up only the sessions in that folder (`dev/sessions/clean-test-sessions.sh <folder>`). Never stop or remove sessions by name across folders: you can take down a real one.
 - Code that differs by system lives in `hooks/platform/` (macOS and Linux), and each file is edited from its own system: see [CONTRIBUTING.md](../../CONTRIBUTING.md). A GitHub check runs the validation, the tests and the setup on both systems on every push.
 - After every change: `claude plugin validate plugins/sessions` and `claude plugin test plugins/sessions`. The tests cover the pure logic and drawing the panel in the terminal and in the read-only surfaces (desktop, VS Code, phone).
-- `dev/sessions/hidden-terminal.py` drives `claude`, `claude attach` or the launcher in a hidden terminal (keys in, screen out; `HT_COLS`/`HT_ROWS` set its size), so you can test switching, focus and dialogs without touching your windows.
+- `dev/sessions/hidden-terminal.py` drives `claude`, `claude attach` or the launcher in a hidden terminal (keys in, screen out; `HT_COLS`/`HT_ROWS` set its size, `HT_SECONDS` how long it lives), so you can test switching, focus and dialogs without touching your windows. End a viewer by sending its hidden terminal SIGHUP, not by typing `/exit`: that only detaches, into the agent view of all your sessions.
 - Reloading isn't instant: open sessions pick up changed mod files by themselves, sometimes only when their turn ends, and an idle one can take a long time. `claude respawn <id>` reloads it right away.
 
 ## Old pre-started sessions
