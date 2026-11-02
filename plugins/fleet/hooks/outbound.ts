@@ -191,22 +191,26 @@ const WRITES = new Set([
 ])
 const READS = new Set([
   'get', 'list', 'search', 'read', 'fetch', 'query', 'find', 'describe', 'view', 'download', 'export', 'lookup', 'check', 'count',
-  'show', 'status', 'scan', 'inspect', 'preview', 'suggest', 'resolve', 'info', 'browse', 'context', 'select', 'authenticate',
-  'screenshot', 'console', 'network',
+  'show', 'status', 'scan', 'inspect', 'preview', 'suggest', 'resolve', 'info', 'browse', 'context', 'select', 'screenshot', 'console',
+  'network',
 ])
 const NEUTRAL = new Set([
   'delete', 'remove', 'trash', 'untrash', 'archive', 'unarchive', 'mark', 'unmark', 'label', 'unlabel', 'apply', 'close', 'resize',
-  'switch', 'stop', 'cancel', 'star', 'unstar', 'mute', 'snooze', 'pin', 'unpin', 'complete',
+  'switch', 'stop', 'cancel', 'star', 'unstar', 'mute', 'snooze', 'pin', 'unpin', 'complete', 'authenticate',
 ])
 
 /** The words of a tool's name: send_message → send, message; createDraft → create, draft */
 export function nameWords(name: string): string[] {
   return name
+// Words that send as the tool's verb, its first word fleet knows (copy_file, add_attachment, draft_email, message),
+// but are things a read names elsewhere (get_message, list_drafts, list_commits)
+const LEADING_WRITES = new Set(['add', 'set', 'sync', 'copy', 'deploy', 'release', 'message', 'draft', 'transfer', 'import', 'commit'])
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .split(/[^A-Za-z0-9]+/)
     .map(w => w.toLowerCase())
     .filter(Boolean)
 }
+// Signing in sends nothing of the project and brings no outside text back
 
 /** mcp__<server>__<tool> split; null for anything else */
 export function mcpParts(tool: string): { server: string; name: string } | null {
@@ -256,7 +260,8 @@ export function classifyMcp(tool: string, input: Record<string, unknown>, c: Out
   if (!parts || /^fleet$/i.test(parts.server)) return { send: null, outside: false }
   const words = nameWords(parts.name)
   const remote = outsideServer(parts.server)
-  const writes = words.some(w => WRITES.has(w))
+  const verb = words.find(w => WRITES.has(w) || LEADING_WRITES.has(w) || READS.has(w) || NEUTRAL.has(w))
+  const writes = words.some(w => WRITES.has(w)) || (!!verb && LEADING_WRITES.has(verb))
   const reads = !writes && words.some(w => READS.has(w))
   const neutral = !writes && !reads && words.some(w => NEUTRAL.has(w))
   const outside = toolListed(tool, c.outside) || (remote && reads)

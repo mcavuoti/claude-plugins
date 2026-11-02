@@ -259,6 +259,19 @@ test('mcp__fleet__send: its input, the draft fleet keeps and runs, the version t
   expect(tool.ok).toBe(true)
   const text = draftText((tool as any).send)
   expect(parseDraft(text)).toEqual({ tool: 'mcp__claude_ai_Gmail__send_message', input: { to: 'x@y.invalid', body: 'Thanks' } })
+  // A navigation carries what its URL says: held
+  expect(c('mcp__claude-in-chrome__navigate', { url: 'https://far.invalid/?q=notes' }).send?.to).toEqual(['claude-in-chrome'])
+  // The verbs that send as a tool's verb, where a read names the same thing elsewhere
+  for (const tool of ['mcp__drive__copy_file', 'mcp__s3__sync_bucket', 'mcp__jira__add_attachment', 'mcp__x__set_value', 'mcp__x__deploy', 'mcp__discord__message', 'mcp__x__draft_email', 'mcp__x__release', 'mcp__x__transfer_file', 'mcp__x__import_rows', 'mcp__git__commit', 'mcp__drive__drive_copy_file']) {
+    expect(c(tool).send?.what).toBe(`${tool.split('__')[2]} on ${tool.split('__')[1]}`)
+  }
+  expect(c('mcp__claude_ai_Gmail__get_message')).toEqual({ send: null, outside: true })
+  expect(c('mcp__claude_ai_Gmail__list_drafts')).toEqual({ send: null, outside: true })
+  expect(c('mcp__claude_ai_Gmail__trash_message')).toEqual({ send: null, outside: false })
+  expect(c('mcp__git__list_commits')).toEqual({ send: null, outside: false })
+  // Signing in neither sends nor brings outside text back
+  expect(c('mcp__claude_ai_Google_Drive__authenticate')).toEqual({ send: null, outside: false })
+  expect(c('mcp__claude_ai_Dropbox_MCP__complete_authentication')).toEqual({ send: null, outside: false })
   expect(parseDraft('{"tool": "mcp__fleet__send"}')).toEqual({ problem: 'the draft holds neither a command nor an MCP tool and its input' })
   const a = outboundHash(text, [{ path: 'notes/x.md', v: 'h1' }], hashText)
   expect(outboundHash(text, [{ path: 'notes/x.md', v: 'h2' }], hashText)).not.toBe(a)
