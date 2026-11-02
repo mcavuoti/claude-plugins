@@ -68,6 +68,9 @@ export type UsageView = { period: Period; scope: 'all' | 'project' }
 export type Renaming = { sessionId: string; title: string } | null
 // Why the panel isn't shown, for the line above the prompt: closed by you, or waiting for a wider window
 export type PaneNote = '' | 'closed' | 'narrow'
+// The ccc tell request whose $.prompt.submit is on its way (its id, and when it was submitted), kept in $.state so a
+// reload of the mod's code doesn't submit it twice; null when none
+export type TellInFlight = { id: string; at: number } | null
 
 // ---- The API for other plugins: $.sessions, contract api 1 ----
 // What other plugins call. Everything above, and PluginState below, is this plugin's own and not part of it.
@@ -186,6 +189,7 @@ declare module 'claude-code' {
       shortId: string
       limits: RateLimit[]
       summary: PanelSummary
+      tellInFlight: TellInFlight
     }
   }
 }

@@ -225,6 +225,21 @@ test('⧗ on a row working, or done and unseen in the background, for staleMinut
   expect(text).toContain('⧗ Working, or done and unseen, for 60 min or more')
 })
 
+test("a subagent's run inside a long turn doesn't restart the working time (nor hide the ⧗)", SLOW, async ($, on) => {
+  const w = world(on)
+  await startSession($, w)
+  const started = w.clock.now()
+  await $.turn.start({ turnId: 't1', text: 'refactor the module' } as any)
+  await w.clock.advance(20 * MIN)
+  await $.turn.start({ turnId: 't2', agentId: 'helper-1', text: 'look for the callers' } as any)
+  await w.clock.settle()
+  expect((w.store.get(`state:${SID}`) as any)?.turnStarted).toBe(started)
+  // The next turn of the main loop does start the time again
+  await $.turn.start({ turnId: 't3', text: 'and now the tests' } as any)
+  await w.clock.settle()
+  expect((w.store.get(`state:${SID}`) as any)?.turnStarted).toBe(w.clock.now())
+})
+
 test("spend far above a session's usual hour: a line under its row, one notification, nothing stopped", async ($, on) => {
   const now = 1_000_000_000
   const samples = [

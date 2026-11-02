@@ -577,7 +577,8 @@ export function parseInbox(text: string): InboxRequest | null {
 //   <id>.status     format, state, reason, at: what ccc tell prints, and what a script reads later
 // state: queued (waiting for its turn), delivered (its turn started), held (refused because the person stopped the
 // session with Esc: it goes once they type in it again), refused (never delivered, with why). The mod takes a request
-// by renaming <id>.req to <id>.taken (<id>.held while it's held)
+// by renaming <id>.req to <id>.taken (<id>.held while it's held), and renames a taken one whose turn never came (the
+// session restarted first) back to <id>.req
 export const TELL_MAX_BYTES = 4096
 export type TellState = 'queued' | 'delivered' | 'held' | 'refused'
 export function tellStatusText(state: TellState, reason: string, at: number): string {

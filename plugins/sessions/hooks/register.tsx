@@ -13,6 +13,7 @@ import type {
   SessionsMethod,
   SessionsResult,
   SessionsStatus,
+  TellInFlight,
   Usage,
   UsageView,
 } from '../types'
@@ -173,6 +174,8 @@ const paneNote = atom({ plugin: 'sessions', key: 'paneNote' } as const, '' as Pa
 const limits = atom({ plugin: 'sessions', key: 'limits' } as const, [] as RateLimit[])
 // About all the project's rows, whatever is shown: the f filter, how many there are, what they spent
 const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, waiting: 0, unseen: 0, spent: null } as PanelSummary)
+// The ccc tell request on its way to a turn (checkTells): in $.state, which a reload of the mod's code keeps
+const tellInFlight = atom({ plugin: 'sessions', key: 'tellInFlight' } as const, null as TellInFlight)
 
 let claude = 'claude'
 let myId = ''
@@ -2160,9 +2163,16 @@ async function checkInbox($: any) {
 // the 0.5 s timer. Only a background session the person opted in (/sessions tell on) takes them. Each one is submitted
 // with $.prompt.submit, which waits for the session to be idle and resolves when its turn starts (delivered; turn.start
 // says so too, after a reload). Refused by the engine (the person stopped the session with Esc, and plugin prompts wait
-// for them), it's held until the person types in the session again
+// for them), it's held until the person types in the session again.
+// The request on its way is kept in $.state (tellInFlight), which a reload of the mod's code keeps: its turn may still
+// come, so it isn't submitted again, nor is the next one while it's out. A request taken and not on its way (the
+// session restarted before its turn, or the call was lost: still taken a minute after the session went idle) goes back
+// in line; one whose submit failed goes back once, and is refused the second time
 let telling = false
 let lastTellPrune = 0
+const tellFailures = new Map<string, number>()
+// Since when the official list has shown this session idle, as checkTells saw it
+let idleSince: number | undefined
 function tellDir(): string {
   const own = lastList.find(s => s.sessionId === myId)
   return dataDir && own?.kind === 'background' && typeof own.id === 'string' && isRef(own.id) ? `${dataDir}/tell/${own.id}` : ''
@@ -2184,53 +2194,95 @@ async function checkTells($: any) {
     return
   }
   const names = entries.map(f => String(f.name))
-  const next = names.filter(n => /^\d+-\d+\.req$/.test(n)).sort()[0]
   const now = await $.clock.now()
-  if (!next) {
-    // What scripts didn't read within a day goes
-    if (now - lastTellPrune < 600000) return
-    lastTellPrune = now
-    const old = entries.filter(f => /\.status$/.test(String(f.name)) && now - Number(f.mtimeMs) > 86400000).map(f => `${dir}/${f.name}`)
-    if (old.length) await runSafe($, ['rm', '-f', ...old])
-    return
-  }
   telling = true
-  const id = next.slice(0, -4)
-  const refuse = async (reason: string) => {
-    await tellStatus($, dir, id, 'refused', reason)
-    await runSafe($, ['rm', '-f', `${dir}/${next}`, `${dir}/${id}.txt`])
-    debugLine($, `ccc tell ${id}: refused (${reason})`)
-  }
   try {
-    let req: ReturnType<typeof parseTellRequest> = null
-    let text = ''
-    try {
-      req = parseTellRequest(await $.fs.read(`${dir}/${next}`))
-      text = await $.fs.read(`${dir}/${id}.txt`)
-    } catch {}
-    if (!req || req.format !== FORMAT) return await refuse('written by another version of the sessions mod: restart the sessions (u)')
-    if (!names.includes('allow')) return await refuse("this session doesn't take text from ccc tell: /sessions tell on in it")
-    if (!text.trim()) return await refuse('no text')
-    if (new TextEncoder().encode(text).length > TELL_MAX_BYTES) return await refuse('longer than 4 KB')
-    if ((await runSafe($, ['mv', '-f', `${dir}/${next}`, `${dir}/${id}.taken`])).exitCode !== 0) return
-    debugLine($, `ccc tell ${id} from ${req.from}: submitted`)
-    const r: any = await $.prompt.submit({ text: tellPrompt(id, req.from, text) })
-    if (r?.drop) {
-      await runSafe($, ['mv', '-f', `${dir}/${id}.taken`, `${dir}/${id}.held`])
-      await tellStatus($, dir, id, 'held', `${r.drop}: it goes once the person types in the session`)
-      debugLine($, `ccc tell ${id}: held (${r.drop})`)
+    // A request a module before a reload submitted: left to its turn while the session works; idle a minute later with
+    // it still taken, that call was lost
+    const flying = await read($, tellInFlight)
+    const idle = lastList.find(s => s.sessionId === myId)?.status === 'idle'
+    idleSince = idle ? (idleSince ?? now) : undefined
+    if (flying && names.includes(`${flying.id}.taken`)) {
+      if (idleSince === undefined || now - idleSince < 60000 || now - flying.at < 60000) return
+      debugLine($, `ccc tell ${flying.id}: still taken a minute after the session went idle, so its call was lost`)
+    }
+    if (flying) await update($, tellInFlight, () => null)
+    // Taken and not on its way: back in line (the next tick takes them in order)
+    const strays = names.filter(n => /^\d+-\d+\.taken$/.test(n))
+    for (const n of strays) {
+      const id = n.slice(0, -6)
+      if ((await runSafe($, ['mv', '-f', `${dir}/${n}`, `${dir}/${id}.req`])).exitCode === 0) {
+        await tellStatus($, dir, id, 'queued', 'taken but not delivered (the session restarted before its turn, or the call was lost): it goes again when the session is idle')
+        debugLine($, `ccc tell ${id}: back in line`)
+      }
+    }
+    if (strays.length) return
+    const next = names.filter(n => /^\d+-\d+\.req$/.test(n)).sort()[0]
+    if (!next) {
+      // What scripts didn't read within a day goes
+      if (now - lastTellPrune < 600000) return
+      lastTellPrune = now
+      const old = entries.filter(f => /\.status$/.test(String(f.name)) && now - Number(f.mtimeMs) > 86400000).map(f => `${dir}/${f.name}`)
+      if (old.length) await runSafe($, ['rm', '-f', ...old])
       return
     }
-    await tellDelivered($, id)
-  } catch {
-    // A failure (or the mod reloading) leaves the request taken: turn.start still says when its turn starts
+    await tellOne($, dir, names, next)
   } finally {
     telling = false
   }
 }
 
+async function tellOne($: any, dir: string, names: string[], next: string) {
+  const id = next.slice(0, -4)
+  const refuse = async (reason: string) => {
+    await tellStatus($, dir, id, 'refused', reason)
+    await runSafe($, ['rm', '-f', `${dir}/${next}`, `${dir}/${id}.taken`, `${dir}/${id}.txt`])
+    debugLine($, `ccc tell ${id}: refused (${reason})`)
+  }
+  let req: ReturnType<typeof parseTellRequest> = null
+  let text = ''
+  try {
+    req = parseTellRequest(await $.fs.read(`${dir}/${next}`))
+    text = await $.fs.read(`${dir}/${id}.txt`)
+  } catch {}
+  if (!req || req.format !== FORMAT) return refuse('written by another version of the sessions mod: restart the sessions (u)')
+  if (!names.includes('allow')) return refuse("this session doesn't take text from ccc tell: /sessions tell on in it")
+  if (!text.trim()) return refuse('no text')
+  if (new TextEncoder().encode(text).length > TELL_MAX_BYTES) return refuse('longer than 4 KB')
+  // On its way before it's taken: a reload in between finds it in $.state, and its file still in line
+  const at = await $.clock.now()
+  await update($, tellInFlight, () => ({ id, at }))
+  if ((await runSafe($, ['mv', '-f', `${dir}/${next}`, `${dir}/${id}.taken`])).exitCode !== 0) {
+    await update($, tellInFlight, () => null)
+    return
+  }
+  debugLine($, `ccc tell ${id} from ${req.from}: submitted`)
+  let r: any
+  try {
+    r = await $.prompt.submit({ text: tellPrompt(id, req.from, text) })
+  } catch (err) {
+    await update($, tellInFlight, () => null)
+    const failures = (tellFailures.get(id) ?? 0) + 1
+    tellFailures.set(id, failures)
+    if (failures > 1) return refuse(`couldn't be submitted: ${String(err).slice(0, 120)}`)
+    if ((await runSafe($, ['mv', '-f', `${dir}/${id}.taken`, `${dir}/${id}.req`])).exitCode === 0) await tellStatus($, dir, id, 'queued', "its submit failed once: it's tried again")
+    debugLine($, `ccc tell ${id}: submit failed (${String(err).slice(0, 120)}), tried again`)
+    return
+  }
+  if (r?.drop) {
+    await update($, tellInFlight, () => null)
+    await runSafe($, ['mv', '-f', `${dir}/${id}.taken`, `${dir}/${id}.held`])
+    await tellStatus($, dir, id, 'held', `${r.drop}: it goes once the person types in the session`)
+    debugLine($, `ccc tell ${id}: held (${r.drop})`)
+    return
+  }
+  await tellDelivered($, id)
+}
+
 // A request's turn started (its $.prompt.submit resolved, or turn.start carried it): delivered, once
 async function tellDelivered($: any, id: string) {
+  if ((await read($, tellInFlight))?.id === id) await update($, tellInFlight, () => null)
+  tellFailures.delete(id)
   const dir = tellDir()
   if (!dir || !(await exists($, `${dir}/${id}.taken`))) return
   await runSafe($, ['rm', '-f', `${dir}/${id}.taken`, `${dir}/${id}.txt`])
@@ -2816,11 +2868,13 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // The main loop's turns only: a subagent's run inside a turn starts no new one (the working time and ⧗ count from
+  // the main turn), and nothing here holds the run up
   on('turn.start', async ($, e, next) => {
-    if (active) {
-      await markTurnStart($)
+    if (active && e.agentId === undefined) {
+      bg(markTurnStart($))
       // A ccc tell request's turn: delivered (also when the call that submitted it was lost to a reload)
-      const id = e.agentId === undefined ? tellIdIn(String(e.text ?? '')) : null
+      const id = tellIdIn(String(e.text ?? ''))
       if (id) bg(tellDelivered($, id))
     }
     return next(e)
@@ -2858,7 +2912,7 @@ export const register: Register = (on, options) => {
       }
       return { consumed: 'sessions: an unknown notice' }
     }
-    if (active) await markTurnStart($)
+    if (active) bg(markTurnStart($))
     return next(e)
   })
 

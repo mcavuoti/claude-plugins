@@ -126,6 +126,41 @@ test('a turn that carries a request marks it delivered, also when the call that 
   expect(state(w, '6-1')).toBe('delivered')
 })
 
+test('a request taken and never delivered (the session restarted before its turn) goes back in line and is delivered', async ($, on) => {
+  const e = engine(on)
+  const w = world(on)
+  // Taken by the process before this one, which ended before the request's turn
+  request(w, '7-1', 'deploy done')
+  w.files.set(`${TELL}/7-1.taken`, w.files.get(`${TELL}/7-1.req`) ?? '')
+  w.files.delete(`${TELL}/7-1.req`)
+  w.files.set(`${TELL}/allow`, `format=2\nat=1\n`)
+  await startSession($, w)
+  await w.clock.advance(1500)
+  expect(e.prompts).toEqual([`[ccc tell 7-1 from cron: sent by a script, not typed by the person]\ndeploy done`])
+  expect(state(w, '7-1')).toBe('delivered')
+  expect(w.files.has(`${TELL}/7-1.taken`)).toBe(false)
+})
+
+test('a submit that fails goes back in line once, and is refused the second time', async ($, on) => {
+  const e = engine(on)
+  const w = world(on)
+  await startSession($, w)
+  await sessions($, 'tell on')
+  e.answer.value = () => {
+    throw new Error('the engine refused the prompt')
+  }
+  request(w, '8-1', 'ping')
+  await w.clock.advance(600)
+  expect(e.prompts).toHaveLength(1)
+  expect(state(w, '8-1')).toBe('queued')
+  expect(w.files.has(`${TELL}/8-1.req`)).toBe(true)
+  await w.clock.advance(1000)
+  expect(e.prompts).toHaveLength(2)
+  expect(state(w, '8-1')).toBe('refused')
+  expect(w.files.get(`${TELL}/8-1.status`)).toContain("couldn't be submitted")
+  expect([...w.files.keys()].filter(f => f.startsWith(`${TELL}/8-1.`) && !f.endsWith('.status'))).toEqual([])
+})
+
 test('ccc tell for a stopped session: a running session wakes it under the wake rules and answers the launcher', async ($, on) => {
   const list = [
     { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
