@@ -35,7 +35,7 @@ declare module 'claude-code' {
       /** What each thread of this session read of the world: 'main' or a helper's agentId → path → the read */
       reads: Record<string, Record<string, FleetRead>>
       /** What the gate told each thread once already: thread → path → the version it was refused at; 'pins:<path>'
-       * → the pin problems it was told (one per line); 'copy:<path>' → the worktree copy's version */
+       * → the pin problems it was told (one per line); 'copy:<path>' → 'told' (a write of a worktree's copy, once) */
       warned: Record<string, Record<string, string>>
       /** What the band counts besides the questions: the project's suspect files and files failing a check */
       flags: number
