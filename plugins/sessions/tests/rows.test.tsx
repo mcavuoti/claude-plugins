@@ -227,3 +227,22 @@ test('folds made in another session apply here once the panel doesn\'t have the 
   await w.clock.advance(3000)
   expect(await drawnOrder($, ['charlie', '▸ Desk'])).toEqual(['▸ Desk'])
 })
+
+test('⚙n: what a running background session has going on in the background, as the service counts it', async ($, on) => {
+  const w = world(on, { list: list() })
+  w.files.set('/Users/x/jobs/bbbbbbbb/state.json', JSON.stringify({ inFlight: { tasks: 2, drainableMonitors: 0, kinds: ['local_agent', 'local_bash'] } }))
+  // An artifact watch alone isn't work
+  w.files.set('/Users/x/jobs/cccccccc/state.json', JSON.stringify({ inFlight: { tasks: 1, drainableMonitors: 1, kinds: ['artifact_watch'] } }))
+  await startSession($, w)
+  const ui = await $.ui.mount(PANEL)
+  expect((await ui.find({ key: 'row:bbbbbbbb-0000-0000-0000-000000000000' }))?.text).toContain(' ⚙2')
+  expect((await ui.find({ key: 'row:cccccccc-0000-0000-0000-000000000000' }))?.text).not.toContain('⚙')
+  expect(JSON.stringify(await ui.drawn())).toContain('⚙ Running in the background')
+  await ui.unmount()
+  // Done: gone at the next refresh
+  w.files.set('/Users/x/jobs/bbbbbbbb/state.json', JSON.stringify({ inFlight: { tasks: 0, drainableMonitors: 0 } }))
+  await w.clock.advance(3000)
+  const again = await $.ui.mount(PANEL)
+  expect(JSON.stringify(await again.drawn())).not.toContain('⚙')
+  await again.unmount()
+})

@@ -37,6 +37,8 @@ export type Row = {
   depth: number
   // In a section the person folded (c): drawn as that section's one line, not as a row
   folded: boolean
+  // A running background session's subagents and background tasks (⚙n), as the background service counts them
+  helpers: number
 }
 
 // One rate-limit window of the account, as a session's last response reported it (five_hour, seven_day, …)

@@ -121,9 +121,14 @@ const SPEND_COLUMN = 7
 const BADGE_COLUMN = 4
 // A child session is drawn this many columns in, under its parent
 const INDENT = 2
-// The columns taken beside the names when any row needs them: children's indent and badges
+// The helpers column: a space, ⚙ (one column) and the largest count
+function helperColumn(list: readonly Row[]): number {
+  const most = Math.max(0, ...list.map(f => f.helpers))
+  return most > 0 ? 2 + String(most).length : 0
+}
+// The columns taken beside the names when any row needs them: children's indent, badges and helpers
 function markColumns(list: readonly Row[]): number {
-  return (list.some(f => f.depth > 0) ? INDENT : 0) + (list.some(f => f.badge) ? BADGE_COLUMN : 0)
+  return (list.some(f => f.depth > 0) ? INDENT : 0) + (list.some(f => f.badge) ? BADGE_COLUMN : 0) + helperColumn(list)
 }
 // The colors for each state, from Claude's theme (they adapt to light, dark and colorblind modes)
 const TINT: Record<Color, string> = { red: 'error', blue: 'suggestion', yellow: 'warning', green: 'success', gray: 'inactive' }
@@ -902,6 +907,9 @@ async function refresh($: any) {
     const hb = heartbeatStatus(beats[s.sessionId] ?? null, s.pid, now)
     const spend = spendOf(e)
     const marked = marksNow[refOf(s)] ?? NO_MARK
+    // What a running background session has going on beside its turn: its subagents and background tasks, as the
+    // background service counts them (artifact watches aside)
+    const helpers = s.kind === 'background' && s.pid && typeof s.id === 'string' ? ((await backgroundTasks($, s.id))?.count ?? 0) : 0
     fresh.push({
       sessionId: s.sessionId,
       id: s.id ?? null,
@@ -925,6 +933,7 @@ async function refresh($: any) {
       ...marked,
       depth: 0,
       folded: false,
+      helpers,
     })
   }
   installedVersion = newest
@@ -2603,7 +2612,7 @@ export const register: Register = (on, options) => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + 5 <= room
+      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + 5 <= room
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
     // Columns: [▌][● ][name…][↑][◆][ model  ctx  time][ spend]; in narrow panels the model is left out
     // Rows use only the width they need: in the box above the prompt (small windows or not fullscreen) the panel takes
@@ -2616,6 +2625,7 @@ export const register: Register = (on, options) => {
     const nameWidth = Math.max(8, total - 4 - infoWidth - marksWidth)
     const badgeWidth = list.some(f => f.badge) ? BADGE_COLUMN : 0
     const indentWidth = list.some(f => f.depth > 0) ? INDENT : 0
+    const helperWidth = helperColumn(list)
     const padRight = (t: string, w: number) => t + ' '.repeat(Math.max(0, w - displayWidth(t)))
     const padLeft = (t: string, w: number) => ' '.repeat(Math.max(0, w - displayWidth(t))) + t
     const info = (f: Row) =>
@@ -2631,6 +2641,8 @@ export const register: Register = (on, options) => {
       f.noPanel || f.otherFormat ? <Text color={TINT.yellow}>!</Text> : <Text color="claude">{f.outdated ? '↑' : ' '}</Text>
     // Another plugin's badge (up to 3 columns), in its tint or dim; its status line goes under the row, indented to the name
     const badge = (f: Row) => (badgeWidth ? <Text color={f.tint || undefined} dimColor={f.tint ? undefined : true}>{padRight(f.badge ? ` ${f.badge}` : '', badgeWidth)}</Text> : null)
+    // ⚙n: what the session runs in the background (⚙ takes one column: padded by hand, not by displayWidth)
+    const helpers = (f: Row) => (helperWidth ? <Text dimColor>{(f.helpers > 0 ? ` ⚙${f.helpers}` : '').padEnd(helperWidth)}</Text> : null)
     const statusLine = (f: Row) =>
       f.line ? (
         <Text key={`l:${f.sessionId}`} color={f.tint || undefined} dimColor={f.tint ? undefined : true}>
@@ -2643,7 +2655,7 @@ export const register: Register = (on, options) => {
     const foldSelected = plan.some(it => it.kind === 'fold' && `h:${it.section}` === selectedRow)
     const jumpable = shownRows.filter(f => !f.current)
     const initial = foldSelected ? undefined : (shownRows.find(f => `s:${f.sessionId}` === selectedRow) ?? jumpable[0] ?? shownRows[0])?.sessionId
-    // A row: [▌ or space][indent][●][ ][name][↑ or !][◆][badge][model ctx time][spend]. The session you're in: the theme's
+    // A row: [▌ or space][indent][●][ ][name][↑ or !][◆][badge][⚙n][model ctx time][spend]. The session you're in: the theme's
     // soft background and a bar in Claude's color. It's selected with the arrows like the others (for u and r, even if
     // it's the only one in the list); Enter there doesn't jump anywhere
     const row = (f: Row) => [
@@ -2667,6 +2679,7 @@ export const register: Register = (on, options) => {
         {mark(f)}
         <Text>{f.pinned ? '◆' : ' '}</Text>
         {badge(f)}
+        {helpers(f)}
         <Text dimColor>{f.current ? padRight(info(f), total - 4 - nameWidth - marksWidth).slice(1) : info(f).slice(1)}</Text>
       </Box>,
       statusLine(f),
@@ -2745,6 +2758,7 @@ export const register: Register = (on, options) => {
           </Text>
         )}
         {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (auto with Remote Control)</Text>}
+        {helperWidth > 0 && <Text dimColor>⚙ Running in the background: subagents, shells</Text>}
         {about.spent !== null && <Text dimColor>{truncate(`${formatUsd(about.spent)} est. spent here so far (list price)`, total)}</Text>}
         {/* Tokens spent: period (d, w, m) and scope (p: all of Claude or this project); bars per hour or per day */}
         {showUsage && <Box flexGrow={1} minHeight={1} />}
