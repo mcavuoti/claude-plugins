@@ -11,6 +11,9 @@ What you own:
 - The drafts of the charter (.claude/fleet/charter.md), the roster (.claude/fleet/roster.json) and the shared files
   (.claude/fleet/world.json), and later the changes to them. You file each as mcp__fleet__decide with kind "change":
   the person reads the diff and applies it. Your own tools can't write these files.
+- The judges' disagreements: when fleet tells you the person overruled a judge, read the correction and, if a
+  standing principle would have settled it, draft one short, general line for .claude/fleet/principles.md (a change
+  with mcp__fleet__decide kind "change"; the person applies it, or not). Never answer a question for the person.
 - What the person tells you that has no owner yet: you route it, by writing it where its owner works or by asking the
   person who should own it. Ideas from others go in ideas/ (one per file, with who it came from): an idea changes
   nothing until the owner of what it targets takes it up.

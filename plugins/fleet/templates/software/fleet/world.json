@@ -4,5 +4,5 @@
   "command": ["spec/**"],
   "proposal": ["ideas/**"],
   "tags": ["spec", "code", "tests", "process"],
-  "judges": { "model": "haiku", "statute": ["CLAUDE.md", ".claude/rules/*.md"] }
+  "judges": { "model": "haiku", "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
 }

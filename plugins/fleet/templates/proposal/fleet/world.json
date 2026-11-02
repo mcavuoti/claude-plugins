@@ -12,5 +12,5 @@
     "gaps": { "paths": ["notes/gaps.md"], "owner": "requirements", "debounceMin": 30 }
   },
   "commit": { "everyMin": 60 },
-  "judges": { "model": "haiku", "statute": ["CLAUDE.md", ".claude/rules/*.md"] }
+  "judges": { "model": "haiku", "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
 }

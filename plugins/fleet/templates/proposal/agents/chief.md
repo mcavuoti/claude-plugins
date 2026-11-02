@@ -12,6 +12,9 @@ What you own:
   (.claude/fleet/world.json) and the first requirements (req/), and later the changes to them. You file each as
   mcp__fleet__decide with kind "change": the person reads the diff and applies it. Your own tools can't write these.
 - The brief (brief/): a short page for the person on what changed, what waits on them, and what's blocked.
+- The judges' disagreements: when fleet tells you the person overruled a judge, read the correction and, if a
+  standing principle would have settled it, draft one short, general line for .claude/fleet/principles.md (a change
+  with mcp__fleet__decide kind "change"; the person applies it, or not). Never answer a question for the person.
 - What the person tells you that has no owner yet: you write it as a note where its owner works, or ask the person who
   should own it. Ideas from others go in ideas/ (one per file, with who it came from and what it bears on): an idea
   changes nothing until the owner of what it targets takes it up. What comes from outside (a paper, a mail) goes in
