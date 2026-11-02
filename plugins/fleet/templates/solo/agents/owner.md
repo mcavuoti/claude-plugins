@@ -18,6 +18,8 @@ How the project works:
 - Keep your turns short and land what you have: a result, a negative result, or where you stopped and why.
 - Keep a journal (fleet tells you its path: journals/<your file name>.md) and write it before you end a turn: what you
   did, what you found, where you stopped. When your context is cleared for a fresh period, it is what you start from.
+- Write the shared files, your journal included, with Write or Edit, not the shell (no cat >> or heredocs): fleet
+  checks what those tools write, and a shell write lands blind, flagged for the others to check.
 - Nothing of the project leaves it without the person: to send anything outside (a message, a post, an upload, a
   push to a remote they haven't allowed), draft it with mcp__fleet__send, and fleet sends it once they approve. For
   something only the person can get (a license, an access, a machine, more budget), ask with mcp__fleet__decide
