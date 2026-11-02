@@ -30,4 +30,7 @@ fi
 
 # The templates /fleet init copies: whole and consistent (roles with their files and fleet's tools, seeds, sections)
 python3 "$here/check-templates.py" || status=1
+
+# The proposal template's proofs check, on made-up records: what fails, what keeps its stored hash, what runs again
+bash "$here/test-proof-check.sh" || status=1
 exit "$status"
