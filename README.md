@@ -4,7 +4,7 @@ A [Claude Code](https://code.claude.com) plugin marketplace: one repository that
 
 | Plugin | What it does |
 |---|---|
-| [`sessions`](plugins/sessions/README.md) | A side panel with the current folder's Claude Code sessions: status colors, switching between sessions in one terminal window, stop, restart, rename, auto-pinning (and reopening) sessions with Remote Control, token usage, and a status line. |
+| [`sessions`](plugins/sessions/README.md) | A side panel with the current folder's Claude Code sessions: status colors, switching between sessions in one terminal window, stop, restart, rename, auto-pinning (and reopening) sessions with Remote Control, token usage, a status line, `ccc tell` for scripts, and an API other plugins use to start, wake and mark sessions. |
 | [`fleet`](plugins/fleet/README.md) | Turned on per project, on top of `sessions`: background sessions ask you their decisions without stopping, and you answer them from any session of the project with `/fleet`, at no token cost; a session hears when a shared file it read changed, and its write of a stale one is refused once with who changed it. |
 
 ## Install

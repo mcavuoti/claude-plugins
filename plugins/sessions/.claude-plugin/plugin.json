@@ -1,7 +1,7 @@
 {
   "name": "sessions",
-  "version": "0.11.0",
-  "description": "Side panel with this folder's sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, spend and token usage, a status line, and an API for other plugins",
+  "version": "0.12.0",
+  "description": "Side panel with this folder's sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, spend and token usage, a status line, ccc tell for scripts, and an API for other plugins",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
   "types": "./types/index.d.ts",
