@@ -389,6 +389,7 @@ test('the first stamps are a baseline of every config file: one stamped alone le
     '.claude/fleet/principles.md',
     '.claude/fleet/roster.json',
     '.claude/fleet/slots.json',
+    '.claude/fleet/verify.md',
     '.claude/fleet/world.json',
   ])
   expect(await fleet($, 'accept')).toBe('No change made outside fleet waits to be stamped.')

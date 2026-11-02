@@ -1,7 +1,7 @@
 // Pure logic of /fleet brief (tested in tests/brief.test.ts): what the person reads when he comes by, computed from the
 // project's files at no token cost, always in the same order: what needs him; what changed in the world and who
-// changed it; what's blocked (what auto mode refused an instance too), stale, suspect, quiet past its cadence or
-// without fleet; the spend and its forecast; the inputs and ideas. The chief may add up to five lines of its own
+// changed it; what's blocked (what auto mode refused an instance too), stale, suspect, unproven, moved upstream under an
+// instance's own code, quiet past its cadence or without fleet; the spend and its forecast; the inputs and ideas. The chief may add up to five lines of its own
 // (/fleet brief --chief). No `$` here.
 
 import type { Level } from './authority'
@@ -37,6 +37,10 @@ export type BriefFacts = {
     stale: { name: string; files: number }[]
     /** What auto mode blocked each instance today, which only that session's /permissions lists */
     autoMode?: { name: string; blocks: BlocksFile }[]
+    /** Findings and results with no proof, one line each (path, id, why) */
+    unproven?: { line: string; who: string | null }[]
+    /** What moved upstream under an instance's own changes, one line each (code.ts codeBriefLines) */
+    code?: string[]
   }
   spend: {
     project: { usd: number; cap: number | null } | null
@@ -133,6 +137,8 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
     ...b.blocks.map(x => `   - ${x.id} (${x.who}, ${ago(f.now - x.at)}) holds up: ${x.blocks}`),
     ...b.suspects.map(x => `   - suspect: ${x.line}${x.who ? ` (written last by ${x.who})` : ''}`),
     ...b.failing.map(x => `   - ${x.path} fails the check ${x.check}: ${x.message}${x.who ? ` (written last by ${x.who})` : ''}`),
+    ...(b.unproven ?? []).map(x => `   - unproven: ${x.line}${x.who ? ` (written last by ${x.who})` : ''}`),
+    ...(b.code ?? []).map(x => `   - ${x}`),
     ...b.cadence.map(x => `   - ${x.name}: nothing landed in ${hoursText(x.hours)} (its cadence is ${hoursText(x.cadenceH)})`),
     ...b.stale.map(x => `   - ${x.name} read ${x.files} shared file${x.files === 1 ? '' : 's'} that changed since`),
     ...(b.autoMode ?? []).flatMap(x => blocksLines(x.name, x.blocks, f.me.offsetMin).map((l, i) => `${i ? '     ' : '   - '}${l}`)),
