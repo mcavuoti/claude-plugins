@@ -3,7 +3,12 @@ import { expect, test } from 'claude-code/testing'
 import { cut, deliveryText, parseCommand, type Question, type QueueRecord } from '../hooks/decisions'
 import {
   JUDGE_SYSTEM,
+  PRINCIPLES_TEXT,
   belowAgreement,
+  distinguishing,
+  isGeneric,
+  sameQuestion,
+  supportProblem,
   liveGate,
   liveWords,
   overruleText,
@@ -94,14 +99,26 @@ test('the case law: only the person’s answers (never a judge’s own), dialogs
   expect(fixed.find(p => p.id === 'D-2')).toMatchObject({ kind: 'correction', questions: [{ label: 'Amber', judged: 'Red' }], why: 'red is for errors' })
 })
 
-test('an exact repeat: the same question and options, in any order and case, answered with one of them', () => {
+test('an exact repeat: the same question, options and descriptions, in any order and case, and blocks, answered with one of them and nothing more', () => {
   const ps = precedentsOf([answered('D-1', DB, 'SQLite'), answered('D-4', DB, 'Redis', { at: AT + 5000, closedAt: AT + 120000 })])
   expect(exactRepeat(DB, ps)).toEqual({ id: 'D-4', label: 'Redis', at: AT + 120000 })
-  const shuffled: Question = { ...DB, question: 'which database, for the cache', options: [{ label: 'redis' }, { label: 'SQLite' }] }
+  const shuffled: Question = { ...DB, question: 'which database, for the cache', options: [{ label: 'redis' }, { label: 'SQLite', description: 'One file; no server.' }] }
   expect(exactRepeat(shuffled, ps)).toMatchObject({ id: 'D-4', label: 'redis' })
   expect(exactRepeat({ ...DB, options: [...DB.options, { label: 'Memcached' }] }, ps)).toBe(null)
   expect(exactRepeat(COLOR, ps)).toBe(null)
   expect(norm('  Dólar, ¿Sí?  ')).toBe('dolar si')
+  // The same words with another meaning: a description changed, what waits on it
+  const MIGRATE: Question = { question: 'Proceed with the migration?', options: [{ label: 'Yes', description: 'the 2 MB test fixtures' }, { label: 'No' }], recommended: 'Yes', why: 'small' }
+  const moved = precedentsOf([answered('D-2', MIGRATE, 'Yes', { blocks: 'the test data' })])
+  expect(exactRepeat(MIGRATE, moved, 'the test data')).toMatchObject({ id: 'D-2', label: 'Yes' })
+  expect(exactRepeat({ ...MIGRATE, options: [{ label: 'Yes', description: 'drops the production users table' }, { label: 'No' }] }, moved, 'the test data')).toBe(null)
+  expect(exactRepeat(MIGRATE, moved)).toBe(null)
+  expect(exactRepeat(MIGRATE, moved, 'the release')).toBe(null)
+  // An answer with his note ("only this time"), or in his own words, is the judge's to read, not code's to repeat
+  const noted = precedentsOf([{ ...answered('D-3', DB, 'SQLite'), answers: [{ label: 'SQLite', note: 'only this time', origin: 'composer' }] }])
+  expect(exactRepeat(DB, noted)).toBe(null)
+  const worded = precedentsOf([{ ...answered('D-3', DB, 'SQLite'), answers: [{ text: 'SQLite for now', origin: 'composer' }] }])
+  expect(exactRepeat(DB, worded)).toBe(null)
 })
 
 test('relevance: the same area and the rarer shared words first, at most n, read oldest first', () => {
@@ -123,9 +140,16 @@ test('the prompt: the statute first (cached, line by line), the case law, then t
     { label: 'charter.md', text: '# Charter\n\nKeep it to one machine.\n' },
     { label: 'principles.md', text: '# Principles\n\nPrefer one file over a server.\n' },
   ])
-  expect(st.text).toContain('--- principles.md ---\nprinciples.md:1 | # Principles\nprinciples.md:3 | Prefer one file over a server.')
+  // principles.md's lines that /fleet init wrote are fleet's words: neither shown nor citable
+  expect(st.text).toContain('--- principles.md ---\nprinciples.md:3 | Prefer one file over a server.')
+  expect(st.lines.has('principles.md:1')).toBe(false)
   expect(st.lines.get('charter.md:3')).toBe('Keep it to one machine.')
   expect(statuteOf([]).text).toContain('(none written yet)')
+  const fresh = statuteOf([{ label: 'principles.md', text: PRINCIPLES_TEXT }])
+  expect([fresh.lines.size, fresh.text.includes('(none written yet)')]).toEqual([0, true])
+  expect(fresh.text).not.toContain('--- principles.md ---')
+  const kept = statuteOf([{ label: 'principles.md', text: `${PRINCIPLES_TEXT}Prefer SQLite for anything local.\n` }])
+  expect([...kept.lines.keys()]).toEqual(['principles.md:7'])
   // A cut never leaves half of a character (the API refuses a lone surrogate)
   const emoji = statuteOf([{ label: 'CLAUDE.md', text: `${'x'.repeat(399)}🎉 and more` }]).text
   expect(emoji).toContain(`CLAUDE.md:1 | ${'x'.repeat(399)}\n`)
@@ -175,10 +199,46 @@ test('citations, checked by code: shown to the judge, a precedent with that very
   expect(checkVerdict(v('SQLite', []), DB, shown, statute).unchecked?.problem).toBe('it cited nothing')
   expect(checkVerdict({ q: 1, outcome: 'hold', cites: [], why: 'taste' }, DB, shown, statute).outcome).toBe('hold')
   expect(citeKey('[T-3]'.replace(/^\[|\]$/g, ''))).toBe('T-3')
+  // A taste is a "no": it supports what its words or principle name, never what it said no to
   const taste = precedentsOf([{ id: 'T-1', source: 'taste', at: AT, questions: [], answers: [], taste: { said: 'one SQLite file is enough', about: 'a cache server', principle: 'no servers for local data', person: true } }])[0]!
   expect(containsOption(taste, { label: 'SQLite' })).toBe(true)
   expect(containsOption(taste, { label: 'Redis' })).toBe(false)
+  const no = precedentsOf([{ id: 'T-2', source: 'taste', at: AT, questions: [], answers: [], taste: { said: 'no Redis, revert it', about: 'Redis as the session cache', principle: 'one file for local data', person: true } }])[0]!
+  expect(supportProblem(no, { label: 'Redis' })).toBe('T-2 is the person\'s "no" to "Redis"')
+  expect(checkVerdict(v('Redis', ['T-2']), DB, new Map([['T-2', no]]), statute).unchecked?.problem).toBe('T-2 is the person\'s "no" to "Redis"')
+  // A precedent supports a label through the question asked (the same, or most of its words), a generic one only the same
+  const YES: Question = { question: 'Delete the old staging logs?', options: [{ label: 'Yes' }, { label: 'No' }], recommended: 'Yes', why: 'space' }
+  const logs = precedentsOf([answered('D-3', YES, 'Yes')])
+  const api: Question = { ...YES, question: 'Rewrite the public API in the storage layer?' }
+  expect(checkVerdict(v('Yes', ['D-3']), api, new Map([['D-3', logs[0]!]]), statute).unchecked?.problem).toBe('D-3 answered "Yes" to another question (a generic answer counts only for the same question)')
+  expect(checkVerdict(v('Yes', ['D-3']), { ...YES, question: 'Delete the old staging logs now?' }, new Map([['D-3', logs[0]!]]), statute).unchecked?.problem).toContain('to another question')
+  expect(checkVerdict(v('Yes', ['D-3']), { ...YES, question: 'delete the old staging logs' }, new Map([['D-3', logs[0]!]]), statute).outcome).toBe('decided')
+  expect(checkVerdict(v('SQLite', ['D-1']), { ...DB, question: 'Which database for the cache layer?' }, shown, statute).outcome).toBe('decided')
+  expect(checkVerdict(v('SQLite', ['D-1']), { ...DB, question: 'Which database for the job queue?' }, shown, statute).unchecked?.problem).toBe('D-1 answered "SQLite" to another question')
+  expect([isGeneric('Yes'), isGeneric('Go ahead'), isGeneric('b'), isGeneric('SQLite')]).toEqual([true, true, true, false])
+  expect([sameQuestion('Which database for the cache?', 'Which database for the cache layer?'), sameQuestion('Which color for the band?', 'Which database for the cache?')]).toEqual([true, false])
+  // His own words name it: support in shadow, never for a live answer ("anything but Redis" names Redis)
+  const words = precedentsOf([{ ...answered('D-4', DB, 'x'), answers: [{ text: 'anything but Redis', origin: 'composer' }] }])
+  const byWords = new Map([['D-4', words[0]!]])
+  expect(checkVerdict(v('Redis', ['D-4']), DB, byWords, statute).outcome).toBe('decided')
+  expect(checkVerdict(v('Redis', ['D-4']), DB, byWords, statute, true).unchecked?.problem).toBe('D-4 names "Redis" only in the person\'s words, which a live answer doesn\'t rest on')
+  // A statute line speaks to an option with a word that sets it apart: not a stop word, not one the other options have
+  const SESSIONS: Question = { question: 'Where do the sessions live?', options: [{ label: 'SQLite', description: 'one file' }, { label: 'Redis', description: 'keeps the sessions in memory, with a server' }], recommended: 'Redis', why: 'fast' }
+  expect(distinguishing(SESSIONS.options[1]!, SESSIONS.options)).toEqual(['redis', 'sessions', 'memory', 'server'])
+  expect(lineSpeaksTo('Keep it simple: one thing with another.', SESSIONS.options[1]!, SESSIONS.options)).toBe(false)
   expect(lineSpeaksTo('Prefer one file over a server', { label: 'SQLite', description: 'one file, no server' })).toBe(true)
+  expect(lineSpeaksTo('A file per thing', DB.options[0]!, [DB.options[0]!, { label: 'Redis', description: 'a file in memory' }])).toBe(false)
+  // Fleet's own principles.md lines aren't there to cite
+  const boiler = statuteOf([{ label: 'principles.md', text: PRINCIPLES_TEXT }]).lines
+  expect(checkVerdict(v('Redis', ['principles.md:3']), SESSIONS, shown, boiler).unchecked?.problem).toBe("principles.md:3 isn't a precedent or a statute line it was shown")
+  // A live answer cites only the command-level statute: charter.md and principles.md
+  const rules = statuteOf([
+    { label: 'CLAUDE.md', text: '# Project\n\nPrefer SQLite for anything local.\n' },
+    { label: 'principles.md', text: '# Principles\n\nPrefer SQLite for anything local.\n' },
+  ]).lines
+  expect(checkVerdict(v('SQLite', ['CLAUDE.md:3']), DB, shown, rules).outcome).toBe('decided')
+  expect(checkVerdict(v('SQLite', ['CLAUDE.md:3']), DB, shown, rules, true).unchecked?.problem).toBe('CLAUDE.md:3 is in CLAUDE.md, which sessions write too: a live answer cites only charter.md or principles.md')
+  expect(checkVerdict(v('SQLite', ['principles.md:3', 'D-1']), DB, shown, rules, true).outcome).toBe('decided')
 })
 
 test('agreement, the register’s entry and /fleet’s line; the stats per area', () => {

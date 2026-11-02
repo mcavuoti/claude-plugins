@@ -5465,7 +5465,7 @@ async function judgeDecision($: any, rec: QueueRecord) {
     const verdicts: Verdict[] = []
     const asked: number[] = []
     for (const [i, q] of rec.questions.entries()) {
-      const r = exactRepeat(q, ps)
+      const r = exactRepeat(q, ps, rec.blocks)
       if (r) verdicts.push({ q: i + 1, outcome: 'decided', option: r.label, cites: [r.id], why: `the same question, answered so in ${r.id}`, repeat: true })
       else asked.push(i + 1)
     }
@@ -5473,6 +5473,9 @@ async function judgeDecision($: any, rec: QueueRecord) {
     const holdAll = (why: string) => {
       for (const q of asked) verdicts.push({ q, outcome: 'hold', cites: [], why })
     }
+    // A verdict checked again as a live answer would be: no text answer as support, statute only from charter.md and
+    // principles.md
+    let recheck: (v: Verdict) => Verdict = v => v
     if (asked.length) {
       const spent = await judgeLedger($, now)
       if (spent.usd >= c.usdDay) {
@@ -5497,6 +5500,7 @@ async function judgeDecision($: any, rec: QueueRecord) {
         if (r?.isAnswered) {
           const byId = new Map(shown.map(p => [p.id, p]))
           for (const v of parseVerdicts(String(r.text ?? ''), rec.questions, asked)) verdicts.push(checkVerdict(v, rec.questions[v.q - 1] as Question, byId, statute.lines))
+          recheck = v => checkVerdict(v, rec.questions[v.q - 1] as Question, byId, statute.lines, true)
         } else {
           file.problem ??= `the judge gave no answer (${r?.reason ?? 'none'})`
           holdAll(file.problem)
@@ -5505,7 +5509,7 @@ async function judgeDecision($: any, rec: QueueRecord) {
     }
     verdicts.sort((a, b) => a.q - b.q)
     // A live area: what the record settles is answered now, as the judge's; what's malformed goes back to its asker
-    const live = await liveAction($, rec, file, now)
+    const live = await liveAction($, rec, file, now, recheck)
     await publish($, judgeFile(rec.id), json(file))
     const u = file.usage
     log($, `${rec.id} judged: ${verdicts.map(verdictWords).join('; ')}${u ? `; usage in ${u.input} out ${u.output} cache read ${u.cacheRead} write ${u.cacheWrite}, ${usdText(file.usd ?? 0)}` : asked.length ? '' : '; no model call'}${file.problem ? ` (${file.problem})` : ''}${file.live ? `; live area ${rec.area}${file.liveWhy ? `, but ${file.liveWhy}` : ''}` : ''}`)
@@ -5537,8 +5541,9 @@ async function judgeDecision($: any, rec: QueueRecord) {
 
 /** What a live area lets the judge do with its verdicts: nothing unless the asker's own flags say reversible, no
  * money, inside the project, and today's cap isn't reached; then send it back (any question malformed), or answer the
- * questions it decided with checked citations (the rest wait for the person). The judge file says why it didn't */
-async function liveAction($: any, rec: QueueRecord, file: JudgeFile, now: number): Promise<{ sendBack: string | null; answer: Verdict[] }> {
+ * questions it decided whose citations check as a live answer's must (recheck: an exact repeat needs none). The rest
+ * wait for the person; the judge file says why */
+async function liveAction($: any, rec: QueueRecord, file: JudgeFile, now: number, recheck: (v: Verdict) => Verdict): Promise<{ sendBack: string | null; answer: Verdict[] }> {
   const none = { sendBack: null, answer: [] }
   if (!rec.area || file.gated) return none
   const st = await judgesStateNow($)
@@ -5555,7 +5560,19 @@ async function liveAction($: any, rec: QueueRecord, file: JudgeFile, now: number
   }
   const back = file.verdicts.find(v => v.outcome === 'send-back')
   if (back) return { sendBack: back.why, answer: [] }
-  return { sendBack: null, answer: file.verdicts.filter(v => v.outcome === 'decided' && v.option !== undefined && !v.unchecked) }
+  const answer: Verdict[] = []
+  const left: string[] = []
+  for (const v of file.verdicts) {
+    if (v.outcome !== 'decided' || v.option === undefined || v.unchecked) continue
+    if (v.repeat) answer.push(v)
+    else {
+      const strict = recheck(v)
+      if (strict.outcome === 'decided') answer.push(v)
+      else left.push(`${v.q}) ${strict.unchecked?.problem ?? 'its citations'}`)
+    }
+  }
+  if (left.length) file.liveWhy = `not as a live answer: ${left.join('; ')}`
+  return { sendBack: null, answer }
 }
 
 /** The register's judged choices, as /fleet stats counts them: with the questions the person overruled */
