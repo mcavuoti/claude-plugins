@@ -16,8 +16,10 @@
 //   gh's create, comment, edit, upload and review (and gh api with a method or fields) and glab's, mail, sendmail and
 //   nc; a package's publish (npm, yarn, pnpm, cargo, twine, poetry, gem), docker and podman push, an upload to cloud
 //   storage (aws s3, gsutil, gcloud storage, az storage blob, rclone to a remote), ftp, lftp and smbclient, and a
-//   redirection to /dev/tcp or /dev/udp; and the commands outbound.json's commands names. A program or script that
-//   sends by itself isn't seen: the models' own guardrails and the person's permission settings are the rest.
+//   redirection to /dev/tcp or /dev/udp; and the commands outbound.json's commands names. A push goes by the URL of
+//   its remote (a url set on the line, --repo, another receive-pack or a cd out of the project hold it), and an
+//   endpoint, registry or proxy a command's environment names is where it goes too. A program or script that sends by
+//   itself isn't seen: the models' own guardrails and the person's permission settings are the rest.
 
 import { cut } from './decisions'
 

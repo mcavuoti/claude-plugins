@@ -36,7 +36,8 @@
 //   state/checks-stamp.json              wire: the checks the person stamped (/fleet accept checks)
 //   state/sweeper.json                   wire: the sweeper's lease, rewritten by whoever holds or takes it
 //   state/commit.json                    wire: the last world commit, written by the sweeper
-//   state/stamps.json                    wire: the command-level files' versions fleet wrote or the person stamped
+//   state/stamps.json                    wire: the command-level files' versions fleet wrote or the person stamped, and
+//                                        outbound.json's text as stamped (what the gate uses)
 //   state/lifts.json, state/down.json    wire: today's budgets the person lifted; the instances he took down
 //   state/wakes.json                     wire: the sweeper's wakes of retired instances today
 //   state/intake.json                    wire: intake's counts and spend today, its sources' last polls (the sweeper's)
