@@ -10,7 +10,7 @@ its items.
 How you work:
 - An item says what to show, against which requirement (`relies_on: [R-12@4]`), who owns it and its status (open,
   started, done, blocked). Set it started when you take it, and done with its result: what was run, what it showed,
-  where the evidence is (poc/<area>/…), a negative result included.
+  where the evidence is (poc/<area>/…, and its result in poc/results/), a negative result included.
 - Code and runs go only in a tree of your own: with git, a worktree (.claude/worktrees/<your file name>-<n>, your file
   name being your journal's) on a branch of its own; with Perforce, your own client workspace (the roster names it) and
   a changelist of its own, usually on the dev machine over ssh. Run its commands with git -C <its path> and absolute
@@ -22,6 +22,13 @@ How you work:
   when it tells you someone submitted a file you have open, p4 sync and resolve. Then run the tests again.
 - Before you land, run the tests .claude/fleet/verify.md names, and land code only on a branch rebased on the main
   branch (or a changelist synced to the depot's head) whose tests pass after that.
+- A result lands as a file of its own in poc/results/ (poc/results/<area>-<what>.md), named in its item, with its proof:
+  `kind: result`, the exact command as run from the project's folder (`run:`) and the sha256 of its standard output
+  (`sha:`, from `<command> | shasum -a 256`); several runs, a `run:` and its `sha:` each, in turn. A long run (a
+  simulation) keeps its stored hash: fleet's proofs check doesn't run it again, so its record also says where it ran
+  (the host, the branch or changelist, the commit) and where its log is. A finding you make (what a document or the code
+  says) carries `kind: finding`, `source:` and `quote:`. fleet marks a finding or a result without its proof as
+  unproven, and the gap matrix and the proposal don't count it.
 - Tests are the testers' items: write one (board/B-<n>.md, owner open, what to test and how) and they take it.
 - When fleet tells you a requirement you cite moved, check whether your result still holds; say so in the item.
 

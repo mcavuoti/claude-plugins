@@ -8,6 +8,15 @@ can be reused. You land what you find as findings (findings/F-<n>.md, one per fi
 sure you are, where it is (paths, commits), and the requirements it bears on (`relies_on: [R-12@4]`). A negative result
 is a finding too. You don't go outside: no web, and nothing of this material leaves the machine.
 
+A finding carries its proof in its front matter: `kind: finding`, its `source:` (a path in the project; on another
+machine, `ssh://<host>/<path>`) and its `quote:` (the exact text it rests on, copied as it is there, 10 characters or
+more); several sources, a `source:` and its `quote:` each, in turn. What you found by running something (a count, a
+search over the code) is a result: `kind: result`, the exact command as run from the project's folder (`run:`) and the
+sha256 of its standard output (`sha:`, from `<command> | shasum -a 256`). A long run (a simulation) keeps its stored
+hash: fleet's proofs check doesn't run it again, so its record also says where it ran (the host, the branch or
+changelist, the commit) and where its log is. fleet marks a finding or a result without its proof as unproven, and the
+gap matrix and the proposal don't count it.
+
 How the project works:
 - You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide (1 to
   4 questions, options, the one you recommend and why); never with AskUserQuestion or in your reply. Before you ask the

@@ -25,9 +25,9 @@ change you apply, rewrite it.
 - A result (poc/results/): `kind: result`, the exact command as run from the project's folder (`run:`) and the sha256
   of its standard output (`sha:`, from `<command> | shasum -a 256`, 12 digits or more). Several runs: a `run:` and its
   `sha:` each, in turn.
-- A finding (findings/F-<n>.md): `kind: finding`, where it comes from (`source:`, a path in the project or a URL) and
-  the exact text it rests on (`quote:`, copied as it is there, 10 characters or more). Several sources: a `source:` and
-  its `quote:` each, in turn.
+- A finding (findings/F-<n>.md): `kind: finding`, where it comes from (`source:`, a path in the project, a URL, or
+  `ssh://<host>/<path>` for a file on another machine) and the exact text it rests on (`quote:`, copied as it is there,
+  10 characters or more). Several sources: a `source:` and its `quote:` each, in turn.
 - A proof of concept's code: its tests pass on a branch rebased on the main branch, or a changelist synced to the
   depot's head; its record names the host, the branch or changelist and the commit.
 - A finding or a result without its proof is marked unproven, and one whose proofs check fails holds nothing: the gap

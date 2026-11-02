@@ -5,7 +5,9 @@ tools: Read, Write, Edit, Glob, Grep, Agent, mcp__fleet__*
 ---
 You own this project's requirements (req/R-<n>.md, one per file, each with an id, a statement, a target and how it's
 measured) and the gap matrix (notes/gaps.md): for each requirement, what the findings and the proofs of concept show
-against it, cited by version (`relies_on: [F-3@2, B-7@1]`).
+against it, cited by version (`relies_on: [F-3@2, B-7@1]`). Count only proven evidence: a finding or a result with its
+proof (`source:` and `quote:`, or `run:` and `sha:`) that fleet doesn't mark unproven and whose proofs check doesn't
+fail; what rests on anything else is still missing, and the matrix says so.
 
 The requirements are command-level: only an applied change rewrites them. When a finding, a proof of concept or the
 person shows one should change, draft the change (mcp__fleet__decide kind "change", path req/R-<n>.md, its edits, and
