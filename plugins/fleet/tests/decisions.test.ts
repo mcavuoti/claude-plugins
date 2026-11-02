@@ -216,15 +216,24 @@ test('answers by the decision id: D-3 b, D-3 apply, a note on D-3', () => {
 })
 
 test('an answer that points at another list item, and one that only says a number in passing', () => {
-  for (const t of ['the same as question 2', 'same as 2', 'igual que la 2', 'like #2', 'lo mismo que la 2', 'la 2', 'question 2']) expect(pointsAtItem(t)).toBe(2)
-  for (const t of ['Docs, 2 pages', 'Leave it to Owner A', 'after 2 days', 'version 2.0 of the plan']) expect(pointsAtItem(t)).toBe(null)
+  for (const t of ['the same as question 2', 'same as 2', 'igual que la 2', 'like #2', 'lo mismo que la 2', 'la 2', 'question 2', '#2', 'Same as question 2.']) expect(pointsAtItem(t)).toBe(2)
+  // The number ends a reference: said in passing, it isn't one
+  for (const t of ['Docs, 2 pages', 'Leave it to Owner A', 'after 2 days', 'version 2.0 of the plan', 'launch it in Q1', 'I would like 2 columns', 'answer 2 emails a day', 'priority #1']) expect(pointsAtItem(t)).toBe(null)
+})
+
+test('alike for the list: the same words (case and punctuation aside) and the same options; words merely alike are apart', () => {
+  const yn = [{ label: 'Yes' }, { label: 'No' }]
+  expect(alikeQuestion({ question: 'Should I delete notes/old.md?', options: yn }, { question: 'Should I keep notes/old.md?', options: yn })).toBe(false)
+  expect(alikeQuestion({ question: 'Archive notes/2025/?', options: yn }, { question: 'Archive notes/2024/?', options: yn })).toBe(false)
+  expect(alikeQuestion({ question: 'How should notes/ be split?', options: yn }, { question: 'how should notes/ be split', options: yn })).toBe(true)
+  expect(alikeQuestion({ question: 'How should notes/ be split?', options: yn }, { question: 'How should notes/ be split?', options: [{ label: 'No' }, { label: 'Yes' }] })).toBe(false)
 })
 
 test('the list: one item per open question, the same question from several askers joined, a change alone', () => {
   const q = (question: string, labels: string[]) => ({ question, options: labels.map(label => ({ label })), recommended: labels[0] as string, why: 'w' })
   const a = { ...record('D-1', 0), questions: [q('Which part of the site is yours?', ['Docs', 'Tests'])] }
   const other = { ref: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', name: 'TEST B', root: '/Users/x/proj' }
-  const b = { ...record('D-2', 0), asker: other, questions: [q('Which part of the site is mine?', ['Docs', 'Tests']), q('Which release day?', ['Monday', 'Friday'])] }
+  const b = { ...record('D-2', 0), asker: other, questions: [q('Which part of the site is yours?', ['Docs', 'Tests']), q('Which release day?', ['Monday', 'Friday'])] }
   const c = { ...record('D-3', 0), questions: [q('Which part of the site is yours?', ['Tests', 'Docs'])] }
   const change = { ...record('D-4', 0), kind: 'change' as const }
   const items = listedItems([a, b, c, change], new Set(['D-2.2.json']), alikeQuestion)

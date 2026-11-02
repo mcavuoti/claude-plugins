@@ -61,13 +61,14 @@ declare module 'claude-code' {
        * everything, but a change it files waits for the person's apply */
       outside: FleetMark | null
       /** The person typed the prompt of the main thread's running turn, or into it: the turn, the start of his words,
-       * and his words (up to 4,000 characters: what a taste recorded in the turn must be found in) */
-      personTurn: { turnId: string; quoted: string; text?: string } | null
+       * and his words (up to 4,000 characters: what a taste recorded in the turn must be found in; a prompt typed into
+       * it adds to them); at: when he last typed; origin: composer (a terminal) or bridge (Remote Control) */
+      personTurn: { turnId: string; quoted: string; text?: string; at?: number; origin?: string } | null
       /** Fleet's own prompt started the main thread's running turn to deliver the person's answers: the words of his it
        * carries (text answers, notes, reject reasons, why he dropped or overruled), which a taste may quote */
       fleetTurn: { turnId: string; words: string } | null
       /** The person's prompt that is about to start a turn (prompt.submit comes before turn.start) */
-      pendingPerson: { text: string; at: number } | null
+      pendingPerson: { text: string; at: number; origin?: string } | null
       /** Main-thread turns started in this process (a background session's first prompt can be its launch prompt) */
       turns: number
       /** When this conversation started (the session's start, or its last /clear): its period, for fresh periods */
