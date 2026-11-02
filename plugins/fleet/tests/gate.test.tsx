@@ -226,6 +226,27 @@ test('/fleet world lists, adds and removes globs, typed by the person; /fleet in
   expect(await fleet($, 'world add docs/**')).toContain('newer fleet')
 })
 
+test('the first stamps are a baseline of every config file: one stamped alone leaves the others as they were, not changed outside fleet', WITH_SESSIONS, async ($, on) => {
+  const charter = `${FLEET}/charter.md`
+  const w = world(on, { background: false, worldPaths: ['notes/**'], files: { [charter]: '# Charter\n', [`${FLEET}/roster.json`]: JSON.stringify({ rosterFormat: 1, sections: [], roles: {}, instances: [] }), [`${ROOT}/.claude/agents/owner.md`]: '---\nname: owner\n---\n' } })
+  await startSession($, w)
+  // No stamps yet: the person's typed /fleet world add writes the first ones
+  expect(await fleet($, 'world add docs')).toContain('Added `docs`')
+  expect(Object.keys(json(w, `${FLEET}/state/stamps.json`).files).sort()).toEqual([
+    '.claude/agents/owner.md',
+    '.claude/fleet/charter.md',
+    '.claude/fleet/outbound.json',
+    '.claude/fleet/principles.md',
+    '.claude/fleet/roster.json',
+    '.claude/fleet/slots.json',
+    '.claude/fleet/world.json',
+  ])
+  expect(await fleet($, 'accept')).toBe('No change made outside fleet waits to be stamped.')
+  // An edit after them is flagged
+  w.touch(charter, '# Charter\n\nThe goal.\n')
+  expect(await fleet($, 'accept')).toContain('.claude/fleet/charter.md: changed outside fleet')
+})
+
 test('/fleet status: the world, the latest changes, and who is behind, in this session and the others', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [TODO]: 'todo v1\n' } })
   await begin($, w)

@@ -4236,8 +4236,11 @@ async function configFiles($: any): Promise<string[]> {
 }
 
 async function writeStamps($: any, rels: readonly string[]) {
-  const s = (await readWire<Stamps>($, stateDir('stamps.json'))) ?? { format: FORMAT, files: {} }
-  for (const rel of rels) {
+  const had = await readWire<Stamps>($, stateDir('stamps.json'))
+  const s = had ?? { format: FORMAT, files: {} }
+  // The first stamps are a baseline of every config file as it is (what's there counts as stamped, as it did with no
+  // stamps), so the ones not given aren't flagged as changed outside fleet
+  for (const rel of had ? rels : [...new Set([...(await configFiles($)), ...rels])]) {
     const t = await readText($, `${root}/${rel}`)
     s.files[rel] = t === null ? null : hashText(t)
   }
