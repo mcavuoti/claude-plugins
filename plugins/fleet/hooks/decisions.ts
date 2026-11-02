@@ -620,6 +620,7 @@ export const HELP = [
   '/fleet world           the shared files (world.json); /fleet world add <glob>, /fleet world remove <glob>',
   '/fleet accept [path]   stamp a change made outside fleet (your editor, a script) as yours; alone, lists them',
   '/fleet accept checks   let fleet run the check scripts world.json lists, as they are now',
+  '/fleet accept channel  let fleet run your command channel (roster.json person.channel), as it is now',
   '/fleet 4 apply         apply the change of item 4 as drafted (also 4 reject, and 4 edit to change the draft first)',
   '/fleet 5 done "note"   you got what item 5 asks for (a license, an access…); 5 no "why" if not',
   '/fleet 6 send          send the outbound of item 6 exactly as shown (also 6 reject, 6 edit, and 6 done if you sent it yourself)',
