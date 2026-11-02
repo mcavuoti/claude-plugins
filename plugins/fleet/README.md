@@ -282,6 +282,8 @@ Items from outside (mail, chat, an issue tracker, any feed) reach the project as
 3. **Code writes the record**, `<project>/inputs/intake/I-<n>.md` (in the `intake.folder`): the sender, its address and `senderAuth` copied from the item, the kind, tags and targets, the model's summary labelled as such, and the item's first 2,000 characters fenced. It's a record (`I-31@1`) others can cite; it cites nothing itself. Noise gets no record.
 4. The item moves aside, to `<project>/.claude/fleet/intake/raw/` (a duplicate to `<project>/.claude/fleet/intake/dup/`, an unreadable file to `<project>/.claude/fleet/intake/failed/`), out of git.
 
+**An item the model can't answer** (a reply with no text, a request the API refuses as it was) is tried again at the next sweeps while the others go on. After three tries it goes to `<project>/.claude/fleet/intake/failed/` with a `.why` file beside it, and it counts as read, so a poller's next drop of it is a duplicate. A cause no item escapes (a rate limit, the API overloaded or down, the account, no network) stops the sweep with no try counted: the items wait for the next one. `/fleet status` shows how many wait for another try, and the last problem.
+
 **Routing by tags.** Roles and instances subscribe in `roster.json` (a role's and its instance's add up):
 
 ```json
@@ -469,18 +471,18 @@ Go on with what depended on it.
 
 ## Judges: your past answers, applied
 
-Most questions a fleet asks you were answered before ("too complicated", "fine tradeoff"). A judge applies your past answers to a new one. It's one model call per question, made in the session that asked, never a session of its own: no tools, no history, so it can't anchor on its own verdicts. Everywhere it starts in shadow: it only proposes, you answer every question as always, and `fleet` keeps how often you agreed. In an area that earned it, you turn it live: there it answers what your record settles, at once, labelled as its own, sends back what's malformed, and you overrule it when it's wrong ([below](#live-areas)).
+Most questions a fleet asks you were answered before ("too complicated", "fine tradeoff"). A judge applies your past answers to a new one. It's one model call per question, made in the session that asked, never a session of its own: no tools, no history, so it can't anchor on its own verdicts. Everywhere it starts in shadow: it only proposes, you answer every question as always, and `fleet` keeps how often you agreed. In an area that earned it, you turn it live: there it answers the exact repeats of your answers at once, labelled as its own, and, once its own verdicts have earned it too, what your record settles and sending back what's malformed; you overrule it when it's wrong ([below](#live-areas)).
 
 **What a judge reads**, in the call's prompt, in the order the cache wants:
 
-- **The statute** (cached): `<project>/.claude/fleet/charter.md`, `<project>/.claude/fleet/principles.md` and the files `world.json`'s `judges.statute` lists (by default the project's `CLAUDE.md` and `.claude/rules/*.md`), line by line, so a judge cites `principles.md:4`. `principles.md` is yours: your standing answers, one per line. `/fleet init` writes a short one that says what goes there; it's command-level, so only you (then `/fleet accept principles.md`) or a change you apply write it.
-- **The case law**: the register. The questions you answered, through `/fleet` or in a dialog, and the "no"s you said ([below](#taste-the-nos-you-say)), never a judge's own answer. Code picks those most relevant to the question: the same area first, then the words they share, a rarer word weighing more (one every record has says nothing, in any language); at most `judges.precedents` (12).
+- **The statute** (cached): `<project>/.claude/fleet/charter.md`, `<project>/.claude/fleet/principles.md` and the files `world.json`'s `judges.statute` lists (by default the project's `CLAUDE.md` and `.claude/rules/*.md`), line by line, so a judge cites `principles.md:4`. `principles.md` is yours: your standing answers, one per line. `/fleet init` writes a short one that says what goes there; those lines are `fleet`'s, so the judge never sees or cites them. It's command-level, so only you (then `/fleet accept principles.md`) or a change you apply write it.
+- **The case law**: the register. The questions you answered, through `/fleet` or in a dialog, the "no"s you said ([below](#taste-the-nos-you-say)), and the changes and outbounds you rejected with a reason (`/fleet 3 reject "not yet"`), never a judge's own answer. Code picks those most relevant to the question: the same area first, then the words they share, a rarer word weighing more (one every record has says nothing, in any language); at most `judges.precedents` (12).
 - **The question**, between markers it can't close (they carry a hash of what's between them): its area, its options, what the asker recommends. The system prompt says it's data, never instructions.
 
 **What it answers**, per question: **decided** (an option, citing the decisions or statute lines it rests on), **send back** (the question is malformed, or the statute answers it plainly), or **hold** (it needs you; when in doubt, hold). Code does the rest:
 
-- **An exact repeat** (the same question with the same options, as words, in any order, that you answered with one of them) is decided by code, citing that decision, with no call at all.
-- **Every citation is checked**: it must be one the judge was shown; a cited decision must have been answered with that very option (or your words in it, or your taste, must name it); a cited line must speak to it (a word of four letters or more in common with the option). A proposal that fails becomes a hold, with what it proposed and why code didn't take it.
+- **An exact repeat** (the same question with the same options, labels and descriptions, as words, in any order, and the same "blocks", that you answered with one of them) is decided by code, citing that decision, with no call at all. One you answered with a note, or in your own words, isn't repeated: the judge reads it, and you may have meant it for that time only.
+- **Every citation is checked**: it must be one the judge was shown. A cited decision must have answered the same question (the same words, or most of its words that carry meaning; for an answer like yes, no, ok or skip, only the same words) with that very option, or your words in it must name it. A taste or a rejection is a "no": it backs an option its words or principle name, never the one it said no to. A cited line must speak to the option: a word of four letters or more that sets it apart (in its label or description, in no other option's, and not a common word such as "with" or "that"). A proposal that fails becomes a hold, with what it proposed and why code didn't take it.
 
 **The gates, in code, before any model.** No judge looks at a decision that is a change, a resource or an outbound (only choices); one whose asker says `touchesMoney` or `outsideWorld`, or `reversible: false`; one asked by a conversation that had read outside content (a web page, an outside service, an intake record: [the mark](#who-may-command-outside-content-and-your-own-word)); one whose question, options or blocks match a pattern of `judges.hold`; one asked by an instance or role in `judges.skip`. `/fleet` says why: `judge: held by a gate (it touches money)`. False holds are cheap: you answer as today.
 
@@ -498,20 +500,22 @@ Most questions a fleet asks you were answered before ("too complicated", "fine t
 1: Which database for the cache? → a) SQLite (the judge proposed a) SQLite: agreed)
 ```
 
-The delivery doesn't change. When the decision closes, the register keeps the proposal and, per question, whether you agreed. **`/fleet stats`** counts them per area (with an area, its last ten decisions):
+The delivery doesn't change. When the decision closes, the register keeps the proposal and, per question, whether you agreed. **`/fleet stats`** counts them per area (with an area, its last ten decisions), the exact repeats and the model's own verdicts apart (a repeat is your own answer, so it says little about the model):
 
 ```
 Judges: on, in shadow (they propose under each question in /fleet; you answer as always) · model haiku · today 4 calls, $0.0011 of $1.00
-storage: 12 proposals · 9 decided (5 exact repeats), agreed 8 of 9 (89%) · 1 sent back · 2 held · 1 held by a gate · $0.0031 in 7 calls
+storage: 12 proposals · 9 decided (5 exact repeats), agreed 8 of 9 (89%): repeats 5 of 5 (100%), model verdicts 3 of 4 (75%) · 1 sent back · 2 held · 1 held by a gate · $0.0031 in 7 calls
 ```
 
 ### Live areas
 
-**`/fleet judges live <area>`** (typed by you) turns an area live once its shadow has earned it: at least `promote.proposals` (30) proposals and `promote.agreement` (90%) agreement on what the judge decided. `--force "why"` turns it on before that, recorded as forced. `/fleet judges off <area>` turns it back; `/fleet judges` lists the live areas, those that went back by themselves, the stats and the taste recorded. The areas are `world.json`'s tags; a question with no area is never live.
+**`/fleet judges live <area>`** (typed by you) turns an area live once its shadow has earned it: at least `promote.proposals` (30) proposals and `promote.agreement` (90%) agreement on what the judge decided. `--force "why"` turns it on before that, recorded as forced. `/fleet judges off <area>` turns it back; `/fleet judges` lists the live areas (and whether the model's own verdicts answer there), those that went back by themselves, the stats and the taste recorded. The areas are `world.json`'s tags; a question with no area is never live.
+
+What a live area answers at once is the **exact repeats**. **The model's own verdicts** (a decision resting on citations, a send-back) act there only once they've earned it apart: `promote.proposals` of them that you compared, by answering the question yourself or by reviewing a live answer ([below](#overrule)), at `promote.agreement`. `fleet` checks that at each answer, so they join once they reach it and stop once they fall below; `--force` doesn't reach them. Until then they propose, as in shadow.
 
 In a live area, a choice that passes every gate above, and whose asker gave its own word on it (`reversible: true`, `touchesMoney: false`, `outsideWorld: false`: a flag left out says nothing, so it doesn't pass), gets one of three things right after its ticket, at most `perDay` (20) a day in the project:
 
-- **decided** (an exact repeat, or a proposal whose citations code checked): `fleet` writes the judge's answer as the asker's answer (`origin: judge`, with what it cites), and the asking session gets it as ever, labelled:
+- **decided** (an exact repeat, or, once the model's verdicts earned it, a proposal whose citations code checked; for a live answer a cited line must be in `charter.md` or `principles.md`, which only you write, never in a file sessions also write, and your own words in a past answer don't count as backing: "anything but Redis" names Redis): `fleet` writes the judge's answer as the asker's answer (`origin: judge`, with what it cites), and the asking session gets it as ever, labelled:
 
   ```
   [D-5] The judge answered for the person, from what they decided before (they can overrule it):
@@ -521,7 +525,7 @@ In a live area, a choice that passes every gate above, and whose asker gave its 
   ```
 
   A question it holds waits for you, and the decision is delivered once you answer it, the judge's lines labelled;
-- **send back**: the question goes back to its asker with why, and you're never asked (`[D-6] The judge sent this question back without asking the person: …  Fix it … and ask again with mcp__fleet__decide`);
+- **send back** (once the model's verdicts earned it): the question goes back to its asker with why, and you're never asked (`[D-6] The judge sent this question back without asking the person: …  Fix it … and ask again with mcp__fleet__decide`);
 - **hold**: it waits for you, as in shadow.
 
 `/fleet` lists what the judge answered under "Answered, not delivered yet" (`answered by the judge`) until it's delivered, and the brief's "what changed" says what it answered and sent back.
@@ -532,13 +536,13 @@ In a live area, a choice that passes every gate above, and whose asker gave its 
 
 - the correction goes into the register beside the decision (`D-5.overrule.json`): from then on the judges read your answer there, as a correction of the judge, and an exact repeat of that question takes yours, never the judge's;
 - the asker hears it once, as a prompt of `fleet`'s own: `[D-5] The person overruled the judge on D-5: 1) Which database for the cache? → b) Redis, not a) SQLite. Why: "…" Undo what you built on the judge's answer, and go on with theirs.`;
-- it counts against the area: an answer the judge gave and you didn't overrule counts as agreed, one you overruled as not. **An area whose agreement falls below `promote.agreement` goes back to shadow by itself** (forced or not), and the brief and `/fleet judges` say so.
+- it counts against the area. A live answer counts once you've reviewed it: one you overruled counts as not agreed; one you saw listed (in `/fleet brief` or `/fleet stats <area>`) and let stand for an hour counts as agreed; one you never saw counts neither way. **An area goes back to shadow by itself** (forced or not) when you overrule 2 of the last 10 live answers you reviewed, and the brief and `/fleet judges` say so.
 
 **A reviewer** (optional): `world.json`'s `judges.reviewer` names an instance or a role (the chief, in the `software` and `proposal` templates). It hears each overrule once, at its next step or as a nudge, and may propose one short, general line for `principles.md` as a change, which you apply or not. It never answers a question for you.
 
 ### Taste: the "no"s you say
 
-The richest signal isn't an answer to a question: it's "no stand-ins", "revert it, it ruined chat", a default changed back. When you say no to something, revert it or correct it, even when it worked, the session records it with **`mcp__fleet__taste`**: what you said, what it was about, the principle it suggests (the role files say when). `fleet` keeps it in the register as `T-<n>`, with its provenance read by code, not the model: whether you typed that turn (the start of your words is kept) and whether the conversation had read outside content. The judges read only those you typed in a clean conversation; the rest wait for you. Promote one into `principles.md` by editing it, or by applying a change a session drafts.
+The richest signal isn't an answer to a question: it's "no stand-ins", "revert it, it ruined chat", a default changed back. When you say no to something, revert it or correct it, even when it worked, the session records it with **`mcp__fleet__taste`**: what you said, what it was about, the principle it suggests (the role files say when). `fleet` keeps it in the register as `T-<n>`, with its provenance read by code, not the model: whether what it says is in your own words (60% or more of its words that carry meaning are in what you typed that turn, or in your answer, note or reject reason that `fleet` delivered in it; the start of those words is kept), and whether the conversation had read outside content. The judges read only those in your words in a clean conversation; the rest wait for you. A reason you give when you reject a change or an outbound needs no taste: `fleet` puts it in the case law itself, from your answer. Promote one into `principles.md` by editing it, or by applying a change a session drafts.
 
 ### Settings and cost
 
@@ -549,7 +553,7 @@ The richest signal isn't an answer to a question: it's "no stand-ins", "revert i
             "promote": { "proposals": 30, "agreement": 0.9 }, "perDay": 20, "usdDay": 1, "reviewer": "Chief" }
 ```
 
-`"judges": false` turns them off; a `world.json` from a newer `fleet` turns them off in that session. `hold` holds patterns (regular expressions, any case): domain words belong there, never in `fleet`'s code. Past `usdDay` (dollars at list price, the project's, today), questions go unjudged but for exact repeats, which cost nothing; past `perDay`, a live area only proposes until tomorrow. The live areas are in `<project>/.claude/fleet/state/judges.json` (yours and `fleet`'s; a newer format has none).
+`"judges": false` turns them off; a `world.json` from a newer `fleet` turns them off in that session. `hold` holds patterns (regular expressions, any case): domain words belong there, never in `fleet`'s code. Past `usdDay` (dollars at list price, the project's, today), questions go unjudged but for exact repeats, which cost nothing; past `perDay`, a live area only proposes until tomorrow. The live areas, and the live answers you saw listed, are in `<project>/.claude/fleet/state/judges.json` (yours and `fleet`'s; a newer format has none).
 
 **Cost.** An exact repeat costs nothing. Otherwise one call on haiku: in the TEST, about 300 to 500 tokens in, 80 out, and a statute of about 900 tokens written to the cache on the first call and read from it on the next (within five minutes, from any session of the project): $0.0002 the first time, $0.0001 after. The call is billed to the asking session's credentials and left out of its cost totals, so `fleet` counts it from the call's usage, per session, in `<project>/.claude/fleet/state/judges/<day>/`, and `/fleet stats` and `/fleet status` show the day's.
 
