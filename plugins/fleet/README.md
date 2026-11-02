@@ -209,7 +209,7 @@ The sweeper marks the rows in every panel, one mark each, in this order:
 | Command | Does |
 |---|---|
 | `/fleet down [name…]` | takes instances down (all with no names): no wakes or nudges, `/fleet up` skips them; one that runs keeps running until you stop it (`s` in the panel: `fleet` never stops a session) |
-| `/fleet remove <name> [--yes]` | lists, then with `--yes` deletes, a stopped instance's settings, heartbeat, spend and reads; it stays in the roster, down, and `/fleet up <name>` starts it afresh (a new session, seeded again) |
+| `/fleet remove <name> [--yes]` | lists, then with `--yes` deletes, a stopped instance's settings, heartbeat, spend and reads (when `sessions` doesn't answer, one whose `fleet` beat in the last 3 minutes counts as running: nothing of it goes); it stays in the roster, down, and `/fleet up <name>` starts it afresh (a new session, seeded again) |
 | `/fleet worktrees [prune [--yes]]` | the linked worktrees under `<project>/.claude/worktrees/`, which instance works in each; `prune --yes` runs `git worktree remove` on those no instance is in (git refuses one with changes not committed) |
 | `/fleet budget [name\|project] [amount\|+n]` | today's spend and caps; sets or raises one for today ([below](#budgets-and-wakes)) |
 

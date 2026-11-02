@@ -5237,12 +5237,18 @@ async function removeCommand($: any, names: string[], yes: boolean, origin: stri
   const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: p.picked.map(i => i.name) })) : null
   const out: string[] = []
   const ready: { inst: Instance; paths: string[]; dirs: string[] }[] = []
+  const now = await $.clock.now()
   for (const inst of p.picked) {
     if (st?.ready && rowsOf(inst, st.rows).running) {
       out.push(`${inst.name} is still running: /fleet down "${inst.name}", stop it with s in the panel, then /fleet remove again.`)
       continue
     }
     const hb = await heartbeatOf($, inst.slug)
+    // With no answer from sessions, a heartbeat that's fresh means it may run: its files stay
+    if (!st?.ready && hb && now - hb.at < HEARTBEAT_STALE_MS) {
+      out.push(`${inst.name} may be running (sessions didn't answer, and its fleet beat ${ago(now - hb.at)} ago): nothing deleted. Stop it with s in the panel, then /fleet remove again.`)
+      continue
+    }
     const paths = [settingsPath(inst.slug), ...(hb?.sessionId ? [readsPath(hb.sessionId)] : [])]
     ready.push({ inst, paths: [], dirs: [] })
     const entry = ready[ready.length - 1] as { paths: string[]; dirs: string[] }

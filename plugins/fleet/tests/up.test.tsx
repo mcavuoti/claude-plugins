@@ -154,6 +154,13 @@ test('/fleet down: no wakes, /fleet up skips them until named; /fleet remove for
   expect(Object.keys(json(w, `${STATE}/down.json`).instances)).toEqual(['owner-b'])
   expect(await fleet($, 'up --dry-run')).toContain('down: skipped (/fleet up <name> brings it back)')
   expect(await fleet($, 'remove owner-b')).toContain('Owner B is still running: /fleet down "Owner B", stop it with s in the panel, then /fleet remove again.')
+  // sessions doesn't answer and its fleet beat a minute ago: it may run, so nothing goes, even with --yes
+  const beat = w.files.get(`${FLEET}/instances/owner-b/state.json`) as string
+  w.files.set(`${FLEET}/instances/owner-b/state.json`, JSON.stringify({ ...JSON.parse(beat), at: w.clock.now() - 60000 }))
+  sessionsSay(w, {})
+  expect(await fleet($, 'remove owner-b --yes')).toContain("Owner B may be running (sessions didn't answer, and its fleet beat 1m ago): nothing deleted.")
+  expect(w.files.has(`${FLEET}/instances/owner-b.json`)).toBe(true)
+  w.files.set(`${FLEET}/instances/owner-b/state.json`, beat)
   sessionsSay(w, { rows: { bbbbbbbb: row('bbbbbbbb', 'Owner B', 'stopped') } })
   const list = await fleet($, 'remove owner-b')
   expect(list).toContain(`Owner B: would delete ${FLEET}/instances/owner-b.json, ${FLEET}/instances/owner-b/`)
