@@ -24,9 +24,9 @@ function engine(on: any) {
   return { prompts, answer }
 }
 
-function request(w: World, id: string, text: string, format = 2) {
+function request(w: World, id: string, text: string, format = 3) {
   w.files.set(`${TELL}/${id}.txt`, text)
-  w.files.set(`${TELL}/${id}.status`, `format=2\nstate=queued\nreason=\nat=1\n`)
+  w.files.set(`${TELL}/${id}.status`, `format=3\nstate=queued\nreason=\nat=1\n`)
   w.files.set(`${TELL}/${id}.req`, `format=${format}\nfrom=cron\nat=${w.clock.now()}\n`)
 }
 
@@ -39,7 +39,7 @@ test('/sessions tell on and off: the person lets ccc tell reach this background 
   await startSession($, w)
   expect(await sessions($, 'tell')).toContain('Off. /sessions tell on turns it on')
   expect(await sessions($, 'tell on')).toContain('ccc tell "one" "<text>" (or its id, aaaaaaaa)')
-  expect(w.files.get(`${TELL}/allow`)).toMatch(/^format=2\nat=\d+\n$/)
+  expect(w.files.get(`${TELL}/allow`)).toMatch(/^format=3\nat=\d+\n$/)
   expect(await sessions($, 'tell')).toContain('On.')
   expect(await sessions($, 'tell off')).toContain('Off')
   expect(w.files.has(`${TELL}/allow`)).toBe(false)
@@ -133,7 +133,7 @@ test('a request taken and never delivered (the session restarted before its turn
   request(w, '7-1', 'deploy done')
   w.files.set(`${TELL}/7-1.taken`, w.files.get(`${TELL}/7-1.req`) ?? '')
   w.files.delete(`${TELL}/7-1.req`)
-  w.files.set(`${TELL}/allow`, `format=2\nat=1\n`)
+  w.files.set(`${TELL}/allow`, `format=3\nat=1\n`)
   await startSession($, w)
   await w.clock.advance(1500)
   expect(e.prompts).toEqual([`[ccc tell 7-1 from cron: sent by a script, not typed by the person]\ndeploy done`])
@@ -170,11 +170,11 @@ test('ccc tell for a stopped session: a running session wakes it under the wake 
   const w = world(on, { list })
   w.files.set('/Users/x/daemon.log', '[2026-10-26T10:00:00.000Z] [bg] bg retire dddddddd: settled, idle 61m\n[2026-10-26T10:00:01.000Z] [bg] bg settled eeeeeeee (killed)\n')
   await startSession($, w)
-  w.files.set(`${DATA}/inbox/${SID}`, `format=2\naction=wake\nat=${w.clock.now()}\nref=dddddddd\nreply=${DATA}/replies/1-1\n`)
+  w.files.set(`${DATA}/inbox/${SID}`, `format=3\naction=wake\nat=${w.clock.now()}\nref=dddddddd\nreply=${DATA}/replies/1-1\n`)
   await w.clock.advance(600)
   expect(w.runs.some(a => a[1] === 'respawn' && a[2] === 'dddddddd')).toBe(true)
-  expect(w.files.get(`${DATA}/replies/1-1`)).toBe('format=2\nresult=ok\nstate=queued\nreason=woke “idle one”\n')
-  w.files.set(`${DATA}/inbox/${SID}`, `format=2\naction=wake\nat=${w.clock.now()}\nref=eeeeeeee\nreply=${DATA}/replies/1-2\n`)
+  expect(w.files.get(`${DATA}/replies/1-1`)).toBe('format=3\nresult=ok\nstate=queued\nreason=woke “idle one”\n')
+  w.files.set(`${DATA}/inbox/${SID}`, `format=3\naction=wake\nat=${w.clock.now()}\nref=eeeeeeee\nreply=${DATA}/replies/1-2\n`)
   await w.clock.advance(600)
   expect(w.runs.some(a => a[1] === 'respawn' && a[2] === 'eeeeeeee')).toBe(false)
   expect(w.files.get(`${DATA}/replies/1-2`)).toContain('result=failed\nstate=refused\nreason=“stopped one” wasn\'t retired for being idle')

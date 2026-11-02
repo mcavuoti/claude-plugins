@@ -54,7 +54,7 @@ test('contract: api 1 and its methods, also before the mod has started here', WI
   world(on)
   const c = await call($, 'contract')
   expect(c.api).toBe(1)
-  expect(c.format).toBe(2)
+  expect(c.format).toBe(3)
   expect(typeof c.version).toBe('string')
   expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks'])
 })

@@ -18,7 +18,7 @@
 # Everything lives inside a function and the last line calls it and exits: bash reads the function whole before
 # running it, so a new version of this file (when the plugin is updated) doesn't break a launcher that's already running.
 
-FORMAT=2
+FORMAT=3
 
 # python3, unless on a Mac it's the stand-in that asks to install the developer tools
 usable_python() {

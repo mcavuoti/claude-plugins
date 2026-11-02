@@ -11,7 +11,7 @@ test('session.start starts the mod once: heartbeat, panel and /sessions; a draw 
   expect(w.registered).toEqual(['sessions'])
   expect(w.opens.filter(o => o.id === 'sessions').length).toBe(1)
   const beat = w.files.get(`${DATA}/alive/${SID}`) ?? ''
-  expect(beat).toContain('format=2\n')
+  expect(beat).toContain('format=3\n')
   expect(beat).toContain('via=session.start\n')
   expect(beat).toContain('version=0.10.0\n')
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
@@ -72,12 +72,12 @@ test('a fresh focus request from ccc gives the panel the keyboard and is consume
   const w = world(on)
   await startSession($, w)
   const inbox = `${DATA}/inbox/${SID}`
-  w.files.set(inbox, `format=2\naction=focus\nat=${w.clock.now()}\n`)
+  w.files.set(inbox, `format=3\naction=focus\nat=${w.clock.now()}\n`)
   await w.clock.advance(600)
   expect(w.files.has(inbox)).toBe(false)
   expect(w.opens.some(o => o.id === 'sessions' && o.focus === true)).toBe(true)
   const before = w.opens.length
-  w.files.set(inbox, `format=2\naction=focus\nat=${w.clock.now() - 60000}\n`)
+  w.files.set(inbox, `format=3\naction=focus\nat=${w.clock.now() - 60000}\n`)
   await w.clock.advance(600)
   expect(w.files.has(inbox)).toBe(false)
   expect(w.opens.slice(before).some(o => o.focus === true)).toBe(false)
@@ -121,7 +121,7 @@ test('closed by you: no panel at start, no panel on arrival, the band says how t
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(JSON.stringify(await ui.drawn())).toContain('panel closed · /sessions to open')
   // Arriving with ccc (a focus request) lands on the prompt
-  w.files.set(`${DATA}/inbox/${SID}`, `format=2\naction=focus\nat=${w.clock.now()}\n`)
+  w.files.set(`${DATA}/inbox/${SID}`, `format=3\naction=focus\nat=${w.clock.now()}\n`)
   await w.clock.advance(600)
   expect(w.opens.filter(o => o.id === 'sessions')).toEqual([])
   await ui.press({ key: 'show-panel' })
@@ -257,7 +257,7 @@ for (const reason of ['clear', 'resume'] as const) {
     list[0]!.sessionId = NEW
     await w.clock.advance(1000)
     expect(w.files.has(`${DATA}/alive/${SID}`)).toBe(false)
-    expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=2\n')
+    expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=3\n')
     expect(w.store.get(`state:${SID}`)).toBe(undefined)
     expect((w.store.get(`state:${NEW}`) as any)?.created).toBeDefined()
     // The old conversation's title isn't the new one's; having seen the session carries over
@@ -270,7 +270,7 @@ for (const reason of ['clear', 'resume'] as const) {
     expect(band).not.toContain('"dddddddd"')
     await ui.unmount()
     // A request for the new id is heard
-    w.files.set(`${DATA}/inbox/${NEW}`, `format=2\naction=focus\nat=${w.clock.now()}\n`)
+    w.files.set(`${DATA}/inbox/${NEW}`, `format=3\naction=focus\nat=${w.clock.now()}\n`)
     await w.clock.advance(600)
     expect(w.files.has(`${DATA}/inbox/${NEW}`)).toBe(false)
   })
@@ -282,20 +282,20 @@ test('an id change nobody announced (no session.end) is caught by the 15 s beat'
   const NEW = 'eeeeeeee-0000-0000-0000-000000000000'
   w.id.value = NEW
   await w.clock.advance(15500)
-  expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=2\n')
+  expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=3\n')
   expect(w.files.has(`${DATA}/alive/${SID}`)).toBe(false)
 })
 
 test('debug logs off (the default): no --debug-file, and the launcher is told so', async ($, on) => {
   const w = world(on)
   await startSession($, w)
-  expect(w.files.get(`${DATA}/config`)).toBe('format=2\ndebug=0\n')
+  expect(w.files.get(`${DATA}/config`)).toBe('format=3\ndebug=0\n')
 })
 
 test('debug logs on: the launcher is told, and a session the panel creates writes its debug log', { options: { debugLogs: true } }, async ($, on) => {
   const w = world(on)
   await startSession($, w)
-  expect(w.files.get(`${DATA}/config`)).toBe('format=2\ndebug=1\n')
+  expect(w.files.get(`${DATA}/config`)).toBe('format=3\ndebug=1\n')
   await $.ui.mount({ plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
   await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface: 'terminal' })
   await $.ui.input({ plugin: 'sessions', key: 'name', text: 'TEST one', requestId: 'sessions', surface: 'terminal' })
@@ -383,39 +383,47 @@ test("every command runs in a folder that exists, never the session's own, which
   await ui.unmount()
 })
 
-test('the root follows the session into a worktree and back, and so do the list and the order file', async ($, on) => {
+test("a worktree of the project is the project: a session there keeps the main checkout's list and order file", async ($, on) => {
   const list = folderList()
   const w = world(on, { list })
+  // The repository checks in its CLAUDE.md, so the worktree has a copy: it doesn't make the worktree a project of its own
   w.files.set(`${ROOT}/CLAUDE.md`, '# myapp')
   w.files.set(`${WT}/CLAUDE.md`, '# myapp')
   w.dirs.add(WT)
   await startSession($, w)
   expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
-  // EnterWorktree: the worktree, a checkout with its own CLAUDE.md, is the project now
+  // EnterWorktree: the session works in the worktree and is still in its project, with every session of it
   await move(w, list, WT)
-  expect(w.files.get(`${DATA}/order/${WT.replace(/\//g, '_')}`)).toContain(`root=${WT}\n`)
-  expect(orderIds(w, WT)).toEqual(['aaaaaaaa', 'cccccccc'])
-  // ExitWorktree, and the worktree is deleted: back to the main checkout, and the dead folder's order file goes
+  expect(w.files.has(`${DATA}/order/${WT.replace(/\//g, '_')}`)).toBe(false)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
+  const ui = await $.ui.mount(PANEL)
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).toContain('two')
+  expect(drawn).toContain('three')
+  await ui.unmount()
+  // ExitWorktree, and the worktree is deleted: the same project, without the worktree's other session
   w.dirs.delete(WT)
   w.files.delete(`${WT}/CLAUDE.md`)
   list.splice(2, 1)
   await move(w, list, ROOT)
-  expect(w.files.has(`${DATA}/order/${WT.replace(/\//g, '_')}`)).toBe(false)
   expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
   const r: any = await $.command.run({ command: 'sessions', args: 'status', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
   expect(r.text).toContain(`project: ${ROOT}`)
 })
 
-test("a root folder that's gone gives way to the session's current folder", async ($, on) => {
+test('the root follows the session to another folder, and a root folder that\'s gone gives way to its current one', async ($, on) => {
+  const SUB = `${ROOT}/sub`
   const list = folderList()
+  list[2].cwd = SUB
   const w = world(on, { list })
-  w.dirs.add(WT)
+  w.dirs.add(SUB)
   await startSession($, w)
-  await move(w, list, WT)
-  expect(orderIds(w, WT)).toEqual(['aaaaaaaa', 'cccccccc'])
-  // The session's root still names the worktree, which was deleted; the session itself is back in the main checkout
-  w.dirs.delete(WT)
-  await move(w, list, WT, ROOT)
+  // /cd into a folder of its own (no marker above it): that folder is its project now
+  await move(w, list, SUB)
+  expect(orderIds(w, SUB)).toEqual(['aaaaaaaa', 'cccccccc'])
+  // The session's root still names that folder, which was deleted; the session itself is back in the main checkout
+  w.dirs.delete(SUB)
+  await move(w, list, SUB, ROOT)
   expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
   const ui = await $.ui.mount(PANEL)
   expect(JSON.stringify(await ui.drawn())).toContain('two')

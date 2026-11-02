@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
+import { buildNotice, heartbeatText, parseNotice } from '../hooks/state'
 import { BAND, COMMAND, DATA, ROOT, SID, SLOW, startSession, world } from './world'
 
 // What the panel's rows show beyond each session: sections (the person's /sessions section, the headers, the freeze
@@ -343,5 +344,85 @@ test('with the f filter, a child whose parent waits for nobody is drawn as any r
   expect((await ui.find({ key: 'row:cccccccc-0000-0000-0000-000000000000' }))?.text).toMatch(/^ {3}● charlie/)
   await ui.press({ key: 'waiting' })
   expect((await ui.find({ key: 'row:cccccccc-0000-0000-0000-000000000000' }))?.text).toMatch(/^ ● charlie/)
+  await ui.unmount()
+})
+
+// Stop and Restart asked in the session acted on, which can't show a dialog (its agent leaves AskUserQuestion out)
+const BRAVO = 'bbbbbbbb-0000-0000-0000-000000000000'
+const PEER = { kind: 'peer', plugin: 'sessions' } as const
+
+// Bravo runs the mod (a fresh heartbeat of its process); with a window, this session is in the one in front, opened
+// with ccc (the window can switch in place)
+function reachableBravo(w: any, window = true) {
+  w.files.set(`${DATA}/alive/${BRAVO}`, heartbeatText({ pid: 4243, at: w.clock.now() + 600000, version: '0.13.2', via: 'session.start' }))
+  if (!window) return
+  w.ps.value = '  100 ttys001  bash /Users/x/p/hooks/visor.sh start\n  101 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = (args: string[]) => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+}
+
+function sentNotices(on: any): any[] {
+  const sent: any[] = []
+  on('session.send', (_: any, e: any) => {
+    const n = parseNotice(String(e.text))
+    if (n) sent.push(n)
+    return { isDelivered: true }
+  })
+  return sent
+}
+
+for (const window of [true, false]) {
+  test(`asked to stop where no dialog can show: the answer says it wasn't shown (${window ? 'the window goes back' : "the window can't go back, and says where to go"})`, async ($, on) => {
+    const w = world(on, { list: list() })
+    reachableBravo(w, window)
+    const sent = sentNotices(on)
+    // No hook answers it, as in a session whose agent hasn't the tool: the engine has none to call
+    await startSession($, w)
+    await $.session.receive({ text: buildNotice('ask', { from: BRAVO, topic: 'stop', detail: '' }), origin: PEER } as any)
+    await w.clock.settle()
+    expect(sent.find(n => n.kind === 'answer')?.data).toMatchObject({ sessionId: SID, action: 'unshown', cameBack: window })
+    expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === 'stop')).toBe(false)
+    expect(w.toasts.some(t => t.includes('go back to “bravo”'))).toBe(!window)
+  })
+}
+
+test('asked to stop, dismissed with Esc: the answer is a cancel, as before', async ($, on) => {
+  const w = world(on, { list: list() })
+  reachableBravo(w)
+  const sent = sentNotices(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, () => ({ result: "Error: The user doesn't want to proceed with this tool use.", isError: true }))
+  await startSession($, w)
+  await $.session.receive({ text: buildNotice('ask', { from: BRAVO, topic: 'stop', detail: '' }), origin: PEER } as any)
+  await w.clock.settle()
+  expect(sent.find(n => n.kind === 'answer')?.data).toMatchObject({ sessionId: SID, action: 'cancel' })
+})
+
+test("s on a session that can't show the question: it's asked here instead, and what's chosen is done", async ($, on) => {
+  const w = world(on, { list: list() })
+  reachableBravo(w)
+  const sent = sentNotices(on)
+  let asked = 0
+  on('tool.call', { tool: 'AskUserQuestion' }, (_: any, e: any) => {
+    asked++
+    return { result: { answers: { [e.questions[0].question]: 'Stop' } } }
+  })
+  await startSession($, w)
+  setFocused(w, true)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  // Bravo selected, as the arrows leave it (the engine moving the ring onto its row)
+  await $.ui.focus({ requestId: 'sessions', key: `s:${BRAVO}`, element: `s:${BRAVO}`, component: 'Pane', origin: { kind: 'engine' } } as any)
+  await ui.press({ key: 'stop' })
+  await w.clock.settle()
+  // The window went to bravo and the question was sent there, not asked here
+  expect(sent.find(n => n.kind === 'ask')?.data).toMatchObject({ from: SID, topic: 'stop' })
+  expect(asked).toBe(0)
+  // Bravo couldn't show it: the window came back, and this session asks
+  await $.session.receive({ text: buildNotice('answer', { sessionId: BRAVO, action: 'unshown', cameBack: true }), origin: PEER } as any)
+  await w.clock.settle()
+  expect(asked).toBe(1)
+  expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === 'stop' && a[2] === 'bbbbbbbb')).toBe(true)
+  // An answer nobody asked for any more does nothing
+  await $.session.receive({ text: buildNotice('answer', { sessionId: BRAVO, action: 'unshown', cameBack: true }), origin: PEER } as any)
+  await w.clock.settle()
+  expect(asked).toBe(1)
   await ui.unmount()
 })
