@@ -18,6 +18,7 @@ const PROBE = {
         else if (m === 'sections') out = await $.sessions.sections()
         else if (m === 'defineSection') out = await $.sessions.defineSection(input)
         else if (m === 'assignSection') out = await $.sessions.assignSection(input)
+        else if (m === 'start') out = await $.sessions.start(input)
         return { text: JSON.stringify({ out }) }
       } catch (err) {
         return { text: JSON.stringify({ threw: String(err) }) }
@@ -47,13 +48,13 @@ function list(): any[] {
 
 // The golden list: what api 1 serves. A method is never removed or renamed within an api (docs/plugin-contract.md):
 // removing one here is a new api, released together with every plugin that calls it
-test('contract: api 1 and its six methods, also before the mod has started here', WITH_PROBE, async ($, on) => {
+test('contract: api 1 and its methods, also before the mod has started here', WITH_PROBE, async ($, on) => {
   world(on)
   const c = await call($, 'contract')
   expect(c.api).toBe(1)
   expect(c.format).toBe(1)
   expect(typeof c.version).toBe('string')
-  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection'])
+  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start'])
 })
 
 test('current and status: not ready before the start, then this session and the others from the official list', WITH_PROBE, async ($, on) => {
@@ -187,4 +188,43 @@ test('sections: a sections.json from a newer sessions is left alone, refused wit
   const ui = await $.ui.mount({ plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
   expect(JSON.stringify(await ui.drawn())).toContain('sections.json is from a newer sessions')
   await ui.unmount()
+})
+
+test('start: checked, queued and started from the mod\'s own timer, with its agent and settings; refusals say why', WITH_PROBE, async ($, on) => {
+  const w = world(on, { list: list() })
+  const SETTINGS_FILE = `${ROOT}/.claude/fleet/instances/w.json`
+  w.files.set(SETTINGS_FILE, '{}')
+  // Before the mod has read the list here it can't check the name
+  expect((await call($, 'start', { name: 'TEST w', cwd: ROOT })).reason).toBe('not-ready')
+  await startSession($, w)
+  const reason = async (input: unknown) => {
+    const r = await call($, 'start', input)
+    return `${r.reason}: ${r.detail}`
+  }
+  expect(await reason({ name: '', cwd: ROOT })).toContain('invalid')
+  expect(await reason({ name: 'TEST w', cwd: 'myapp' })).toContain('invalid')
+  expect(await reason({ name: 'TEST w', cwd: `${ROOT}/../x` })).toContain('invalid')
+  expect(await reason({ name: 'TEST w', cwd: ROOT, agent: 'no spaces please' })).toContain('invalid')
+  expect(await reason({ name: 'TEST w', cwd: '/Users/x/nowhere' })).toBe("invalid: /Users/x/nowhere isn't a folder")
+  expect(await reason({ name: 'TEST w', cwd: ROOT, settings: '/Users/x/settings.json' })).toBe(`refused: a settings file inside ${ROOT}/.claude/`)
+  expect(await reason({ name: 'TEST w', cwd: ROOT, settings: `${ROOT}/.claude/missing.json` })).toContain("invalid: ")
+  expect(await reason({ name: 'TEST w', cwd: '/Users/x' })).toBe("refused: Claude doesn't start background sessions in your home folder")
+  // A name the project already has (a regular session's too)
+  expect(await reason({ name: 'myapp-1f', cwd: ROOT })).toBe(`refused: a session named “myapp-1f” is already in ${ROOT}`)
+  const before = w.runs.length
+  expect(await call($, 'start', { name: ' TEST  w ', cwd: `${ROOT}/`, agent: 'scout', settings: SETTINGS_FILE })).toEqual({ ok: true, queued: true })
+  // The same name again while it's queued
+  expect(await reason({ name: 'TEST w', cwd: ROOT })).toBe(`refused: a session named “TEST w” is already in ${ROOT}`)
+  // Nothing ran inside the call: the mod's timer starts it, in that folder
+  expect(w.runs.slice(before).some(a => a[1] === '--bg')).toBe(false)
+  await w.clock.advance(600)
+  const i = w.runs.findIndex(a => a[1] === '--bg')
+  expect(w.runs[i]).toEqual(['/bin/claude', '--bg', '--agent', 'scout', '--settings', SETTINGS_FILE, '-n', 'TEST w'])
+  expect(w.cwds[i]).toBe(ROOT)
+  expect(w.toasts).toEqual([])
+  // A folder Claude doesn't trust: said in this session when it's tried
+  w.bgError.value = 'Workspace not trusted. Run `claude` in /Users/x/myapp once and accept the trust prompt, then retry.'
+  expect(await call($, 'start', { name: 'TEST v', cwd: ROOT })).toEqual({ ok: true, queued: true })
+  await w.clock.advance(600)
+  expect(w.toasts).toEqual([`Couldn't start “TEST v”: Claude doesn't trust ${ROOT} yet, so it can't start a session there in the background: run claude there once and accept its question`])
 })

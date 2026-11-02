@@ -130,6 +130,13 @@ export type Sessions = {
   /** Puts a session in one of the caller's own sections, or takes it out of one (null). Never over the person's choice,
    * nor another plugin's */
   assignSection: (input: { source: string; ref: SessionsRef; section: string | null }) => Promise<SessionsResult>
+  // Methods added within api 1 after its first release (0.11.0) are optional: a copy older than the method lacks it.
+  // contract().methods says whether this one has it
+  /** 0.12.0. Starts a background session named `name` in the folder `cwd` (claude --bg -n, with `--agent` and
+   * `--settings` when given; never a prompt). It's queued and started from sessions' own timer: find it afterwards
+   * with status({ names }). Refused for a name already in that folder's project, a settings file outside `<cwd>/.claude/`
+   * and the home folder; a folder Claude doesn't trust is said in this session when it's tried */
+  start?: (input: { name: string; cwd: string; agent?: string; settings?: string }) => Promise<SessionsResult & { queued?: true }>
 }
 export type SessionsMethod = keyof Sessions
 

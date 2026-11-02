@@ -93,6 +93,9 @@ import {
   sortRows,
   windowTargetText,
   autoName,
+  bgRefusal,
+  checkStart,
+  type StartRequest,
   debugLogName,
   reloadDecision,
   FORMAT,
@@ -1349,6 +1352,39 @@ function hexDigit(): string {
   return ((b[0] ?? 0) % 16).toString(16)
 }
 
+// Starts a background session in a folder (claude --bg, with its agent and settings file if any), writing Claude's
+// debug log when the option is on. '' when it started, else why not
+async function launch($: any, l: StartRequest): Promise<string> {
+  const debug = debugLogs && dataDir ? ['--debug-file', `${dataDir}/debug/${debugLogName(l.name)}`] : []
+  const agent = l.agent ? ['--agent', l.agent] : []
+  const settings = l.settings ? ['--settings', l.settings] : []
+  const r = await runSafe($, [claude, '--bg', ...agent, ...settings, '-n', l.name, ...debug], { cwd: l.cwd, timeoutMs: 60000 })
+  return r.exitCode === 0 ? '' : bgRefusal(`${r.stderr}\n${r.stdout}`, l.cwd)
+}
+
+// The sessions other plugins asked to start ($.sessions.start), one at a time from this mod's own 0.5 s timer: a
+// method runs inside its caller's hook, and claude --bg can take seconds. Each name is checked once more against the
+// official list, read right then. What didn't start is said in this session, where the call came from
+let launches: (StartRequest & { root: string })[] = []
+let launching = false
+async function runLaunches($: any) {
+  if (launching || launches.length === 0) return
+  launching = true
+  try {
+    for (let l = launches.shift(); l; l = launches.shift()) {
+      const r = await run($, [claude, 'agents', '--json', '--all'])
+      const list = r.exitCode === 0 ? validateList(r.stdout) : []
+      const taken = Array.isArray(list) && list.some(s => s.name === l.name && inProject(String(s.cwd), l.root, home))
+      const refusal = taken ? `a session named “${l.name}” is already in ${l.root}` : await launch($, l)
+      debugLine($, `start “${l.name}” in ${l.cwd}: ${refusal || 'started'}`)
+      if (refusal) $.ui.toast(`Couldn't start “${l.name}”: ${refusal}`)
+      else await storeSet($, 'list', {})
+    }
+  } finally {
+    launching = false
+  }
+}
+
 async function createSession($: any, name: string) {
   await update($, askingName, () => false)
   // The new session starts in the project root: the current one, and only if it's still there
@@ -1362,10 +1398,9 @@ async function createSession($: any, name: string) {
   const taken = lastList.filter(x => typeof x.cwd === 'string' && inProject(x.cwd, myCwd, home)).flatMap(x => [x.name, x.id].filter(Boolean))
   const clean = name.trim() || autoName(myCwd, taken, hexDigit)
   const since = (await $.clock.now()) - 5000
-  const debug = debugLogs && dataDir ? ['--debug-file', `${dataDir}/debug/${debugLogName(clean)}`] : []
-  const r = await run($, [claude, '--bg', '-n', clean, ...debug], myCwd)
-  if (r.exitCode !== 0) {
-    $.ui.toast(`Couldn't create “${clean}”`)
+  const refusal = await launch($, { name: clean, cwd: myCwd })
+  if (refusal) {
+    $.ui.toast(`Couldn't create “${clean}”: ${refusal}`)
     return
   }
   // Without parsing the output text: the new session is looked up in the official list (JSON), by name and start time
@@ -1543,11 +1578,7 @@ async function followFolder($: any) {
     return
   }
   followedFrom = folder
-  const markers: string[] = []
-  for (const dir of rootCandidates(base)) {
-    if ((await exists($, `${dir}/AGENTS.md`)) || (await exists($, `${dir}/CLAUDE.md`))) markers.push(dir)
-  }
-  const root = rootFrom(base, markers)
+  const root = await rootOf($, base)
   if (root === myCwd) return
   const previous = myCwd
   myCwd = root
@@ -1556,6 +1587,15 @@ async function followFolder($: any) {
   // for the project's other sessions, unless its folder is gone
   lastOrder = ''
   if (previous && dataDir && !(await exists($, previous))) await runSafe($, ['rm', '-f', `${dataDir}/order/${fileKey(previous)}`])
+}
+
+// The project root of a folder (rootFrom), with the AGENTS.md and CLAUDE.md markers looked for on disk
+async function rootOf($: any, folder: string): Promise<string> {
+  const markers: string[] = []
+  for (const dir of rootCandidates(folder)) {
+    if ((await exists($, `${dir}/AGENTS.md`)) || (await exists($, `${dir}/CLAUDE.md`))) markers.push(dir)
+  }
+  return rootFrom(folder, markers)
 }
 
 function truncate(text: string, width: number): string {
@@ -1837,7 +1877,7 @@ async function sectionsList($: any): Promise<string> {
 // here: current and status answer ready: false, and the section methods find the data folder from the environment
 const SESSIONS_API: SessionsApi = 1
 // The methods this copy serves: a key missing from Sessions, or one too many, fails the type check
-const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1 } satisfies Record<SessionsMethod, 1>
+const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1 } satisfies Record<SessionsMethod, 1>
 // How long another plugin's call waits for the sections lock before answering busy (6 × 50 ms)
 const CALL_LOCK_TRIES = 6
 
@@ -1928,6 +1968,24 @@ function sessionsApi($: any): Sessions {
       )
     },
     assignSection: async input => changeSections($, file => assignChange(file, input?.source, input?.ref, input?.section), CALL_LOCK_TRIES),
+    start: async input => {
+      const v = checkStart(input)
+      if (!v.ok) return v
+      const l = v.request
+      if (!ready()) return { ok: false, reason: 'not-ready', detail: "sessions hasn't read the session list in this session yet: try again in a few seconds" }
+      if (l.cwd === home) return { ok: false, reason: 'refused', detail: bgRefusal('trusted one session at a time', l.cwd) }
+      let folder = false
+      try {
+        folder = (await $.fs.stat(l.cwd)).kind === 'dir'
+      } catch {}
+      if (!folder) return { ok: false, reason: 'invalid', detail: `${l.cwd} isn't a folder` }
+      if (l.settings && !(await exists($, l.settings))) return { ok: false, reason: 'invalid', detail: `${l.settings} doesn't exist` }
+      const root = await rootOf($, l.cwd)
+      const same = (name: unknown, cwd: unknown) => name === l.name && typeof cwd === 'string' && inProject(cwd, root, home)
+      if (lastList.some(s => same(s.name, s.cwd)) || launches.some(x => same(x.name, x.cwd))) return { ok: false, reason: 'refused', detail: `a session named “${l.name}” is already in ${root}` }
+      launches.push({ ...l, root })
+      return { ok: true, queued: true }
+    },
   }
 }
 
@@ -2011,6 +2069,7 @@ async function start($: any) {
     }
     $.clock.every(500, () => {
       bg(checkInbox($))
+      bg(runLaunches($))
     })
     $.clock.every(3000, () => {
       bg(refresh($))

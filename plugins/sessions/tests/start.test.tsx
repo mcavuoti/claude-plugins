@@ -161,7 +161,7 @@ test('/sessions status: how the mod started, the session, the copy of the mod, t
   expect(r.text).toContain(`Session: ${SID} · project: ${ROOT}`)
   expect(r.text).toContain('Heartbeat: written 3 s ago')
   expect(r.text).toContain('No panel running in: two (no heartbeat)')
-  expect(r.text).toContain('For other plugins: $.sessions api 1 · contract, current, status, sections, defineSection, assignSection (ready)')
+  expect(r.text).toContain('For other plugins: $.sessions api 1 · contract, current, status, sections, defineSection, assignSection, start (ready)')
 })
 
 test("New: Enter on an empty name creates a session named after the folder, unused in the project", async ($, on) => {

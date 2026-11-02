@@ -1,6 +1,6 @@
 # `$.sessions`: the contract for other plugins (api 1)
 
-From 0.11.0 the `sessions` mod adds a noun to `$` that other plugins call: what this session is, the state of other sessions, and sections in the panel. It never spends tokens and never talks to the model. Its types are written in one place, [`types/index.d.ts`](../types/index.d.ts) (from `SessionsApi` down); this page says how to use it and how it changes, and doesn't repeat the shapes.
+From 0.11.0 the `sessions` mod adds a noun to `$` that other plugins call: what this session is, the state of other sessions, and sections in the panel; from 0.12.0 also starting sessions. It never spends tokens and never talks to the model. Its types are written in one place, [`types/index.d.ts`](../types/index.d.ts) (from `SessionsApi` down); this page says how to use it and how it changes, and doesn't repeat the shapes.
 
 ## Depending on it
 
@@ -37,11 +37,13 @@ From 0.11.0 the `sessions` mod adds a noun to `$` that other plugins call: what 
 | `sections()` | every section and who's in which |
 | `defineSection({ source, spec })` | creates or updates one of your sections |
 | `assignSection({ source, ref, section })` | puts a session in one of your sections, or takes it out of it (`null`) |
+| `start({ name, cwd, agent, settings })` (0.12.0) | starts a background session named `name` in the folder `cwd`, running as `agent` with the settings file `settings` (both optional): queued, and started a moment later |
 
 - **Refs.** A session is named by its official short id from `claude agents` (it stays across `/clear`), or `sid:<sessionId>` for a regular session, which has none.
 - **Before `sessions` has started** in this session, `current()` and `status()` answer `ready: false`; the section methods work, finding the data folder from the environment.
 - **Sections.** `source` is your plugin's name; your section ids are `<source>:<name>`, and `me:` and `sessions:` are reserved (the person's own sections are `me:<slug>`, made with `/sessions section <title>`). You define and assign only your own, never over the person's choice or another plugin's: those answer `{ ok: false, reason: 'refused', detail }`. Bad input is `invalid`. Sections live in `sessions-data/sections.json` under a lock; when another session holds it, the call answers `busy` after about 300 ms: try again on a later tick. A `sections.json` written by a newer `sessions` is never rewritten: `defineSection` and `assignSection` are refused with a restart in the detail, and `sections()` rejects.
 - **How they're drawn.** The project's sessions in no section come first with no header, then each section by `order` (a plugin's default 200, the person's 100) and title, each with a dim header line, only when two or more groups have rows. While the panel has the keyboard nothing moves: a section or member you set then shows when the person leaves the panel. The order `ccc` opens sessions in doesn't change with sections.
+- **Starting.** `start` checks what it can at once and answers `{ ok: true, queued: true }`; `sessions`' own timer then runs `claude --bg [--agent <agent>] [--settings <settings>] -n <name>` in `cwd`, with no prompt (a launch prompt would read as typed by the person). Find the session afterwards with `status({ names: [name] })`. Refused: a name the folder's project already has (or that's queued), a settings file outside `<cwd>/.claude/`, and the home folder. A folder Claude doesn't trust is only found out when it's tried: the session the call came from says so. Before `sessions` has read the session list here, `not-ready`.
 - **What a method never does.** A method's `$` calls run inside your hook (Claude lends it your hook's context), so none submits a prompt, asks the person or moves the focus, every path is absolute and every command runs from a folder that exists.
 
 ## How it changes
@@ -53,7 +55,7 @@ From 0.11.0 the `sessions` mod adds a noun to `$` that other plugins call: what 
 | wire `FORMAT` | `hooks/state.ts` and the launcher's files | a change to the files and notices sessions share among themselves (`.claude/rules/sessions-wire-format.md`) |
 | `sectionsFormat` | `SECTIONS_FORMAT` in `hooks/state.ts` | never in practice: sections only gain fields; a breaking change ships a one-time rewrite into a new key or file |
 
-1. **Within an api, changes only add**: new methods, new optional input fields, new output fields. Ignore output fields you don't know, and check `contract().methods` for a method newer than the api.
+1. **Within an api, changes only add**: new methods, new optional input fields, new output fields. Ignore output fields you don't know, and check `contract().methods` for a method newer than the api. A method added after the api's first release is optional in the type (`start?:`), since an older copy lacks it: call it as `$.sessions.start?.(…)` once `has()` said yes.
 2. **A removal or a change of meaning raises `SessionsApi`** in one commit that also updates every plugin of this repository that calls it, and releases them together. There's no deprecation period: after an update every session is restarted.
 3. **One list of methods.** `METHODS` in `hooks/register.tsx` is what `contract()` serves; `satisfies Record<SessionsMethod, 1>` makes a method missing from the type, or one too many, fail the type check. The golden list in `tests/contract.test.tsx` fails when a method disappears.
 

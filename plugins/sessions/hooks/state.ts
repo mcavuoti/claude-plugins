@@ -574,6 +574,36 @@ export function debugLogName(name: string): string {
   return `${name.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._]+/, '').slice(0, 80) || 'session'}.log`
 }
 
+// Why `claude --bg` didn't start a session, from what it printed, in the words ccc uses: a folder Claude doesn't trust
+// yet, the home folder, or its own first line
+export function bgRefusal(output: string, folder: string): string {
+  if (output.includes('not trusted')) return `Claude doesn't trust ${folder} yet, so it can't start a session there in the background: run claude there once and accept its question`
+  if (output.includes('trusted one session at a time')) return "Claude doesn't start background sessions in your home folder"
+  return output.trim().split('\n')[0] || 'claude --bg failed'
+}
+
+// A session another plugin asks to start ($.sessions.start): its name (one line, up to 80 characters), the absolute
+// folder it starts in, the agent it runs as (claude --agent) and a settings file (claude --settings) inside that
+// folder's .claude/. What can be checked without the disk; the folder, the file and the name's uniqueness are checked
+// by the caller
+export type StartRequest = { name: string; cwd: string; agent?: string; settings?: string }
+export function checkStart(input: any): { ok: true; request: StartRequest } | (SessionsResult & { ok: false }) {
+  const invalid = (detail: string) => ({ ok: false as const, reason: 'invalid' as const, detail })
+  const name = typeof input?.name === 'string' ? input.name.trim().replace(/\s+/g, ' ') : ''
+  if (!name || Array.from(name).length > 80 || /\p{Cc}/u.test(name)) return invalid('name is 1 to 80 characters on one line')
+  const raw = typeof input?.cwd === 'string' ? input.cwd : ''
+  const cwd = raw.length > 1 ? raw.replace(/\/+$/, '') : raw
+  if (!cwd.startsWith('/') || /(^|\/)\.\.?(\/|$)/.test(cwd)) return invalid('cwd is an absolute folder')
+  const agent = input?.agent
+  if (agent !== undefined && (typeof agent !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(agent))) return invalid('agent is an agent name')
+  const settings = input?.settings
+  if (settings !== undefined) {
+    if (typeof settings !== 'string' || !settings.startsWith('/') || /(^|\/)\.\.?(\/|$)/.test(settings)) return invalid('settings is an absolute path')
+    if (!settings.startsWith(`${cwd === '/' ? '' : cwd}/.claude/`)) return { ok: false, reason: 'refused', detail: `a settings file inside ${cwd === '/' ? '' : cwd}/.claude/` }
+  }
+  return { ok: true, request: { name, cwd, ...(agent ? { agent } : {}), ...(settings ? { settings } : {}) } }
+}
+
 // Whether to update this session's mod in place with /reload-plugins: only when a newer version of the same install
 // is installed (the running copy's folder is a sibling of the installed one: <cache>/<marketplace>/sessions/<version>),
 // once per version, and only when nothing would be cut or confused: the session idle (no turn, nothing waiting for
