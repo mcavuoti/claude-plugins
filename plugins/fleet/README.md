@@ -1,6 +1,16 @@
 # fleet
 
-A Claude Code mod, turned on per project, for running a project as a fleet of permanent background sessions. In 0.7.1 it does nine things:
+A Claude Code mod, turned on per project, for running a project as a fleet of permanent background sessions.
+
+**Start here.**
+1. Install `sessions`, then `fleet` turned off, and turn it on in the project ([Install](#install)).
+2. `/fleet init proposal` (or `solo`, `software`, `blank`) in a session of the project.
+3. `/fleet up --dry-run`: the plan, the cost and the marks to look at before the first wave: [a mode that doesn't ask](#the-roster-fleet-up), [your own places in `outbound.json`](#what-leaves-goes-through-you-outbound), [a git repository](#worktrees), [while you're away](#while-youre-away) and, at work, [its checklist](#running-it-on-a-work-machine).
+4. `/fleet up Chief`: the chief interviews you through questions you answer with `/fleet` from any session.
+5. `/fleet 1 apply …` on the drafts it files (the charter, the roster), then `/fleet up --wave 1`.
+6. `/fleet brief` whenever you come by.
+
+In 0.7.1 it does nine things:
 
 - **a roster**: a project lists its roles and instances in `roster.json` (a template writes the first one), and `/fleet up` starts the instances that aren't running, each as a background session of its role's agent file, with its own settings, budget and place in the panel; each one seeds itself, and a chief interviews you and drafts the charter ([below](#the-roster-fleet-up));
 - a background session that needs your decision asks it without stopping, keeps working on what doesn't depend on it, and gets your answer later; you answer from any session of the project, with a slash command that spends no tokens;
@@ -57,11 +67,13 @@ and in each project that should use it, from the project's folder:
 claude plugin enable fleet@mcavuoti --scope local
 ```
 
-That writes `<project>/.claude/settings.local.json` in the project (yours only, not shared with the repository), and one `claude plugin update fleet@mcavuoti` later reaches every project. Sessions of the project that were already running pick it up when they restart (`u` in the panel). Then, in any session of the project:
+That writes `<project>/.claude/settings.local.json` in the project (yours only, not shared with the repository), and one `claude plugin update fleet@mcavuoti` later reaches every project. Sessions of the project that were already running pick it up when they restart: `u` in the panel for a background session, `/exit` and `claude -c` for one of yours. Then, in any session of the project:
 
 ```
 /fleet init <template>
 ```
+
+`/fleet` is an unknown command when `fleet` isn't enabled in this folder (the line above), or when the session started before it was (restart it).
 
 **`sessions` stays the one of your user settings.** The `enable` above also writes `sessions@mcavuoti: true` into `settings.local.json` ("also enabled 1 dependency"), and with that key the first session of the project installs a copy of `sessions` pinned to the project (a local install record) that `claude plugin update sessions@mcavuoti` never reaches. `/fleet init` takes the key out when your user settings enable `sessions` (it backs the file up first, as `settings.local.json.bak-antes-fleet`, and says so); `fleet` then loads with the `sessions` of your user settings. `/fleet init`, `/fleet status` and `/fleet up --dry-run` name a local copy that's already there, with the command that removes it, run in the project: `claude plugin uninstall sessions@mcavuoti --scope local` (it warns that `fleet` requires it: `fleet` goes on with your user-scope `sessions`). Installing `fleet` with `--scope local` instead makes the same copy, so it's the same fix.
 
@@ -173,7 +185,7 @@ Running it again only adds what's missing and brings `.gitignore` in line with `
 - lints the roster: a role file missing, or not listing `mcp__fleet__*`, or named otherwise in its front matter; two instances with one name; a parent, section, role or zone that isn't there; `bypassPermissions` (never started); and warns when the budgets add up past the project's cap or the wake forecast passes half of it, when an instance's mode would ask ("runs in default mode (your settings): the first write or command waits for you, with nobody to answer"), and when the project is in a git repository and an instance that edits has no `worktree.bgIsolation`. An error stops it; a warning never does;
 - prints the plan: each instance with its role file, section and parent, wave, model and effort, budget and wake forecast, its permission mode (a running one's as it runs), and what it would do (start, running, wake, down); the cost; the command-level files changed outside fleet;
 - writes each chosen instance's settings, `<project>/.claude/fleet/instances/<slug>.json`: the roster's settings for it, then `fleet`'s own, which can't be taken out: the env `FLEET_ROOT`, `FLEET_INSTANCE` and `FLEET_ROLE`, `model` and `effortLevel`, and deny rules, `Edit(//<path>)`, for each command-level file and for `<project>/.claude/fleet/instances/` (Edit covers Write; checked in a probe). No sandbox, no other denies;
-- starts each instance that isn't running through `sessions` (`claude --bg --agent <agent> --settings <its file> -n <name>`, from the project's folder, with no prompt: a launch prompt would read as yours), and wakes one that's stopped. Names given start those (and bring back one you took down); `--wave n` starts waves 1 to n; neither starts them all. A running instance takes rewritten settings when you restart it (`u`): `/fleet status` says when its file changed since it started.
+- starts each instance that isn't running through `sessions` (`claude --bg --agent <agent> --settings <its file> -n <name>`, from the project's folder, with no prompt: a launch prompt would read as yours), and wakes one that's stopped. Names given start those (and bring back one you took down); `--wave n` starts waves 1 to n; with neither, all of them start. A running instance takes rewritten settings when you restart it (`u`): `/fleet status` says when its file changed since it started.
 
 What each instance does when it starts (its own `fleet`):
 
