@@ -4,14 +4,17 @@ import {
   authOf,
   dedupKey,
   fenceFor,
+  MAX_TRIES,
   MODEL_CHARS,
   finalKind,
+  intakeFailure,
   intakeOf,
   intakePrompt,
   itemFileName,
   itemsFromMcp,
   lintSubscriptions,
   nextIntakeNumber,
+  noteTry,
   parseClassification,
   parseItem,
   pointerText,
@@ -70,6 +73,32 @@ test('the prompt: the vocabulary first (cached), the item between markers its te
   expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(long)).toBe(false)
   const subject = (parseItem(JSON.stringify({ ...ITEM, subject: `${'s'.repeat(299)}🎉` }), 'mail', 'm1.json') as { item: Item }).item.subject
   expect(subject).toBe('s'.repeat(299))
+})
+
+test('a call that gave no answer: a global cause stops the sweep and counts no try; the item\'s own counts one, and the third goes aside', () => {
+  const api = (status: number | null, error: string) => ({ isAnswered: false, reason: 'api-error', status, error, usage: {} })
+  expect(intakeFailure(api(429, 'rate_limit'))).toEqual({ global: true, why: "the model's API answered an error (rate_limit, 429)" })
+  expect(intakeFailure(api(529, 'overloaded')).global).toBe(true)
+  expect(intakeFailure(api(401, 'authentication_failed')).global).toBe(true)
+  expect(intakeFailure(api(500, 'server_error')).global).toBe(true)
+  expect(intakeFailure(api(null, 'unknown'))).toEqual({ global: true, why: "the model's API answered an error (unknown, no response)" })
+  expect(intakeFailure(undefined, { error: new Error('blocked model') })).toEqual({ global: true, why: 'the model call was refused (Error: blocked model)' })
+  expect(intakeFailure(api(400, 'invalid_request'))).toEqual({ global: false, why: "the model's API answered an error (invalid_request, 400)" })
+  expect(intakeFailure({ isAnswered: false, reason: 'empty-reply', usage: {} })).toEqual({ global: false, why: 'the model replied with no text' })
+  expect(intakeFailure({ isAnswered: false, reason: 'aborted', usage: {} }).global).toBe(false)
+  const st = rollIntake(null, 1, '2026-11-02', '2026-11-02T12')
+  const AT = Date.UTC(2026, 10, 2, 12)
+  expect(MAX_TRIES).toBe(3)
+  expect(noteTry(st, 'aaaa', 'the model replied with no text', AT)).toEqual({ n: 1, last: false })
+  expect(noteTry(st, 'aaaa', 'the model replied with no text', AT + 60000)).toEqual({ n: 2, last: false })
+  expect(st.tries).toEqual({ aaaa: { n: 2, at: AT + 60000, why: 'the model replied with no text' } })
+  expect(noteTry(st, 'aaaa', 'the model replied with no text', AT + 120000)).toEqual({ n: 3, last: true })
+  expect(st.tries).toEqual({})
+  // A count whose item is gone from the inbox goes after a day
+  noteTry(st, 'bbbb', 'x', AT)
+  noteTry(st, 'cccc', 'y', AT + 25 * 3600000)
+  expect(Object.keys(st.tries ?? {})).toEqual(['cccc'])
+  expect(rollIntake({ ...st, day: '2026-11-01' }, 1, '2026-11-02', '2026-11-02T12').tries).toEqual(st.tries)
 })
 
 test("the model's answer, checked by code: kinds, tags of the vocabulary, targets that are records", () => {

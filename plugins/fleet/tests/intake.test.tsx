@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { INTAKE_SYSTEM } from '../hooks/intake'
+import { INTAKE_SYSTEM, dedupKey } from '../hooks/intake'
 import { FAKE_SESSIONS, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 import { OWNER } from './up.test'
 
@@ -191,4 +191,60 @@ test('the MCP adapter: the sweeper calls the listing tool when due and drops wha
   expect(asked.length).toBe(1)
   expect(json(w, `${FLEET}/state/intake.json`).polled.mailbox).toMatchObject({ items: 0 })
   expect(await fleet($, 'status')).toContain('  source mailbox: list_unread on fakemail every 10 min; last at ')
+})
+
+test('an item the model can’t answer is tried at three sweeps, then set aside with why; the others go on; a global cause stops the sweep', WITH_SESSIONS, async ($, on) => {
+  const asked: string[] = []
+  let overloaded = false
+  const usage = { input_tokens: 900, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+  on('model.complete', (_: any, e: any) => {
+    const subject = /subject: (.*)/.exec(String(e.prompt))?.[1] ?? ''
+    asked.push(subject)
+    if (overloaded) return { value: { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage } as any }
+    if (subject === 'Silent') return { value: { isAnswered: false, reason: 'empty-reply', usage } as any }
+    return { value: { isAnswered: true, text: ANSWERS[subject] ?? '{"kind": "noise"}', usage } as any }
+  })
+  const w = project(on)
+  for (const k of Object.keys(ITEMS)) w.files.delete(k)
+  w.touch(`${INBOX}/x.json`, item('<x@x>', 'colleague@example.invalid', 'Silent', 'An item nobody can sort.'))
+  w.touch(`${INBOX}/y.json`, item('<y@x>', 'colleague@example.invalid', 'Tech note', 'A new cache library came out.'))
+  const key = dedupKey({ source: 'mail', ref: '<x@x>' })
+  const minute = async () => {
+    for (let i = 0; i < 30; i++) await tick(w)
+  }
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  for (let i = 0; i < 8; i++) await tick(w)
+  // The first sweep: x gave no answer (one try, read again at the next sweep), and y was read all the same
+  expect(asked).toEqual(['Silent', 'Tech note'])
+  expect(under(w, `${ROOT}/inputs/intake`)).toEqual(['I-1.md'])
+  expect(json(w, `${FLEET}/state/intake.json`).tries).toMatchObject({ [key]: { n: 1, why: 'the model replied with no text' } })
+  expect(w.files.has(`${FLEET}/intake/seen/${key}.json`)).toBe(false)
+  expect(await fleet($, 'status')).toContain("1 the model couldn't answer yet (tried again each sweep, 3 times at most, then to intake/failed/)")
+  // The third try sets it aside with why, and keeps its dedup mark: a poller's next drop of it isn't read again
+  await minute()
+  await minute()
+  expect(asked.filter(x => x === 'Silent').length).toBe(3)
+  expect(w.files.has(`${INBOX}/x.json`)).toBe(false)
+  expect(under(w, `${FLEET}/intake/failed`)).toEqual(['mail-x.json', 'mail-x.why'])
+  expect(w.files.get(`${FLEET}/intake/failed/mail-x.why`)).toContain('the model replied with no text, 3 tries (the last at 2026-11-02T12:')
+  expect(json(w, `${FLEET}/intake/seen/${key}.json`)).toMatchObject({ failed: 'the model replied with no text' })
+  expect(json(w, `${FLEET}/state/intake.json`)).toMatchObject({ failed: 1, tries: {}, records: 1 })
+  w.touch(`${INBOX}/x2.json`, item('<x@x>', 'colleague@example.invalid', 'Silent', 'An item nobody can sort.'))
+  await minute()
+  expect(asked.filter(x => x === 'Silent').length).toBe(3)
+  expect(under(w, `${FLEET}/intake/dup`).length).toBe(1)
+  // A cause no item escapes (the API overloaded): the sweep stops at the first item, counts no try, and they all wait
+  overloaded = true
+  w.touch(`${INBOX}/p.json`, item('<p@x>', 'colleague@example.invalid', 'An idea', 'What if we also sold it to schools?'))
+  w.touch(`${INBOX}/q.json`, item('<q@x>', 'colleague@example.invalid', 'Tech note', 'Another library came out.'))
+  const before = asked.length
+  await minute()
+  expect(asked.length).toBe(before + 1)
+  expect(json(w, `${FLEET}/state/intake.json`).tries).toEqual({})
+  expect([w.files.has(`${INBOX}/p.json`), w.files.has(`${INBOX}/q.json`)]).toEqual([true, true])
+  expect(await fleet($, 'status')).toContain("(the model's API answered an error (overloaded, 529): items wait in the inbox)")
+  overloaded = false
+  await minute()
+  expect(under(w, `${ROOT}/inputs/intake`)).toEqual(['I-1.md', 'I-2.md', 'I-3.md'])
 })

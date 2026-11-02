@@ -188,14 +188,17 @@ import {
 import {
   INTAKE_SYSTEM,
   ITEM_FORMAT,
+  MAX_TRIES,
   dedupKey,
   finalKind,
+  intakeFailure,
   intakeOf,
   intakePrompt,
   itemFileName,
   itemsFromMcp,
   lintSubscriptions,
   nextIntakeNumber,
+  noteTry,
   tagsOf,
   parseClassification,
   parseItem,
@@ -2676,9 +2679,11 @@ async function intakeTick($: any) {
       sweep.intakeDirty = true
       break
     }
+    // At most five model calls a sweep, answered or not
+    const calls = st.calls
     const r = await intakeOne($, c, f, st, now)
     if (r === 'stop') break
-    if (r === 'read') done++
+    if (st.calls > calls) done++
   }
   if (JSON.stringify(st) !== before && !(await replace($, stateDir('intake.json'), json(st)))) {
     await run($, ['mkdir', '-p', stateDir()])
@@ -2715,8 +2720,10 @@ async function pollSource($: any, src: IntakeSource, st: IntakeState, now: numbe
 }
 
 // One item: dedup (claimed no-clobber), one model call, the record written by code, its landing routed, the raw kept
-// aside. read: it took a model call; skip: nothing to read (a duplicate, a newer format, a broken file); stop: the
-// model couldn't be had (it's read again at the next sweep)
+// aside. read: it was read; skip: on to the next item (a duplicate, a newer format, a broken file, or one the model
+// couldn't answer: it's tried again at the next sweep, and after MAX_TRIES it goes to intake/failed/ with why); stop: a
+// cause no item escapes (the account, the API's load, the network: intake.ts intakeFailure), and every item waits for
+// the next sweep
 async function intakeOne($: any, c: IntakeConfig, f: { source: string; name: string; path: string }, st: IntakeState, now: number): Promise<'read' | 'skip' | 'stop'> {
   const text = await readText($, f.path)
   if (text === null) return 'skip'
@@ -2749,22 +2756,42 @@ async function intakeOne($: any, c: IntakeConfig, f: { source: string; name: str
   // The project's records it may ask to change (not other intake records)
   const ids = [...idIndex.entries()].filter(([, rel]) => !isIntakePath(rel)).map(([id]) => id).sort()
   let r: any
+  let thrown: { error: unknown } | undefined
   try {
     r = await $.model.complete({ model: c.model, system: INTAKE_SYSTEM, prompt: intakePrompt(c.tags, ids, item, body), maxTokens: 500, effort: 'low', timeoutMs: 90000 })
+    st.calls++
+    st.usd = Math.round((st.usd + usageUsd(c.model, r?.usage)) * 1e6) / 1e6
+    st.perSource[f.source] = (st.perSource[f.source] ?? 0) + 1
   } catch (err) {
-    await remove($, [seenPath])
-    intakeRun.problem = `the model call was refused (${String(err).slice(0, 160)}): items wait in the inbox`
-    log($, `intake: ${intakeRun.problem}`)
-    return 'stop'
+    thrown = { error: err }
   }
-  st.calls++
-  st.usd = Math.round((st.usd + usageUsd(c.model, r?.usage)) * 1e6) / 1e6
-  st.perSource[f.source] = (st.perSource[f.source] ?? 0) + 1
-  if (!r?.isAnswered) {
-    await remove($, [seenPath])
-    intakeRun.problem = `the model gave no answer (${r?.reason ?? 'none'}): items wait in the inbox`
-    log($, `intake: ${intakeRun.problem}`)
-    return 'stop'
+  if (thrown || !r?.isAnswered) {
+    const why = intakeFailure(r, thrown)
+    if (why.global) {
+      await remove($, [seenPath])
+      intakeRun.problem = `${why.why}: items wait in the inbox`
+      log($, `intake: ${intakeRun.problem}`)
+      return 'stop'
+    }
+    const t = noteTry(st, key, why.why, now)
+    if (!t.last) {
+      await remove($, [seenPath])
+      log($, `intake ${f.source}/${f.name}: ${why.why} (try ${t.n} of ${MAX_TRIES}; again at the next sweep)`)
+      return 'skip'
+    }
+    // Aside, with why; its dedup mark stays (marked failed), so a poller's next drop of it isn't read again
+    st.failed++
+    const aside = intakeDir(`failed/${f.source}-${f.name}`)
+    await moveAside($, f.path, aside)
+    if (bodyPath) await moveAside($, bodyPath, `${aside.replace(/\.json$/, '')}.body`)
+    await $.fs.write(`${aside.replace(/\.json$/, '')}.why`, `${why.why}, ${MAX_TRIES} tries (the last at ${new Date(now).toISOString()})\n`)
+    await replace($, seenPath, json({ format: FORMAT, source: item.source, ref: item.ref, at: now, failed: why.why }))
+    log($, `intake ${f.source}/${f.name}: ${why.why}, ${MAX_TRIES} tries: moved to ${intakeDir('failed/')}`)
+    return 'skip'
+  }
+  if (st.tries?.[key]) {
+    const { [key]: _done, ...rest } = st.tries
+    st.tries = rest
   }
   const cls = parseClassification(String(r.text ?? ''), c.tags, new Set(ids))
   await loadRoster($)
@@ -6308,7 +6335,7 @@ async function outsideStatus($: any): Promise<string[]> {
       const st = await readWire<IntakeState>($, stateDir('intake.json'))
       const inbox = intakeRun.inbox
       lines.push(
-        `intake: on, records in ${intakeCfg.folder}/ (${intakeCfg.model}, at most ${intakeCfg.perSourceHour} items a source an hour and ${usd(intakeCfg.usdDay)} a day); today ${st && st.day === today(now) ? `${st.records} record(s), ${st.noise} noise, ${st.failed} unreadable, ${st.calls} call(s), ${usd(st.usd)}` : 'nothing yet'}; ${sweep.holding ? `inbox: ${inbox} waiting` : 'the sweeper reads the inbox'}${intakeRun.newer ? `; ${intakeRun.newer} from a newer poller (update fleet)` : ''}${intakeRun.problem ? ` (${intakeRun.problem})` : ''}`,
+        `intake: on, records in ${intakeCfg.folder}/ (${intakeCfg.model}, at most ${intakeCfg.perSourceHour} items a source an hour and ${usd(intakeCfg.usdDay)} a day); today ${st && st.day === today(now) ? `${st.records} record(s), ${st.noise} noise, ${st.failed} unreadable, ${st.calls} call(s), ${usd(st.usd)}` : 'nothing yet'}${Object.keys(st?.tries ?? {}).length ? `; ${Object.keys(st?.tries ?? {}).length} the model couldn't answer yet (tried again each sweep, ${MAX_TRIES} times at most, then to intake/failed/)` : ''}; ${sweep.holding ? `inbox: ${inbox} waiting` : 'the sweeper reads the inbox'}${intakeRun.newer ? `; ${intakeRun.newer} from a newer poller (update fleet)` : ''}${intakeRun.problem ? ` (${intakeRun.problem})` : ''}`,
       )
       for (const src of intakeCfg.sources) {
         const p = st?.polled[src.name]

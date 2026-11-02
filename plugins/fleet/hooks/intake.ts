@@ -489,10 +489,49 @@ export type IntakeState = {
   /** The highest I-<n> handed out */
   last: number
   problem?: string
+  /** The items the model couldn't answer yet, by their dedup key: how many tries, the last one's time and why. One
+   * that fails MAX_TRIES times goes to intake/failed/ */
+  tries?: Record<string, { n: number; at: number; why: string }>
 }
 
 export function newIntakeState(format: number, day: string, hour: string): IntakeState {
-  return { format, day, usd: 0, calls: 0, records: 0, noise: 0, failed: 0, hour, perSource: {}, polled: {}, last: 0 }
+  return { format, day, usd: 0, calls: 0, records: 0, noise: 0, failed: 0, hour, perSource: {}, polled: {}, last: 0, tries: {} }
+}
+
+/** How many times the model may fail on one item before it goes aside, to intake/failed/ */
+export const MAX_TRIES = 3
+
+// What says nothing about the item: the account, the API's load, the network
+const GLOBAL_ERRORS = new Set(['rate_limit', 'overloaded', 'server_error', 'authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'cloud_credential_error', 'model_not_found'])
+
+/** Why a call gave no answer, and whether the cause is global (the account, the API's load, the network, a model the
+ * engine won't call: every item would fail the same, so intake stops until the next sweep and counts no try) or the
+ * item's own (a request the API refused as it was, a reply with no text, a call cut by its time limit: the item counts a
+ * try, and the sweep goes on with the next one). thrown: what a call that rejected threw */
+export function intakeFailure(r: unknown, thrown?: { error: unknown }): { global: boolean; why: string } {
+  if (thrown) return { global: true, why: `the model call was refused (${line(String(thrown.error), 160)})` }
+  const x = (isObject(r) ? r : {}) as Record<string, unknown>
+  if (x.reason === 'api-error') {
+    const status = typeof x.status === 'number' ? x.status : null
+    const kind = typeof x.error === 'string' && x.error ? x.error : 'unknown'
+    const global = status === null || status === 429 || status >= 500 || GLOBAL_ERRORS.has(kind)
+    return { global, why: `the model's API answered an error (${kind}, ${status === null ? 'no response' : status})` }
+  }
+  if (x.reason === 'empty-reply') return { global: false, why: 'the model replied with no text' }
+  if (x.reason === 'aborted') return { global: false, why: 'the call was cut before the model replied' }
+  return { global: false, why: `the model gave no answer (${line(x.reason, 40) || 'none'})` }
+}
+
+/** One more failed try of an item: the next state of its count, and whether it's the last (it goes to failed/). The
+ * counts of items no longer seen (gone from the inbox) go after a day */
+export function noteTry(st: IntakeState, key: string, why: string, now: number): { n: number; last: boolean } {
+  const tries = { ...(st.tries ?? {}) }
+  for (const [k, t] of Object.entries(tries)) if (now - t.at > 24 * 3600000) delete tries[k]
+  const n = (tries[key]?.n ?? 0) + 1
+  if (n >= MAX_TRIES) delete tries[key]
+  else tries[key] = { n, at: now, why: line(why, 200) }
+  st.tries = tries
+  return { n, last: n >= MAX_TRIES }
 }
 
 /** The state for today and this hour: the day's counts start over at midnight, the sources' at each hour */
