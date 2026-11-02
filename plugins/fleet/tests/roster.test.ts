@@ -115,7 +115,7 @@ test('the lints: what stops /fleet up, and what it only says', () => {
 
 test("the settings fleet writes: the roster's, then its env, model, effort and the denies of the command-level files", () => {
   const level = commandLevel({ worldFormat: 1, paths: ['req/**', 'notes/**'], command: ['req/**', 'spec/{a,b}.md', '../bad'] }, ['checks/board.sh'])
-  expect(level).toEqual({ files: ['.claude/fleet/charter.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/fleet/outbound.json', 'checks/board.sh'], globs: ['.claude/agents/**', 'req/**', 'spec/{a,b}.md'] })
+  expect(level).toEqual({ files: ['.claude/fleet/charter.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/fleet/outbound.json', '.claude/fleet/slots.json', 'checks/board.sh'], globs: ['.claude/agents/**', 'req/**', 'spec/{a,b}.md'] })
   expect(isCommandLevel('req/R-1.md', level, false)).toBe(true)
   expect(isCommandLevel('.claude/agents/chief.md', level, false)).toBe(true)
   expect(isCommandLevel('notes/a.md', level, false)).toBe(false)
@@ -126,6 +126,7 @@ test("the settings fleet writes: the roster's, then its env, model, effort and t
     'Edit(//Users/x/proj/.claude/fleet/roster.json)',
     'Edit(//Users/x/proj/.claude/fleet/world.json)',
     'Edit(//Users/x/proj/.claude/fleet/outbound.json)',
+    'Edit(//Users/x/proj/.claude/fleet/slots.json)',
     'Edit(//Users/x/proj/checks/board.sh)',
     'Edit(//Users/x/proj/.claude/agents/**)',
     'Edit(//Users/x/proj/req/**)',

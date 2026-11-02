@@ -72,7 +72,7 @@ test('/fleet init refuses the home folder and a config.json from a newer fleet',
 test('decide is offered in a background session of a fleet project only, in the first request', WITH_SESSIONS, async ($, on) => {
   const w = world(on)
   await startSession($, w)
-  expect(w.tools.map(t => [t.name, t.isDeferred])).toEqual([['decide', false], ['send', false]])
+  expect(w.tools.map(t => [t.name, t.isDeferred])).toEqual([['decide', false], ['send', false], ['slot', false]])
   expect(w.tools[0].inputSchema.properties.questions.maxItems).toBe(4)
   expect(w.commands).toEqual(['fleet'])
 })

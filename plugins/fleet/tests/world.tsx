@@ -110,8 +110,9 @@ export type World = {
   beforeTool: { value: (tool: string) => void }
   // Writes a file as another program would (an editor, a script, another session): bumps its time
   touch: (path: string, text: string) => void
-  // Any other command fleet runs (git, a check script): its answer, or undefined for "unknown command"
-  exec: { value: (argv: string[], cwd: string) => { exitCode: number; stdout?: string; stderr?: string } | undefined }
+  // Any other command fleet runs (git, a check script, the person's channel): its answer, or undefined for "unknown
+  // command"; stdin: what fleet wrote to it
+  exec: { value: (argv: string[], cwd: string, stdin?: string) => { exitCode: number; stdout?: string; stderr?: string } | undefined }
 }
 
 export type WorldOptions = {
@@ -231,13 +232,13 @@ export function world(on: On, options: WorldOptions = {}): World {
     const stat = file !== undefined ? { kind: 'file' as const, size: file.length, mtimeMs: mtimes.get(p) ?? 0, isLink: false } : { kind: 'dir' as const, size: 0, mtimeMs: dirTimes.get(p) ?? 0, isLink: false }
     return { value: e.resolve ? { ...stat, realPath: p } : stat }
   })
-  const exec = { value: (_argv: string[], _cwd: string): { exitCode: number; stdout?: string; stderr?: string } | undefined => undefined }
+  const exec = { value: (_argv: string[], _cwd: string, _stdin?: string): { exitCode: number; stdout?: string; stderr?: string } | undefined => undefined }
   on('process.run', (_, e) => {
     const argv = [...e.argv]
     runs.push(argv)
     const ok = { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
-    const other = exec.value(argv, String(e.init?.cwd ?? ''))
+    const other = exec.value(argv, String(e.init?.cwd ?? ''), e.init?.stdin)
     if (other) return { value: { stdout: '', stderr: '', ...other, isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.init?.cwd !== '/') return failed('fleet runs every command from /')
     const [cmd, ...args] = argv

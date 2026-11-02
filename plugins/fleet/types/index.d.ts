@@ -64,6 +64,12 @@ declare module 'claude-code' {
       landedAt: number
       /** When fleet last cleared this instance for a fresh period (0: never) */
       freshAt: number
+      /** The intake records routed to this instance that its model was told of: id → when */
+      intakeTold: Record<string, number>
+      /** The slot leases this session's model was told it holds: "<slot>/<n>/<taken at>" → when */
+      slotTold: Record<string, number>
+      /** The slots this session waits in line for */
+      slotWait: string[]
     }
   }
 }

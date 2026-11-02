@@ -38,6 +38,13 @@ export type BriefFacts = {
     forecast: { caps: number; wakesUsd: number } | null
     windows: { kind: string; percentUsed: number }[]
   }
+  /** The intake records of the window: what each is, who sent it, who it reached (none: nobody subscribes, and there's
+   * no front door); a request for a change and its drafter */
+  intake?: { id: string; path: string; at: number; kind: string; from: string; standing: string; to: string[]; front: boolean; drafter: string | null; targets: string[] }[]
+  /** Derived documents a revised record made stale, and the slots someone waits for */
+  derived?: { path: string; kind: string; owner: string; pins: string[] }[]
+  slots?: { slot: string; waiting: { name: string; at: number }[] }[]
+  intakeSpend?: { usd: number; records: number } | null
 }
 
 const SHOWN = 15
@@ -74,11 +81,21 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   const count = (k: BriefNeed['kind']) => f.needs.filter(n => n.kind === k).length
   const what = [kindWords(count('choice'), 'question', 'questions'), kindWords(count('change'), 'change', 'changes'), kindWords(count('resource'), 'resource', 'resources'), kindWords(count('outbound'), 'outbound draft', 'outbound drafts')].filter(Boolean)
   out.push('', what.length ? `1. Needs you: ${what.join(', ')} (/fleet lists them to answer)` : '1. Nothing needs you.')
+  const needsAt = out.length - 1
   for (const n of [...f.needs].sort((a, b) => a.at - b.at).slice(0, SHOWN)) {
     out.push(`   - ${n.id} ${n.kind === 'choice' ? 'question' : n.kind}: ${n.what} · ${n.who} · ${ago(f.now - n.at)} ago${n.blocks ? ` · blocks: ${n.blocks}` : ''}${n.outside ? ` · drafted after reading outside content (${n.outside})` : ''}`)
   }
   if (f.needs.length > SHOWN) out.push(`   - and ${f.needs.length - SHOWN} more`)
   if (f.waiting) out.push(`   ${f.waiting} answered, not delivered yet`)
+  // Items from outside that reached nobody (no subscriber, no front door), and requests for a change nobody drafts
+  const intake = (f.intake ?? []).filter(i => i.at >= f.since)
+  const orphans = intake.filter(i => !i.to.length)
+  const undrafted = intake.filter(i => i.kind === 'command-claim' && !i.drafter)
+  if (orphans.length || undrafted.length) {
+    if (!f.needs.length) out[needsAt] = '1. Needs you: items from outside nobody takes up'
+    for (const i of undrafted) out.push(`   - ${i.id}: a request for a change to ${i.targets.join(', ') || 'something it names'} from ${i.from || 'an unknown sender'} (${i.standing}), and nobody subscribes to draft it: read ${i.path}`)
+    for (const i of orphans.filter(x => !undrafted.includes(x))) out.push(`   - ${i.id}: ${i.kind} from ${i.from || 'an unknown sender'} reached nobody (no subscriber, no front door): ${i.path}`)
+  }
   // 2. What changed, and who changed it
   const shared = newestPerFile(f.events, f).filter(e => !['information', 'proposal'].includes(f.levelOf(e.path)))
   const closed = [...f.closed].filter(c => c.at >= f.since).sort((a, b) => b.at - a.at)
@@ -97,6 +114,8 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
     ...b.stale.map(x => `   - ${x.name} read ${x.files} shared file${x.files === 1 ? '' : 's'} that changed since`),
     ...b.noFleet.map(x => `   - ${x}: running with no fleet (u in the panel restarts it)`),
     ...b.down.map(x => `   - ${x}: down (/fleet up "${x}" brings it back)`),
+    ...(f.derived ?? []).map(d => `   - stale: ${d.path} (${d.kind}, owned by ${d.owner}): ${d.pins.join(', ')} moved since it cited them`),
+    ...(f.slots ?? []).flatMap(x => x.waiting.map(w => `   - ${w.name} waits for the slot ${x.slot} (${ago(f.now - w.at)})`)),
   ]
   out.push('', lines.length ? '3. Blocked and stale:' : '3. Nothing is blocked or stale.', ...lines)
   // 4. Spend, in both kinds of account
@@ -108,9 +127,16 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   out.push('', parts.length ? `4. Spend: ${parts.join('; ')}` : '4. Spend: no roster, and no window reading yet')
   const heavy = s.instances.filter(i => i.state !== 'ok' || i.usd > 0).sort((a, c) => c.usd - a.usd)
   for (const i of heavy.slice(0, SHOWN)) out.push(`   - ${i.name}: ${usd(i.usd)}${i.cap !== null ? ` of ${usd(i.cap)}` : ''}${i.state === 'over' ? ', used up' : i.state === 'warn' ? ', past 80%' : ''}`)
-  // 5. Inputs and ideas
-  const ideas = newestPerFile(f.events, f).filter(e => ['information', 'proposal'].includes(f.levelOf(e.path)))
-  out.push('', ideas.length ? `5. Inputs and ideas: ${ideas.length}` : '5. No new inputs or ideas.')
+  // 5. Inputs and ideas: the items from outside (with whom they reached), then the other landings on those levels
+  const ideas = newestPerFile(f.events, f).filter(e => e.via !== 'intake' && ['information', 'proposal'].includes(f.levelOf(e.path)))
+  const shownIntake = [...intake].sort((a, c) => c.at - a.at)
+  const n = ideas.length + shownIntake.length
+  out.push('', n ? `5. Inputs and ideas: ${n}${shownIntake.length ? ` (${shownIntake.length} from outside${f.intakeSpend ? `, intake ${usd(f.intakeSpend.usd)} today` : ''})` : ''}` : '5. No new inputs or ideas.')
+  for (const i of shownIntake.slice(0, SHOWN)) {
+    const reached = i.to.length ? `${i.front ? 'the front door, ' : ''}${i.to.join(', ')}` : 'nobody'
+    out.push(`   - ${i.id} (${i.path}): ${i.kind} from ${i.from || 'an unknown sender'} (${i.standing}) at ${clock(i.at, f.me.offsetMin)} → ${reached}${i.drafter ? `; ${i.drafter} drafts it` : ''}`)
+  }
+  if (shownIntake.length > SHOWN) out.push(`   - and ${shownIntake.length - SHOWN} more from outside`)
   for (const e of ideas.slice(0, SHOWN)) out.push(eventLine(e, f))
   if (ideas.length > SHOWN) out.push(`   - and ${ideas.length - SHOWN} more`)
   if (chief.length) out.push('', "The chief's notes:", ...chief.map(l => `   ${l}`))
