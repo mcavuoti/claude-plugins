@@ -30,7 +30,8 @@ export const HEARTBEAT_VERSION = '0.10.0'
 // model: short model name; context: % of the context used; version: the Claude version the session runs; agent: the
 // agent it runs as (`claude --agent`), null for none; root: the project root its panel uses; usd: what it has cost so
 // far at list price (as /cost says); limits: the account's rate-limit windows its last response reported (empty off a
-// subscription); spendAlert: it's spending far above its own usual hour (SpendAlert), while it lasts
+// subscription); spendAlert: it's spending far above its own usual hour (SpendAlert), while it lasts; usualHour: its
+// own usual hour at list price once it has one (usualHour), which the project's newer sessions are judged by
 export type SessionState = {
   created?: number
   turnStarted?: number
@@ -46,6 +47,7 @@ export type SessionState = {
   usd?: number
   limits?: RateLimit[]
   spendAlert?: SpendAlert
+  usualHour?: number
 }
 
 // What a session spends, read per session and never assumed: on a subscription its responses report rate-limit windows
@@ -1186,63 +1188,85 @@ export function addSpend(previous: unknown, usd: number | undefined, limits: rea
   return { ledger: { last: cost, total: next, kind, samples: kept }, sampled }
 }
 
-// The last hour against the usual one: hour, what it spent in the last hour; usual, the median of its past active hours
-// (it spent something) over the last day; rise, how much the account's window rose in the last hour (null off a
-// subscription, or when the window reset). null: not enough history to judge (an hour, and three active hours before)
-export type SpendBurst = { hour: number; usual: number; rise: number | null }
-export function spendBurst(l: SpendLedger, now: number): SpendBurst | null {
-  const at = (t: number) => {
-    let found: [number, number, number] | undefined
-    for (const s of l.samples) if (s[0] <= t) found = s
-    return found
-  }
-  const hourAgo = at(now - 3600000)
-  if (!hourAgo) return null
+// The middle value (the mean of the two middle ones for an even count); null for none
+export function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null
+  const sorted = [...values].sort((x, y) => x - y)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 ? (sorted[mid] ?? 0) : ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2
+}
+
+function sampleAt(l: SpendLedger, t: number): [number, number, number] | undefined {
+  let found: [number, number, number] | undefined
+  for (const s of l.samples) if (s[0] <= t) found = s
+  return found
+}
+
+// A session's own usual hour: the median of its past active hours (it spent something) over the last day, before the
+// last hour; null with fewer than three of them. Each session publishes it (SessionState.usualHour), for the others of
+// its project
+export function usualHour(l: SpendLedger, now: number): number | null {
   const active: number[] = []
   for (let k = 1; k <= 24; k++) {
-    const a = at(now - k * 3600000)
-    const b = at(now - (k + 1) * 3600000)
+    const a = sampleAt(l, now - k * 3600000)
+    const b = sampleAt(l, now - (k + 1) * 3600000)
     if (!a || !b || a === b) continue
     if (a[1] - b[1] > 0.005) active.push(a[1] - b[1])
   }
-  if (active.length < 3) return null
-  const sorted = active.sort((x, y) => x - y)
-  const mid = Math.floor(sorted.length / 2)
-  const usual = sorted.length % 2 ? (sorted[mid] ?? 0) : ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2
+  return active.length < 3 ? null : median(active)
+}
+
+// The last hour against the usual one: hour, what it spent in the last hour; usual, its own usual hour (usualHour), or
+// until it has one, projectUsual, the median of the usual hours of its project's other sessions (basis says which), so
+// a session that loops from its first hour is judged too; rise, how much the account's window rose in the last hour
+// (null off a subscription, or when the window reset). null: not enough history to judge (an hour of its own, and a
+// usual hour, its own or its project's)
+export type SpendBurst = { hour: number; usual: number; rise: number | null; basis: 'own' | 'project' }
+export function spendBurst(l: SpendLedger, now: number, projectUsual: number | null = null): SpendBurst | null {
+  const hourAgo = sampleAt(l, now - 3600000)
+  if (!hourAgo) return null
+  const own = usualHour(l, now)
+  const usual = own ?? (projectUsual !== null && projectUsual > 0 ? projectUsual : null)
+  if (usual === null) return null
   const newest = l.samples[l.samples.length - 1]
   const rise = newest && newest[2] >= 0 && hourAgo[2] >= 0 && newest[2] >= hourAgo[2] ? newest[2] - hourAgo[2] : null
-  return { hour: l.total - hourAgo[1], usual, rise }
+  return { hour: l.total - hourAgo[1], usual, rise, basis: own === null ? 'project' : 'own' }
 }
 
 // Far above its usual hour: at least SPEND_FACTOR times it, and at least SPEND_FLOOR_USD at list price (small sums
 // aren't worth a word). Once marked, it stays so until it falls below half of both
 export const SPEND_FACTOR = 4
 export const SPEND_FLOOR_USD = 3
-export function spendIsHigh(b: SpendBurst | null, marked: boolean): boolean {
+export function spendIsHigh(b: (Pick<SpendBurst, 'hour' | 'usual'> & Partial<SpendBurst>) | null, marked: boolean): boolean {
   if (!b) return false
   const k = marked ? 0.5 : 1
   return b.hour >= SPEND_FLOOR_USD * k && b.hour >= SPEND_FACTOR * b.usual * k
 }
 
 // What a session publishes while its spend runs high (SessionState.spendAlert): since when, the last hour and the usual
-// one at list price, the window's rise (null off a subscription), its kind, and whether the person was notified
-export type SpendAlert = { since: number; hour: number; usual: number; rise: number | null; kind: string; notified: boolean }
+// one at list price, the window's rise (null off a subscription), its kind, whether the person was notified, and
+// whether the usual hour is its own or its project's (basis, SpendBurst; absent: its own)
+export type SpendAlert = { since: number; hour: number; usual: number; rise: number | null; kind: string; notified: boolean; basis?: 'own' | 'project' }
 // The line under its row and the notification: dollars on an API account; on a subscription (where dollars aren't
 // billed) how many times its usual hour, and how much the account's window rose meanwhile
-function spendParts(a: SpendAlert): { times: string; window: string } {
+function spendParts(a: SpendAlert): { times: string; window: string; usual: string } {
   return {
     times: a.usual > 0 ? `${Math.round(a.hour / a.usual)}×` : 'far above',
     window: a.rise !== null && a.kind ? `${windowLabel(a.kind)} +${Math.round(a.rise)}% this hour` : '',
+    usual: a.basis === 'project' ? "the project's usual hour" : 'its usual hour',
   }
 }
 export function spendLine(a: SpendAlert, mode: 'subscription' | 'api' | 'unknown'): string {
   const p = spendParts(a)
-  if (mode === 'subscription') return `spending ${p.times} its usual hour${p.window ? ` · ${p.window}` : ''}`
+  if (mode === 'subscription') return `spending ${p.times} ${p.usual}${p.window ? ` · ${p.window}` : ''}`
+  // The project's, shorter: it fits under the row in the narrowest panel
+  if (a.basis === 'project') return `${formatUsd(a.hour)} last hour · project's usual ${formatUsd(a.usual)}`
   return `${formatUsd(a.hour)} in the last hour · usually ${formatUsd(a.usual)}`
 }
 export function spendText(name: string, a: SpendAlert, mode: 'subscription' | 'api' | 'unknown'): string {
   const who = `“${Array.from(name).slice(0, 60).join('')}”`
   const p = spendParts(a)
-  if (mode === 'subscription') return `${who} is spending ${p.times} its usual hour${p.window ? ` (${p.window})` : ''}: check it isn't looping`
-  return `${who} spent ${formatUsd(a.hour)} in the last hour, usually ${formatUsd(a.usual)}: check it isn't looping`
+  if (mode === 'subscription') return `${who} is spending ${p.times} ${p.usual}${p.window ? ` (${p.window})` : ''}: check it isn't looping`
+  const usual = a.basis === 'project' ? `the project's sessions usually ${formatUsd(a.usual)}` : `usually ${formatUsd(a.usual)}`
+  return `${who} spent ${formatUsd(a.hour)} in the last hour, ${usual}: check it isn't looping`
 }

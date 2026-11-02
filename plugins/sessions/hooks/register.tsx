@@ -126,6 +126,9 @@ import {
   parseQuietHours,
   sentToday,
   spendBurst,
+  median,
+  usualHour,
+  type SpendLedger,
   spendIsHigh,
   spendLine,
   spendText,
@@ -1082,13 +1085,17 @@ async function watchSpend($: any, usd: number | undefined, windows: RateLimit[],
   const next = addSpend(ledger, usd, windows, now)
   ledger = next.ledger
   if (next.sampled) await storeSet($, `spend:${myId}`, next.ledger)
-  const b = spendBurst(next.ledger, now)
+  const b = spendBurst(next.ledger, now, projectUsual)
   const was = previous.spendAlert
   if (!b || !spendIsHigh(b, !!was)) return undefined
   const cents = (x: number) => Math.round(x * 100) / 100
   const since = was?.since ?? now
-  return { since, hour: cents(b.hour), usual: cents(b.usual), rise: b.rise === null ? null : Math.round(b.rise), kind: next.ledger.kind, notified: was?.notified === true || since === spendNotified }
+  return { since, hour: cents(b.hour), usual: cents(b.usual), rise: b.rise === null ? null : Math.round(b.rise), kind: next.ledger.kind, notified: was?.notified === true || since === spendNotified, basis: b.basis }
 }
+
+// The median of the usual hours the project's other sessions published (SessionState.usualHour), as the last refresh
+// read them: a session with no usual hour of its own yet (fewer than three active hours) is judged by it (null: none)
+let projectUsual: number | null = null
 
 // The person hears once while this session's spend runs high: it's marked as notified in its record (and here, in case
 // a write of the record raced it)
@@ -1136,8 +1143,11 @@ async function refresh($: any) {
   // Each session's version, to mark afterwards the ones with an older one than the installed version
   const versions: Record<string, string> = {}
   let newest = await readInstalledVersion($)
+  // The usual hours the project's other sessions published, for a session with none of its own yet
+  const usuals: number[] = []
   for (const s of project) {
     const e = await readState($, s.sessionId)
+    if (s.sessionId !== myId && typeof e?.usualHour === 'number' && e.usualHour > 0) usuals.push(e.usualHour)
     const seen = await seenAt($, s.sessionId)
     const unnamed = !s.name || s.name === s.id
     const ownTitle = String((await storeGet($, `title:${s.sessionId}`)) ?? '')
@@ -1207,6 +1217,7 @@ async function refresh($: any) {
     })
   }
   waitsNow = waits
+  projectUsual = median(usuals)
   installedVersion = newest
   // ↑ also when a session runs an older version of this mod than the installed one (its heartbeat says which)
   const modInstalled = plugin?.version ?? ''
@@ -2069,6 +2080,8 @@ async function publishUsage($: any) {
   const previous = (await readState($, myId)) ?? {}
   const now = await $.clock.now()
   const spendAlert = await watchSpend($, spend.usd, spend.limits, previous, now)
+  const own = ledgerFor === myId && ledger ? usualHour(ledger as SpendLedger, now) : null
+  const usual = own === null ? undefined : Math.round(own * 100) / 100
   const same =
     previous.model === model &&
     previous.context === context &&
@@ -2077,8 +2090,9 @@ async function publishUsage($: any) {
     previous.root === root &&
     previous.usd === spend.usd &&
     JSON.stringify(previous.limits ?? []) === JSON.stringify(spend.limits) &&
-    JSON.stringify(previous.spendAlert) === JSON.stringify(spendAlert)
-  if (!same) await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? now, model, context, version, agent, root, usd: spend.usd, limits: spend.limits, spendAlert })
+    JSON.stringify(previous.spendAlert) === JSON.stringify(spendAlert) &&
+    previous.usualHour === usual
+  if (!same) await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? now, model, context, version, agent, root, usd: spend.usd, limits: spend.limits, spendAlert, usualHour: usual })
 }
 
 // After restarting with u from its own panel, the notice is shown when the window reconnects: at startup nobody is
@@ -2436,8 +2450,9 @@ async function notificationsText($: any, now: number): Promise<string> {
       ? ` · last, ${howLong(now - Number(last.at))} ago from ${String(last.from)}: ${String(last.text)} (phone: ${String(last.phone)}${last.notification ? `; notification: ${String(last.notification)}` : ''})`
       : ''
   const lines = [`Notifications: ${when}${quiet}, ${count}${lastText}`]
-  const burst = ledgerFor === myId && ledger ? spendBurst(ledger as any, now) : null
-  lines.push(`Spend: ${burst ? `this session spent ${formatUsd(burst.hour)} in the last hour at list price, usually ${formatUsd(burst.usual)}` : "not enough history yet to judge this session's spend against its usual hour"}`)
+  const burst = ledgerFor === myId && ledger ? spendBurst(ledger as SpendLedger, now, projectUsual) : null
+  const usual = burst?.basis === 'project' ? `the project's sessions usually ${formatUsd(burst.usual)} (it has too few active hours of its own yet)` : `usually ${formatUsd(burst?.usual ?? 0)}`
+  lines.push(`Spend: ${burst ? `this session spent ${formatUsd(burst.hour)} in the last hour at list price, ${usual}` : "not enough history yet to judge this session's spend against its usual hour"}`)
   lines.push(staleMs > 0 ? `⧗ on rows working, or done and unseen, for ${howLong(staleMs)}` : 'No ⧗ on rows (staleMinutes 0)')
   return lines.join('\n')
 }

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { addSpend, dueWaits, inQuietHours, parseQuietHours, spendBurst, spendIsHigh, spendLine, spendText, waitText, type SpendAlert } from '../hooks/state'
+import { addSpend, dueWaits, inQuietHours, median, parseQuietHours, spendBurst, spendIsHigh, spendLine, spendText, usualHour, waitText, type SpendAlert } from '../hooks/state'
 import { COMMAND, ROOT, SID, startSession, world, type World, SLOW } from './world'
 
 // Telling the person: a push when a session of the project waits too long (once per wait, one session for the
@@ -97,7 +97,9 @@ test('spend running high: four times its usual hour and $3 at list price, until 
   // Too little history: no judgement
   expect(spendBurst(ledger([0.5, 0.5], now), now)).toBeNull()
   const usual = ledger([0.5, 0.4, 0.6, 0.5], now)
-  expect(spendBurst({ ...usual, total: usual.total + 6, samples: [...usual.samples, [now, usual.total + 6, 20]] }, now)).toEqual({ hour: 6, usual: 0.5, rise: 7 })
+  expect(spendBurst({ ...usual, total: usual.total + 6, samples: [...usual.samples, [now, usual.total + 6, 20]] }, now)).toEqual({ hour: 6, usual: 0.5, rise: 7, basis: 'own' })
+  // With a usual hour of its own, the project's doesn't count
+  expect(spendBurst({ ...usual, total: usual.total + 6, samples: [...usual.samples, [now, usual.total + 6, 20]] }, now, 5)?.usual).toBe(0.5)
   expect(spendIsHigh({ hour: 6, usual: 0.5, rise: null }, false)).toBe(true)
   expect(spendIsHigh({ hour: 1.9, usual: 0.4, rise: null }, false)).toBe(false)
   expect(spendIsHigh({ hour: 10, usual: 4, rise: null }, false)).toBe(false)
@@ -109,6 +111,23 @@ test('spend running high: four times its usual hour and $3 at list price, until 
   expect(spendLine(alert, 'subscription')).toBe('spending 12× its usual hour · 5h +7% this hour')
   expect(spendText('one', alert, 'api')).toBe('“one” spent $6.00 in the last hour, usually $0.50: check it isn\'t looping')
   expect(spendText('one', { ...alert, rise: null }, 'subscription')).toBe('“one” is spending 12× its usual hour: check it isn\'t looping')
+})
+
+test("spend in a session's first hours: judged by the median of the usual hours its project's other sessions published", () => {
+  const now = 100 * HOUR
+  // An hour and a quarter old, spending $20 an hour from its first minute
+  const young = { last: 25, total: 25, kind: '', samples: [[now - 75 * MIN, 0, -1], [now - HOUR, 5, -1], [now, 25, -1]] as [number, number, number][] }
+  expect(spendBurst(young, now)).toBeNull()
+  expect(spendBurst(young, now, median([0.5, 2, 3]))).toEqual({ hour: 20, usual: 2, rise: null, basis: 'project' })
+  expect(spendIsHigh(spendBurst(young, now, 2), false)).toBe(true)
+  // Less than an hour of its own: still nothing to judge
+  expect(spendBurst({ ...young, samples: young.samples.slice(1) }, now - 1, 2)).toBeNull()
+  expect([median([3, 1, 2]), median([1, 2, 3, 4]), median([])]).toEqual([2, 2.5, null])
+  expect(usualHour(young, now)).toBeNull()
+  const alert: SpendAlert = { since: 0, hour: 20, usual: 2, rise: null, kind: '', notified: false, basis: 'project' }
+  expect(spendLine(alert, 'api')).toBe("$20.00 last hour · project's usual $2.00")
+  expect(spendLine(alert, 'subscription')).toBe("spending 10× the project's usual hour")
+  expect(spendText('new one', alert, 'api')).toBe("“new one” spent $20.00 in the last hour, the project's sessions usually $2.00: check it isn't looping")
 })
 
 test('a session waiting past waitPushMinutes: one push for that wait, its name only, and the notification channel when the phone is not reached', SLOW, async ($, on) => {
@@ -264,5 +283,21 @@ test("spend far above a session's usual hour: a line under its row, one notifica
   expect(w.pushes).toHaveLength(1)
   expect(w.runs.some(a => a.includes('stop') || a.includes('respawn'))).toBe(false)
   expect(await status($)).toContain('this session spent $6.00 in the last hour at list price, usually $0.50')
+})
+
+test('a session that spends far from its first hour is told by the usual hour its project\'s other sessions published', async ($, on) => {
+  const now = 1_000_000_000
+  // An hour of its own and nothing spent then; the other session of the project usually spends $0.50 an hour
+  const w = world(on, { list: list('idle'), store: { [`spend:${SID}`]: { last: 0, total: 0, kind: '', samples: [[now - HOUR - 1, 0, -1]] }, [`state:${BRAVO}`]: { usualHour: 0.5 } } })
+  remoteControl(w)
+  w.pushAnswer.value = { pushSent: true }
+  await startSession($, w)
+  w.usage.value = { context: { percent: 10 }, rateLimits: [], cost: { usd: 8.5 } }
+  await w.clock.advance(15000)
+  expect((w.store.get(`state:${SID}`) as any)?.spendAlert).toMatchObject({ hour: 8.5, usual: 0.5, basis: 'project', notified: true })
+  expect(w.pushes).toEqual(["“one” spent $8.50 in the last hour, the project's sessions usually $0.50: check it isn't looping"])
+  await w.clock.advance(3000)
+  expect(await drawn($)).toContain("$8.50 last hour · project's usual $0.50")
+  expect(await status($)).toContain("the project's sessions usually $0.50 (it has too few active hours of its own yet)")
 })
 
