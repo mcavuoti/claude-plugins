@@ -49,6 +49,9 @@ type Overrides = {
   permissions?: Permissions
   /** Any other settings for the instance's --settings file (env, enabledPlugins, worktree…), merged */
   settings?: Record<string, unknown>
+  /** What items from outside reach it (intake.ts): their tags, their kinds, the records they ask to change; a role's
+   * and its instance's add up */
+  subscribe?: { tags?: string[]; kinds?: string[]; paths?: string[] }
 }
 export type RoleSpec = Overrides
 export type InstanceSpec = Overrides & { name: string; role: string; section?: string; parent?: string; wave?: number; brief?: string }
@@ -62,6 +65,9 @@ export type Roster = {
   budget?: { usdDay?: number }
   wakes?: { everyMin?: number; perDay?: number }
   settings?: Record<string, unknown>
+  /** The person: his addresses, the principals who may ask for changes, the front door, and how alerts reach him
+   * (channel.ts) */
+  person?: Record<string, unknown>
   [key: string]: unknown
 }
 /** An instance as /fleet up starts it: the roster's fields resolved */
@@ -85,7 +91,10 @@ export type Instance = {
   brief: string
   permissions: Permissions
   settings: Record<string, unknown>
+  /** What items from outside reach it: tags, kinds, the paths of the records they ask to change (globs) */
+  subscribe: Subscription
 }
+export type Subscription = { tags: string[]; kinds: string[]; paths: string[] }
 
 // ---- roster.json ----
 
@@ -200,9 +209,33 @@ export function instancesOf(r: Roster): Instance[] {
       brief: typeof spec.brief === 'string' ? spec.brief.trim() : '',
       permissions: mergePermissions(zone?.permissions, role.permissions, spec.permissions),
       settings: mergeSettings(isObject(r.settings) ? r.settings : undefined, zone?.settings, role.settings, spec.settings),
+      subscribe: mergeSubscriptions(role.subscribe, spec.subscribe),
     })
   }
   return out
+}
+
+/** A role's subscription and its instance's, added up (tags and kinds lowercase) */
+function mergeSubscriptions(...layers: unknown[]): Subscription {
+  const out: Subscription = { tags: [], kinds: [], paths: [] }
+  for (const l of layers) {
+    if (!isObject(l)) continue
+    out.tags.push(...strings(l.tags).map(t => t.trim().toLowerCase()).filter(Boolean))
+    out.kinds.push(...strings(l.kinds).map(t => t.trim().toLowerCase()).filter(Boolean))
+    out.paths.push(...strings(l.paths).filter(g => !checkGlob(g)))
+  }
+  return { tags: [...new Set(out.tags)], kinds: [...new Set(out.kinds)], paths: [...new Set(out.paths)] }
+}
+
+/** The front door: the instance roster.json's person.front names, else the first whose role is chief; null without
+ * one (then what nobody subscribes to waits in the brief) */
+export function frontOf(r: Roster | null, instances: readonly Instance[]): Instance | null {
+  const named = isObject(r?.person) && typeof r?.person?.front === 'string' ? (r.person.front as string).trim().toLowerCase() : ''
+  if (named) {
+    const i = instances.find(x => x.name.toLowerCase() === named)
+    if (i) return i
+  }
+  return instances.find(i => i.role === 'chief') ?? null
 }
 
 export function wakesOf(r: Roster | null): { everyMin: number; perDay: number } {

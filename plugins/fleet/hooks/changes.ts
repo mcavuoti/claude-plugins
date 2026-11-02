@@ -10,6 +10,7 @@
 
 import type { FleetRead } from '../types'
 import { FORMAT } from './decisions'
+import type { IntakeMeta } from './intake'
 
 /** Project data: world.json. It only gains fields, and a write keeps the fields it doesn't know */
 export const WORLD_FORMAT = 1
@@ -25,8 +26,9 @@ export type WorldConfig = { worldFormat: number; paths: string[]; [key: string]:
 export type Who = { sessionId: string | null; agentId: string | null; ref: string | null; name: string | null; person?: true }
 /** tool: the model's Write, Edit or NotebookEdit, through the gate; bash: found after a Bash command; outside: found by a
  * session's scan (an editor, a script, a session without fleet); accept: the person stamped the current version as his;
- * answer: fleet wrote a command-level record, applying a change the person approved (drafts.ts) */
-export type Via = 'tool' | 'bash' | 'outside' | 'accept' | 'answer'
+ * answer: fleet wrote a command-level record, applying a change the person approved (drafts.ts); intake: fleet wrote an
+ * intake record, an item from outside read by the sweeper (intake.ts) */
+export type Via = 'tool' | 'bash' | 'outside' | 'accept' | 'answer' | 'intake'
 export type ChangeEvent = {
   format: number
   /** When it changed (for an outside change, the file's modification time) */
@@ -56,6 +58,8 @@ export type ChangeEvent = {
   confirmed?: string[]
   /** The writer's context had read outside content (authority.ts): provenance for the brief, never a mark on readers */
   outside?: true
+  /** An intake record (via intake): its kind, tags, sender, the model's summary and who it's routed to; never the body */
+  intake?: IntakeMeta
 }
 /** A thread: 'main' for the main loop, else the helper's agentId */
 export type Threads = Record<string, Record<string, FleetRead>>
@@ -272,6 +276,7 @@ function sessionWords(by: Who, me: Me): string {
 /** Who made a change, after "by": "TEST B (Edit)", "TEST B (a Bash command, landed blind)", "the person"; for an
  * outside change, "nobody fleet knows" (changeLine words it as outside fleet) */
 export function whoText(e: ChangeEvent, me: Me): string {
+  if (e.via === 'intake') return `fleet's intake (an item from ${e.intake?.from || 'outside'})`
   if (e.via === 'outside' || !e.by) return 'nobody fleet knows'
   const who = sessionWords(e.by, me)
   if (e.via === 'accept') return 'the person'
@@ -287,7 +292,7 @@ const OUTSIDE = 'outside fleet (an editor, a script, or a session without fleet)
 export function changeLine(e: ChangeEvent, me: Me): string {
   const what = `${e.to === null ? 'was removed' : 'changed'} at ${clock(e.at, me.offsetMin)}`
   const rev = e.id && e.rev && e.to !== null ? `, now ${e.id}@${e.rev}${e.kind && e.kind !== 'revision' ? ` (${e.kind})` : ''}` : ''
-  return `${e.via === 'outside' || !e.by ? `${what} ${OUTSIDE}` : `${what} by ${whoText(e, me)}`}${rev}`
+  return `${e.via === 'intake' ? `${what} by ${whoText(e, me)}` : e.via === 'outside' || !e.by ? `${what} ${OUTSIDE}` : `${what} by ${whoText(e, me)}`}${rev}`
 }
 
 // ---- The gate ----
