@@ -8,7 +8,7 @@
     {
       "name": "sessions",
       "source": "./plugins/sessions",
-      "description": "Side panel with this folder's Claude Code sessions: status colors, one-window switching, stop, restart, rename, auto-pin and reopen with Remote Control, token usage, and a status line",
+      "description": "Side panel with this folder's Claude Code sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, spend and token usage, a status line, and an API for other plugins",
       "category": "productivity",
       "tags": ["sessions", "background", "panel", "remote-control", "status-line"]
     }
