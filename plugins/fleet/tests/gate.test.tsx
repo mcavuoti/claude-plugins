@@ -182,6 +182,13 @@ test('R6: the scan runs during a long command; what the command writes lands as 
   await tick(w, 10000)
   await tick(w, 10000)
   expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([expect.objectContaining({ via: 'outside', by: null })])
+  // A command that started after the scan first saw a change looked at the world with it: it isn't its, nothing waits
+  w.touch(PLAN, 'plan from the editor\n')
+  await tick(w, 10000)
+  reads([{ thread: 'main', at: w.clock.now() }])
+  await tick(w, 10000)
+  await tick(w, 10000)
+  expect(mine(w).filter(e => e.path === 'notes/plan.md').at(-1)).toMatchObject({ via: 'outside', to: hashText('plan from the editor\n') })
 })
 
 test('a command run in the background: what changes while it runs is probably its; what it changed lands when it completes', WITH_SESSIONS, async ($, on) => {

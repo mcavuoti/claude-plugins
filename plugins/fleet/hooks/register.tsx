@@ -1301,7 +1301,6 @@ let tooBig = false
 let tooBigAt = 0
 // Why: 'files' (past MAX_WORLD_FILES) or 'entries' (past MAX_WALK)
 let tooBigWhy: 'files' | 'entries' = 'files'
-let bashRunning = 0
 // This session's foreground commands running now, by a number of their own; shown is set once one has run 3 s (the
 // reads file then says so)
 const fgRunning = new Map<number, { thread: string; at: number; shown: boolean }>()
@@ -2601,14 +2600,15 @@ async function bashHook($: any, e: any, next: any) {
     return r
   }
   const thread = threadOf(e)
+  // From before its look at the world: a landing from then on isn't the command's, and a change the scan sees from
+  // then on may be
+  const startedAt = await $.clock.now()
   let before: Snapshot | undefined
   if (!tooBig) {
     try {
       before = await snapshot($)
     } catch {}
   }
-  const startedAt = await $.clock.now()
-  bashRunning++
   // Past 3 s, the other sessions hear it runs (its reads file): their sweeper leaves what changes meanwhile to it
   const n = ++fgCount
   fgRunning.set(n, { thread, at: startedAt, shown: false })
@@ -2622,7 +2622,6 @@ async function bashHook($: any, e: any, next: any) {
   try {
     r = await next(e)
   } finally {
-    bashRunning--
     if (fgRunning.get(n)?.shown) saveReadsSoon($)
     fgRunning.delete(n)
   }
@@ -2665,25 +2664,36 @@ async function bgDone($: any, task: string) {
   log($, `Bash in the background (${task}) completed${lines.length ? `: ${lines.join(' | ').slice(0, 400)}` : ''}`)
 }
 
-/** What runs in the project's sessions now, for the sweeper's scan: a foreground command (this session's, or another's
- * past 3 s: what changes meanwhile is left to its own post-scan), and the newest background one's session and thread
- * (what changes meanwhile is probably its) */
-async function runningNow($: any): Promise<{ foreground: boolean; background: Who | null }> {
+/** The Bash commands running in the project's sessions now, for the sweeper's scan, each with when it took its look at
+ * the world: the foreground ones (this session's, and another's past 3 s) and the background ones, by session and thread */
+type RunningNow = { foreground: number[]; background: { who: Who; at: number }[] }
+
+async function runningNow($: any): Promise<RunningNow> {
   const now = await $.clock.now()
   const sessionId = String(await $.session.id())
-  let foreground = bashRunning > 0
-  let newest: { who: Who; at: number } | null = null
-  for (const b of Object.values(await read($, bgCommands))) if (!newest || b.at > newest.at) newest = { who: await whoAmI($, b.thread), at: b.at }
+  const out: RunningNow = { foreground: [...fgRunning.values()].map(c => c.at), background: [] }
+  for (const b of Object.values(await read($, bgCommands))) out.background.push({ who: await whoAmI($, b.thread), at: b.at })
   for (const name of await names($, `${fleetDir()}/reads`)) {
     if (!name.endsWith('.json') || name === `${sessionId}.json`) continue
     const p = parseReads((await readText($, `${fleetDir()}/reads/${name}`)) ?? '')
     if (!p || 'otherFormat' in p || !p.running?.length || now - p.at > 3 * 60000) continue
     for (const c of p.running) {
-      if (!c.task) foreground ||= now - c.at < 11 * 60000
-      else if (now - c.at < 24 * HOUR && (!newest || c.at > newest.at)) newest = { who: { sessionId: p.sessionId, agentId: c.thread === 'main' ? null : c.thread, ref: p.ref, name: p.name }, at: c.at }
+      if (!c.task) {
+        if (now - c.at < 11 * 60000) out.foreground.push(c.at)
+      } else if (now - c.at < 24 * HOUR) out.background.push({ who: { sessionId: p.sessionId, agentId: c.thread === 'main' ? null : c.thread, ref: p.ref, name: p.name }, at: c.at })
     }
   }
-  return { foreground, background: newest?.who ?? null }
+  return out
+}
+
+/** Who may have made a change the scan first saw at since: a foreground command that looked at the world before then
+ * (its own post-scan will say: the change waits), else the newest such background one (probably its); a command that
+ * started later saw the change already, so it isn't its */
+function authorOf(r: RunningNow, since: number): 'wait' | Who | null {
+  if (r.foreground.some(at => at <= since)) return 'wait'
+  let newest: { who: Who; at: number } | null = null
+  for (const b of r.background) if (b.at <= since && (!newest || b.at > newest.at)) newest = b
+  return newest?.who ?? null
 }
 
 // ---- Outside changes: every 10 s, the world against what this session last saw ----
@@ -2711,8 +2721,8 @@ async function scanWorld($: any) {
   const changed = removalsLast(changedPaths(knownSnapshot(), snap), snap)
   if (!changed.length) return
   await pullEvents($)
-  // Asked once a scan, when a change is to be recorded: whether a command runs that may be its author
-  let running: { foreground: boolean; background: Who | null } | null = null
+  // Asked once a scan, when a change is to be recorded: the commands running that may be its author
+  let running: RunningNow | null = null
   for (const rel of changed) {
     const s = snap.get(rel)
     const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
@@ -2734,16 +2744,18 @@ async function scanWorld($: any) {
       continue
     }
     if (now - u.since < 4000) continue
-    // A foreground command runs (here, or in another session past 3 s): the change may be its, and its own post-scan
-    // says so when it ends; until then it waits, unexplained
+    // A foreground command that ran when it changed (here, or in another session past 3 s): the change may be its, and
+    // its own post-scan says so when it ends; until then it waits, unexplained
     running ??= await runningNow($)
-    if (running.foreground) continue
+    const author = authorOf(running, u.since)
+    if (author === 'wait') continue
     const claim = `${eventsDir('claims')}/${hashText(`${rel}\n${v ?? 'removed'}\n${Math.floor(s?.mtimeMs ?? k?.mtimeMs ?? 0)}`).slice(1)}`
     if ((await publish($, claim, json({ format: FORMAT, path: rel, at: now }))) === 'ok') {
       const id = records ? idOf(rel, records) : null
       if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
-      // A background command runs: probably its doing (never the person's for sure), recorded as that session's, blind
-      const by = running.background
+      // A background command ran when it changed: probably its doing (never the person's for sure), recorded as that
+      // session's, blind
+      const by = author
       const fields = await landRecord($, rel, f, by ? 'bash' : 'outside', by)
       // Recorded now: a copy that kept an older time (rsync -a, cp -p) is still news to a thread that read the file
       // since. Its own time only says when it changed
