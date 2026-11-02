@@ -1749,6 +1749,15 @@ async function outboundGate($: any, e: any): Promise<{ held: { deny: string } | 
   }
 }
 
+/** When a gate's hook threw before the call ran: in a background session of a fleet project, a call that may reach the
+ * network is refused (an MCP tool, or a command naming one of the network commands); null lets it run */
+function heldOnError(e: any): { deny: string } | null {
+  if (!jobRef || !root) return null
+  const tool = String(e?.tool ?? '')
+  const risky = tool === 'Bash' ? NETWORK.test(String(e?.command ?? '')) : tool.startsWith('mcp__') && !tool.startsWith('mcp__fleet__')
+  return risky ? { deny: "fleet couldn't check whether this sends the project's content outside, so it was not run. If it should go out, draft it with mcp__fleet__send; the person approves it and fleet runs it." } : null
+}
+
 // ---- Outside content (decision 2b): a conversation that read a web page or an outside service's result is marked
 // until /clear. It can still do everything; a change it files waits for the person. The mark never travels ----
 
@@ -4571,7 +4580,9 @@ export const register: Register = on => {
 
   on('tool.call', { tool: ['Write', 'Edit', 'NotebookEdit'] }, async ($, e, next) => gate($, e, next)).catch(($, e, next) => next(e))
 
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => bashHook($, e, next)).catch(($, e, next) => next(e))
+  // A guard that throws is skipped and the tool runs: before the command ran, the one hard line holds one that may reach
+  // the network (in a background session); after it, or for any other command, it fails open as the rest of fleet
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => bashHook($, e, next)).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
@@ -4668,7 +4679,7 @@ export const register: Register = on => {
     const r: any = await next(e)
     if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
     return r
-  }).catch(($, e, next) => next(e))
+  }).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
   // Reading the web is free, and marks the conversation (decision 2b): its changes then wait for the person
   on('tool.call', { tool: ['WebFetch', 'WebSearch'] }, async ($, e, next) => {
