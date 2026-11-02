@@ -360,6 +360,45 @@ test('the world commit: only the shared files, with --only so other staged work 
   expect(await fleet($, 'status')).toMatch(/world commits: every 60 min, only the shared files; last at \d\d:\d\d \(the project is a linked worktree/)
 })
 
+test('R10: a world commit that fails waits 5, 10, 20 min for its next try; a check that can’t run waits 10 min or a change of its script', WITH_SESSIONS, async ($, on) => {
+  const checks = [{ glob: 'notes/**', argv: ['bash', 'checks/notes.sh'] }]
+  const w = world(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], checks, commit: { everyMin: 60 } }), [`${ROOT}/checks/notes.sh`]: 'echo\n', [PLAN]: 'plan\n' } })
+  let commits = 0
+  let checked = 0
+  w.exec.value = argv => {
+    if (argv[0] === 'bash') {
+      checked++
+      return { exitCode: 127, stderr: 'bash: checks/notes.sh: command not found' }
+    }
+    if (argv[0] !== 'git') return undefined
+    const sub = argv[3]
+    if (sub === 'rev-parse') return { exitCode: 0, stdout: `${ROOT}\n${ROOT}/.git\n${ROOT}/.git\n` }
+    if (sub === 'worktree') return { exitCode: 0, stdout: `worktree ${ROOT}\n` }
+    if (sub === 'status') return { exitCode: 0, stdout: ' M notes/plan.md\0' }
+    if (sub === 'commit') {
+      commits++
+      return { exitCode: 1, stderr: 'error: gpg failed to sign the data' }
+    }
+    return { exitCode: 0 }
+  }
+  await begin($, w)
+  expect(await fleet($, 'accept checks')).toContain('Stamped: notes.sh')
+  // Over half an hour of sweeps: tried at the first, then 5 and 10 minutes after (not once a minute)
+  for (let i = 0; i < 30; i++) await tick(w, 60000)
+  expect(commits).toBe(3)
+  expect(json(w, `${STATE}/commit.json`)).toMatchObject({ ok: false, failures: 3, error: 'error: gpg failed to sign the data' })
+  expect(await fleet($, 'status')).toMatch(/world commits: every 60 min, only the shared files; none yet; the last try failed: error: gpg failed to sign the data, tried again at \d\d:\d\d/)
+  // The check that can't run: once, then again after 10 minutes, not every minute
+  expect(checked).toBe(3)
+  expect(await fleet($, 'status')).toMatch(/notes\.sh couldn't run: bash: checks\/notes\.sh: command not found \(tried again at \d\d:\d\d, or when it or its script changes\)/)
+  // Its script changes (stamped again): tried at the next sweep
+  w.touch(`${ROOT}/checks/notes.sh`, 'echo fixed\n')
+  await tick(w, 11000)
+  await fleet($, 'accept checks')
+  await tick(w, 60000)
+  expect(checked).toBe(4)
+})
+
 test('worktree copies: a read of a copy that matches counts for the shared file; a write of a copy is told once where the shared one is; copies are never the world', WITH_SESSIONS, async ($, on) => {
   const COPY = `${ROOT}/.claude/worktrees/w1/notes/plan.md`
   const w = world(on, { worldPaths: ['**/*.md'], files: { [PLAN]: 'plan v1\n', [COPY]: 'plan v1\n' } })

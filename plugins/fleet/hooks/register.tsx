@@ -2676,12 +2676,13 @@ async function sweepTick($: any) {
     if (full || sweep.slotsDirty) await sweepSlotsNow($).catch(err => log($, `slots: ${String(err).slice(0, 200)}`))
     if (full) {
       sweep.lastSweep = now
+      // Wakes and alerts first: a check or a commit that hangs to its timeout doesn't hold them
+      await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
+      await alertsTick($).catch(err => log($, `alerts: ${String(err).slice(0, 200)}`))
       if (worldUp) {
         await sweepChecks($)
         await maybeCommit($)
       }
-      await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
-      await alertsTick($).catch(err => log($, `alerts: ${String(err).slice(0, 200)}`))
     }
     if (full || sweep.intakeDirty) await intakeTick($).catch(err => log($, `intake: ${String(err).slice(0, 200)}`))
   } catch (err) {
@@ -3096,7 +3097,19 @@ async function intakeOne($: any, c: IntakeConfig, f: { source: string; name: str
 
 // ---- Check scripts: the project's own, run on landing and by the sweeper, stamped by the person ----
 
-const checkState = { stampAt: 0, stamp: { ok: false, key: '' }, errors: new Map<string, string>(), scripts: { key: '', at: 0, list: [] as string[] } }
+// skip: a check that couldn't run (it can't start, or runs past its timeout), with its definition and scripts then
+// (the stamp's key) and when: not tried again until they change or ten minutes pass
+const checkState = { stampAt: 0, stamp: { ok: false, key: '' }, errors: new Map<string, string>(), skip: new Map<string, { key: string; at: number }>(), scripts: { key: '', at: 0, list: [] as string[] } }
+const CHECK_RETRY_MS = 10 * 60000
+
+/** Whether a check that couldn't run is still to be left alone (same definition and scripts, less than 10 min ago) */
+async function skipCheck($: any, check: Check): Promise<boolean> {
+  const s = checkState.skip.get(check.name)
+  if (!s) return false
+  if (s.key === `${check.key}|${(await checksStamp($)).key}` && (await $.clock.now()) - s.at < CHECK_RETRY_MS) return true
+  checkState.skip.delete(check.name)
+  return false
+}
 
 /** The files of the project the checks' command lines name (records.ts scriptsOf), those that exist: stamped with the
  * checks and command-level. A few seconds' cache */
@@ -3152,10 +3165,12 @@ async function runCheck($: any, check: Check, rels: string[]) {
   if (!out) {
     const why = r.exitCode === 124 ? `timed out after ${Math.round(check.timeoutMs / 1000)} s` : (r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 200) || `exit ${r.exitCode}`
     checkState.errors.set(check.name, why)
-    log($, `check ${check.name} couldn't run: ${why}`)
+    checkState.skip.set(check.name, { key: `${check.key}|${(await checksStamp($)).key}`, at: await $.clock.now() })
+    log($, `check ${check.name} couldn't run: ${why} (tried again in 10 min, or when it or its script changes)`)
     return
   }
   checkState.errors.delete(check.name)
+  checkState.skip.delete(check.name)
   const now = await $.clock.now()
   for (const [rel, message] of out) {
     const path = checkPath(rel)
@@ -3179,7 +3194,7 @@ function scheduleChecks($: any, rels: string[]) {
       (async () => {
         if (!(await checksStamp($)).ok) return
         for (const c of (records as Records).checks) {
-          if (c.when !== 'land') continue
+          if (c.when !== 'land' || (await skipCheck($, c))) continue
           const mine = rels.filter(r => c.re.test(r))
           if (mine.length) await runCheck($, c, mine)
         }
@@ -3198,9 +3213,11 @@ async function sweepChecks($: any) {
   const now = await $.clock.now()
   for (const c of records.checks) {
     if (c.when === 'sweep' && now - (sweep.lastRun[c.name] ?? 0) < c.everyMin * 60000) continue
+    if (await skipCheck($, c)) continue
     sweep.lastRun[c.name] = now
     const due = [...known].filter(([rel, k]) => k.v !== null && c.re.test(rel) && needsCheck(byPath.get(rel), c, k.v)).map(([rel]) => rel)
-    for (let i = 0; i < due.length; i += 50) await runCheck($, c, due.slice(i, i + 50))
+    // One batch that can't run is enough to know: the rest wait with it
+    for (let i = 0; i < due.length && !checkState.skip.has(c.name); i += 50) await runCheck($, c, due.slice(i, i + 50))
   }
 }
 
@@ -3637,6 +3654,11 @@ async function stampChannel($: any, origin: string): Promise<string> {
 
 // ---- The world commit (world.json commit.everyMin, off by default): only world paths, never in a worktree ----
 
+/** How long a world commit that failed n times in a row waits for its next try: 5, 10, 20… minutes, at most everyMin */
+function commitBackoffMin(failures: number, everyMin: number): number {
+  return Math.min(5 * 2 ** Math.min(failures - 1, 10), everyMin)
+}
+
 async function maybeCommit($: any) {
   const every = records?.commitEveryMin
   if (!every || !world) return
@@ -3645,7 +3667,12 @@ async function maybeCommit($: any) {
   try {
     last = JSON.parse((await readText($, stateDir('commit.json'))) ?? '')
   } catch {}
-  if (last && last.format === FORMAT && now - Number(last.at || 0) < every * 60000) return
+  if (last && last.format === FORMAT) {
+    if (now - Number(last.at || 0) < every * 60000) return
+    // A commit that failed is tried again 5, 10, 20… minutes later (at most every everyMin), not at every sweep
+    const fails = Number(last.failures || 0)
+    if (last.ok === false && fails > 0 && now - Number(last.tried || 0) < commitBackoffMin(fails, every) * 60000) return
+  }
   const note = async (n: string) => {
     if (n !== sweep.commitNote) log($, `world commit: ${n}`)
     sweep.commitNote = n
@@ -3674,7 +3701,8 @@ async function maybeCommit($: any) {
   // --only: the commit takes these paths as they are, and leaves whatever else the person staged staged
   const c = add.exitCode === 0 ? await run($, ['git', '-C', realRoot, 'commit', '-q', '--only', '-m', msg, '--', ...abs], { timeoutMs: 60000 }) : add
   const ok = c.exitCode === 0
-  await replace($, stateDir('commit.json'), json({ format: FORMAT, at: ok ? now : Number(last?.at || 0), tried: now, ok, files: files.length, ...(ok ? {} : { error: (c.stderr || c.stdout).trim().slice(0, 300) }) }))
+  const failures = ok ? 0 : Number(last?.format === FORMAT ? last.failures || 0 : 0) + 1
+  await replace($, stateDir('commit.json'), json({ format: FORMAT, at: ok ? now : Number(last?.at || 0), tried: now, ok, files: files.length, ...(ok ? {} : { error: (c.stderr || c.stdout).trim().slice(0, 300), failures }) }))
   return note(ok ? `${msg} (${files.length} file(s))` : `failed: ${(c.stderr || c.stdout).trim().slice(0, 200)}`)
 }
 
@@ -3796,6 +3824,7 @@ async function stampChecks($: any, origin: string): Promise<string> {
   }
   checkState.stampAt = 0
   checkState.errors.clear()
+  checkState.skip.clear()
   log($, `checks stamped: ${records.checks.map(c => c.name).join(', ')}`)
   return [
     `Stamped: ${list.join('; ')}.`,
@@ -3879,7 +3908,10 @@ async function recordsStatus($: any, me: Me): Promise<string[]> {
   if (records.checks.length) {
     const st = await checksStamp($)
     lines.push(`checks: ${records.checks.map(c => `${c.name} (${c.when === 'land' ? 'at landing' : `every ${c.everyMin} min`})`).join(', ')}${st.ok ? '' : ': not stamped, so not run: /fleet accept checks runs them'}`)
-    for (const [name, why] of checkState.errors) lines.push(`  ${name} couldn't run: ${why}`)
+    for (const [name, why] of checkState.errors) {
+      const s = checkState.skip.get(name)
+      lines.push(`  ${name} couldn't run: ${why}${s ? ` (tried again at ${clock(s.at + CHECK_RETRY_MS, me.offsetMin)}, or when it or its script changes)` : ''}`)
+    }
     const bad = failing()
     lines.push(bad.length ? 'failing a check:' : 'failing a check: nothing')
     for (const f of bad.slice(0, 20)) lines.push(`  ${f.path}: ${f.check}: ${f.message}`)
@@ -3890,7 +3922,8 @@ async function recordsStatus($: any, me: Me): Promise<string[]> {
       c = JSON.parse((await readText($, stateDir('commit.json'))) ?? '')
     } catch {}
     const lastAt = c && Number(c.at) ? `last at ${clock(Number(c.at), me.offsetMin)}` : 'none yet'
-    lines.push(`world commits: every ${records.commitEveryMin} min, only the shared files; ${lastAt}${c && c.ok === false && c.error ? `; the last try failed: ${c.error}` : ''}${sweep.holding && sweep.commitNote ? ` (${sweep.commitNote})` : ''}`)
+    const retry = c && c.ok === false && Number(c.failures) > 0 ? `, tried again at ${clock(Number(c.tried || 0) + commitBackoffMin(Number(c.failures), records.commitEveryMin) * 60000, me.offsetMin)}` : ''
+    lines.push(`world commits: every ${records.commitEveryMin} min, only the shared files; ${lastAt}${c && c.ok === false && c.error ? `; the last try failed: ${c.error}${retry}` : ''}${sweep.holding && sweep.commitNote ? ` (${sweep.commitNote})` : ''}`)
   } else lines.push('world commits: off (world.json "commit": { "everyMin": 60 } turns them on)')
   if (startedInTree) lines.push(`worktree: this session started in ${startedInTree}; its project is the main checkout's, ${root}`)
   if (trees.linked.length) lines.push(`worktrees: ${trees.linked.length} linked (${trees.linked.slice(0, 4).join(', ')}): their copies of shared files are not the world`)
