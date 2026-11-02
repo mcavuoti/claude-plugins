@@ -11,6 +11,7 @@ import {
   hostAllowed,
   hostOf,
   hostsNamed,
+  mayReachNetwork,
   newOutbound,
   outboundDelivery,
   outboundHash,
@@ -262,6 +263,15 @@ test('Bash: an endpoint, registry or proxy the environment names is where it goe
   expect(held('GIT_CONFIG_GLOBAL=/tmp/x.gitconfig git status', OWN)).toEqual([])
   // Plain variables say nothing
   expect(held('DEBUG=1 NODE_ENV=production FOO=https://far.example scp notes/x.md devbox:/srv/', OWN)).toEqual([])
+})
+
+test('when the gate erred: a command that may reach the network is refused; local git and a local copy run', () => {
+  for (const line of ['git push', 'git -C sub push origin', 'cd x && git fetch', 'git pull --rebase', 'git clone https://x.invalid/r.git', 'git ls-remote origin', 'git send-email x.patch', 'ssh far.invalid true', 'scp notes/x.md far.invalid:/tmp/', "rsync -av notes/ 'me@far.invalid:backup/'", 'curl https://x.invalid', 'npm publish']) {
+    expect([line, mayReachNetwork(line)]).toEqual([line, true])
+  }
+  for (const line of ['git status', 'git log --oneline -5', 'git commit -m "push the fix"', 'git -C sub diff HEAD~1', 'ssh-keygen -l -f key', 'scp a.md b.md', 'rsync -a notes/ backup/', 'ls -la']) {
+    expect([line, mayReachNetwork(line)]).toEqual([line, false])
+  }
 })
 
 test('MCP: a tool that sends, one that reads outside content, one that does neither; the lists and recipients', () => {

@@ -16,6 +16,7 @@ import {
   hostAllowed,
   hostsNamed,
   matches,
+  mayReachNetwork,
   mcpParts,
   newOutbound,
   outboundDelivery,
@@ -2051,8 +2052,6 @@ async function outboundOf($: any, e: any, c: OutboundConfig): Promise<{ sends: S
   return { sends: r.send ? [r.send] : [], how: 'tool', outside: r.outside ? `${String(e.tool)}` : null }
 }
 
-const NETWORK = /\b(curl|wget|scp|rsync|sftp|ssh|git|gh|glab|mail|mailx|sendmail|mutt|nc|ncat|netcat|ftp|lftp|smbclient|rclone|gsutil)\b|\b(npm|yarn|pnpm|cargo|poetry)\b.*\bpublish\b|\btwine\b.*\bupload\b|\bgem\b.*\bpush\b|\b(docker|podman)\b.*\bpush\b|\baws\b.*\bs3(api)?\b|\b(gcloud|az)\b.*\bstorage\b|\/dev\/(tcp|udp)\//
-
 /** Whether the gate holds in this session: a background session, or one started from a background session's Bash (it
  * inherited CLAUDE_JOB_DIR, which names the other session, or an instance's FLEET_INSTANCE): nobody is at it either */
 function gateHolds(): boolean {
@@ -2073,7 +2072,7 @@ async function outboundGate($: any, e: any): Promise<{ held: { deny: string } | 
   } catch (err) {
     log($, `outbound check: ${String(err).slice(0, 200)}`)
     if (!gateHolds()) return { held: null, outside: null }
-    const risky = e.tool === 'Bash' ? NETWORK.test(String(e.command ?? '')) : true
+    const risky = e.tool === 'Bash' ? mayReachNetwork(String(e.command ?? '')) : true
     return {
       held: risky ? { deny: `fleet couldn't check whether this sends the project's content outside (${String(err).slice(0, 120)}), so it was not ${e.tool === 'Bash' ? 'run' : 'made'}. If it should go out, draft it with mcp__fleet__send; the person approves it and fleet runs it.` } : null,
       outside: null,
@@ -2086,7 +2085,7 @@ async function outboundGate($: any, e: any): Promise<{ held: { deny: string } | 
 function heldOnError(e: any): { deny: string } | null {
   if (!gateHolds() || !root) return null
   const tool = String(e?.tool ?? '')
-  const risky = tool === 'Bash' ? NETWORK.test(String(e?.command ?? '')) : tool.startsWith('mcp__') && !tool.startsWith('mcp__fleet__')
+  const risky = tool === 'Bash' ? mayReachNetwork(String(e?.command ?? '')) : tool.startsWith('mcp__') && !tool.startsWith('mcp__fleet__')
   return risky ? { deny: "fleet couldn't check whether this sends the project's content outside, so it was not run. If it should go out, draft it with mcp__fleet__send; the person approves it and fleet runs it." } : null
 }
 

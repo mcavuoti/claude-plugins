@@ -1103,6 +1103,25 @@ export function hostsNamed(text: string): string[] {
   return out
 }
 
+// A command that may reach the network, for when the gate itself erred: git's network subcommands, ssh, and scp or
+// rsync to a host, and the other sending commands. Local git and a local copy aren't
+const NETWORK = new RegExp(
+  [
+    String.raw`\b(curl|wget|sftp|gh|glab|mail|mailx|sendmail|mutt|nc|ncat|netcat|ftp|lftp|smbclient|rclone|gsutil)\b`,
+    String.raw`\bgit\b(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)\s+\S+|\s+--?[\w-]+(?:=\S*)?)*\s+(push|fetch|pull|clone|ls-remote|send-email)\b`,
+    String.raw`(?<![\w-])ssh(?![\w-])\s+\S`,
+    String.raw`(?<![\w-])(scp|rsync)(?![\w-])[^;&|\n]*\s['"]?(?:rsync:\/\/|(?:[^\s:/@'"]+@)?[^\s:/@'"]+:)`,
+    String.raw`\b(npm|yarn|pnpm|cargo|poetry)\b.*\bpublish\b|\btwine\b.*\bupload\b|\bgem\b.*\bpush\b|\b(docker|podman)\b.*\bpush\b`,
+    String.raw`\baws\b.*\bs3(api)?\b|\b(gcloud|az)\b.*\bstorage\b|\/dev\/(tcp|udp)\/`,
+  ].join('|'),
+)
+
+/** Whether a Bash command may reach the network, when the gate couldn't classify it (it threw): then it's refused,
+ * since the one hard line doesn't open because fleet erred; anything else runs */
+export function mayReachNetwork(command: string): boolean {
+  return NETWORK.test(command)
+}
+
 // ---- Words ----
 
 export function sendWords(sends: readonly Send[]): string {
