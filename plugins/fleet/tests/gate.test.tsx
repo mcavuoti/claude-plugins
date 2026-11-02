@@ -174,6 +174,18 @@ test('a change made outside fleet is found by the scan, recorded once and heard;
   expect(await fleet($, 'accept src/x.ts')).toContain("isn't a shared file of this project")
 })
 
+test('R3: parallel tool calls of one step carry the digest once', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [TODO]: 'todo v1\n' } })
+  await begin($, w)
+  await call($, { tool: 'Read', file_path: PLAN })
+  landByB(w, PLAN, 'plan v2 from B\n')
+  await tick(w)
+  const all = await Promise.all([call($, { tool: 'Read', file_path: TODO }), call($, { tool: 'Bash', command: 'ls' }), call($, { tool: 'Bash', command: 'pwd' })])
+  const told = all.map(r => (r.context ?? []).join('\n')).filter(c => c.includes('notes/plan.md: changed at'))
+  expect(told.length).toBe(1)
+  expect((await call($, { tool: 'Bash', command: 'ls' })).context).toBe(undefined)
+})
+
 test('R5: an outside change that keeps an older time (rsync -a, cp -p) is recorded when found, and heard by a thread that read the file since', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n' } })
   await begin($, w)

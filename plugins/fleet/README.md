@@ -603,7 +603,7 @@ What happens, in every session of the project (background or not), for each thre
   - notes/plan.md: changed at 14:02 by TEST B (Edit)
   ```
 
-  Mid-turn it rides the next tool result (Read, Write, Edit, NotebookEdit, Bash); otherwise it goes with the next prompt that starts a turn. Each change is told once, and nothing is added when nothing it read changed.
+  Mid-turn it rides the next tool result (Read, Write, Edit, NotebookEdit, Bash); otherwise it goes with the next prompt that starts a turn. Each change is told once (a batch of tool calls run together carries it on one of them), and nothing is added when nothing it read changed.
 - **A Bash command** that writes a shared file isn't stopped: `fleet` compares the shared files before and after the command and records what changed as that thread's landing, marked *landed blind*. When the command changed a file someone else had changed after this thread read it, the model is told to check that change is still there.
 - **Outside changes** (your editor, a script, a session without `fleet`) are found by a scan every 10 seconds and recorded once for the project as changed *outside fleet*, as of when they were found: a copy that kept an older time (`rsync -a`, `cp -p`, a sync client) is still news to a session that read the file since, and the words say when the file itself changed. `/fleet accept notes/plan.md` stamps the current version as yours: the sessions that read an older version hear it as your change. `/fleet accept` alone lists the outside changes not stamped yet.
 - **`/fleet status`** shows the shared files, the last changes and, for every session of the project, the files it read whose version has changed since.

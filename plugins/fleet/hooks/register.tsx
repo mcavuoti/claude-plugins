@@ -1851,14 +1851,29 @@ async function digestFor($: any, thread: string, withBudget = true): Promise<{ l
   }
 }
 
-/** A tool's result with the digest (and any other lines) for the model, when it can carry them */
+// Each thread's digests one at a time: parallel tool calls of one step (Claude runs a batch of Reads at once) would
+// each compute the same lines before any marked them told. A lock of this copy of the module only: what's told lives
+// in $.state
+const lineChains = new Map<string, Promise<unknown>>()
+
+/** A tool's result with the digest (and any other lines) for the model, when it can carry them. One at a time per
+ * thread, from computing the lines to marking them told, so a change is told once however many calls run together */
 async function withLines($: any, r: any, thread: string, extra: string[] = []): Promise<any> {
   if (!r || r.deny !== undefined || r.isError) return r
-  const d = await digestFor($, thread)
-  const lines = [...extra, ...d.lines]
-  if (!lines.length) return r
-  await d.told()
-  return { ...r, context: [...(r.context ?? []), ...lines] }
+  const mine = (lineChains.get(thread) ?? Promise.resolve()).then(async () => {
+    const d = await digestFor($, thread)
+    const lines = [...extra, ...d.lines]
+    if (!lines.length) return r
+    await d.told()
+    return { ...r, context: [...(r.context ?? []), ...lines] }
+  })
+  const tail = mine.catch(() => {})
+  lineChains.set(thread, tail)
+  try {
+    return await mine
+  } finally {
+    if (lineChains.get(thread) === tail) lineChains.delete(thread)
+  }
 }
 
 // ---- Records: versions, pins (records.ts) ----
