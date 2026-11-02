@@ -1959,11 +1959,31 @@ async function landRecord($: any, rel: string, after: { v: string | null; text: 
   const revs = await revsOf($, id)
   const prev = revs[revs.length - 1] ?? null
   if (prev && prev.hash === after.v) return { id, rev: prev.rev, ...extra }
-  const change = after.text === null ? null : changeOf(after.text, records.changeKey)
-  const kind = landingKind(change, prev, after.v === null)
+  // A file of the id went while another is there (a rename: R-12.md → R-12-max-rate.md, git mv; the scans take the
+  // removals last): no retraction. The record's own file still there needs no version; one it moved to gets one at its
+  // new path, editorial when the text is the same
+  let path = rel
+  let landed = after
+  if (after.v === null && prev) {
+    const recs = records
+    const others = [...known].filter(([p, k]) => p !== rel && k.v !== null && idOf(p, recs) === id).map(([p]) => p).sort()
+    if (others.includes(prev.path)) return { id, rev: prev.rev, ...extra }
+    if (others.length) {
+      path = others[0] as string
+      landed = await versionOf($, `${realRoot}/${path}`)
+      if (landed.v === null) {
+        path = rel
+        landed = after
+      }
+    }
+  }
+  const change = landed.text === null ? null : changeOf(landed.text, records.changeKey)
+  const kind = path !== rel && prev && landed.v === prev.hash ? 'editorial' : landingKind(change, prev, landed.v === null)
+  const revPins = path === rel ? pins : pinsFrom(landed.text, path)
   const at = await $.clock.now()
+  if (path !== rel) log($, `${rel}: gone, and ${id} is at ${path} now (a rename): ${kind}, not a retraction`)
   for (let n = (prev?.rev ?? 0) + 1, tries = 0; tries < 20; tries++, n++) {
-    const entry: Rev = { format: FORMAT, id, path: rel, rev: n, hash: after.v, kind, changeHash: change?.hash ?? null, at, by, via, pins, ...(suspect.length ? { suspect } : {}), ...(confirmed.length ? { confirmed } : {}) }
+    const entry: Rev = { format: FORMAT, id, path, rev: n, hash: landed.v, kind, changeHash: change?.hash ?? null, at, by, via, pins: revPins, ...(suspect.length ? { suspect } : {}), ...(confirmed.length ? { confirmed } : {}) }
     const r = await publish($, `${revDir(id)}/${n}.json`, json(entry))
     if (r === 'ok') {
       forget(id)
@@ -2356,6 +2376,12 @@ async function snapshot($: any): Promise<Snapshot | undefined> {
   return out
 }
 
+/** Changed paths with the removed ones last: a renamed record's new file is known before its old one's removal is
+ * reckoned (landRecord) */
+function removalsLast(changed: string[], now: Snapshot): string[] {
+  return [...changed.filter(p => now.has(p)), ...changed.filter(p => !now.has(p))]
+}
+
 function knownSnapshot(): Snapshot {
   return new Map([...known].map(([p, k]) => [p, { mtimeMs: k.mtimeMs, size: k.size }]))
 }
@@ -2366,7 +2392,7 @@ function knownSnapshot(): Snapshot {
 async function afterBash($: any, thread: string, before: Snapshot, startedAt: number): Promise<string[]> {
   const after = await snapshot($)
   if (!after) return []
-  const changed = changedPaths(before, after)
+  const changed = removalsLast(changedPaths(before, after), after)
   if (!changed.length) return []
   await pullEvents($)
   const sessionId = String(await $.session.id())
@@ -2470,7 +2496,7 @@ async function scanWorld($: any) {
     sweep.dirty = true
     return
   }
-  const changed = changedPaths(knownSnapshot(), snap)
+  const changed = removalsLast(changedPaths(knownSnapshot(), snap), snap)
   if (!changed.length) return
   await pullEvents($)
   for (const rel of changed) {
@@ -2670,6 +2696,8 @@ async function sweepTick($: any) {
 async function computeSuspects($: any) {
   sweep.dirty = false
   if (!records) return
+  // Which file is each record's, from what the scans know now (a rename, a twin removed)
+  indexIds()
   const facts: Facts[] = []
   for (const [rel, k] of [...known].sort((a, b) => a[0].localeCompare(b[0]))) {
     const id = idOf(rel, records)

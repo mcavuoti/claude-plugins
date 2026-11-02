@@ -189,6 +189,33 @@ test('strict (world.json): nothing passes on a second try, only a read clears it
   expect(await fleet($, 'status')).toContain('strict on every shared file')
 })
 
+test('R4: renaming a record (git mv, or outside fleet) is an editorial version at its new path, not a retraction: what cites it stays current', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['req/**', 'board/**'], files: { [R1]: 'R-1 v1\n', [R2]: 'R-2 v1\n', [B1]: '---\nrelies_on: [R-1@1, R-2@1]\n---\nB-1: the work\n' } })
+  await begin($, w)
+  await tick(w)
+  expect(json(w, `${STATE}/revs/R-1/1.json`)).toMatchObject({ rev: 1, path: 'req/R-1.md' })
+  const move = (from: string, to: string) => {
+    const text = w.files.get(from) as string
+    w.files.delete(from)
+    w.touch(to, text)
+  }
+  // A command renames R-1 as it is
+  w.bash.value = () => move(R1, `${ROOT}/req/R-1-max-rate.md`)
+  await call($, { tool: 'Bash', command: 'git mv req/R-1.md req/R-1-max-rate.md' })
+  expect(json(w, `${STATE}/revs/R-1/2.json`)).toMatchObject({ rev: 2, path: 'req/R-1-max-rate.md', kind: 'editorial', hash: hashText('R-1 v1\n') })
+  // Outside fleet, R-2 is renamed and edited at once: its new file has the version, and the removal adds none
+  move(R2, `${ROOT}/req/R-2-units.md`)
+  w.touch(`${ROOT}/req/R-2-units.md`, '---\nchange: "editorial: the units spelled out"\n---\nR-2 v1\n')
+  await tick(w, 10000)
+  await tick(w, 10000)
+  await tick(w)
+  expect(under(w, `${STATE}/revs/R-2`)).toEqual(['1.json', '2.json'])
+  expect(json(w, `${STATE}/revs/R-2/2.json`)).toMatchObject({ path: 'req/R-2-units.md', kind: 'editorial' })
+  // Nothing turned suspect, and the records' files are the new ones
+  expect(json(w, `${STATE}/suspects.json`).suspects).toEqual([])
+  expect(events(w).find(e => e.path === 'req/R-1.md' && e.to === null)).toMatchObject({ id: 'R-1', rev: 2, kind: 'editorial' })
+})
+
 test('C10b: a Bash heredoc that writes a record citing a stale pin and one never read lands blind, and the record is suspect', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { worldPaths: ['req/**', 'board/**'], files: { [R1]: 'R-1 v1\n', [R2]: 'R-2 v1\n', [`${ROOT}/req/R-3.md`]: 'R-3 v1\n' } })
   await begin($, w)
