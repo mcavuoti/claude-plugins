@@ -227,7 +227,7 @@ let defaultWindowWidth = 0
 let remeasure = false
 // The session that was asked whether to stop: only its answer is accepted, and only for a while. fallback is the row
 // that stays selected if it leaves the list: its neighbor in the list you were looking at when you pressed Stop
-let pendingAsk: { sessionId: string; at: number; fallback?: string; topic: Topic; detail: string } | undefined
+let pendingAsk: { sessionId: string; at: number; fallback?: string; topic: Topic; detail: string; target: Row } | undefined
 // How many times you moved the panel's focus yourself (arrows, Tab, click): so the focus isn't fought over when the
 // panel takes it on its own
 let personMoves = 0
@@ -338,7 +338,9 @@ function debugLine($: any, text: string) {
 // at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
 // (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
-// and the window in front, shared for 1.5 s by the seen check: at, windows / tty).
+// and the window in front, shared for 1.5 s by the seen check: at, windows / tty), answer:<id> (the answer to a Stop or
+// Restart question that session asked, when the asked session couldn't send it as a notice: format, sessionId,
+// action, cameBack, at; that session's panel takes it and deletes it).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
@@ -365,10 +367,13 @@ async function storeGet($: any, key: string): Promise<any> {
   }
 }
 
-async function storeSet($: any, key: string, value: unknown) {
+async function storeSet($: any, key: string, value: unknown): Promise<boolean> {
   try {
     await $.store.set(`${await storeNamespaceOf($)}${key}`, value)
-  } catch {}
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function storeDelete($: any, key: string) {
@@ -1425,14 +1430,72 @@ async function agentsViewShowing($: any, v: { agentsViews: { pid: string; tty: s
 }
 
 // A notice to another session's mod (see buildNotice), only if it answers: its heartbeat says it runs and speaks this
-// format. Anything else would reach that session's model as text
-async function sendNotice($: any, f: Row, kind: NoticeKind, data: Record<string, unknown> = {}): Promise<boolean> {
-  if (!f.reachable || f.current) return false
+// format. Anything else would reach that session's model as text. '' once it reached that session's queue, else why
+// not: Claude sends it only from a session whose agent has the SendMessage tool (a fleet instance's role may leave it
+// out), and says so in its answer rather than throwing
+async function noticeTo($: any, f: Row, kind: NoticeKind, data: Record<string, unknown> = {}): Promise<string> {
+  if (f.current) return 'it is this session'
+  if (!f.reachable) return "its panel isn't running, or runs another version"
   try {
-    await $.session.send({ to: { sessionId: f.sessionId }, text: buildNotice(kind, data) })
-    return true
+    const r = await $.session.send({ to: { sessionId: f.sessionId }, text: buildNotice(kind, data) })
+    return r && r.isDelivered === false ? String(r.reason || 'it was not delivered').slice(0, 200) : ''
+  } catch (err) {
+    return String(err).slice(0, 200)
+  }
+}
+
+async function sendNotice($: any, f: Row, kind: NoticeKind, data: Record<string, unknown> = {}): Promise<boolean> {
+  return (await noticeTo($, f, kind, data)) === ''
+}
+
+// Whether this session can send notices: Claude sends them through the SendMessage tool, which an agent can leave out
+// of its tools (then $.session.send answers not delivered). When it can't be told, it's taken that it can
+async function canMessage($: any): Promise<boolean> {
+  try {
+    const tools: any[] = await $.tool.list()
+    return !Array.isArray(tools) || tools.some(t => t?.name === 'SendMessage')
   } catch {
-    return false
+    return true
+  }
+}
+
+// The other session of a Stop or Restart question, whatever this panel shows (the f filter, or a session of another
+// project root): the project's rows, else the official list, else what the notice carries about it
+function peerRow(sessionId: string, carried: Record<string, unknown> = {}): Row {
+  const shown = projectRows.find(f => f.sessionId === sessionId && !f.current)
+  if (shown) return shown
+  const s = lastList.find(x => x.sessionId === sessionId)
+  const id = typeof s?.id === 'string' && s.id ? s.id : typeof carried.id === 'string' && /^[0-9a-f]{8}$/.test(carried.id) ? carried.id : null
+  const title = String((typeof s?.name === 'string' && s.name) || (typeof carried.title === 'string' && carried.title) || id || sessionId.slice(0, 8)).slice(0, 80)
+  const background = s ? s.kind === 'background' : carried.background !== false
+  return {
+    sessionId,
+    id,
+    title,
+    color: 'green',
+    time: '',
+    model: '',
+    context: '',
+    current: false,
+    background,
+    outdated: false,
+    pinned: false,
+    noPanel: false,
+    otherFormat: false,
+    // It sent this session a notice of this format, or this session sent it one: its mod answers
+    reachable: true,
+    ref: '',
+    section: '',
+    sectionTitle: '',
+    usd: null,
+    badge: '',
+    tint: '',
+    line: '',
+    needsPerson: false,
+    depth: 0,
+    folded: false,
+    helpers: 0,
+    stale: false,
   }
 }
 
@@ -1619,12 +1682,19 @@ async function decide($: any, f: Row, topic: Topic) {
   // If that session is already waiting for you (a permission, a question), this question would queue up behind that one
   // and on arriving you'd answer its own by mistake: so it's asked here.
   // First go there, then send the question: if going failed, no question is left waiting where nobody sees it
-  const askThere = topic !== 'remove' && f.color !== 'red' && f.reachable
-  if (askThere && (await frontWindowShowingMe($)) && (await jump($, f, false))) {
-    pendingAsk = { sessionId: f.sessionId, at: await $.clock.now(), fallback, topic, detail }
-    if (!(await sendNotice($, f, 'ask', { from: myId, topic, detail }))) {
+  // A session that can't send notices (its agent has no SendMessage) asks here: the question couldn't go there
+  const askThere = topic !== 'remove' && f.color !== 'red' && f.reachable && (await canMessage($))
+  const front = askThere ? await frontWindowShowingMe($) : null
+  if (askThere && front && (await jump($, f, false))) {
+    pendingAsk = { sessionId: f.sessionId, at: await $.clock.now(), fallback, topic, detail, target: f }
+    // What that session needs to come back here and answer, even when its panel doesn't show this one (its f filter,
+    // or another project root)
+    const own = projectRows.find(x => x.current)
+    const why = await noticeTo($, f, 'ask', { from: myId, topic, detail, id: myShortId(), title: own?.title ?? '', background: me().background })
+    if (why) {
       pendingAsk = undefined
-      $.ui.toast(`Couldn't ask “${f.title}”; nothing was changed`)
+      await comeBack($, front, f)
+      $.ui.toast(`Couldn't ask “${f.title}” (${why}); nothing was changed`)
     }
     return
   }
@@ -1633,16 +1703,42 @@ async function decide($: any, f: Row, topic: Topic) {
   await focusRow($, f.sessionId, fallback)
 }
 
+// The window went to f, but the question couldn't follow it there: this session back in that window
+async function comeBack($: any, front: string, f: Row) {
+  const title = projectRows.find(x => x.current)?.title ?? myShortId()
+  const v = await windows($)
+  if (me().background && f.id && (v.byId[f.id] ?? []).includes(front) && (await switchInPlace($, { command: 'attach', id: myShortId(), title }, front))) return
+  await platform.bringWindow(sys($), front, title)
+}
+
 // In the session being acted on: the question shows up here; once answered, the window goes back to the session it was
 // asked from and the answer is handed to it so it does it. If it can't be shown here (unshown), the window goes back
-// all the same and that session asks in its own window
-async function answerQuestion($: any, from: string, topic: Topic, detail: string) {
-  const own = (await read($, rows)).find(f => f.current)
+// all the same and that session asks in its own window. The answer goes as a notice; a session whose agent has no
+// SendMessage can't send one, so it leaves the answer in the store (answer:<id>), where that session's panel looks
+async function answerQuestion($: any, data: Record<string, unknown>) {
+  const from = String(data.from ?? '')
+  const topic: Topic = data.topic === 'restart' ? 'restart' : 'stop'
+  const detail = typeof data.detail === 'string' ? data.detail.slice(0, 300) : ''
+  const own = projectRows.find(f => f.current)
   const asked = await askQuestion($, own?.title ?? 'this session', topic, detail)
-  const origin = (await read($, rows)).find(f => f.sessionId === from)
-  const cameBack = origin ? await jump($, origin, false) : false
-  if (asked.unshown && origin && !cameBack) $.ui.toast(`Couldn't show the question here: go back to “${origin.title}”, which asks it`)
-  if (origin) await sendNotice($, origin, 'answer', { sessionId: myId, action: asked.unshown ? UNSHOWN : (asked.action ?? 'cancel'), cameBack })
+  const origin = peerRow(from, data)
+  const action = asked.unshown ? UNSHOWN : (asked.action ?? 'cancel')
+  const cameBack = await jump($, origin, false)
+  const why = await noticeTo($, origin, 'answer', { sessionId: myId, action, cameBack })
+  const handed = !why || (await storeSet($, `answer:${from}`, { format: FORMAT, sessionId: myId, action, cameBack, at: await $.clock.now() }))
+  if (!handed) $.ui.toast(`Couldn't hand the answer to “${origin.title}” (${why}): nothing was changed, go back to it`)
+  else if (asked.unshown && !cameBack) $.ui.toast(`Couldn't show the question here: go back to “${origin.title}”, which asks it`)
+}
+
+// The answer a session that couldn't send notices left in the store for this one (answerQuestion), while a question
+// of this one waits
+async function checkStoredAnswer($: any) {
+  if (!pendingAsk) return
+  const a = await storeGet($, `answer:${myId}`)
+  if (!a || typeof a !== 'object') return
+  await storeDelete($, `answer:${myId}`)
+  if (Number(a.format) !== FORMAT || !(Number(a.at) >= pendingAsk.at)) return
+  await receiveAnswer($, a)
 }
 
 // Back in this session: do what was chosen over there (only if it's the answer to the question that was sent). If the
@@ -1650,12 +1746,13 @@ async function answerQuestion($: any, from: string, topic: Topic, detail: string
 async function receiveAnswer($: any, data: Record<string, unknown>) {
   const now = await $.clock.now()
   if (!pendingAsk || pendingAsk.sessionId !== data.sessionId || now - pendingAsk.at > 600000) return
-  const { fallback, topic, detail } = pendingAsk
+  const { fallback, topic, detail, target } = pendingAsk
   pendingAsk = undefined
-  const f = (await read($, rows)).find(x => x.sessionId === data.sessionId)
-  const action = data.action === UNSHOWN && f ? await askDialog($, f.title, topic, detail) : data.action
+  // The row as it is now, or as it was when it was asked (this panel may not show it any more: the f filter)
+  const f = projectRows.find(x => x.sessionId === data.sessionId && !x.current) ?? target
+  const action = data.action === UNSHOWN ? await askDialog($, f.title, topic, detail) : data.action
   // If the window couldn't come back here, it still shows that session: it isn't closed
-  if (f && (action === 'stop' || action === 'stop-rm' || action === 'restart')) await perform($, f, action, data.cameBack === true)
+  if (action === 'stop' || action === 'stop-rm' || action === 'restart') await perform($, f, action, data.cameBack === true)
   await focusRow($, String(data.sessionId), fallback)
 }
 
@@ -2005,10 +2102,11 @@ async function rename($: any, text: string) {
       return
     }
     const f = (await read($, rows)).find(x => x.sessionId === r.sessionId)
-    if (f && (await sendNotice($, f, 'rename', { name }))) {
+    const why = f ? await noticeTo($, f, 'rename', { name }) : "it isn't in the list"
+    if (!why) {
       $.ui.toast(`Renaming “${r.title}” to “${name}”…`)
     } else {
-      $.ui.toast(`“${r.title}” doesn't answer (its panel isn't running, or runs another version): use /rename there`)
+      $.ui.toast(`Couldn't rename “${r.title}” from here (${why}): use /rename there`)
     }
   } catch {
     $.ui.toast(`Couldn't rename “${r.title}”`)
@@ -2801,6 +2899,7 @@ async function start($: any) {
       await update($, usageView, () => ({ period: view.period, scope: view.scope }))
     }
     $.clock.every(500, () => {
+      bg(checkStoredAnswer($))
       bg(checkInbox($))
       bg(runLaunches($))
       bg(runWakes($))
@@ -2960,9 +3059,7 @@ export const register: Register = (on, options) => {
         return { consumed: 'sessions: focus the panel after a switch' }
       }
       if (n.kind === 'ask') {
-        const from = String(d.from ?? '')
-        const detail = typeof d.detail === 'string' ? d.detail.slice(0, 300) : ''
-        if (active && from) bg(answerQuestion($, from, d.topic === 'restart' ? 'restart' : 'stop', detail))
+        if (active && d.from) bg(answerQuestion($, d))
         return { consumed: 'sessions: ask here about stopping or restarting this session' }
       }
       if (n.kind === 'answer') {
