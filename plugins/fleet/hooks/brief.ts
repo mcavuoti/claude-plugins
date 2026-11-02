@@ -53,7 +53,7 @@ export type BriefFacts = {
   judges?: string[]
 }
 
-const SHOWN = 15
+export const SHOWN = 15
 
 function kindWords(n: number, one: string, many: string): string {
   return n ? `${n} ${n === 1 ? one : many}` : ''

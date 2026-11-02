@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { FleetInflight, FleetMark, FleetRead } from '../types'
 import { OUTSIDE_TOOLS, checkResource, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, markWords, preAnswer, resourceDelivery, resourceTicket, type OutsideMark, type ResourceSpec } from './authority'
-import { CHIEF_PROMPT, briefText, chiefLines, closedLine, type BriefFacts, type BriefNeed } from './brief'
+import { CHIEF_PROMPT, SHOWN as BRIEF_SHOWN, briefText, chiefLines, closedLine, type BriefFacts, type BriefNeed } from './brief'
 import {
   OUTBOUND_FORMAT,
   SEND_DESCRIPTION,
@@ -143,11 +143,14 @@ import {
   TASTE_DESCRIPTION,
   TASTE_SCHEMA,
   agreementOf,
-  agreementRate,
   areaOf,
-  belowAgreement,
+  demoteCheck,
+  liveActs,
   liveGate,
   liveWords,
+  markSeen,
+  modelCheck,
+  reviewedBy,
   newJudgesState,
   overruleText,
   promoteCheck,
@@ -177,6 +180,8 @@ import {
   statuteOf,
   tasteResult,
   usdText,
+  WINDOW,
+  WINDOW_OVERRULES,
   type JudgeConfig,
   type JudgeEntry,
   type JudgeFile,
@@ -5540,9 +5545,10 @@ async function judgeDecision($: any, rec: QueueRecord) {
 }
 
 /** What a live area lets the judge do with its verdicts: nothing unless the asker's own flags say reversible, no
- * money, inside the project, and today's cap isn't reached; then send it back (any question malformed), or answer the
- * questions it decided whose citations check as a live answer's must (recheck: an exact repeat needs none). The rest
- * wait for the person; the judge file says why */
+ * money, inside the project, and today's cap isn't reached; then answer the exact repeats; and once the model's own
+ * verdicts earned it in the area (modelCheck, the owner's D3), send it back (any question malformed), or answer the
+ * questions it decided whose citations check as a live answer's must (recheck). The rest wait for the person; the
+ * judge file says why */
 async function liveAction($: any, rec: QueueRecord, file: JudgeFile, now: number, recheck: (v: Verdict) => Verdict): Promise<{ sendBack: string | null; answer: Verdict[] }> {
   const none = { sendBack: null, answer: [] }
   if (!rec.area || file.gated) return none
@@ -5558,37 +5564,52 @@ async function liveAction($: any, rec: QueueRecord, file: JudgeFile, now: number
     file.liveWhy = `today's ${judgesCfg.perDay} live answers in the project are used up`
     return none
   }
+  const model = modelCheck(statsOf(await judgedEntries($)).get(rec.area), judgesCfg)
   const back = file.verdicts.find(v => v.outcome === 'send-back')
-  if (back) return { sendBack: back.why, answer: [] }
+  if (back && model.ok) return { sendBack: back.why, answer: [] }
   const answer: Verdict[] = []
   const left: string[] = []
+  let waiting = !!back
   for (const v of file.verdicts) {
     if (v.outcome !== 'decided' || v.option === undefined || v.unchecked) continue
     if (v.repeat) answer.push(v)
+    else if (!model.ok) waiting = true
     else {
       const strict = recheck(v)
       if (strict.outcome === 'decided') answer.push(v)
       else left.push(`${v.q}) ${strict.unchecked?.problem ?? 'its citations'}`)
     }
   }
-  if (left.length) file.liveWhy = `not as a live answer: ${left.join('; ')}`
+  const whys = [...(waiting ? [`${model.why}: they only propose here`] : []), ...(left.length ? [`not as a live answer: ${left.join('; ')}`] : [])]
+  if (whys.length) file.liveWhy = whys.join('; ')
   return { sendBack: null, answer }
 }
 
-/** The register's judged choices, as /fleet stats counts them: with the questions the person overruled */
+/** The register's judged choices, as /fleet stats counts them: with the questions the person overruled, and whether
+ * he reviewed its live answers (saw them listed an hour ago or more: state/judges.json's seen) */
 async function judgedEntries($: any): Promise<(StatsInput & { id: string; at: number; record: RegisterRecord })[]> {
   const { records, overrules } = await registerAll($)
   const over = new Map(overrules.map(o => [o.id, o]))
+  const seen = (await judgesStateNow($)).seen ?? {}
+  const now = await $.clock.now()
   return records
     .filter(r => r.source === 'decide' && r.kind === undefined && r.judge)
     .map(r => {
       const o = over.get(r.id)
       const overruled = o ? o.answers.flatMap((a, i) => (a ? [i + 1] : [])) : []
-      return { id: r.id, at: r.at, record: r, area: r.area ?? null, judge: r.judge as JudgeEntry, ...(overruled.length ? { overruled } : {}) }
+      return { id: r.id, at: r.at, record: r, area: r.area ?? null, judge: r.judge as JudgeEntry, ...(overruled.length ? { overruled } : {}), ...(reviewedBy(seen[r.id], now) ? { seen: true } : {}) }
     })
 }
 
-async function statsCommand($: any, area: string): Promise<string> {
+/** The person saw these decisions' live answers listed (in a listing he typed): they count as reviewed an hour later,
+ * unless he overrules them */
+async function sawLive($: any, ids: readonly string[], origin: string) {
+  if (origin !== 'composer' || !ids.length) return
+  const next = markSeen(await judgesStateNow($), ids, await $.clock.now())
+  if (next) await writeJudgesState($, next)
+}
+
+async function statsCommand($: any, area: string, origin: string): Promise<string> {
   await ensureWorld($)
   const c = judgesCfg
   const now = await $.clock.now()
@@ -5628,6 +5649,12 @@ async function statsCommand($: any, area: string): Promise<string> {
             .join('; ')
       lines.push(`   ${x.id} · ${ago(now - x.at)} ago · ${said}${j.usd ? ` · ${usdText(j.usd)}` : ''}`)
     }
+    // What he saw answered live here counts as reviewed (let stand) an hour from now, unless he overrules it
+    await sawLive(
+      $,
+      mine.filter(x => x.judge.answered?.length || x.judge.sentBack).map(x => x.id),
+      origin,
+    )
   } else if (stats.size) {
     for (const s of [...stats.values()].sort((a, b) => b.proposals - a.proposals || a.area.localeCompare(b.area))) lines.push(statsLine(s))
   } else lines.push('Nothing judged yet: the judges propose on each choice a background session asks you, and the stats count once you answer.')
@@ -5677,11 +5704,13 @@ async function judgesCommand($: any, c: Extract<Command, { kind: 'judges' }>, or
     const live = Object.entries(st.live).sort(([a], [b]) => a.localeCompare(b))
     lines.push(
       live.length
-        ? `Live: ${live.map(([area, x]) => `${area} (since ${ago(now - x.at)} ago${x.forced ? `, forced${x.why ? `: "${x.why}"` : ''}` : ''}; ${stats.get(area)?.live ?? 0} answered, ${stats.get(area)?.overruled ?? 0} overruled)`).join('; ')}. Shadow elsewhere.`
+        ? `Live: ${live.map(([area, x]) => `${area} (since ${ago(now - x.at)} ago${x.forced ? `, forced${x.why ? `: "${x.why}"` : ''}` : ''}; ${stats.get(area)?.live ?? 0} answered, ${stats.get(area)?.overruled ?? 0} overruled; ${modelCheck(stats.get(area), cfg).ok ? "the model's own verdicts answer too" : 'exact repeats only'})`).join('; ')}. Shadow elsewhere.`
         : 'Live: no area; the judges only propose (shadow).',
     )
     for (const [area, b] of Object.entries(st.back).sort(([, x], [, y]) => y.at - x.at).slice(0, 5)) lines.push(`Back to shadow: ${area} at ${clock(b.at, me.offsetMin)} (${ago(now - b.at)} ago): ${b.why}`)
-    lines.push(`To turn an area live: /fleet judges live <area> (it needs ${cfg.promote.proposals} proposals and ${Math.round(cfg.promote.agreement * 100)}% agreement on what the judge decided; --force "why" turns it on anyway, recorded); /fleet judges off <area>.`)
+    lines.push(
+      `To turn an area live: /fleet judges live <area> (it needs ${cfg.promote.proposals} proposals and ${Math.round(cfg.promote.agreement * 100)}% agreement on what the judge decided; --force "why" turns it on anyway, recorded); /fleet judges off <area>. There exact repeats answer at once; the model's own verdicts once ${cfg.promote.proposals} of them you compared agree ${Math.round(cfg.promote.agreement * 100)}% or more.`,
+    )
     for (const s of [...stats.values()].sort((a, b) => b.proposals - a.proposals || a.area.localeCompare(b.area))) lines.push(`  ${statsLine(s)}`)
     const taste = records.filter(r => r.source === 'taste' && r.taste).slice(-5)
     if (taste.length) {
@@ -5707,8 +5736,9 @@ async function judgesCommand($: any, c: Extract<Command, { kind: 'judges' }>, or
   }
   if (!cfg.on) return 'The judges are off (world.json says "judges": false): turn them on first.'
   if (st.live[area]) return `${area} is live already (since ${ago(now - st.live[area].at)} ago).`
-  const check = promoteCheck(statsOf(await judgedEntries($)).get(area), cfg)
-  const w = liveWords(area, check, c.force, cfg)
+  const areaStats = statsOf(await judgedEntries($)).get(area)
+  const check = promoteCheck(areaStats, cfg)
+  const w = liveWords(area, check, c.force, cfg, modelCheck(areaStats, cfg))
   if (!w.ok) return w.text
   st.live[area] = { at: now, by: here, ...(check.ok ? {} : { forced: true as const }), ...(c.why ? { why: c.why } : {}) }
   delete st.back[area]
@@ -5781,20 +5811,19 @@ async function overruleCommand($: any, c: Extract<Command, { kind: 'overrule' }>
   const v = (await askerViews($, [{ asker: rec.asker } as QueueRecord]))({ asker: rec.asker } as QueueRecord)
   lines.push(`${v.name} hears it as a message from fleet when it's idle. The correction is in the register: the judges read it from now on, ahead of their own answers.${judgesCfg.reviewer ? ` ${judgesCfg.reviewer} is told, to propose a principle.` : ''}`)
   log($, `${c.id} overruled by the person (in ${here})`)
-  // The area's agreement, with this correction counted: below the threshold it goes back to shadow
+  // The window, with this correction counted: 2 overrules among the last 10 live answers he reviewed (saw listed, or
+  // overruled) and the area goes back to shadow; one he never saw counts neither way
   const area = rec.area ?? null
   if (area) {
     const st = await judgesStateNow($)
-    const s = statsOf(await judgedEntries($)).get(area)
-    const rate = s ? agreementRate(s) : null
-    const words = `agreement on what the judge decided ${rate === null ? '—' : `${Math.round(rate * 100)}%`} (${s?.agreed ?? 0} of ${(s?.agreed ?? 0) + (s?.disagreed ?? 0)})`
-    if (st.live[area] && belowAgreement(s, judgesCfg)) {
+    const d = demoteCheck(liveActs(await judgedEntries($), area))
+    if (st.live[area] && d.demote) {
       delete st.live[area]
-      st.back[area] = { at: now, why: `its ${words} fell below ${Math.round(judgesCfg.promote.agreement * 100)}% when you overruled ${c.id}` }
+      st.back[area] = { at: now, why: `${d.words} when you overruled ${c.id}` }
       await writeJudgesState($, st)
       log($, `judges: ${area} back to shadow (${st.back[area]?.why})`)
-      lines.push(`Area ${area}: ${words}, below ${Math.round(judgesCfg.promote.agreement * 100)}%: back to shadow (the judges only propose there now; /fleet judges live ${area} turns it on again).`)
-    } else lines.push(`Area ${area}: ${words}${st.live[area] ? ', still live' : ''}.`)
+      lines.push(`Area ${area}: ${d.words}: back to shadow (the judges only propose there now; /fleet judges live ${area} turns it on again).`)
+    } else lines.push(`Area ${area}: ${d.words}${st.live[area] ? `, still live (${WINDOW_OVERRULES} of the last ${WINDOW} bring it back to shadow)` : ''}.`)
   }
   bg(beat($))
   return lines.join('\n')
@@ -6154,15 +6183,17 @@ async function intakeSpendToday($: any, now: number): Promise<{ usd: number; rec
 }
 
 /** The judges' part of the brief's "what changed": what they answered or sent back in live areas, the person's
- * overrules, and an area that went back to shadow by itself */
-async function judgeBriefLines($: any, since: number, offsetMin: number): Promise<string[]> {
+ * overrules, and an area that went back to shadow by itself. ids: the decisions whose live answers it lists */
+async function judgeBriefLines($: any, since: number, offsetMin: number): Promise<{ lines: string[]; ids: string[] }> {
   const { records, overrules } = await registerAll($)
   const overruled = new Set(overrules.map(o => o.id))
   const lines: string[] = []
+  const ids: string[] = []
   for (const r of records) {
     const j = r.judge
     if (!j || (r.closedAt ?? r.at) < since) continue
     const where = r.area ? ` (area ${r.area})` : ''
+    if ((j.answered?.length || j.sentBack) && lines.length < BRIEF_SHOWN) ids.push(r.id)
     if (j.answered?.length) {
       const cites = [...new Set(j.verdicts.filter(v => j.answered?.includes(v.q)).flatMap(v => v.cites))]
       lines.push(`the judge answered ${r.id}${where} for you, citing ${cites.join(', ')}${overruled.has(r.id) ? '' : `: /fleet overrule ${r.id} <answer> corrects it`}`)
@@ -6172,7 +6203,7 @@ async function judgeBriefLines($: any, since: number, offsetMin: number): Promis
   for (const o of overrules) if (o.at >= since) lines.push(`you overruled the judge on ${o.id}${o.area ? ` (area ${o.area})` : ''}${o.why ? `: "${o.why}"` : ''}`)
   const st = await judgesStateNow($)
   for (const [area, b] of Object.entries(st.back)) if (b.at >= since) lines.push(`area ${area} went back to shadow at ${clock(b.at, offsetMin)}: ${b.why}`)
-  return lines
+  return { lines, ids }
 }
 
 async function briefCommand($: any, chief: boolean, origin: string): Promise<string> {
@@ -6265,6 +6296,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     const u = await $.session.usage()
     windows = Array.isArray(u?.rateLimits) ? u.rateLimits.filter((x: any) => typeof x?.kind === 'string' && typeof x?.percentUsed === 'number') : []
   } catch {}
+  const judged = await judgeBriefLines($, since, me.offsetMin)
   const facts: BriefFacts = {
     now,
     me,
@@ -6300,9 +6332,11 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     derived: worldOn() ? (flagged.suspects?.derived ?? []).map(d => ({ path: d.path, kind: d.kind, owner: d.owner, pins: d.pins.map(x => `${x.pin} (now v${x.now})`) })) : [],
     slots: await slotsWaiting($),
     intakeSpend: await intakeSpendToday($, now),
-    judges: await judgeBriefLines($, since, me.offsetMin),
+    judges: judged.lines,
   }
   const text = briefText(facts)
+  // The live answers it listed: he saw them (they count as reviewed an hour from now, unless he overrules them)
+  await sawLive($, judged.ids, origin)
   if (!chief) return text
   // The chief's lines: one model call with its role file and the charter, over the brief (its own session isn't touched)
   const c = instances.find(i => i.role === 'chief') ?? instances.find(i => i.agent === 'chief')
@@ -6514,7 +6548,7 @@ async function fleetCommand($: any, e: any): Promise<string> {
   if (c.kind === 'init') return origin === 'composer' ? initCommand($, c.template, c.commitRegister) : onlyPerson('sets a project up', origin)
   if (!root) return `Not set up in this project: /fleet init sets it up in ${await $.session.root()}`
   if (c.kind === 'list') return listCommand($)
-  if (c.kind === 'stats') return statsCommand($, c.area)
+  if (c.kind === 'stats') return statsCommand($, c.area, origin)
   if (c.kind === 'judges') return judgesCommand($, c, origin)
   if (c.kind === 'overrule') return origin === 'composer' ? overruleCommand($, c, origin) : onlyPerson('overrules a judge', origin)
   // The world, accept and the roster's commands are the person's own too, like answers (below): typed at a terminal

@@ -4,9 +4,15 @@ import { cut, deliveryText, parseCommand, type Question, type QueueRecord } from
 import {
   JUDGE_SYSTEM,
   PRINCIPLES_TEXT,
-  belowAgreement,
+  REVIEW_MS,
+  demoteCheck,
   distinguishing,
   isGeneric,
+  liveActs,
+  markSeen,
+  modelCheck,
+  newJudgesState,
+  reviewedBy,
   sameQuestion,
   supportProblem,
   liveGate,
@@ -265,12 +271,22 @@ test('agreement, the register’s entry and /fleet’s line; the stats per area'
   ])
   const s = stats.get('storage')!
   expect([s.proposals, s.decided, s.repeats, s.agreed, s.disagreed, s.held, s.gated, s.calls]).toEqual([2, 2, 2, 1, 1, 1, 1, 2])
-  expect(statsLine(s)).toBe('storage: 2 proposals · 2 decided (2 exact repeats), agreed 1 of 2 (50%) · 0 sent back · 1 held · 1 held by a gate · $0.0006 in 2 calls')
+  expect([s.repeatAgreed, s.repeatDisagreed, s.modelAgreed, s.modelDisagreed]).toEqual([1, 1, 0, 0])
+  expect(statsLine(s)).toBe('storage: 2 proposals · 2 decided (2 exact repeats), agreed 1 of 2 (50%): repeats 1 of 2 (50%), model verdicts 0 of 0 (—) · 0 sent back · 1 held · 1 held by a gate · $0.0006 in 2 calls')
   expect(stats.get('(no area)')?.sentBack).toBe(1)
   const c = judgesOf(null).judges
   expect(promoteCheck(s, c)).toEqual({ ok: false, why: 'it has 2 proposals (it needs 30 proposals and 90% agreement on what the judge decided)' })
   expect(promoteCheck({ ...s, proposals: 40, agreed: 36, disagreed: 4 }, c).ok).toBe(true)
   expect(promoteCheck({ ...s, proposals: 40, agreed: 35, disagreed: 5 }, c).why).toContain('its agreement is 88%')
+  // 30 exact repeats and no model verdict: the area may go live, for the repeats; the model's own verdicts have no record
+  const repeat = { area: 'storage', judge: judgeEntryOf({ ...f, verdicts: [f.verdicts[0]!] }, [{ label: 'SQLite' }]) }
+  const repeats = statsOf(Array.from({ length: 30 }, () => repeat)).get('storage')
+  expect(promoteCheck(repeats, c)).toEqual({ ok: true, why: '30 proposals, 100% agreement' })
+  expect(modelCheck(repeats, c)).toEqual({ ok: false, why: "the model's own verdicts have 0 compared (they need 30 compared at 90%)" })
+  const own = (label: string) => ({ area: 'storage', judge: judgeEntryOf({ ...f, verdicts: [{ q: 1, outcome: 'decided', option: 'SQLite', cites: ['principles.md:3'], why: '' }] }, [{ label }]) })
+  const model = statsOf([...Array.from({ length: 27 }, () => own('SQLite')), ...Array.from({ length: 3 }, () => own('Redis'))]).get('storage')
+  expect([model?.modelAgreed, model?.modelDisagreed, modelCheck(model, c)]).toEqual([27, 3, { ok: true, why: "the model's own verdicts: 30 compared, 90% agreement" }])
+  expect(modelCheck(statsOf([...Array.from({ length: 26 }, () => own('SQLite')), ...Array.from({ length: 4 }, () => own('Redis'))]).get('storage'), c).why).toBe("the model's own verdicts agree 87% (they need 30 compared at 90%)")
 })
 
 test('taste: its input, its number, and what the session is told by its provenance; an area of the project’s tags', () => {
@@ -293,19 +309,42 @@ test('live: the asker’s own word is needed (a flag left out says nothing); the
   expect(liveGate({ reversible: true, outsideWorld: false })).toBe("its asker didn't say it touches no money")
   expect(liveGate({ reversible: true, touchesMoney: false })).toBe("its asker didn't say it stays inside the project")
   const c = judgesOf(null).judges
-  expect(liveWords('storage', { ok: false, why: 'it has 3 proposals (…)' }, false, c).ok).toBe(false)
-  const forced = liveWords('storage', { ok: false, why: 'it has 3 proposals (…)' }, true, c)
+  const notYet = { ok: false, why: "the model's own verdicts have 0 compared (they need 30 compared at 90%)" }
+  expect(liveWords('storage', { ok: false, why: 'it has 3 proposals (…)' }, false, c, notYet).ok).toBe(false)
+  const forced = liveWords('storage', { ok: false, why: 'it has 3 proposals (…)' }, true, c, notYet)
   expect(forced.ok).toBe(true)
   expect(forced.text).toContain('Area storage is live (forced: it has 3 proposals (…); recorded).')
-  expect(forced.text).toContain('at most 20 a day in the project')
-  const s = statsOf([{ area: 'storage', judge: { area: 'storage', verdicts: [{ q: 1, outcome: 'decided', option: 'SQLite', cites: ['D-1'], why: '' }], agreed: [null], answered: [1] }, overruled: [1] }]).get('storage')!
-  expect([s.decided, s.live, s.overruled, s.agreed, s.disagreed]).toEqual([1, 1, 1, 0, 1])
-  expect(belowAgreement(s, c)).toBe(true)
-  const fine = statsOf([{ area: 'storage', judge: { area: 'storage', verdicts: [{ q: 1, outcome: 'decided', option: 'SQLite', cites: ['D-1'], why: '' }], agreed: [null], answered: [1] } }]).get('storage')!
-  expect([fine.live, fine.agreed, belowAgreement(fine, c)]).toEqual([1, 1, false])
+  expect(forced.text).toContain('when it\'s an exact repeat of your answer, labelled as the judge\'s; at most 20 a day in the project')
+  expect(forced.text).toContain("The model's own verdicts only propose there until they earn it apart (the model's own verdicts have 0 compared")
+  expect(forced.text).toContain('goes back to shadow once you overrule 2 of the last 10 live answers you reviewed')
+  expect(liveWords('storage', { ok: true, why: '30 proposals, 100% agreement' }, false, c, { ok: true, why: 'x' }).text).toContain("The model's own verdicts answer too")
+  // A live answer counts once the person reviewed it: overruled (not agreed), or seen listed and let stand (agreed)
+  const one = (extra: { overruled?: number[]; seen?: boolean }) => ({ area: 'storage', judge: { area: 'storage', verdicts: [{ q: 1, outcome: 'decided' as const, option: 'SQLite', cites: ['D-1'], why: '' }], agreed: [null], answered: [1] }, ...extra })
+  const s = statsOf([one({ overruled: [1] })]).get('storage')!
+  expect([s.decided, s.live, s.reviewed, s.overruled, s.agreed, s.disagreed, s.modelDisagreed]).toEqual([1, 1, 1, 1, 0, 1, 1])
+  const unseen = statsOf([one({})]).get('storage')!
+  expect([unseen.live, unseen.reviewed, unseen.agreed, unseen.disagreed]).toEqual([1, 0, 0, 0])
+  const seen = statsOf([one({ seen: true })]).get('storage')!
+  expect([seen.live, seen.reviewed, seen.agreed, seen.modelAgreed]).toEqual([1, 1, 1, 1])
+  expect(statsLine(s)).toContain('1 answered live (1 reviewed), 1 overruled')
   // A decision the judge sent back that the person answered anyway counts against it
   const back = statsOf([{ area: 'ui', judge: { area: 'ui', verdicts: [{ q: 1, outcome: 'send-back', cites: [], why: 'x' }], agreed: [null], sentBack: true }, overruled: [1] }]).get('ui')!
   expect([back.sentBack, back.overruled, back.disagreed]).toEqual([1, 1, 1])
+  // Back to shadow on a window: 2 overrules among the last 10 live answers he reviewed; one he never saw counts neither way
+  const entry = (n: number, extra: { overruled?: number[]; seen?: boolean }) => ({ id: `D-${n}`, at: AT + n * 60000, ...one(extra) })
+  const acts = (list: ReturnType<typeof entry>[]) => demoteCheck(liveActs(list, 'storage'))
+  expect(acts([entry(1, { overruled: [1] })])).toMatchObject({ demote: false, overruled: 1, reviewed: 1, words: 'you overruled 1 of the last 1 live answer you reviewed' })
+  expect(acts([entry(1, { overruled: [1] }), entry(2, {}), entry(3, { overruled: [1] })])).toMatchObject({ demote: true, overruled: 2, reviewed: 2 })
+  const many = [entry(1, { overruled: [1] }), ...Array.from({ length: 9 }, (_, i) => entry(i + 2, { seen: true })), entry(11, { overruled: [1] })]
+  expect(acts(many)).toMatchObject({ demote: false, overruled: 1, reviewed: 10 })
+  expect(acts([...Array.from({ length: 300 }, (_, i) => entry(i + 1, {})), entry(301, { overruled: [1] }), entry(302, { overruled: [1] })])).toMatchObject({ demote: true, overruled: 2, reviewed: 2 })
+  expect(liveActs([entry(1, {}), { ...entry(2, {}), area: 'ui' }], 'storage').length).toBe(1)
+  // What the person saw listed: kept once (its first time), and reviewed an hour later
+  const st = markSeen(newJudgesState(1), ['D-1', 'D-2'], AT)!
+  expect(st.seen).toEqual({ 'D-1': AT, 'D-2': AT })
+  expect(markSeen(st, ['D-1'], AT + 5000)).toBe(null)
+  expect(markSeen(st, ['D-1', 'D-3'], AT + 5000)?.seen).toEqual({ 'D-1': AT, 'D-2': AT, 'D-3': AT + 5000 })
+  expect([reviewedBy(AT, AT + REVIEW_MS - 1), reviewedBy(AT, AT + REVIEW_MS), reviewedBy(undefined, AT)]).toEqual([false, true, false])
 })
 
 test('/fleet judges and /fleet overrule: the grammar', () => {

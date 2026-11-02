@@ -9,10 +9,12 @@
 // precedents or statute lines it rests on), send-back (the question is malformed, or the files answer it), hold (it
 // needs the person). Code does the rest: the gates before any model (never money, the outside world, what can't be
 // undone, a question asked after reading outside content, a kind other than a choice), the exact repeats (no model),
-// every citation checked, the agreement once the person answers, the stats per area. In shadow it only proposes; in an
-// area the person turned live (0.7.0), it answers what the record settles, labelled as the judge's, sends back what's
-// malformed, and the person can overrule it: his correction is case law the judges read next time, and counts against
-// the area, which goes back to shadow once its agreement falls below the threshold.
+// every citation checked, the agreement once the person answers, the stats per area (the exact repeats and the model's
+// own verdicts apart). In shadow it only proposes; in an area the person turned live (0.7.0), it answers the exact
+// repeats, labelled as the judge's, and, once the model's own verdicts earned it apart (the owner's D3), what a checked
+// citation settles, and sends back what's malformed; the person can overrule it: his correction is case law the judges
+// read next time, and counts against the area, which goes back to shadow once he overrules 2 of the last 10 live
+// answers he reviewed.
 
 import type { OutsideMark } from './authority'
 import { hashText, type WorldConfig } from './changes'
@@ -662,29 +664,58 @@ export type AreaStats = {
   decided: number
   /** Of them, exact repeats found by code */
   repeats: number
+  /** Agreement on what the judge decided (the person's answer, or a live answer he reviewed), in all; and apart, on
+   * the exact repeats (code's) and on the model's own verdicts, which go live only on their own record */
   agreed: number
   disagreed: number
+  repeatAgreed: number
+  repeatDisagreed: number
+  modelAgreed: number
+  modelDisagreed: number
   sentBack: number
   held: number
   /** Decisions no judge looked at, held by a gate */
   gated: number
-  /** Questions a judge answered in a live area (0.7.0), and of them the ones the person overruled */
+  /** Questions a judge answered in a live area (0.7.0); of them the ones the person reviewed (saw listed, or
+   * overruled), and the ones he overruled */
   live: number
+  reviewed: number
   overruled: number
   usd: number
   calls: number
 }
 
 /** One closed decision as the stats read it: its area, the register's judge, and the questions it answered and the
- * person overruled (0.7.0) */
-export type StatsInput = { area: string | null; judge: Omit<JudgeEntry, 'id' | 'at'>; overruled?: number[] }
+ * person overruled (0.7.0); seen: the person saw its live answers listed (in /fleet brief or /fleet stats <area>) an
+ * hour ago or more and didn't overrule them, so they count as reviewed (REVIEW_MS); at: when it closed (the window) */
+export type StatsInput = { area: string | null; judge: Omit<JudgeEntry, 'id' | 'at'>; overruled?: number[]; seen?: boolean; at?: number }
 
 export const NO_AREA = '(no area)'
+/** How long after the person saw a live answer listed it counts as one he let stand */
+export const REVIEW_MS = 3600000
+/** An area goes back to shadow when he overrules WINDOW_OVERRULES of the last WINDOW live answers he reviewed */
+export const WINDOW = 10
+export const WINDOW_OVERRULES = 2
 
 export function emptyStats(area: string): AreaStats {
-  return { area, proposals: 0, decided: 0, repeats: 0, agreed: 0, disagreed: 0, sentBack: 0, held: 0, gated: 0, live: 0, overruled: 0, usd: 0, calls: 0 }
+  return { area, proposals: 0, decided: 0, repeats: 0, agreed: 0, disagreed: 0, repeatAgreed: 0, repeatDisagreed: 0, modelAgreed: 0, modelDisagreed: 0, sentBack: 0, held: 0, gated: 0, live: 0, reviewed: 0, overruled: 0, usd: 0, calls: 0 }
 }
 
+function tally(s: AreaStats, repeat: boolean, a: boolean | null) {
+  if (a === null) return
+  if (a) {
+    s.agreed++
+    if (repeat) s.repeatAgreed++
+    else s.modelAgreed++
+  } else {
+    s.disagreed++
+    if (repeat) s.repeatDisagreed++
+    else s.modelDisagreed++
+  }
+}
+
+/** The stats per area. What the person answered himself counts as agreement or not; a live answer counts only once he
+ * reviewed it (overruled: not agreed; seen and let stand: agreed); one he never saw counts neither way */
 export function statsOf(entries: readonly StatsInput[]): Map<string, AreaStats> {
   const out = new Map<string, AreaStats>()
   for (const e of entries) {
@@ -711,28 +742,35 @@ export function statsOf(entries: readonly StatsInput[]): Map<string, AreaStats> 
           s.live++
           if (over.has(v.q)) {
             s.overruled++
-            s.disagreed++
-          } else s.agreed++
+            s.reviewed++
+            tally(s, !!v.repeat, false)
+          } else if (e.seen) {
+            s.reviewed++
+            tally(s, !!v.repeat, true)
+          }
           continue
         }
-        const a = j.agreed[v.q - 1]
-        if (a === true) s.agreed++
-        else if (a === false) s.disagreed++
+        tally(s, !!v.repeat, j.agreed[v.q - 1] ?? null)
       }
     }
-    // A decision the judge sent back that the person answered anyway (0.7.0)
+    // A decision the judge sent back (0.7.0), the model's own verdict: answered anyway by the person (overruled), or
+    // seen and let stand
     if (j.sentBack && over.size) {
       s.overruled++
-      s.disagreed++
-    }
+      tally(s, false, false)
+    } else if (j.sentBack && e.seen) tally(s, false, true)
   }
   return out
 }
 
-/** The agreement on what the judge decided: agreed out of what the person answered (or let stand) */
+/** The agreement on what the judge decided: agreed out of what the person answered (or reviewed and let stand) */
 export function agreementRate(s: AreaStats): number | null {
   const n = s.agreed + s.disagreed
   return n ? s.agreed / n : null
+}
+
+function rate(agreed: number, disagreed: number): number | null {
+  return agreed + disagreed ? agreed / (agreed + disagreed) : null
 }
 
 function pct(r: number | null): string {
@@ -743,21 +781,23 @@ export function usdText(n: number): string {
   return n < 0.01 && n > 0 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`
 }
 
-/** One area's line for /fleet stats */
+/** One area's line for /fleet stats: the agreement in all, then apart on the exact repeats and the model's verdicts */
 export function statsLine(s: AreaStats): string {
   const r = agreementRate(s)
+  const of = (a: number, d: number) => `${a} of ${a + d} (${pct(rate(a, d))})`
   return [
     `${s.area}: ${s.proposals} proposal${s.proposals === 1 ? '' : 's'}`,
-    `${s.decided} decided (${s.repeats} exact repeat${s.repeats === 1 ? '' : 's'}), agreed ${s.agreed} of ${s.agreed + s.disagreed} (${pct(r)})`,
+    `${s.decided} decided (${s.repeats} exact repeat${s.repeats === 1 ? '' : 's'}), agreed ${s.agreed} of ${s.agreed + s.disagreed} (${pct(r)}): repeats ${of(s.repeatAgreed, s.repeatDisagreed)}, model verdicts ${of(s.modelAgreed, s.modelDisagreed)}`,
     `${s.sentBack} sent back`,
     `${s.held} held`,
     `${s.gated} held by a gate`,
-    ...(s.live || s.overruled ? [`${s.live} answered live, ${s.overruled} overruled`] : []),
+    ...(s.live || s.overruled ? [`${s.live} answered live (${s.reviewed} reviewed), ${s.overruled} overruled`] : []),
     `${usdText(s.usd)} in ${s.calls} call${s.calls === 1 ? '' : 's'}`,
   ].join(' · ')
 }
 
-/** Whether an area has earned live answers (0.7.0): enough proposals, and enough agreement on what the judge decided */
+/** Whether an area has earned live answers (0.7.0): enough proposals, and enough agreement on what the judge decided.
+ * What that turns on is the exact repeats; the model's own verdicts need modelCheck too */
 export function promoteCheck(s: AreaStats | undefined, c: JudgeConfig): { ok: boolean; why: string } {
   const p = s?.proposals ?? 0
   const r = s ? agreementRate(s) : null
@@ -765,6 +805,42 @@ export function promoteCheck(s: AreaStats | undefined, c: JudgeConfig): { ok: bo
   if (p < c.promote.proposals) return { ok: false, why: `it has ${p} proposal${p === 1 ? '' : 's'} (it needs ${need})` }
   if (r === null || r < c.promote.agreement) return { ok: false, why: `its agreement is ${pct(r)} (it needs ${need})` }
   return { ok: true, why: `${p} proposals, ${pct(r)} agreement` }
+}
+
+/** Whether the model's own verdicts (not exact repeats) have earned live answers in an area: promote.proposals of them
+ * the person compared (answered himself, or reviewed live), at promote.agreement. Checked at each answer, so they join
+ * a live area once they earn it, and leave it once they fall below. --force doesn't reach them (the owner's D3) */
+export function modelCheck(s: AreaStats | undefined, c: JudgeConfig): { ok: boolean; why: string } {
+  const a = s?.modelAgreed ?? 0
+  const n = a + (s?.modelDisagreed ?? 0)
+  const r = rate(a, n - a)
+  const need = `${c.promote.proposals} compared at ${Math.round(c.promote.agreement * 100)}%`
+  if (n < c.promote.proposals) return { ok: false, why: `the model's own verdicts have ${n} compared (they need ${need})` }
+  if (r === null || r < c.promote.agreement) return { ok: false, why: `the model's own verdicts agree ${pct(r)} (they need ${need})` }
+  return { ok: true, why: `the model's own verdicts: ${n} compared, ${pct(r)} agreement` }
+}
+
+/** A live act in an area: a question the judge answered, or a decision it sent back; reviewed when the person
+ * overruled it, or saw it listed and let it stand (seen) */
+export type LiveAct = { id: string; at: number; overruled: boolean; reviewed: boolean }
+
+export function liveActs(entries: readonly (StatsInput & { id: string })[], area: string): LiveAct[] {
+  const out: LiveAct[] = []
+  for (const e of entries) {
+    if ((e.area ?? NO_AREA) !== area || e.judge.gated) continue
+    const over = new Set(e.overruled ?? [])
+    const acts = [...(e.judge.answered ?? []).map(q => over.has(q)), ...(e.judge.sentBack ? [over.size > 0] : [])]
+    for (const o of acts) out.push({ id: e.id, at: e.at ?? 0, overruled: o, reviewed: o || !!e.seen })
+  }
+  return out.sort((a, b) => a.at - b.at)
+}
+
+/** The demotion window: of the last WINDOW live acts the person reviewed, how many he overruled. Ones he never saw
+ * count neither way. demote: WINDOW_OVERRULES or more */
+export function demoteCheck(acts: readonly LiveAct[]): { demote: boolean; overruled: number; reviewed: number; words: string } {
+  const last = acts.filter(a => a.reviewed).slice(-WINDOW)
+  const overruled = last.filter(a => a.overruled).length
+  return { demote: overruled >= WINDOW_OVERRULES, overruled, reviewed: last.length, words: `you overruled ${overruled} of the last ${last.length} live answer${last.length === 1 ? '' : 's'} you reviewed` }
 }
 
 // ---- Taste: the person's "no", recorded by the session that heard it (mcp__fleet__taste) ----
@@ -826,37 +902,55 @@ export function tasteResult(id: string, t: TasteSpec): string {
   return `Recorded as ${id} in the register, marked as not heard from the person directly (${why}): the judges don't read it until the person promotes it into .claude/fleet/principles.md.`
 }
 
-// ---- Live areas (0.7.0): state/judges.json, written by the person's /fleet judges and by an overrule that drops an
-// area's agreement below the threshold ----
+// ---- Live areas (0.7.0): state/judges.json, written by the person's /fleet judges, by an overrule that brings an
+// area back to shadow, and by the listings he typed that showed him live answers ----
 
-/** Which areas are live (since when, forced past the threshold, why) and which went back to shadow by themselves */
+/** Which areas are live (since when, forced past the threshold, why), which went back to shadow by themselves, and
+ * the live answers the person saw listed (a decision's id → when he first saw it; at most SEEN_KEPT) */
 export type JudgesState = {
   format: number
   live: Record<string, { at: number; forced?: true; why?: string; by?: string }>
   back: Record<string, { at: number; why: string }>
+  seen?: Record<string, number>
 }
+
+export const SEEN_KEPT = 500
 
 export function newJudgesState(format: number): JudgesState {
-  return { format, live: {}, back: {} }
+  return { format, live: {}, back: {}, seen: {} }
 }
 
-/** Whether an area's agreement fell below the threshold (only what the judge decided counts; how many proposals it
- * has doesn't: an area the person forced live goes back once the judge is wrong too often, not for being young) */
-export function belowAgreement(s: AreaStats | undefined, c: JudgeConfig): boolean {
-  const r = s ? agreementRate(s) : null
-  return r !== null && r < c.promote.agreement
+/** The state with these decisions marked as seen now (those seen before keep their time), or null when nothing is new */
+export function markSeen(s: JudgesState, ids: readonly string[], now: number): JudgesState | null {
+  const seen = { ...(s.seen ?? {}) }
+  const fresh = ids.filter(id => seen[id] === undefined)
+  if (!fresh.length) return null
+  for (const id of fresh) seen[id] = now
+  const kept = Object.entries(seen)
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, SEEN_KEPT)
+  return { ...s, seen: Object.fromEntries(kept) }
 }
 
-/** The words for an area going live, or the refusal: it hasn't earned it, and --force wasn't given */
-export function liveWords(area: string, check: { ok: boolean; why: string }, force: boolean, c: JudgeConfig): { ok: boolean; text: string } {
-  if (!check.ok && !force) return { ok: false, text: `Not turned live: ${area}: ${check.why}. /fleet stats ${area} shows it; /fleet judges live ${area} --force "why" turns it on anyway, recorded as forced.` }
+/** Whether the person reviewed a decision's live answers by now: he saw them listed REVIEW_MS ago or more */
+export function reviewedBy(seenAt: number | undefined, now: number): boolean {
+  return seenAt !== undefined && now - seenAt >= REVIEW_MS
+}
+
+/** The words for an area going live, or the refusal: it hasn't earned it, and --force wasn't given. model: whether the
+ * model's own verdicts have earned it there too (modelCheck); --force reaches only the exact repeats */
+export function liveWords(area: string, check: { ok: boolean; why: string }, force: boolean, c: JudgeConfig, model: { ok: boolean; why: string }): { ok: boolean; text: string } {
+  if (!check.ok && !force) return { ok: false, text: `Not turned live: ${area}: ${check.why}. /fleet stats ${area} shows it; /fleet judges live ${area} --force "why" turns it on anyway (for exact repeats), recorded as forced.` }
   return {
     ok: true,
     text: [
       `Area ${area} is live${check.ok ? ` (${check.why})` : ` (forced: ${check.why}; recorded)`}.`,
-      `In it, a question that passes every gate, and whose asker says it's reversible, touches no money and stays inside the project, is answered by the judge at once when the record settles it (an exact repeat, or a citation code checks), labelled as the judge's; at most ${c.perDay} a day in the project.`,
-      'One the judge finds malformed goes back to its asker with why; the rest wait for you as always.',
-      `/fleet overrule D-<n> <answer> ["why"] corrects one: the asker hears it, the judges read it next time, and ${area} goes back to shadow once its agreement falls below ${Math.round(c.promote.agreement * 100)}%. /fleet judges off ${area} stops it.`,
+      `In it, a question that passes every gate, and whose asker says it's reversible, touches no money and stays inside the project, is answered by the judge at once when it's an exact repeat of your answer, labelled as the judge's; at most ${c.perDay} a day in the project.`,
+      model.ok
+        ? `The model's own verdicts answer too (a citation of charter.md, principles.md or your answers that code checks), and one it finds malformed goes back to its asker with why: ${model.why}.`
+        : `The model's own verdicts only propose there until they earn it apart (${model.why}); then they answer too, and send back what's malformed.`,
+      'The rest wait for you as always.',
+      `/fleet overrule D-<n> <answer> ["why"] corrects one: the asker hears it, the judges read it next time, and ${area} goes back to shadow once you overrule ${WINDOW_OVERRULES} of the last ${WINDOW} live answers you reviewed (seen in /fleet brief or /fleet stats ${area}). /fleet judges off ${area} stops it.`,
     ].join('\n'),
   }
 }
