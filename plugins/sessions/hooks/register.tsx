@@ -953,7 +953,7 @@ async function notifyOnce($: any, claim: () => Promise<boolean>, text: () => str
   const message = text()
   const r = await tellPerson($, message)
   await storeSet($, 'lastPush', { at: now, text: message, from: myShortId(), ...r })
-  debugLine($, `notified “${message}”: phone ${r.phone}${r.notification ? `, notification ${r.notification}` : ''}`)
+  debugLine($, `notified: ${message} · phone ${r.phone}${r.notification ? `, notification ${r.notification}` : ''}`)
   return true
 }
 
@@ -2310,7 +2310,7 @@ async function notificationsText($: any, now: number): Promise<string> {
   const last = await storeGet($, 'lastPush')
   const lastText =
     last && typeof last === 'object'
-      ? ` · last, ${howLong(now - Number(last.at))} ago from ${String(last.from)}: “${String(last.text)}” (phone: ${String(last.phone)}${last.notification ? `; notification: ${String(last.notification)}` : ''})`
+      ? ` · last, ${howLong(now - Number(last.at))} ago from ${String(last.from)}: ${String(last.text)} (phone: ${String(last.phone)}${last.notification ? `; notification: ${String(last.notification)}` : ''})`
       : ''
   const lines = [`Notifications: ${when}${quiet}, ${count}${lastText}`]
   const burst = ledgerFor === myId && ledger ? spendBurst(ledger as any, now) : null

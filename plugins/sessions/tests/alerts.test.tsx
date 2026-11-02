@@ -125,7 +125,7 @@ test('a session waiting past waitPushMinutes: one push for that wait, its name o
   expect(w.notifies).toEqual(['“bravo” has been waiting for you for 11 min'])
   await w.clock.advance(5 * MIN)
   expect(w.pushes).toHaveLength(1)
-  expect(await status($)).toContain('1 of 5 today · last, 5 min ago from aaaaaaaa: ““bravo” has been waiting for you for 11 min” (phone: not sent (user_present); notification: not sent (no-channel))')
+  expect(await status($)).toContain('1 of 5 today · last, 5 min ago from aaaaaaaa: “bravo” has been waiting for you for 11 min (phone: not sent (user_present); notification: not sent (no-channel))')
   // Answered, then waiting again: a new wait, a new push
   sessions[1].status = 'idle'
   w.store.set('list', {})
