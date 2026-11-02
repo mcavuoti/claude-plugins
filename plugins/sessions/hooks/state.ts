@@ -476,6 +476,12 @@ export function parseKeyLines(text: string): Record<string, string> {
   return out
 }
 
+// One word for a POSIX shell (bash, zsh; fish reads it the same way): in single quotes, where nothing expands ($, `,
+// !), with each ' written as '\''
+export function shellQuote(word: string): string {
+  return `'${word.replace(/'/g, "'\\''")}'`
+}
+
 // A path as one file name: the order file of a project, the window file of a terminal
 export function fileKey(path: string): string {
   return path.replace(/\//g, '_')

@@ -62,6 +62,7 @@ import {
   sparkline,
   stopReasons,
   storeNamespace,
+  shellQuote,
   isRef,
   type StopReason,
   colorOf,
@@ -414,8 +415,10 @@ function windowFile(tty: string): string {
   return `${dataDir}/windows/${fileKey(tty)}`
 }
 
+// The shell command a new window runs (Terminal's do script, a Linux terminal's bash -c): every word in single quotes,
+// so a folder named with $(…), backticks or ! runs nothing
 function launcherCommand(t: WindowTarget): string {
-  return `cd ${JSON.stringify(myCwd)} && bash ${JSON.stringify(LAUNCHER)} ${t.command === 'attach' ? `attach ${t.id}` : 'agents'}`
+  return `cd ${shellQuote(myCwd)} && bash ${shellQuote(LAUNCHER)} ${t.command === 'attach' ? `attach ${shellQuote(t.id)}` : 'agents'}`
 }
 
 function agentsTarget(): WindowTarget {

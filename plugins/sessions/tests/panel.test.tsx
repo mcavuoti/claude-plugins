@@ -72,6 +72,7 @@ import {
   formatUsd,
   limitsText,
   waitingMembers,
+  shellQuote,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -456,6 +457,12 @@ test('order: the panel order (waiting, done, working, idle, stopped, then title)
   expect(back?.rows[2]).toEqual({ sessionId: 's4', color: 'green', id: 'cccccccc', title: 'alpha x' })
   expect(back?.rows[4]?.id).toBe(null)
   expect(fileKey('/Users/x/myapp')).toBe('_Users_x_myapp')
+})
+
+test("a new window's command: each word in single quotes, so nothing in a folder's name expands", () => {
+  expect(shellQuote('/Users/x/demo-$(echo INJECTED) `id` !!')).toBe("'/Users/x/demo-$(echo INJECTED) `id` !!'")
+  expect(shellQuote("/Users/x/it's here")).toBe("'/Users/x/it'\\''s here'")
+  expect(shellQuote('')).toBe("''")
 })
 
 test('shared files: key=value lines, one value per key, line breaks flattened', () => {
