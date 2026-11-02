@@ -270,6 +270,42 @@ test('a nudge: an idle instance whose shared file changed is prompted by its own
   expect(OWNER).toContain('mcp__fleet__*')
 })
 
+test('a dropped nudge keeps what it carried: the next nudge carries the change again, also after an Esc once the person typed', WITH_SESSIONS, async ($, on) => {
+  const w = await instance($, on, { files: { [`${ROOT}/notes/a.md`]: 'a\n', [`${FLEET}/roster.json`]: JSON.stringify({ ...JSON.parse(PROJECT[`${FLEET}/roster.json`] as string), wakes: { everyMin: 30, perDay: 5 } }) } })
+  await tick(w)
+  expect(w.submits.length).toBe(1)
+  await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/a.md` } as any)
+  // Owner B lands a change to it, as its fleet would
+  const before = w.files.get(`${ROOT}/notes/a.md`) as string
+  w.touch(`${ROOT}/notes/a.md`, 'a, by B\n')
+  const at = w.clock.now()
+  w.touch(`${FLEET}/events/${hourFolder(at)}/${at}-bbbbbbbb-1.json`, JSON.stringify({ format: 1, at, path: 'notes/a.md', from: hashText(before), to: hashText('a, by B\n'), via: 'tool', tool: 'Edit', blind: false, by: { sessionId: B_SID, agentId: null, ref: 'bbbbbbbb', name: 'Owner B' } }))
+  w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: `${at}-bbbbbbbb-1.json` }))
+  // The nudge is dropped: nothing it carried is told, and it isn't counted among the wakes
+  w.answerSubmit.value = () => ({ drop: 'the queue was cleared' })
+  await tick(w, 6000)
+  expect(w.submits.length).toBe(2)
+  expect(w.submits[1]).toContain('- notes/a.md: changed at')
+  expect(w.files.has(`${HB}/nudges.json`)).toBe(false)
+  // 30 s later the next one carries the change again; an Esc drops it too
+  w.answerSubmit.value = () => ({ drop: 'the session was stopped and nobody has sent input since' })
+  await tick(w, 31000)
+  expect(w.submits.length).toBe(3)
+  expect(w.submits[2]).toContain('- notes/a.md: changed at')
+  // Stopped: nothing more until the person types here (a command of his doesn't carry the digest)
+  await tick(w, 120000)
+  expect(w.submits.length).toBe(3)
+  w.answerSubmit.value = text => ({ text })
+  await $.prompt.submit({ text: '/fleet status', command: 'fleet', origin: { kind: 'composer' }, wait: false } as any)
+  await tick(w, 40000)
+  expect(w.submits.length).toBe(4)
+  expect(w.submits[3]).toContain('- notes/a.md: changed at')
+  expect(json(w, `${HB}/nudges.json`)).toMatchObject({ format: 1, count: 1 })
+  // Told now: the next step doesn't carry it again
+  const step: any = await $.tool.call({ tool: 'Bash', command: 'true' } as any)
+  expect((step.context ?? []).join('\n')).not.toContain('notes/a.md')
+})
+
 test('an instance at a permission prompt: its heartbeat says so, with its mode; the sweeper marks its row, which needs the person', WITH_SESSIONS, async ($, on) => {
   on('classic.PermissionRequest', () => ({}))
   on('classic.PostToolUse', () => ({}))

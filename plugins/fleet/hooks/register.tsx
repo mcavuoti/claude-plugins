@@ -337,6 +337,8 @@ const intakeTold = atom({ plugin: 'fleet', key: 'intakeTold' } as const, {} as R
 const slotTold = atom({ plugin: 'fleet', key: 'slotTold' } as const, {} as Record<string, number>)
 const slotWait = atom({ plugin: 'fleet', key: 'slotWait' } as const, [] as string[])
 const overruling = atom({ plugin: 'fleet', key: 'overruling' } as const, {} as Record<string, FleetInflight>)
+// A fresh period's hand-off, from the /clear until a turn carrying it starts
+const handoff = atom({ plugin: 'fleet', key: 'handoff' } as const, null as { text: string; at: number } | null)
 
 // This copy of the module: a hot reload makes a new one and drops the old one's timers and the submits it waited on
 const EPOCH = Math.random().toString(36).slice(2, 10)
@@ -3827,6 +3829,25 @@ async function seedText($: any, inst: Instance): Promise<string> {
     .join('\n\n')
 }
 
+/** A nudge's submit. What it carries is told (its lines, its count among the wakes) only once its turn started ({ text
+ * }): a { drop } keeps it all for the next nudge (after an Esc, once the person typed here), a failure too, 30 s later */
+function nudgeSubmit($: any, what: string, text: string, started: () => Promise<unknown>) {
+  const settle = async (why: string | null, stop: boolean) => {
+    if (why === null) await started()
+    else {
+      if (stop) await update($, stopped, () => true)
+      const now = await $.clock.now()
+      await update($, retryAt, r => Math.max(r, now + 30000))
+      log($, `${what}: ${why}; kept for the next one`)
+    }
+    await update($, nudgeAt, () => 0)
+  }
+  $.prompt.submit({ text }).then(
+    (r: any) => bg(r && typeof r.drop === 'string' ? settle(`dropped (${r.drop})`, /stopped|nobody has sent input/i.test(r.drop)) : settle(null, false)),
+    (err: unknown) => bg(settle(`failed (${String(err).slice(0, 200)})`, false)),
+  )
+}
+
 // A nudge: an idle instance whose shared files changed (or that owns flagged files) is prompted by its own fleet, at
 // most once per wakes.everyMin and wakes.perDay a day with the sweeper's wakes; never while it's down or over budget
 async function nudgeTick($: any) {
@@ -3835,10 +3856,19 @@ async function nudgeTick($: any) {
   await maybeSeed($)
   if (!(await read($, seedSent))) return
   const now = await $.clock.now()
-  if ((await read($, busy)) || (await read($, stopped)) || now - (await read($, idleSince)) < 30000) return
+  if ((await read($, busy)) || (await read($, stopped)) || now - (await read($, idleSince)) < 30000 || now < (await read($, retryAt))) return
   const pending = await read($, nudgeAt)
   if (pending && now - pending < 10 * 60000) return
   if (Object.keys(await read($, inflight)).length) return
+  // A fresh period's hand-off that didn't start its turn (dropped, or failed) goes before anything else: the cleared
+  // conversation has nothing else to go on from
+  const handing = await read($, handoff)
+  if (handing) {
+    await update($, nudgeAt, () => now)
+    log($, `fresh period for ${inst.name}: its hand-off again`)
+    nudgeSubmit($, 'the hand-off', handing.text, () => update($, handoff, () => null))
+    return
+  }
   if ((await downSet($)).has(inst.slug)) return
   if ((await budgets($)).find(x => x.inst.slug === inst.slug)?.state === 'over') return
   const day = today(now)
@@ -3852,7 +3882,6 @@ async function nudgeTick($: any) {
     await run($, ['mkdir', '-p', instDir(inst.slug)])
     await replace($, `${instDir(inst.slug)}/nudges.json`, json({ format: FORMAT, ...(mine?.cadenceFor !== undefined ? { cadenceFor: mine.cadenceFor } : {}), ...countWake(mine, now, day), ...extra }))
   }
-  const done = () => bg(update($, nudgeAt, () => 0))
   // A fresh period (decision 4a): a period-old conversation, idle, its journal written since it started
   const journal = await readText($, `${root}/${inst.journal}`)
   const journalAt = await mtimeOf($, `${root}/${inst.journal}`)
@@ -3867,30 +3896,33 @@ async function nudgeTick($: any) {
       await $.command.run({ command: 'clear', args: '' })
     } catch (err) {
       log($, `fresh period for ${inst.name}: /clear failed (${String(err).slice(0, 200)})`)
-      done()
+      await update($, nudgeAt, () => 0)
       return
     }
-    $.prompt.submit({ text: handoffText(inst, root, tail, tail.length === journal.replace(/\r\n/g, '\n').replace(/\n+$/, '').length) }).then(done, done)
+    // Kept until a turn carrying it starts: a dropped hand-off is submitted again (after the person types, after an Esc)
+    const text = handoffText(inst, root, tail, tail.length === journal.replace(/\r\n/g, '\n').replace(/\n+$/, '').length)
+    await update($, handoff, () => ({ text, at: now }))
+    nudgeSubmit($, 'the hand-off', text, () => update($, handoff, () => null))
     return
   }
   // The cadence: one nudge when nothing landed in a period (a negative result, in its journal, counts)
   const c = cadenceOf({ cadenceH: inst.cadenceH, lastLanding: Math.max(carried.lastLanding, await read($, landedAt), journalAt ?? 0) || null, startedAt: carried.startedAt || now, now })
   if (c.due && mine?.cadenceFor !== c.anchor) {
     await update($, nudgeAt, () => now)
-    await counted({ cadenceFor: c.anchor })
     log($, `cadence nudge to ${inst.name} (${hoursText(c.hours)} since its last landing)`)
-    $.prompt.submit({ text: cadenceNudgeText(inst, c.hours) }).then(done, done)
+    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours), () => counted({ cadenceFor: c.anchor }))
     return
   }
   const d = await digestFor($, 'main', false)
   if (!d.lines.length) return
-  // Told now: the nudge carries them (fleet's own prompt.submit hook then finds nothing more to add)
-  await d.told()
   await update($, nudgeAt, () => now)
-  await counted()
   log($, `nudge to ${inst.name}`)
   const text = `${d.lines.join('\n\n')}\n\nThis is a nudge from fleet (at most one every ${wakes.everyMin} min, ${wakes.perDay} a day): check whether your work still holds against these changes and update what depends on them, or end your turn if nothing does.`
-  $.prompt.submit({ text }).then(done, done)
+  // Told once its turn started: the nudge carries them (fleet's own prompt.submit hook doesn't see its own prompts)
+  nudgeSubmit($, 'the nudge', text, async () => {
+    await d.told()
+    await counted()
+  })
 }
 
 /** What an instance's model reads at the start of its conversation (classic.SessionStart, again after /clear and

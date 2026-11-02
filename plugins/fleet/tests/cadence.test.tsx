@@ -104,6 +104,32 @@ test('a fresh period: a period-old conversation, idle, its journal written: flee
   expect(cleared.length).toBe(1)
 })
 
+test('a fresh period whose hand-off is dropped (an Esc) hands it again once the person typed, and clears nothing more', WITH_SESSIONS, async ($, on) => {
+  const cleared: string[] = []
+  on('command.run', { command: 'clear' }, () => {
+    cleared.push('clear')
+    return { text: '' }
+  })
+  const w = await instance($, on, { cadenceH: 1 })
+  await tick(w)
+  await $.tool.call({ tool: 'Write', file_path: `${ROOT}/journals/owner-a.md`, content: '# Owner A\n\n- next: the second part\n' } as any)
+  w.answerSubmit.value = () => ({ drop: 'the session was stopped and nobody has sent input since' })
+  await tick(w, 61 * 60000)
+  expect(cleared).toEqual(['clear'])
+  expect(w.submits.length).toBe(2)
+  expect(w.submits[1]).toContain('This is a fresh period')
+  // Nothing while stopped; the person types, and the same hand-off goes again (no second /clear)
+  await tick(w, 5 * 60000)
+  expect(w.submits.length).toBe(2)
+  w.answerSubmit.value = text => ({ text })
+  await $.prompt.submit({ text: 'hello', origin: { kind: 'composer' }, wait: false } as any)
+  await tick(w, 10 * 60000)
+  expect(w.submits[2]).toBe(w.submits[1])
+  // Handed once it started: never again, and no second /clear (what follows is the period's own cadence nudge)
+  expect(w.submits.slice(3).filter(s => s.includes('This is a fresh period'))).toEqual([])
+  expect(cleared).toEqual(['clear'])
+})
+
 test('a role that keeps a long context is never cleared; one without a journal written this period is nudged instead', WITH_SESSIONS, async ($, on) => {
   const cleared: string[] = []
   on('command.run', { command: 'clear' }, () => (cleared.push('x'), { text: '' }))
