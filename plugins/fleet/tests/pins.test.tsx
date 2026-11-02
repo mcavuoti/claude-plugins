@@ -68,7 +68,7 @@ test('C10: a record cited at a version that has been revised: its owner hears it
   const w = world(on, { worldPaths: ['req/**', 'board/**'], files: { [R1]: 'R-1 v1\n', [B1]: WORK } })
   await begin($, w)
   // A record's read says which version it is
-  expect((await call($, { tool: 'Read', file_path: R1 })).context).toEqual(['fleet: this is R-1@1 (cite it so; fleet tells whoever cites it when it changes).'])
+  expect((await call($, { tool: 'Read', file_path: R1 })).context).toEqual(["fleet: this is R-1@1. It has no change: line, so every edit of it counts as a revision: cite it by version only where what you write rests on what it says now (a status or an owner isn't that)."])
   expect(json(w, `${STATE}/revs/R-1/1.json`)).toMatchObject({ format: 1, id: 'R-1', rev: 1, via: 'base', by: null, hash: hashText('R-1 v1\n') })
   await call($, { tool: 'Read', file_path: B1 })
   // W lands B-1, which makes it B-1's owner
@@ -93,7 +93,7 @@ test('C10: a record cited at a version that has been revised: its owner hears it
   expect(refused.deny).toMatch(new RegExp(`^fleet: this write cites records you need to read first \\(this write was not made\\):\\n- R-1@1: R-1 is at v2 now \\(a revision at ${WHEN} by TEST R\\)\\. Read req/R-1\\.md, decide whether your work still holds, then cite R-1@2`))
   expect(w.files.get(B1)).toContain('started')
   // It re-reads, moves the pin, and lands
-  expect((await call($, { tool: 'Read', file_path: R1 })).context).toEqual(['fleet: this is R-1@2 (cite it so; fleet tells whoever cites it when it changes).'])
+  expect((await call($, { tool: 'Read', file_path: R1 })).context).toEqual(["fleet: this is R-1@2. It has no change: line, so every edit of it counts as a revision: cite it by version only where what you write rests on what it says now (a status or an owner isn't that)."])
   const fixed = await call($, { tool: 'Edit', file_path: B1, old_string: 'relies_on: [R-1@1]', new_string: 'relies_on: [R-1@2]' })
   expect(fixed.deny).toBe(undefined)
   expect(fixed.context).toContain('fleet: board/B-1.md is now B-1@3.')
@@ -107,6 +107,25 @@ test('C10: a record cited at a version that has been revised: its owner hears it
   await tick(w)
   await tick(w)
   expect(json(w, `${STATE}/suspects.json`).suspects.map((s: any) => [s.path, s.reasons.map((r: any) => r.pin)])).toEqual([['board/B-1.md', ['R-1@1', 'R-1@2']]])
+})
+
+test('a journal is history: it cites what it read when, and is never suspect nor refused for a pin; a record with a change line is cited as usual', WITH_SESSIONS, async ($, on) => {
+  const J = `${ROOT}/journals/test-w.md`
+  const roster = { rosterFormat: 1, roles: { owner: { agent: 'owner' } }, instances: [{ name: 'TEST W', role: 'owner' }] }
+  const w = world(on, { worldPaths: ['req/**', 'board/**', 'journals/**'], files: { [R1]: '---\nchange: "addition: the first"\n---\nR-1 v1\n', [`${FLEET}/roster.json`]: JSON.stringify(roster) } })
+  await begin($, w)
+  expect((await call($, { tool: 'Read', file_path: R1 })).context).toEqual(['fleet: this is R-1@1 (cite it so; fleet tells whoever cites it when it changes).'])
+  expect((await call($, { tool: 'Write', file_path: J, content: '- read R-1@1\n' })).deny).toBe(undefined)
+  expect((await call($, { tool: 'Write', file_path: B1, content: WORK })).deny).toBe(undefined)
+  landByR(w, R1, '---\nchange: "revision: the second"\n---\nR-1 v2\n', 2)
+  await tick(w)
+  await tick(w)
+  // The board item that rests on R-1@1 is suspect; the journal that says it read R-1@1 isn't
+  expect(json(w, `${STATE}/suspects.json`).suspects.map((s: any) => s.path)).toEqual(['board/B-1.md'])
+  // A write of the journal still citing R-1@1 isn't refused
+  await call($, { tool: 'Read', file_path: J })
+  expect((await call($, { tool: 'Edit', file_path: J, old_string: '- read R-1@1\n', new_string: '- read R-1@1\n- then more\n' })).deny).toBe(undefined)
+  expect(await band($)).toContain('!! 1 flagged')
 })
 
 test('another session’s landing that keeps a stale pin after reading its record clears the suspect at once, before any scan here', WITH_SESSIONS, async ($, on) => {

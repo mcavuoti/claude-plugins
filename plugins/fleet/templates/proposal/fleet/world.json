@@ -1,6 +1,6 @@
 {
   "worldFormat": 1,
-  "paths": ["req/**", "findings/**", "board/**", "poc/**", "proposal/**", "plan/**", "brief/**", "notes/**", "journals/**", "ideas/**", "inputs/**"],
+  "paths": ["req/**", "findings/**", "board/**", "poc/**/*.md", "poc/results/**", "proposal/**", "plan/**", "brief/**", "notes/**", "journals/**", "ideas/**", "inputs/**"],
   "command": ["req/**"],
   "proposal": ["ideas/**"],
   "information": ["inputs/**"],

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { DEC, FLEET, ROOT, fleet, json, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
+import { DEC, FLEET, HOME, ROOT, fleet, json, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 
 // The person channel from the mod's side: the sweeper sends what waits for him and the closed list of alerts through
 // his channel, within its caps (a command he stamped gets the text on its standard input; a push goes through
@@ -78,6 +78,45 @@ test('a push channel: fleet’s own PushNotification from the sweeper passes; th
   // In this (the person's own) session the model's own push isn't fleet's to refuse
   const r: any = await $.tool.call({ tool: 'PushNotification', message: 'hi', status: 'proactive' } as any)
   expect(r.deny).toBe(undefined)
+})
+
+test('a push that never left (no Remote Control): the alert stays due, the next try backs off, and status says why', WITH_SESSIONS, async ($, on) => {
+  const pushed: string[] = []
+  on('tool.call', { tool: 'PushNotification' }, (_: any, e: any) => {
+    pushed.push(e.message)
+    return { result: { pushSent: false, localSent: false, disabledReason: 'Remote Control is off' } } as any
+  })
+  const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/roster.json`]: JSON.stringify({ rosterFormat: 1, roles: {}, instances: [], person: { channel: { kind: 'push' } } }), [`${DEC}/queue/D-1.json`]: queued('D-1', NOW - 40 * 60000) } })
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  for (let i = 0; i < 40; i++) await tick(w)
+  expect(pushed.length).toBe(1)
+  const a = json(w, `${FLEET}/state/alerts.json`)
+  expect(a).toMatchObject({ count: 1, failures: 1, problem: "alerts aren't reaching you: the sweeper (aaaaaaaa) has no Remote Control", last: { answer: 'push: not sent (Remote Control is off)' } })
+  expect(a.sent).toEqual({})
+  const status = await fleet($, 'status')
+  expect(status).toContain("  alerts aren't reaching you: the sweeper (aaaaaaaa) has no Remote Control")
+  expect(status).toContain('sweeper: this session (no Remote Control: a push alert doesn’t reach your phone)')
+  // Not every minute: 15 minutes later, then an hour
+  for (let i = 0; i < 10; i++) await tick(w, 60000)
+  expect(pushed.length).toBe(1)
+  for (let i = 0; i < 6; i++) await tick(w, 60000)
+  expect(pushed.length).toBe(2)
+  expect(json(w, `${FLEET}/state/alerts.json`)).toMatchObject({ count: 2, failures: 2 })
+  for (let i = 0; i < 30; i++) await tick(w, 60000)
+  expect(pushed.length).toBe(2)
+})
+
+test('a session with Remote Control takes the sweeper over from one without it', WITH_SESSIONS, async ($, on) => {
+  const other = { format: 1, sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', ref: 'bbbbbbbb', name: 'Owner B', at: NOW, remote: false }
+  const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/state/sweeper.json`]: JSON.stringify(other) } })
+  w.files.set(`${HOME}/.claude/jobs/aaaaaaaa/state.json`, JSON.stringify({ sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', state: 'idle', bridgeSessionId: 'session_x' }))
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  for (let i = 0; i < 3; i++) await tick(w)
+  expect(json(w, `${FLEET}/state/sweeper.json`)).toMatchObject({ sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', remote: true })
+  expect(w.logs.some(l => l.includes('sweeper: taking it over from Owner B (this session has Remote Control)'))).toBe(true)
+  expect(await fleet($, 'status')).toContain('sweeper: this session (Remote Control: a push reaches your phone)')
 })
 
 test("the model's own PushNotification in a background session of the project is refused", WITH_SESSIONS, async ($, on) => {

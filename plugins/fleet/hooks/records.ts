@@ -316,6 +316,12 @@ export function citeText(id: string, rev: number): string {
   return `fleet: this is ${id}@${rev} (cite it so; fleet tells whoever cites it when it changes).`
 }
 
+/** ... and with one that has no change line: every edit of it is a revision, so citing it by version flags whatever
+ * cites it at each edit (a journal never is: it's history) */
+export function uncitedText(id: string, rev: number, key: string): string {
+  return `fleet: this is ${id}@${rev}. It has no ${key}: line, so every edit of it counts as a revision: cite it by version only where what you write rests on what it says now (a status or an owner isn't that).`
+}
+
 // ---- Suspects ----
 
 export type Reason = {

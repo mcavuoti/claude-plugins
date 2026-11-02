@@ -124,7 +124,7 @@ import {
   type RegisterRecord,
 } from './decisions'
 import { applyEdits, applyVerdict, changeDelivery, changeTicket, checkChange, diffHead, draftName, lineDiff, sameHash, shortHash, type ChangeSpec } from './drafts'
-import { alertMessage, alertsDue, channelKey, channelScript, channelWords, inQuiet, mcpSendArgs, personOf, type Alert, type AlertsFile, type Channel } from './channel'
+import { afterSend, alertMessage, alertsDue, channelKey, channelScript, channelWords, inQuiet, mcpSendArgs, personOf, type Alert, type AlertsFile, type Channel, type SendOutcome } from './channel'
 import { circularOf, circularWords, derivedKindOf, derivedOf, derivedText, ownsKind, quietEnough, staleDerived, type DerivedKind } from './derived'
 import {
   CHARTER,
@@ -260,6 +260,7 @@ import {
   confirmedPins,
   checksKey,
   citeText,
+  uncitedText,
   commitMessage,
   copyOf,
   copyReadText,
@@ -339,6 +340,8 @@ const slotWait = atom({ plugin: 'fleet', key: 'slotWait' } as const, [] as strin
 const overruling = atom({ plugin: 'fleet', key: 'overruling' } as const, {} as Record<string, FleetInflight>)
 // A fresh period's hand-off, from the /clear until a turn carrying it starts
 const handoff = atom({ plugin: 'fleet', key: 'handoff' } as const, null as { text: string; at: number } | null)
+// What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing)
+const bandNote = atom({ plugin: 'fleet', key: 'bandNote' } as const, '')
 
 // This copy of the module: a hot reload makes a new one and drops the old one's timers and the submits it waited on
 const EPOCH = Math.random().toString(36).slice(2, 10)
@@ -651,6 +654,7 @@ async function start($: any) {
 function timers($: any) {
   if (timersOn || !root) return
   timersOn = true
+  $.clock.after(0, () => bg((async () => (sweep.bornAt = sweep.bornAt || (await $.clock.now())))()))
   if (jobRef) {
     $.clock.after(0, () => bg(rebuild($)))
     $.clock.every(2000, () => bg(deliver($).then(() => deliverOverrules($))))
@@ -1028,6 +1032,9 @@ async function beat($: any) {
   if (jobRef) await keepSection($, records, present)
   await refreshName($)
   await scanWorld($).catch(err => log($, `world scan: ${String(err).slice(0, 200)}`))
+  // What the band says besides the counts: nobody sweeps, the world too big to scan
+  const notes = [...((await sweeperState($)).nobody ? ['nobody sweeps'] : []), ...(tooBig && worldOn() ? ['world too big: no scan'] : [])].join(' · ')
+  if ((await read($, bandNote)) !== notes) await update($, bandNote, () => notes)
   await maybePrune($, records)
 }
 
@@ -1124,12 +1131,14 @@ const unexplained = new Map<string, { v: string | null; since: number }>()
 let baselined = false
 let worldStarted = false
 let tooBig = false
+let tooBigAt = 0
 let bashRunning = 0
 let readsTimer = false
 // This session as other sessions' digests name it, from $.sessions every 10 s
 let myName: string | null = null
 let myRef: string | null = null
-// A world past this many files isn't scanned after each command (the scan every 10 s still runs)
+// A world past this many files isn't scanned at all (neither every 10 s nor after a command): outside changes and
+// suspects are off, and the walk is tried again every 10 minutes or when world.json changes
 const MAX_WORLD_FILES = 5000
 const MiB4 = 4 * 1024 * 1024
 // What world.json says of records (records.ts); null with nothing to say, or when it's wrong (recordsProblem says why,
@@ -1168,6 +1177,14 @@ function revDir(id: string): string {
 /** The pins a world file cites; an intake record cites nothing (what an item from outside says isn't a citation) */
 function pinsFrom(text: string | null, rel: string): string[] {
   return records && text && !isIntakePath(rel) ? pinsOf(text, records).map(pinKey) : []
+}
+
+/** An instance's journal (the roster names each one's): history, not a claim. Its pins are recorded, but it's never
+ * a suspect nor refused for one, so it's never flagged or counted on the band */
+function isJournal(rel: string): boolean {
+  if (!roster) return false
+  const fold = (x: string) => (insensitive ? x.toLowerCase() : x)
+  return roster.instances.some(i => fold(i.journal) === fold(rel))
 }
 
 function isIntakePath(rel: string): boolean {
@@ -1268,6 +1285,8 @@ async function loadWorld($: any) {
   }
   worldProblem = ''
   world = { globs: p.world.paths, res: p.world.paths.map(g => globRegex(g, insensitive)), mtimeMs: st.mtimeMs }
+  // A world too big to scan is tried again at once with the new world.json
+  tooBigAt = 0
   const jc = judgesOf(p.world)
   judgesCfg = jc.judges
   for (const x of jc.problems) if (!judgesProblems.includes(x)) log($, x)
@@ -1582,7 +1601,10 @@ async function noteRead($: any, thread: string, path: unknown): Promise<string[]
     if (last && last.hash === f.v) rev = last.rev
   }
   await setRead($, thread, w.rel, f.v, rev)
-  return id && rev ? [citeText(id, rev)] : []
+  if (!id || !rev) return []
+  // A record with no change line counts every edit as a revision (a board item's status, say): cited by version, it
+  // makes every file that cites it suspect at each edit
+  return [f.text !== null && records && !changeOf(f.text, records.changeKey) ? uncitedText(id, rev, records.changeKey) : citeText(id, rev)]
 }
 
 // reads/<sessionId>.json, a second after a change (for /fleet status in other sessions, and after a restart)
@@ -1990,7 +2012,7 @@ async function gate($: any, e: any, next: any) {
   const v = verdict(mine, cur.v, strict ? undefined : told[w.rel])
   // The pins of what the write leaves: a stale one, or a new one of a record this thread never read, is told once
   const text = resultOf(e, cur.text)
-  const pins = text === null ? null : await checkPins($, thread, text, new Set(pinsFrom(cur.text, w.rel)))
+  const pins = text === null || isJournal(w.rel) ? null : await checkPins($, thread, text, new Set(pinsFrom(cur.text, w.rel)))
   const said = new Set((told[`pins:${w.rel}`] ?? '').split('\n').filter(Boolean))
   const fresh = pins ? pins.keys.filter(k => strict || !said.has(k)) : []
   if (v !== 'pass' || fresh.length) {
@@ -2098,10 +2120,12 @@ async function snapshot($: any): Promise<Snapshot | undefined> {
     return true
   }
   if (!(await walk('', 0))) {
-    if (!tooBig) log($, `the world has more than ${MAX_WORLD_FILES} files: no scan after each command (world.json can narrow it)`)
+    if (!tooBig) log($, `the world has more than ${MAX_WORLD_FILES} files: no scan at all, so outside changes and suspects are off (world.json can narrow it); tried again every 10 min`)
     tooBig = true
+    tooBigAt = await $.clock.now()
     return undefined
   }
+  tooBig = false
   return out
 }
 
@@ -2139,7 +2163,7 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     }
     const mine = (await read($, reads))[thread]?.[rel]
     // The pins of what the command left, as the gate would have checked them (it isn't held: it's marked)
-    const pc = f.text === null ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []))
+    const pc = f.text === null || isJournal(rel) ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []))
     const suspect = pc ? pc.problems.map(p => `${pinKey(p.pin)}:${p.why}`) : []
     const id = records ? idOf(rel, records) : null
     if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
@@ -2203,6 +2227,8 @@ async function bashHook($: any, e: any, next: any) {
 // without fleet), claimed no-clobber so that one session of the project records it
 async function scanWorld($: any) {
   if (!worldOn() || bashRunning > 0) return
+  // Past MAX_WORLD_FILES the walk stops: tried again every 10 minutes, or as soon as world.json changes
+  if (tooBig && (await $.clock.now()) - tooBigAt < 10 * 60000) return
   const snap = await snapshot($)
   if (!snap) return
   const now = await $.clock.now()
@@ -2302,16 +2328,18 @@ async function worldTick($: any) {
   await loadWorld($)
   if (world && !worldStarted) await startWorld($)
   await eventsTick($)
-  if (!worldOn()) return
+  // The sweeper runs whenever the project has fleet: answers to retired instances, alerts, intake and slots don't wait
+  // on the world (an empty, broken, newer or too big world.json turns off only the world's own parts)
   await lease($)
   await sweepTick($)
+  if (!worldOn()) return
   await loadFlags($)
   await refreshTrees($)
 }
 
 // ---- The sweeper: one session of the project, elected by a lease, every 60 s (and soon after each landing) ----
 
-const sweep = { holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0, running: false, dirty: false, intakeDirty: false, slotsDirty: false, lastRun: {} as Record<string, number>, commitNote: '', suspectsKey: '' }
+const sweep = { bornAt: 0, holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0, running: false, dirty: false, intakeDirty: false, slotsDirty: false, lastRun: {} as Record<string, number>, commitNote: '', suspectsKey: '' }
 
 // The lease, <project>/.claude/fleet/state/sweeper.json: whoever holds it rewrites it every 20 s; one older than 90 s
 // (or none) is taken by writing it, and the taker sweeps once it still finds itself there 2 s later (two that took it
@@ -2322,7 +2350,15 @@ async function lease($: any) {
   if (now - sweep.leaseAt < due) return
   sweep.leaseAt = now
   const sessionId = String(await $.session.id())
-  const st = leaseState(parseLease(await readText($, stateDir('sweeper.json'))), sessionId, now)
+  const held = parseLease(await readText($, stateDir('sweeper.json')))
+  let st = leaseState(held, sessionId, now)
+  // A push reaches the phone only from a session with Remote Control (D6): such a session takes the lease from one
+  // without it, and the holder gives it up at its next renewal
+  const remote = await remoteControl($)
+  if (st === 'held' && remote === true && (held as { remote?: boolean | null } | null)?.remote !== true) {
+    if (!sweep.takenAt) log($, `sweeper: taking it over from ${held?.name || held?.ref || 'a session'} (this session has Remote Control)`)
+    st = 'free'
+  }
   if (st === 'held') {
     if (sweep.holding) log($, 'sweeper: another session took it')
     sweep.holding = false
@@ -2335,9 +2371,26 @@ async function lease($: any) {
     sweep.dirty = true
     log($, 'sweeper: this session')
   } else if (st === 'free') sweep.takenAt = now
-  if (!(await replace($, stateDir('sweeper.json'), json({ format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: now })))) {
+  if (!(await replace($, stateDir('sweeper.json'), json({ format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: now, remote })))) {
     await run($, ['mkdir', '-p', stateDir()])
   }
+}
+
+/** Who sweeps, for /fleet status and the band: this session, another one, or nobody (no lease renewed for 5 min, or
+ * none since this session started 5 min ago: no session of the project runs fleet's sweeper, so answers to retired
+ * instances, alerts and intake wait) */
+async function sweeperState($: any): Promise<{ line: string; nobody: boolean }> {
+  const me = await meNow($)
+  const now = await $.clock.now()
+  const l = parseLease(await readText($, stateDir('sweeper.json'))) as (NonNullable<ReturnType<typeof parseLease>> & { remote?: boolean | null }) | null
+  if (sweep.holding) {
+    const remote = await remoteControl($)
+    return { line: `sweeper: this session${remote ? ' (Remote Control: a push reaches your phone)' : jobRef ? ' (no Remote Control: a push alert doesn’t reach your phone)' : ''}${sweep.lastSweep ? `, last sweep at ${clock(sweep.lastSweep, me.offsetMin)}` : ''}`, nobody: false }
+  }
+  if (l && now - l.at <= LEASE_MS) return { line: `sweeper: ${l.name || l.ref || l.sessionId.slice(0, 8)}${l.remote ? ' (Remote Control)' : ''}`, nobody: false }
+  const nobody = l ? now - l.at > 5 * 60000 : !!sweep.bornAt && now - sweep.bornAt > 5 * 60000
+  if (!nobody) return { line: 'sweeper: none right now (one is elected within a minute)', nobody: false }
+  return { line: `nobody sweeps${l ? ` since ${clock(l.at, me.offsetMin)}` : ''}: no session of this project is running fleet's sweeper, so answers to retired instances, alerts and intake wait (the README's "While you're away")`, nobody: true }
 }
 
 async function releaseLease($: any) {
@@ -2349,20 +2402,24 @@ async function releaseLease($: any) {
   if (marksSet.key) await setFleetMarks($, {}, await $.clock.now())
 }
 
-// Every 2 s: a full sweep every 60 s, and the suspects again soon after a landing anywhere in the project
+// Every 2 s: a full sweep every 60 s, and the suspects again soon after a landing anywhere in the project. The world's
+// parts (suspects, checks, the world commit) only while the world is on and this session has its baseline
 async function sweepTick($: any) {
-  if (!sweep.holding || sweep.running || !baselined) return
+  if (!sweep.holding || sweep.running) return
   const now = await $.clock.now()
   const full = now - sweep.lastSweep >= 60000
-  if (!full && !sweep.dirty && !sweep.intakeDirty && !sweep.slotsDirty) return
+  const worldUp = worldOn() && baselined
+  if (!full && !(sweep.dirty && worldUp) && !sweep.intakeDirty && !sweep.slotsDirty) return
   sweep.running = true
   try {
-    if (full || sweep.dirty) await computeSuspects($)
+    if (worldUp && (full || sweep.dirty)) await computeSuspects($)
     if (full || sweep.slotsDirty) await sweepSlotsNow($).catch(err => log($, `slots: ${String(err).slice(0, 200)}`))
     if (full) {
       sweep.lastSweep = now
-      await sweepChecks($)
-      await maybeCommit($)
+      if (worldUp) {
+        await sweepChecks($)
+        await maybeCommit($)
+      }
       await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
       await alertsTick($).catch(err => log($, `alerts: ${String(err).slice(0, 200)}`))
     }
@@ -2399,7 +2456,7 @@ async function computeSuspects($: any) {
       owner = e?.by ?? null
       if (e && e.to === k.v) ({ suspect: blind, confirmed } = e)
     }
-    if (k.pins?.length || blind?.length) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}), ...(confirmed ? { confirmed } : {}) })
+    if ((k.pins?.length || blind?.length) && !isJournal(rel)) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}), ...(confirmed ? { confirmed } : {}) })
   }
   const cited = new Map<string, Rev[]>()
   for (const id of new Set(facts.flatMap(f => f.pins.map(p => parsePin(p)?.id ?? '')))) if (id) cited.set(id, await revsFor($, id))
@@ -3078,37 +3135,43 @@ async function channelStamp($: any, c: Channel): Promise<{ ok: boolean; key: str
   return { ok: !!s && s.key === key, key }
 }
 
-/** One message to the person through his channel: what it answered, and whether it went (ok) */
-async function sendToPerson($: any, c: Channel, text: string): Promise<{ ok: boolean; answer: string }> {
+/** One message to the person through his channel: what it answered, and whether it went (sent), didn't (failed:
+ * refused, an error, a push that never left) or can't be told (unknown: no answer in time, it may have gone); problem:
+ * why alerts aren't reaching him, when that's known */
+async function sendToPerson($: any, c: Channel, text: string): Promise<{ outcome: SendOutcome; answer: string; problem?: string }> {
   if (c.kind === 'push') {
+    const who = myName || myRef || jobRef || 'this session'
     try {
       const r: any = await Promise.race([$.tool.call({ tool: 'PushNotification', message: text, status: 'proactive' }), $.clock.sleep(10000).then(() => null)])
-      if (!r) return { ok: true, answer: 'push: no answer in 10 s' }
-      if (r.deny) return { ok: false, answer: `push refused: ${String(r.deny).slice(0, 100)}` }
-      if (r.result?.pushSent === true) return { ok: true, answer: 'push: sent' }
-      if (r.result?.localSent === true) return { ok: true, answer: 'push: shown on this computer' }
-      return { ok: true, answer: `push: not sent (${String(r.result?.disabledReason ?? (r.isError ? r.text : 'no reason given')).slice(0, 100)})` }
+      if (!r) return { outcome: 'unknown', answer: 'push: no answer in 10 s' }
+      if (r.deny) return { outcome: 'failed', answer: `push refused: ${String(r.deny).slice(0, 100)}` }
+      if (r.result?.pushSent === true) return { outcome: 'sent', answer: 'push: sent' }
+      // Shown on this computer: the person's own session, where he is; a background session's screen nobody sees
+      if (r.result?.localSent === true && !jobRef) return { outcome: 'sent', answer: 'push: shown on this computer' }
+      const why = r.result?.localSent === true ? 'shown on a background session nobody looks at' : String(r.result?.disabledReason ?? (r.isError ? r.text : 'no reason given')).slice(0, 100)
+      return { outcome: 'failed', answer: `push: not sent (${why})`, problem: `alerts aren't reaching you: the sweeper (${who}) has no Remote Control` }
     } catch (err) {
-      return { ok: false, answer: `push: unavailable (${String(err).slice(0, 100)})` }
+      return { outcome: 'failed', answer: `push: unavailable (${String(err).slice(0, 100)})` }
     }
   }
   if (c.kind === 'mcp') {
     try {
       const res: any = await Promise.race([$.mcp.call(c.server, c.tool, mcpSendArgs(c, text, `fleet: ${(root ?? '').split('/').pop()}`)), $.clock.sleep(30000).then(() => ({ timeout: true }))])
-      if (res?.timeout) return { ok: false, answer: `mcp: ${c.tool} didn't answer within 30 s` }
+      if (res?.timeout) return { outcome: 'unknown', answer: `mcp: ${c.tool} didn't answer within 30 s` }
       const said = (Array.isArray(res?.content) ? res.content : []).map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join(' ').trim().slice(0, 120)
-      return res?.isError ? { ok: false, answer: `mcp: ${c.tool} answered an error${said ? `: ${said}` : ''}` } : { ok: true, answer: `mcp: sent to ${c.to}${said ? ` (${said})` : ''}` }
+      return res?.isError ? { outcome: 'failed', answer: `mcp: ${c.tool} answered an error${said ? `: ${said}` : ''}` } : { outcome: 'sent', answer: `mcp: sent to ${c.to}${said ? ` (${said})` : ''}` }
     } catch (err) {
-      return { ok: false, answer: `mcp: couldn't call ${c.tool} on ${c.server} (${String(err).slice(0, 120)})` }
+      return { outcome: 'failed', answer: `mcp: couldn't call ${c.tool} on ${c.server} (${String(err).slice(0, 120)})`, problem: `alerts aren't reaching you: ${c.server} isn't connected in the sweeper's session (configure it for the project or for you)` }
     }
   }
   if (c.kind === 'command') {
-    if (!(await channelStamp($, c)).ok) return { ok: false, answer: 'command: not stamped (/fleet accept channel lets fleet run it)' }
+    if (!(await channelStamp($, c)).ok) return { outcome: 'failed', answer: 'command: not stamped (/fleet accept channel lets fleet run it)' }
     const r = await run($, c.argv, { cwd: realRoot || (root as string), stdin: `${text}\n`, timeoutMs: 20000 })
     const out = (r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 120) ?? ''
-    return r.exitCode === 0 ? { ok: true, answer: `command: ran${out ? ` (${out})` : ''}` } : { ok: false, answer: `command: exit ${r.exitCode}${out ? ` (${out})` : ''}` }
+    if (r.exitCode === 0) return { outcome: 'sent', answer: `command: ran${out ? ` (${out})` : ''}` }
+    return { outcome: r.exitCode === 124 ? 'unknown' : 'failed', answer: `command: exit ${r.exitCode}${out ? ` (${out})` : ''}` }
   }
-  return { ok: false, answer: 'terminal: nothing is sent' }
+  return { outcome: 'failed', answer: 'terminal: nothing is sent' }
 }
 
 // Every full sweep: the alerts due now (the closed list), within the caps, as one message through the person's channel
@@ -3169,7 +3232,9 @@ async function alertsTick($: any) {
   const sent = await sendToPerson($, c, text)
   alertState.last = sent.answer
   log($, `alerts (${v.send.map(a => a.key).join(', ')}): ${sent.answer}`)
-  const next: AlertsFile = sent.ok ? { ...v.file, last: { at: now, text, answer: sent.answer } } : { ...(file ?? { format: FORMAT, day, count: 0, sent: {} }), last: { at: now, text, answer: sent.answer } }
+  // Every attempt counts toward perDay; a failure backs off (15 min, then an hour), a send with no answer isn't
+  // repeated for an hour
+  const next = afterSend(v.file, file, v.send, sent.outcome, { at: now, text, answer: sent.answer }, sent.problem ?? null)
   if (!(await replace($, stateDir('alerts.json'), json(next)))) {
     await run($, ['mkdir', '-p', stateDir()])
     await replace($, stateDir('alerts.json'), json(next))
@@ -3371,7 +3436,7 @@ async function worldStatus($: any): Promise<string[]> {
   if (!started) return [`world: ${globList(world.globs)} (not followed in this session: it isn't interactive)`]
   await pullEvents($)
   const me = await meNow($)
-  const lines = [`world: ${globList(world.globs)} (world.json)${tooBig ? `, more than ${MAX_WORLD_FILES} files: no scan after each command` : ''}`]
+  const lines = [`world: ${globList(world.globs)} (world.json)${tooBig ? `; world too big (more than ${MAX_WORLD_FILES} files): no scan, so outside changes and suspects aren't seen (narrow world.json's paths)` : ''}`]
   const last = recent.slice(-8).reverse()
   lines.push(last.length ? 'recent changes (newest first):' : 'recent changes: none in the last day')
   for (const e of last) lines.push(`  ${e.path}: ${changeLine(e, me)}${e.overwrote ? ', on top of a change it had not seen' : ''}`)
@@ -3443,15 +3508,6 @@ async function recordsStatus($: any, me: Me): Promise<string[]> {
     lines.push(bad.length ? 'failing a check:' : 'failing a check: nothing')
     for (const f of bad.slice(0, 20)) lines.push(`  ${f.path}: ${f.check}: ${f.message}`)
   }
-  const l = parseLease(await readText($, stateDir('sweeper.json')))
-  const now = await $.clock.now()
-  lines.push(
-    sweep.holding
-      ? `sweeper: this session${sweep.lastSweep ? `, last sweep at ${clock(sweep.lastSweep, me.offsetMin)}` : ''}`
-      : l && now - l.at <= LEASE_MS
-        ? `sweeper: ${l.name || l.ref || l.sessionId.slice(0, 8)}`
-        : 'sweeper: none yet (one is elected within a minute)',
-  )
   if (records.commitEveryMin) {
     let c: any = null
     try {
@@ -4570,7 +4626,7 @@ async function rosterTick($: any) {
     const slot = granted.find(l => l.holder.ref === retired.ref && leaseKey(l) !== had?.slotFor)
     const stale = derived.find(d => ownsKind(d, inst) && quietEnough(d, now) && d.key !== had?.derivedFor)
     const pointed = [...intakeEvents.values()].some(e => e.intake?.to.includes(inst.name) && e.at > Number((hb as Record<string, unknown>).intakeSeen ?? 0))
-    if (!answered && !quiet && !slot && !stale && !pointed && !(await isBehind($, hb.sessionId))) continue
+    if (!answered && !quiet && !slot && !stale && !pointed && !(worldOn() && baselined && (await isBehind($, hb.sessionId)))) continue
     const nudges = await readWire<WakeCount>($, `${instDir(inst.slug)}/nudges.json`)
     const others = nudges && nudges.day === day ? nudges.count : 0
     if (wakeVerdict(had ?? null, others, now, day, wakes, answered || !!slot) !== 'ok' || !(await has($, 'wake'))) continue
@@ -6037,7 +6093,8 @@ async function outsideStatus($: any): Promise<string[]> {
   )
   if (person.channel.kind !== 'terminal') {
     const today0 = a && a.day === today(now) ? a.count : 0
-    lines.push(`alerts: ${today0} of ${person.perDay} sent today${person.quiet ? `, quiet ${Math.floor(person.quiet.from / 60)}:${String(person.quiet.from % 60).padStart(2, '0')}-${Math.floor(person.quiet.to / 60)}:${String(person.quiet.to % 60).padStart(2, '0')}` : ''}${a?.held ? `, ${a.held} waiting (the cap or quiet hours)` : ''}${a?.last ? `; the last at ${clock(a.last.at, me.offsetMin)}: ${a.last.answer}` : ''}${alertState.problem && alertState.problem !== problem ? ` (${alertState.problem})` : ''}`)
+    lines.push(`alerts: ${today0} of ${person.perDay} sent today${person.quiet ? `, quiet ${Math.floor(person.quiet.from / 60)}:${String(person.quiet.from % 60).padStart(2, '0')}-${Math.floor(person.quiet.to / 60)}:${String(person.quiet.to % 60).padStart(2, '0')}` : ''}${a?.held ? `, ${a.held} waiting (the cap, quiet hours or a failed send)` : ''}${a?.last ? `; the last at ${clock(a.last.at, me.offsetMin)}: ${a.last.answer}` : ''}${a?.retryAt && a.retryAt > now ? `; trying again at ${clock(a.retryAt, me.offsetMin)}` : ''}${alertState.problem && alertState.problem !== problem ? ` (${alertState.problem})` : ''}`)
+    if (a?.problem) lines.push(`  ${a.problem}`)
   }
   const off = intakeOff()
   if (intakeCfg || intakeProblem) {
@@ -6093,6 +6150,7 @@ async function statusCommand($: any): Promise<string> {
     const present = await answerNames($)
     const waiting = records.filter(r => knownKind(r) && progress(r.id, slots(r), present).complete).length
     lines.push(`project: ${heldCount(records, present)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
+    lines.push((await sweeperState($)).line)
     await ensureWorld($)
     const spent = await judgeLedger($, await $.clock.now())
     const liveAreas = Object.keys((await judgesStateNow($)).live).sort()
@@ -6576,8 +6634,15 @@ export const register: Register = on => {
     const n = await read($, held)
     const f = await read($, flags)
     const o = await read($, overBudget)
-    if (n <= 0 && f <= 0 && o <= 0) return beneath
-    const parts = [...(n > 0 ? [`? ${n} for you`] : []), ...(f > 0 ? [`!! ${f} flagged`] : []), ...(o > 0 ? [`$ ${o} over budget`] : []), n > 0 ? '/fleet' : f > 0 ? '/fleet status' : '/fleet budget']
+    const note = await read($, bandNote)
+    if (n <= 0 && f <= 0 && o <= 0 && !note) return beneath
+    const parts = [
+      ...(n > 0 ? [`? ${n} for you`] : []),
+      ...(f > 0 ? [`!! ${f} flagged`] : []),
+      ...(o > 0 ? [`$ ${o} over budget`] : []),
+      ...(note ? [`! ${note}`] : []),
+      n > 0 ? '/fleet' : f > 0 || note ? '/fleet status' : '/fleet budget',
+    ]
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">

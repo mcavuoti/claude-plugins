@@ -127,21 +127,72 @@ export function channelWords(c: Channel): string {
 export type AlertKind = 'waiting' | 'budget' | 'nofleet' | 'check' | 'intake' | 'outside'
 export type Alert = { key: string; kind: AlertKind; text: string }
 
-/** <project>/.claude/fleet/state/alerts.json, the sweeper's: today's count, each key's last send, the last message */
-export type AlertsFile = { format: number; day: string; count: number; sent: Record<string, number>; held?: number; last?: { at: number; text: string; answer: string } }
+/** <project>/.claude/fleet/state/alerts.json, the sweeper's: today's count, each key's last send, the last message;
+ * after a send that failed, how many failed in a row and when to try again; the keys of a send nobody can tell went
+ * (a timeout: not sent again for an hour); and why alerts aren't reaching the person, while they aren't */
+export type AlertsFile = {
+  format: number
+  day: string
+  count: number
+  sent: Record<string, number>
+  held?: number
+  last?: { at: number; text: string; answer: string }
+  failures?: number
+  retryAt?: number
+  unknown?: Record<string, number>
+  problem?: string
+}
 
-/** Which alerts go now: those not sent in the last day, outside quiet hours (a budget's goes anyway), while today's
- * count is under perDay (one message carries every alert due at once, and counts once). The rest wait */
+/** How a send went: sent; failed (refused, an error, a push that didn't leave): the alerts stay due and the next try
+ * backs off; unknown (no answer in time: it may have gone): not sent again for an hour */
+export type SendOutcome = 'sent' | 'failed' | 'unknown'
+
+const ALERT_HOUR = 3600000
+
+/** Which alerts go now: those not sent in the last day (nor tried in the last hour with no answer), outside quiet
+ * hours (a budget's goes anyway), while today's count is under perDay (one message carries every alert due at once,
+ * and counts once, whether it went or not) and no back-off after a failure holds them. The rest wait */
 export function alertsDue(due: readonly Alert[], file: AlertsFile | null, p: { format: number; now: number; day: string; perDay: number; quiet: boolean }): { send: Alert[]; waiting: Alert[]; file: AlertsFile } {
-  const sent = Object.fromEntries(Object.entries(file?.sent ?? {}).filter(([, at]) => p.now - at < 24 * 3600000))
+  const sent = Object.fromEntries(Object.entries(file?.sent ?? {}).filter(([, at]) => p.now - at < 24 * ALERT_HOUR))
+  const unknown = Object.fromEntries(Object.entries(file?.unknown ?? {}).filter(([, at]) => p.now - at < ALERT_HOUR))
   const count = file && file.day === p.day ? file.count : 0
-  const fresh = due.filter(a => sent[a.key] === undefined)
+  const fresh = due.filter(a => sent[a.key] === undefined && unknown[a.key] === undefined)
   const allowed = fresh.filter(a => !p.quiet || a.kind === 'budget')
-  const send = count < p.perDay ? allowed : []
+  const backoff = !!file?.retryAt && p.now < file.retryAt
+  const send = count < p.perDay && !backoff ? allowed : []
   const waiting = fresh.filter(a => !send.includes(a))
   for (const a of send) sent[a.key] = p.now
-  const next: AlertsFile = { format: p.format, day: p.day, count: count + (send.length ? 1 : 0), sent, ...(waiting.length ? { held: waiting.length } : {}), ...(file?.last ? { last: file.last } : {}) }
+  const next: AlertsFile = {
+    format: p.format,
+    day: p.day,
+    count: count + (send.length ? 1 : 0),
+    sent,
+    ...(waiting.length ? { held: waiting.length } : {}),
+    ...(file?.last ? { last: file.last } : {}),
+    ...(file?.failures ? { failures: file.failures } : {}),
+    ...(file?.retryAt && backoff ? { retryAt: file.retryAt } : {}),
+    ...(Object.keys(unknown).length ? { unknown } : {}),
+    ...(file?.problem ? { problem: file.problem } : {}),
+  }
   return { send, waiting, file: next }
+}
+
+/** alerts.json after a send: sent, the keys stay sent; failed, they stay due (the count still counts it) and the next
+ * try waits 15 min, then an hour; unknown, they aren't sent again for an hour */
+export function afterSend(planned: AlertsFile, before: AlertsFile | null, send: readonly Alert[], outcome: SendOutcome, last: { at: number; text: string; answer: string }, problem: string | null): AlertsFile {
+  const rest: AlertsFile = { ...planned }
+  delete rest.failures
+  delete rest.retryAt
+  delete rest.problem
+  if (outcome === 'sent') return { ...rest, last }
+  const sent = { ...planned.sent }
+  for (const a of send) {
+    if (before?.sent[a.key] !== undefined) sent[a.key] = before.sent[a.key] as number
+    else delete sent[a.key]
+  }
+  if (outcome === 'unknown') return { ...rest, sent, unknown: { ...(planned.unknown ?? {}), ...Object.fromEntries(send.map(a => [a.key, last.at])) }, last, ...(problem ? { problem } : {}) }
+  const failures = (before?.failures ?? 0) + 1
+  return { ...rest, sent, last, failures, retryAt: last.at + (failures === 1 ? 15 : 60) * 60000, ...(problem ? { problem } : {}) }
 }
 
 /** One message for the alerts due at once: the project's name, the alerts (at most about 600 characters), and where to

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
+import { BAND, FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // Slots from the mod's side: mcp__fleet__slot takes a lease of a pool of one, a second taker waits in line, the
 // sweeper takes back a lease that ran out and gives it to the first in line, who hears it at its next step
@@ -21,6 +21,36 @@ function project(on: any, files: Record<string, string> = {}) {
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Tester 1', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'Tester 1', 'idle') } })
   return w
 }
+
+// The sweeper sweeps whatever the world is: with no paths (R1), or one too big to scan (R2), a lease that ran out is
+// still taken back
+const RAN_OUT = { [`${SLOTS}/0.json`]: JSON.stringify({ format: 1, slot: 'sim', n: 0, holder: OTHER, at: NOW - 40 * 60000, until: NOW - 60000, why: 'a long run' }) }
+
+test('R1: a world.json with no paths still has a sweeper: a lease that ran out is taken back', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: [], files: { [`${FLEET}/slots.json`]: JSON.stringify({ slotsFormat: 1, slots: { sim: { count: 1, leaseMin: 30, what: 'the simulator license' } } }), ...RAN_OUT } })
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  for (let i = 0; i < 40; i++) await tick(w)
+  expect(under(w, SLOTS)).toEqual([])
+  expect(w.logs.some(l => l.includes("slot sim: Tester 2's lease ran out: taken back"))).toBe(true)
+  expect(await fleet($, 'status')).toContain('sweeper: this session')
+})
+
+test('R2: a world too big to scan still has a sweeper, stops walking, and says so in status and the band', WITH_SESSIONS, async ($, on) => {
+  const many = Object.fromEntries(Array.from({ length: 5001 }, (_, i) => [`${ROOT}/notes/n${i}.md`, 'x\n']))
+  const w = project(on, { ...many, ...RAN_OUT })
+  await startSession($, w)
+  for (let i = 0; i < 40; i++) await tick(w)
+  expect(under(w, SLOTS)).toEqual([])
+  expect(await fleet($, 'status')).toContain("world too big (more than 5000 files): no scan, so outside changes and suspects aren't seen")
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await ui.drawn())).toContain('! world too big: no scan · /fleet status')
+  await ui.unmount()
+  // Narrowed, it's walked again at once
+  w.touch(`${FLEET}/world.json`, JSON.stringify({ worldFormat: 1, paths: ['notes/n1*.md'] }))
+  for (let i = 0; i < 10; i++) await tick(w)
+  expect(await fleet($, 'status')).not.toContain('world too big')
+})
 
 test('a slot: take, take again to extend, release; list; an unknown one is said', WITH_SESSIONS, async ($, on) => {
   const w = project(on)

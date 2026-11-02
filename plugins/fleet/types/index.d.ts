@@ -66,6 +66,8 @@ declare module 'claude-code' {
       freshAt: number
       /** That fresh period's hand-off (its journal), until a turn carrying it starts: a dropped one is submitted again */
       handoff: { text: string; at: number } | null
+      /** What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing) */
+      bandNote: string
       /** The intake records routed to this instance that its model was told of: id → when */
       intakeTold: Record<string, number>
       /** The slot leases this session's model was told it holds: "<slot>/<n>/<taken at>" → when */
