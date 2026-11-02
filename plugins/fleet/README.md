@@ -1,6 +1,6 @@
 # fleet
 
-A Claude Code mod, turned on per project, for running a project as a fleet of permanent background sessions. In 0.5.0 it does eight things:
+A Claude Code mod, turned on per project, for running a project as a fleet of permanent background sessions. In 0.6.0 it does nine things:
 
 - **a roster**: a project lists its roles and instances in `roster.json` (a template writes the first one), and `/fleet up` starts the instances that aren't running, each as a background session of its role's agent file, with its own settings, budget and place in the panel; each one seeds itself, and a chief interviews you and drafts the charter ([below](#the-roster-fleet-up));
 - a background session that needs your decision asks it without stopping, keeps working on what doesn't depend on it, and gets your answer later; you answer from any session of the project, with a slash command that spends no tokens;
@@ -9,7 +9,8 @@ A Claude Code mod, turned on per project, for running a project as a fleet of pe
 - **the command-level files** (the charter, the roster, `world.json`, `outbound.json`, the role files, the check scripts, and the records a template marks as requirements) are never written by an instance's own tools: an instance drafts a change, you read its diff, and `fleet` writes it once you apply it, if the file is still as it was drafted on ([below](#changes-to-command-level-files));
 - **nothing of the project leaves without you**: in a background session, a call that would send its content to a third party (a message, a post, an upload, a push to a remote you haven't allowed) is refused, and the session drafts it with `mcp__fleet__send`; you read exactly what would go out in `/fleet` and answer `send`, and `fleet` sends it once, as you saw it. Your own hosts, remotes and addresses go in `outbound.json` ([below](#nothing-leaves-without-you-outbound));
 - **who may command, and how the fleet keeps its pace**: a session that read a web page or an outside service's result is marked until `/clear`, and a change it files waits for you; a change you ask for yourself, typing in a clean session, is applied as it's filed; licenses, access and hardware are asked apart (`resource`); an instance that lands nothing in its cadence period is marked and nudged once, most roles start each period afresh from their journal, and `/fleet brief` gives you the project at a glance ([below](#who-may-command-outside-content-and-your-own-word));
-- **mail, chat and you, from outside**: items a poller drops in the project's inbox are each read once by a small model with no tools (the item as data), written as records by `fleet` and routed to the instances that subscribe to their tags; a mail asking for a change, even from your own address, becomes a change for you to confirm with its diff, never a command ([below](#mail-chat-and-other-inputs-intake)); what waits for you and a short list of alerts reach you through a channel you choose: your phone, a mail to yourself, a script of yours, or only here ([below](#reaching-you-the-person-channel-and-alerts)); documents derived from records (a business plan, the proposal) are refreshed by their owner when a record they cite is revised ([below](#derived-documents)); and scarce resources (licenses, machines) are taken in turn ([below](#slots-scarce-resources)).
+- **mail, chat and you, from outside**: items a poller drops in the project's inbox are each read once by a small model with no tools (the item as data), written as records by `fleet` and routed to the instances that subscribe to their tags; a mail asking for a change, even from your own address, becomes a change for you to confirm with its diff, never a command ([below](#mail-chat-and-other-inputs-intake)); what waits for you and a short list of alerts reach you through a channel you choose: your phone, a mail to yourself, a script of yours, or only here ([below](#reaching-you-the-person-channel-and-alerts)); documents derived from records (a business plan, the proposal) are refreshed by their owner when a record they cite is revised ([below](#derived-documents)); and scarce resources (licenses, machines) are taken in turn ([below](#slots-scarce-resources));
+- **judges, in shadow**: each question a background session asks you is read once by a small model with your past answers, your principles and the "no"s you said, and its proposal shows under the question ("judge: a) SQLite, citing D-12"); you answer as always, `fleet` keeps whether you agreed, and `/fleet stats` shows it per area. Never a question that touches money, reaches outside or can't be undone ([below](#judges-your-past-answers-applied)).
 
 It builds on [`sessions`](../sessions/README.md) (0.12.0 or newer): `fleet` starts, wakes, places and marks sessions through its API for other plugins.
 
@@ -114,6 +115,7 @@ A template is a folder (`templates/<name>/` in the plugin, or your own under the
 It also writes:
 
 - `config.json`: the template and whether the register is committed (`"commitRegister": false`);
+- `principles.md`, when the template has none: your standing answers, which the judges read with the charter ([below](#judges-your-past-answers-applied));
 - `world.json`, when the template has none: the shared files, as globs relative to the project ([below](#shared-files-changed-since-you-read-it));
 - `<project>/.claude/fleet/decisions/`: the open decisions, the answers, the drafts of changes and the register;
 - `<project>/.claude/fleet/events/` and `<project>/.claude/fleet/reads/`: the landings on shared files, and what each session read of them;
@@ -323,14 +325,14 @@ The `proposal` template has three: the business plan (the planner), the proposal
 
 ## Changes to command-level files
 
-The command-level files change only when `fleet` writes a change you approved. They are `<project>/.claude/fleet/charter.md`, `roster.json`, `world.json`, `outbound.json` and `slots.json`, the role files in `<project>/.claude/agents/`, the check scripts `world.json` names and the script of a command channel, and the records `world.json` lists under `"command"` (`"command": ["req/**"]` in the `proposal` template). A change you ask for yourself, typing in a clean session, is applied as it's filed ([above](#who-may-command-outside-content-and-your-own-word)); every other one waits for your apply.
+The command-level files change only when `fleet` writes a change you approved. They are `<project>/.claude/fleet/charter.md`, `principles.md`, `roster.json`, `world.json`, `outbound.json` and `slots.json`, the role files in `<project>/.claude/agents/`, the check scripts `world.json` names and the script of a command channel, and the records `world.json` lists under `"command"` (`"command": ["req/**"]` in the `proposal` template). A change you ask for yourself, typing in a clean session, is applied as it's filed ([above](#who-may-command-outside-content-and-your-own-word)); every other one waits for your apply.
 
 - **Filing.** An instance calls `mcp__fleet__decide` with `kind: "change"`, the `path`, a one-line `summary`, and `edits` (`old_string` → `new_string`, as with Edit) or the whole `content`. `fleet` checks the path is command-level, applies the edits to the file as it is now, checks that a roster or a world draft parses, and keeps the draft and a line diff in `<project>/.claude/fleet/decisions/drafts/`. The ticket says nothing changes until you apply it.
 - **Its own tools are refused** on those files, every time, with how to file a change instead (its settings deny them too, so it holds even where `fleet` didn't load).
 - **`/fleet`** lists a change with its file, summary, size, the first lines of its diff, where the draft is and its version.
 - **`/fleet <n> apply`** (typed by you): `fleet` claims the decision once (`<project>/.claude/fleet/decisions/applied/`), checks the file is still at the version it was drafted on and the draft is the one filed, and writes it. A file that moved since is refused ("not applied: … changed after D-5 was drafted") and the asker is told to draft it again; a draft that changed is refused until you type its new version (`/fleet <n> apply h1a2b3c4d`, after `/fleet <n> edit` shows where it is); a second apply is refused. A shared file lands as yours (`changed … by the person (a change applied by fleet)`), and its record gets a version.
 - **`/fleet <n> reject`**, and `/fleet drop <n>`, close it unapplied. The asker hears the outcome as a message from `fleet` (`[D-5] The person applied your change to …`).
-- **Your own edits** are always yours: `fleet` keeps a stamp of each command-level config file as it wrote it or you stamped it, and lists one changed another way in `/fleet status`, `/fleet up` and `/fleet accept`; `/fleet accept roster.json` (or `charter.md`, `world.json`, a role file's path) stamps it as yours. A flag, never a block.
+- **Your own edits** are always yours: `fleet` keeps a stamp of each command-level config file as it wrote it or you stamped it, and lists one changed another way in `/fleet status`, `/fleet up` and `/fleet accept`; `/fleet accept roster.json` (or `charter.md`, `principles.md`, `world.json`, a role file's path) stamps it as yours. A flag, never a block.
 
 ## Budgets and wakes
 
@@ -352,7 +354,9 @@ In a background session (`claude --bg`, or one started from the panel or `ccc`) 
 
 It gets **`mcp__fleet__send`** too: the draft of anything that would send the project's content outside, for you to approve ([above](#nothing-leaves-without-you-outbound)); and **`mcp__fleet__slot`**, to take and release the project's scarce resources ([above](#slots-scarce-resources)).
 
-A regular session (plain `claude`, with you at the keyboard) doesn't get the tool: there the model asks with AskUserQuestion, and `fleet` records your answer (below).
+With a choice the model gives, optionally, its **`area`** (one of `world.json`'s `tags`; a word of its own when the project has none) and its word on it: **`reversible`**, **`touchesMoney`**, **`outsideWorld`**. Only the judges read them ([below](#judges-your-past-answers-applied)).
+
+A regular session (plain `claude`, with you at the keyboard) doesn't get the tool: there the model asks with AskUserQuestion, and `fleet` records your answer (below). Every session of the project, regular or background, gets **`mcp__fleet__taste`**, to record a "no" of yours ([below](#taste-the-nos-you-say)).
 
 ## Answering: `/fleet`
 
@@ -367,11 +371,12 @@ In any session of the project, typed by you (`fleet` takes answers only from you
 | `/fleet 5 done "note"` | you got what item 5 (a resource) asks for; `5 no "why"` if not |
 | `/fleet 6 send` | sends the outbound of item 6 exactly as shown (`6 send <version>` after an edit or a change; `6 reject "why"`; `6 edit`; `6 done` if you sent it yourself) |
 | `/fleet brief [--chief]` | the project at a glance ([above](#fleet-brief)) |
+| `/fleet stats [area]` | what the judges proposed per area, how often you agreed, what they cost; with an area, its last ten decisions ([below](#judges-your-past-answers-applied)) |
 | `/fleet note 1 <text>` | adds a note for whoever asked question 1, delivered with the answer |
 | `/fleet drop 1 [why]` | drops the decision of question 1 without answering it (also `/fleet drop D-3`): the asker is told to go on as it thinks best |
 | `/fleet status` | what `fleet` does in this session: the project, whether `decide` is offered here and why not, `sessions`' API, the counts; the shared files, the last changes to them, and which session read a version that has changed since; the roster's instances (running, their `fleet`, seeded, spend and wakes today, settings changed since they started), the command-level files changed outside fleet; the records, the suspect files, the checks and what fails them, the sweeper and the world commits |
 | `/fleet world` | the shared files (`world.json`); `/fleet world add <glob>` and `/fleet world remove <glob>` change them ([below](#shared-files-changed-since-you-read-it)) |
-| `/fleet accept <path>` | stamps a change to a shared file, or to a command-level config file (`roster.json`, `charter.md`, `world.json`, `outbound.json`, `slots.json`, a role file), made outside fleet (your editor, a script) as yours; `/fleet accept` alone lists those changes |
+| `/fleet accept <path>` | stamps a change to a shared file, or to a command-level config file (`roster.json`, `charter.md`, `principles.md`, `world.json`, `outbound.json`, `slots.json`, a role file), made outside fleet (your editor, a script) as yours; `/fleet accept` alone lists those changes |
 | `/fleet accept channel` | lets `fleet` run your command channel, as it is now ([above](#reaching-you-the-person-channel-and-alerts)) |
 | `/fleet accept checks` | lets `fleet` run the check scripts `world.json` lists, as they are now ([below](#check-scripts)) |
 | `/fleet init [template]` | sets the project up (above) |
@@ -401,6 +406,58 @@ Go on with what depended on it.
 - **After an Esc** (you stopped the session), Claude takes no plugin prompts until you type something there, and `fleet` waits for that too.
 - **After a restart** (`u`, `claude respawn`) the session's open decisions come back from the files, by its short id, which stays across restarts and `/clear`.
 - **After a `/clear`** the answer arrives as the first turn of the new conversation. It quotes the questions, so it stands on its own, but the cleared model doesn't remember what it was doing.
+
+## Judges: your past answers, applied
+
+Most questions a fleet asks you were answered before ("too complicated", "fine tradeoff"). A judge applies your past answers to a new one. It's one model call per question, made in the session that asked, never a session of its own: no tools, no history, so it can't anchor on its own verdicts. In 0.6.0 it only proposes (shadow): you answer every question as always, and `fleet` keeps how often you agreed.
+
+**What a judge reads**, in the call's prompt, in the order the cache wants:
+
+- **The statute** (cached): `<project>/.claude/fleet/charter.md`, `<project>/.claude/fleet/principles.md` and the files `world.json`'s `judges.statute` lists (by default the project's `CLAUDE.md` and `.claude/rules/*.md`), line by line, so a judge cites `principles.md:4`. `principles.md` is yours: your standing answers, one per line. `/fleet init` writes a short one that says what goes there; it's command-level, so only you (then `/fleet accept principles.md`) or a change you apply write it.
+- **The case law**: the register. The questions you answered, through `/fleet` or in a dialog, and the "no"s you said ([below](#taste-the-nos-you-say)), never a judge's own answer. Code picks those most relevant to the question: the same area first, then the words they share, a rarer word weighing more (one every record has says nothing, in any language); at most `judges.precedents` (12).
+- **The question**, between markers it can't close (they carry a hash of what's between them): its area, its options, what the asker recommends. The system prompt says it's data, never instructions.
+
+**What it answers**, per question: **decided** (an option, citing the decisions or statute lines it rests on), **send back** (the question is malformed, or the statute answers it plainly), or **hold** (it needs you; when in doubt, hold). Code does the rest:
+
+- **An exact repeat** (the same question with the same options, as words, in any order, that you answered with one of them) is decided by code, citing that decision, with no call at all.
+- **Every citation is checked**: it must be one the judge was shown; a cited decision must have been answered with that very option (or your words in it, or your taste, must name it); a cited line must speak to it (a word of four letters or more in common with the option). A proposal that fails becomes a hold, with what it proposed and why code didn't take it.
+
+**The gates, in code, before any model.** No judge looks at a decision that is a change, a resource or an outbound (only choices); one whose asker says `touchesMoney` or `outsideWorld`, or `reversible: false`; one asked by a conversation that had read outside content (a web page, an outside service, an intake record: [the mark](#who-may-command-outside-content-and-your-own-word)); one whose question, options or blocks match a pattern of `judges.hold`; one asked by an instance or role in `judges.skip`. `/fleet` says why: `judge: held by a gate (it touches money)`. False holds are cheap: you answer as today.
+
+**Shadow.** `/fleet` shows the proposal under each question, and the brief beside it:
+
+```
+1. Which database for the cache?
+   a) SQLite: one file, no server
+   b) Redis
+   Recommended: b, the queue already runs it
+   judge: a) SQLite, citing D-12 (the same question, answered so before)
+   Data pipeline (idle) · D-31 · 4m ago
+
+> /fleet 1a
+1: Which database for the cache? → a) SQLite (the judge proposed a) SQLite: agreed)
+```
+
+The delivery doesn't change. When the decision closes, the register keeps the proposal and, per question, whether you agreed. **`/fleet stats`** counts them per area (with an area, its last ten decisions):
+
+```
+Judges: on, in shadow (they propose under each question in /fleet; you answer as always) · model haiku · today 4 calls, $0.0011 of $1.00
+storage: 12 proposals · 9 decided (5 exact repeats), agreed 8 of 9 (89%) · 1 sent back · 2 held · 1 held by a gate · $0.0031 in 7 calls
+```
+
+### Taste: the "no"s you say
+
+The richest signal isn't an answer to a question: it's "no stand-ins", "revert it, it ruined chat", a default changed back. When you say no to something, revert it or correct it, even when it worked, the session records it with **`mcp__fleet__taste`**: what you said, what it was about, the principle it suggests (the role files say when). `fleet` keeps it in the register as `T-<n>`, with its provenance read by code, not the model: whether you typed that turn (the start of your words is kept) and whether the conversation had read outside content. The judges read only those you typed in a clean conversation; the rest wait for you. Promote one into `principles.md` by editing it, or by applying a change a session drafts.
+
+### Settings and cost
+
+`world.json` (command-level) may say:
+
+```json
+"judges": { "model": "haiku", "statute": ["CLAUDE.md", ".claude/rules/*.md"], "hold": ["contract"], "skip": ["Chief"], "precedents": 12, "usdDay": 1 }
+```
+
+`"judges": false` turns them off; a `world.json` from a newer `fleet` turns them off in that session. `hold` holds patterns (regular expressions, any case): domain words belong there, never in `fleet`'s code. Past `usdDay` (dollars at list price, the project's, today), questions go unjudged but for exact repeats, which cost nothing. The call is billed to the asking session's credentials and left out of its cost totals, so `fleet` counts it from the call's usage, per session, in `<project>/.claude/fleet/state/judges/<day>/`.
 
 ## Shared files: changed since you read it
 
@@ -509,7 +566,7 @@ Off by default; `"commit": { "everyMin": 60 }` in `world.json` turns it on. Ever
 
 ## The register
 
-Every closed decision, and every AskUserQuestion of the model that you answered in a dialog (an option or text you typed; "Chat about this" and Esc record as not answered), is one JSON file in `<project>/.claude/fleet/decisions/register/<YYYY-MM>/`: the questions, the options, who asked, your answers and notes, where you typed them, and when it was delivered. Another plugin's dialog isn't recorded. It's out of git unless you chose `--commit-register`.
+Every closed decision, and every AskUserQuestion of the model that you answered in a dialog (an option or text you typed; "Chat about this" and Esc record as not answered), is one JSON file in `<project>/.claude/fleet/decisions/register/<YYYY-MM>/`: the questions, the options, who asked, your answers and notes, where you typed them, and when it was delivered; for a choice, its area and flags and what the judge proposed, with whether you agreed. A "no" of yours recorded with `mcp__fleet__taste` is one too (`T-<n>`). Another plugin's dialog isn't recorded. It's out of git unless you chose `--commit-register`.
 
 Once a day the first session to get there closes the decisions of sessions gone from the list as `abandoned` (their answers kept), and removes stray answer files and old temporary files.
 
@@ -519,7 +576,7 @@ Once a day the first session to get there closes the decisions of sessions gone 
 plugins/fleet/
 ├── .claude-plugin/plugin.json   name, version, the sessions dependency, where the state types are
 ├── hooks/hooks.json             which module Claude loads
-├── hooks/register.tsx           the mod: decide, /fleet, delivery, the recorder, the band, the section, the prune; the gate, the reads, the events, the scans, the digest; the roster, /fleet up, instances (binding, heartbeat, seed, nudges, budget, cadence, fresh periods), the change decision applied (or as filed), the sweeper's marks and wakes; the outbound gate and mcp__fleet__send, outside marks, whose prompt it is, resources, /fleet brief; intake and its pointers, the person channel and its alerts, the PushNotification gate, derived documents, slots and mcp__fleet__slot
+├── hooks/register.tsx           the mod: decide, /fleet, delivery, the recorder, the band, the section, the prune; the gate, the reads, the events, the scans, the digest; the roster, /fleet up, instances (binding, heartbeat, seed, nudges, budget, cadence, fresh periods), the change decision applied (or as filed), the sweeper's marks and wakes; the outbound gate and mcp__fleet__send, outside marks, whose prompt it is, resources, /fleet brief; intake and its pointers, the person channel and its alerts, the PushNotification gate, derived documents, slots and mcp__fleet__slot; the judges, /fleet stats and mcp__fleet__taste
 ├── hooks/decisions.ts           pure logic: records and their files, decide's input, the /fleet grammar, the texts (tested)
 ├── hooks/changes.ts             pure logic of the shared files: world.json, globs, placing a path, versions, events, the gate's and the digest's words (tested)
 ├── hooks/records.ts             pure logic of records: ids, pins, change kinds, whether a pin is current, the gate's and the post-scan's verdict on pins, suspects, check results, the lease, the commit, worktree copies (tested)
@@ -532,9 +589,10 @@ plugins/fleet/
 ├── hooks/channel.ts             pure logic of the person channel: roster.json's person, the channels and their one recipient, the alerts and their caps (tested)
 ├── hooks/derived.ts             pure logic of derived documents: world.json's derived kinds, staleness, the debounce, no circular authority (tested)
 ├── hooks/slots.ts               pure logic of slots: slots.json, leases, the line, mcp__fleet__slot's input (tested)
+├── hooks/judges.ts              pure logic of the judges: world.json's judges, the gates, the case law, exact repeats, the statute, the prompt, the verdicts and their citations checked, agreement and the stats, taste (tested)
 ├── templates/<name>/            blank, solo, software, proposal: template.json, fleet/ and agents/, copied by /fleet init
 ├── types/index.d.ts             fleet's state ($.state)
-└── tests/                       decisions, changes, records, roster, drafts, outbound, brief, intake, channel, derived and slots tests (pure); fleet, gate, pins, up, instance, authority, cadence, intake, person, plan and lease tests (the mod, with a stand-in for sessions typed by its contract and for the engine's file tools, shell, model and MCP calls); world.tsx
+└── tests/                       decisions, changes, records, roster, drafts, outbound, brief, intake, channel, derived, slots and judges tests (pure); fleet, gate, pins, up, instance, authority, cadence, intake, person, plan, lease and judge tests (the mod, with a stand-in for sessions typed by its contract and for the engine's file tools, shell, model and MCP calls); world.tsx
 ```
 
 What it writes, all in the project (`fleet` keeps no store and nothing in your home folder): in `<project>/.claude/fleet/`, and on `/fleet init` the role files in `<project>/.claude/agents/` and the template's folders, never over a file that's there.
@@ -542,15 +600,18 @@ What it writes, all in the project (`fleet` keeps no store and nothing in your h
 | Path | What | Version |
 |---|---|---|
 | `config.json` | the template, `commitRegister` | `configFormat` (person data: only gains fields) |
-| `world.json` | the shared files' globs; `"command"`, the command-level records; `"information"` and `"proposal"`, the other levels; `"tags"`, `"intake"` and `"derived"` | `worldFormat` (person data) |
+| `world.json` | the shared files' globs; `"command"`, the command-level records; `"information"` and `"proposal"`, the other levels; `"tags"`, `"intake"`, `"derived"` and `"judges"` | `worldFormat` (person data) |
 | `outbound.json` | the hosts, remotes and recipients you allow; the tools and commands that send, or don't; the tools whose results are outside content | `outboundFormat` (person data) |
 | `slots.json` | the scarce resources: each pool's count, its lease, what it is | `slotsFormat` (person data) |
 | `roster.json` | roles, instances, sections, budgets, wakes, settings; each role's subscriptions; the person (addresses, principals, front door, channel, caps) | `rosterFormat` (person data) |
 | `charter.md`, `interview.md`, `seeds/<role>.md` | the project's charter (command-level), the chief's interview, each role's first prompt | the template's |
+| `principles.md` | your principles, the judges' statute with the charter (command-level) | yours |
 | `<project>/.claude/fleet/decisions/queue/D-<n>.json` | an open decision (a choice; a `change` with its path, summary and versions; a `resource`; an `outbound` with where, why, its files' versions and the version you approve; with what outside content its asker had read), written once by the session that asked | `format` |
 | `<project>/.claude/fleet/decisions/answers/D-<n>.<q>.json`, `….note.json`, `D-<n>.drop.json` | answers (no-clobber: the first wins), notes, drops | `format` |
 | `<project>/.claude/fleet/decisions/drafts/D-<n>.<ext>`, `D-<n>.diff`, `D-<n>.json`, `<project>/.claude/fleet/decisions/applied/D-<n>.json` | a change's draft and its diff, an outbound's exact call, written once; the claim when you apply or send it (no-clobber: once) | `format` (the claim) |
-| `<project>/.claude/fleet/decisions/register/<YYYY-MM>/<id>.json` | closed decisions (an outbound's call with them) and recorded dialogs | `registerFormat` (person data) |
+| `<project>/.claude/fleet/decisions/register/<YYYY-MM>/<id>.json` | closed decisions (an outbound's call with them, a choice's proposal and whether you agreed), recorded dialogs, and your taste (`T-<n>`) | `registerFormat` (person data) |
+| `<project>/.claude/fleet/decisions/judge/D-<n>.json` | what the judge proposed on an open choice (or the gate that held it), and what the call cost; written once by the session that asked, into the register when the decision closes | `format` |
+| `<project>/.claude/fleet/state/judges/<day>/<session>.json` | a session's judge calls and their cost today; written only by it | `format` |
 | `<project>/.claude/fleet/decisions/last`, `<project>/.claude/fleet/decisions/prune/<day>`, `<project>/.claude/fleet/decisions/tmp/` | the last number handed out, the daily prune's marker, files about to be put in place | `format` |
 | `<project>/.claude/fleet/events/<YYYY-MM-DD>/<HH>/<ms>-<session>-<n>.json` | one landing on a shared file (UTC hours), written once by the session that saw it; removed after 7 days | `format` |
 | `<project>/.claude/fleet/events/latest`, `<project>/.claude/fleet/events/claims/` | the last event's name, which every session watches; outside changes claimed no-clobber, so one session records each | `format` |
