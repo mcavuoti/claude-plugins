@@ -6,7 +6,7 @@
 import type { Level } from './authority'
 import { changeLine, clock, type ChangeEvent, type Me } from './changes'
 import { ago } from './decisions'
-import { hoursText, usd } from './roster'
+import { hoursText, usd, usdOf } from './roster'
 
 /** judge: what the judge proposed on a choice, in a few words ("a) SQLite, citing D-3") */
 export type BriefNeed = { id: string; kind: 'choice' | 'change' | 'resource' | 'outbound'; what: string; who: string; at: number; blocks?: string; outside?: string; judge?: string }
@@ -137,12 +137,12 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   // 4. Spend, in both kinds of account
   const s = f.spend
   const parts: string[] = []
-  if (s.project) parts.push(`${usd(s.project.usd)} today${s.project.cap !== null ? ` of ${usd(s.project.cap)} (the project's cap)` : ''}, estimated at list price`)
+  if (s.project) parts.push(`${usdOf(s.project.usd, s.project.cap)} today${s.project.cap !== null ? " (the project's cap)" : ''}, estimated at list price`)
   if (s.forecast) parts.push(`budgets ${usd(s.forecast.caps)} a day, wakes ~${usd(s.forecast.wakesUsd)} a day`)
   if (s.windows.length) parts.push(`this account's windows: ${s.windows.map(w => `${windowName(w.kind)} ${w.percentUsed}%`).join(', ')}`)
   out.push('', parts.length ? `4. Spend: ${parts.join('; ')}` : '4. Spend: no roster, and no window reading yet')
   const heavy = s.instances.filter(i => i.state !== 'ok' || i.usd > 0).sort((a, c) => c.usd - a.usd)
-  for (const i of heavy.slice(0, SHOWN)) out.push(`   - ${i.name}: ${usd(i.usd)}${i.cap !== null ? ` of ${usd(i.cap)}` : ''}${i.state === 'over' ? ', used up' : i.state === 'warn' ? ', past 80%' : ''}`)
+  for (const i of heavy.slice(0, SHOWN)) out.push(`   - ${i.name}: ${usdOf(i.usd, i.cap)}${i.state === 'over' ? ', used up' : i.state === 'warn' ? ', past 80%' : ''}`)
   // 5. Inputs and ideas: the items from outside (with whom they reached), then the other landings on those levels
   const ideas = newestPerFile(f.events, f).filter(e => e.via !== 'intake' && ['information', 'proposal'].includes(f.levelOf(e.path)))
   const shownIntake = [...intake].sort((a, c) => c.at - a.at)

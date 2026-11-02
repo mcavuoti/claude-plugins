@@ -103,7 +103,7 @@ test('the brief: the five sections in order, provenance, levels, the window; and
   }
   const t = briefText(facts)
   expect(t.split('\n')[0]).toBe('Brief · 2026-11-02 12:00 · the last 24 h')
-  const order = ['1. Needs you: 1 outbound draft', '2. What changed: 2 shared files', '3. Blocked and stale:', '4. Spend: $1.50 today', '5. Inputs and ideas: 1'].map(s => t.indexOf(s))
+  const order = ['1. Needs you: 1 outbound draft', '2. What changed: 2 shared files', '3. Blocked and stale:', '4. Spend: $1.50 of', '5. Inputs and ideas: 1'].map(s => t.indexOf(s))
   expect(order.every((x, i) => x > 0 && (i === 0 || x > (order[i - 1] as number)))).toBe(true)
   expect(t).toContain('   1 answered, not delivered yet')
   // The newest change per file; the command-level ones first; who, and whether the writer had read outside content
@@ -112,7 +112,7 @@ test('the brief: the five sections in order, provenance, levels, the window; and
   expect(t).toContain('   - suspect: board/B-7.md (B-7) cites R-1@1, and R-1 is at v2 (written last by Owner B)')
   expect(t).toContain('   - Owner C: nothing landed in 7 h (its cadence is 6 h)')
   expect(t).toContain('   - Tester: running with no fleet (u in the panel restarts it)')
-  expect(t).toContain("4. Spend: $1.50 today of $20 (the project's cap), estimated at list price; budgets $10 a day, wakes ~$0.40 a day; this account's windows: 7d 12%")
+  expect(t).toContain("4. Spend: $1.50 of $20.00 today (the project's cap), estimated at list price; budgets $10.00 a day, wakes ~$0.40 a day; this account's windows: 7d 12%")
   expect(t).toContain('5. Inputs and ideas: 1\n   - proposals/P-1.md (proposal): changed at 11:00 by Owner B (Edit)')
   expect(chiefLines('one\n\n two \nthree\nfour\nfive\nsix')).toEqual(['one', 'two', 'three', 'four', 'five'])
   expect(briefText(facts, ['Send D-2 first.'])).toContain("The chief's notes:\n   Send D-2 first.")

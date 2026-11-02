@@ -215,7 +215,7 @@ test('/fleet brief: what needs you, what changed and who changed it, what’s bl
   expect(b).toContain('   - notes/a.md (its writer had read outside content): changed at ')
   expect(b).not.toContain('notes/old.md')
   expect(b).toContain('3. Blocked and stale:\n   - D-1 (Owner B, 2h) holds up: the cache layer')
-  expect(b).toContain("4. Spend: $0.90 today of $5.00 (the project's cap), estimated at list price; budgets $2.00 a day, wakes ~$0.08 a day; this account's windows: 7d 43%")
+  expect(b).toContain("4. Spend: $0.90 of $5.00 today (the project's cap), estimated at list price; budgets $2.00 a day, wakes ~$0.08 a day; this account's windows: 7d 43%")
   expect(b).toContain('   - Owner A: $0.90 of $1.00, past 80%')
   expect(b).toContain('5. Inputs and ideas: 1\n   - proposals/P-1.md (proposal): changed at ')
   // The chief's lines come only with --chief, typed by the person, and only when the roster has one

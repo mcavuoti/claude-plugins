@@ -256,6 +256,7 @@ import {
   settingsFor,
   settingsText,
   usd,
+  usdOf,
   wakeUsd,
   wakeVerdict,
   wakesOf,
@@ -3901,7 +3902,7 @@ async function budgets($: any): Promise<BudgetRow[]> {
 
 function budgetWords(b: BudgetRow): string {
   const p = budgetCache.project
-  return b.own === b.state || p.cap === null ? `this instance's budget (${usd(b.usd)} of ${usd(b.cap ?? 0)} today, estimated at list price)` : `the project's budget (${usd(p.usd)} of ${usd(p.cap)} today, estimated at list price)`
+  return b.own === b.state || p.cap === null ? `this instance's budget (${usdOf(b.usd, b.cap)} today, estimated at list price)` : `the project's budget (${usdOf(p.usd, p.cap)} today, estimated at list price)`
 }
 
 /** The line an instance's model reads once per day and state: at 80%, land what you have; at 100%, what fleet does */
@@ -4899,7 +4900,7 @@ async function rosterTick($: any) {
                   : fresh && cad?.due
                     ? { badge: '◷', tint: 'warning', line: `nothing landed in ${hoursText(cad.hours)} (cadence ${hoursText(inst.cadenceH ?? 0)})` }
                     : b?.state === 'warn'
-                      ? { badge: '$', tint: 'warning', line: `budget: ${usd(b.usd)} of ${usd(b.cap ?? budgetCache.project.cap ?? 0)} today` }
+                      ? { badge: '$', tint: 'warning', line: `budget: ${usdOf(b.usd, b.cap ?? budgetCache.project.cap)} today` }
                       : null
       if (m) marks[running.ref] = m
       continue
@@ -5171,8 +5172,8 @@ async function budgetCommand($: any, target: string, amount: string, origin: str
   budgetCache.at = 0
   const list = await budgets($)
   const p = budgetCache.project
-  const row = (b: BudgetRow) => `  ${b.inst.name}: ${usd(b.usd)}${b.cap !== null ? ` of ${usd(b.cap)}` : ''} today${b.state === 'over' ? ', used up' : b.state === 'warn' ? ', past 80%' : ''}`
-  const projectLine = `project: ${usd(p.usd)}${p.cap !== null ? ` of ${usd(p.cap)}` : ' (no project cap)'} today${p.state === 'over' ? ', used up: every instance counts as over' : ''}`
+  const row = (b: BudgetRow) => `  ${b.inst.name}: ${usdOf(b.usd, b.cap)} today${b.state === 'over' ? ', used up' : b.state === 'warn' ? ', past 80%' : ''}`
+  const projectLine = `project: ${usdOf(p.usd, p.cap)}${p.cap !== null ? '' : ' (no project cap)'} today${p.state === 'over' ? ', used up: every instance counts as over' : ''}`
   if (!target) return ['Budgets today (estimated at list price; each instance from its own session\'s cost):', projectLine, ...list.map(row), '/fleet budget <name|project> <amount|+n> sets or raises one for today.'].join('\n')
   let key: string | null = null
   let name = 'the project'
@@ -5252,7 +5253,7 @@ async function rosterStatus($: any): Promise<string[]> {
   const p = budgetCache.project
   const wakes = wakesOf(roster.r)
   const f = forecastOf(all, wakes)
-  lines.push(`budget today: ${usd(p.usd)}${p.cap !== null ? ` of ${usd(p.cap)} (the project's cap)` : ' (no project cap)'}; wakes forecast ~${usd(f.wakesUsd)} a day; at most ${wakes.perDay} wakes a day each, one every ${wakes.everyMin} min`)
+  lines.push(`budget today: ${usdOf(p.usd, p.cap)}${p.cap !== null ? " (the project's cap)" : ' (no project cap)'}; wakes forecast ~${usd(f.wakesUsd)} a day; at most ${wakes.perDay} wakes a day each, one every ${wakes.everyMin} min`)
   const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
   const down = await downSet($)
   const now = await $.clock.now()
@@ -5279,7 +5280,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (hb.ref && (await exists($, `${instDir(inst.slug)}/seed-${hb.ref}.json`))) parts.push('seeded')
       }
     }
-    if (b) parts.push(`${usd(b.usd)}${b.cap !== null ? ` of ${usd(b.cap)}` : ''} today${b.state === 'over' ? ' (used up)' : b.state === 'warn' ? ' (past 80%)' : ''}`)
+    if (b) parts.push(`${usdOf(b.usd, b.cap)} today${b.state === 'over' ? ' (used up)' : b.state === 'warn' ? ' (past 80%)' : ''}`)
     const n = await readWire<WakeCount>($, `${instDir(inst.slug)}/nudges.json`)
     const w = (n && n.day === day ? n.count : 0) + (swept && swept.day === day ? (swept.instances[inst.slug]?.count ?? 0) : 0)
     if (w) parts.push(`${w} wake(s) today`)

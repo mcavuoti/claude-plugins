@@ -370,9 +370,9 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
   }
   const cap = projectCap(r)
   const sum = instances.reduce((s, i) => s + (i.usdDay ?? 0), 0)
-  if (cap !== null && sum > cap) warnings.push(`the instances' budgets add up to $${sum.toFixed(2)} a day, over the project's $${cap.toFixed(2)}: the project's cap stops them first`)
+  if (cap !== null && sum > cap) warnings.push(`the instances' budgets add up to ${usd(sum)} a day, over the project's ${usd(cap)}: the project's cap stops them first`)
   const f = forecastOf(instances, wakesOf(r))
-  if (cap !== null && f.wakesUsd > cap / 2) warnings.push(`the wake forecast ($${f.wakesUsd.toFixed(2)} a day) is over half the project's budget`)
+  if (cap !== null && f.wakesUsd > cap / 2) warnings.push(`the wake forecast (${usd(f.wakesUsd)} a day) is over half the project's budget`)
   if (!r.instances.length) warnings.push('the roster has no instances yet: nothing to start')
   return { errors, warnings }
 }
@@ -458,10 +458,22 @@ export function forecastOf(instances: readonly Instance[], wakes: { perDay: numb
   return { caps, wakesUsd, unpriced }
 }
 
-/** Dollars as the person reads them: cents, a tenth of a cent below one cent (a tiny budget is still seen), whole
- * dollars from ten */
+/** Dollars as the person reads them, one format everywhere: cents, never rounded away (a sum compared with a cap
+ * shows what it is: $10.02, not $10), and three significant digits below a dollar, so a small budget doesn't read
+ * as used up ($0.016, not $0.02) */
 export function usd(n: number): string {
-  return `$${n >= 10 ? n.toFixed(0) : n > 0 && n < 0.01 ? n.toFixed(3) : n.toFixed(2)}`
+  if (n > 0 && n < 1) {
+    const p = Number(n.toPrecision(3))
+    const decimals = Math.max(2, Math.min(6, -Math.floor(Math.log10(p)) + 2))
+    return `$${p.toFixed(decimals).replace(/(\.\d\d\d*?)0+$/, '$1')}`
+  }
+  return `$${n.toFixed(2)}`
+}
+
+/** What was spent against a cap; below a dollar's cap with the share too: "$0.016 of $0.02 (80%)" */
+export function usdOf(spent: number, cap: number | null): string {
+  if (cap === null) return usd(spent)
+  return `${usd(spent)} of ${usd(cap)}${cap > 0 && cap < 1 ? ` (${Math.floor((spent / cap) * 100)}%)` : ''}`
 }
 
 // ---- Budgets: each instance's spend per day (its own fleet turns the session's cost deltas into it) ----
