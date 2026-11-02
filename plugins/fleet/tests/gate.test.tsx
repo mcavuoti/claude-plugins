@@ -202,14 +202,23 @@ test('a command run in the background: what changes while it runs is probably it
   expect(await fleet($, 'status')).toContain("by this session's main thread (probably its background command, landed blind)")
   // ... which the person can stamp as his, like an outside change
   expect(await fleet($, 'accept')).toContain('notes/plan.md: changed at')
-  // It writes todo.md and completes: at the next stop, what's left lands as its own
+  // It writes todo.md and completes: at the next stop (or its notification), what's left lands as its own
   w.touch(TODO, 'todo from the build\n')
-  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as any)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'bash-1', type: 'shell', status: 'running', description: 'npm run build' }] } as any)
+  await w.clock.settle()
+  expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([])
+  await $.prompt.submit({ text: '<task-notification><task-id>bash-1</task-id><status>completed</status></task-notification>', origin: { kind: 'task-notification' }, wait: false } as any)
   await w.clock.settle()
   expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([expect.objectContaining({ via: 'bash', blind: true, by: expect.objectContaining({ sessionId: SID }) })])
   expect(mine(w).find(e => e.path === 'notes/todo.md')?.probably).toBe(undefined)
   await tick(w, 1100)
   expect(json(w, `${FLEET}/reads/${SID}.json`)?.running).toBe(undefined)
+  // Another one, whose end only the stop says (no notification seen): gone from the background tasks, it lands
+  await call($, { tool: 'Bash', command: 'npm run docs', run_in_background: true })
+  w.touch(`${ROOT}/notes/docs.md`, 'docs\n')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as any)
+  await w.clock.settle()
+  expect(mine(w).filter(e => e.path === 'notes/docs.md')).toEqual([expect.objectContaining({ via: 'bash', by: expect.objectContaining({ sessionId: SID }) })])
 })
 
 test('a command that writes many shared files lands them in a couple of processes, not several a file', WITH_SESSIONS, async ($, on) => {

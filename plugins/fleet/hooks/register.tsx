@@ -7809,6 +7809,16 @@ export const register: Register = on => {
     if ((e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') && timersOn) {
       bg((async () => ((await read($, stopped)) ? update($, stopped, () => false) : null))())
     }
+    // A background task's notification that names a Bash command of this session's: it completed (or stopped), so what
+    // it wrote lands now, without waiting for the turn's stop
+    if (e.origin?.kind === 'task-notification' && typeof e.text === 'string') {
+      const text = e.text
+      bg(
+        (async () => {
+          for (const task of Object.keys(await read($, bgCommands))) if (text.includes(task)) await bgDone($, task)
+        })(),
+      )
+    }
     // Whose prompt this is (H2 in the debug log): the person's own typing at a terminal, not a background session's
     // launch prompt, which reads as composer too. It makes the turn it starts, or runs into, the person's
     try {
