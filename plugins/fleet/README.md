@@ -45,7 +45,7 @@ and in each project that should use it, from the project's folder:
 claude plugin enable fleet@mcavuoti --scope local
 ```
 
-That writes `.claude/settings.local.json` in the project (yours only, not shared with the repository), and one `claude plugin update fleet@mcavuoti` later reaches every project. Sessions of the project that were already running pick it up when they restart (`u` in the panel). Then, in any session of the project:
+That writes `<project>/.claude/settings.local.json` in the project (yours only, not shared with the repository), and one `claude plugin update fleet@mcavuoti` later reaches every project. Sessions of the project that were already running pick it up when they restart (`u` in the panel). Then, in any session of the project:
 
 ```
 /fleet init
@@ -57,17 +57,17 @@ Whatever the install says about versions, `fleet` asks `sessions` at run time wh
 
 ## Setting a project up: `/fleet init`
 
-`/fleet init` (or `/fleet init blank`, the only template in 0.1.0) creates `.claude/fleet/` in the session's folder:
+`/fleet init` (or `/fleet init blank`, the only template in 0.1.0) creates `<project>/.claude/fleet/` in the session's folder:
 
 - `config.json`: the template and whether the register is committed (`"commitRegister": false`);
-- `decisions/`: the open decisions, the answers and the register;
-- `.gitignore`: keeps `decisions/` out of git. `/fleet init --commit-register` sets `commitRegister` and commits the register (`decisions/register/`) with the project, the rest of `decisions/` still ignored.
+- `<project>/.claude/fleet/decisions/`: the open decisions, the answers and the register;
+- `.gitignore`: keeps `<project>/.claude/fleet/decisions/` out of git. `/fleet init --commit-register` sets `commitRegister` and commits the register (`<project>/.claude/fleet/decisions/register/`) with the project, the rest of `<project>/.claude/fleet/decisions/` still ignored.
 
-Running it again only brings `.gitignore` in line with `config.json`. A session in a subfolder of the project uses the nearest `.claude/fleet/` above it; your home folder is never a project. Sessions that were already running join within a minute.
+Running it again only brings `.gitignore` in line with `config.json`. A session in a subfolder of the project uses the nearest `<project>/.claude/fleet/` above it; your home folder is never a project. Sessions that were already running join within a minute.
 
 ## What a background session gets: `mcp__fleet__decide`
 
-In a background session (`claude --bg`, or one started from the panel or `ccc`) of a project with `.claude/fleet/`, the model gets a tool, `mcp__fleet__decide`, present from its first request. Its description tells the model to use it instead of AskUserQuestion or a question in its reply, which would leave the work waiting until you come by:
+In a background session (`claude --bg`, or one started from the panel or `ccc`) of a project with `<project>/.claude/fleet/`, the model gets a tool, `mcp__fleet__decide`, present from its first request. Its description tells the model to use it instead of AskUserQuestion or a question in its reply, which would leave the work waiting until you come by:
 
 - 1 to 4 questions, each with 2 to 4 options, the option it recommends and one line on why, and optionally what waits on the answer (`blocks`);
 - it answers at once: `Queued as D-3 for the person … The answer arrives later as a message from the fleet plugin that starts with [D-3]`, and the model goes on with what doesn't depend on it, or ends its turn;
@@ -116,7 +116,7 @@ Go on with what depended on it.
 
 ## The register
 
-Every closed decision, and every AskUserQuestion of the model that you answered in a dialog (an option or text you typed; "Chat about this" and Esc record as not answered), is one JSON file in `.claude/fleet/decisions/register/<YYYY-MM>/`: the questions, the options, who asked, your answers and notes, where you typed them, and when it was delivered. Another plugin's dialog isn't recorded. It's out of git unless you chose `--commit-register`.
+Every closed decision, and every AskUserQuestion of the model that you answered in a dialog (an option or text you typed; "Chat about this" and Esc record as not answered), is one JSON file in `<project>/.claude/fleet/decisions/register/<YYYY-MM>/`: the questions, the options, who asked, your answers and notes, where you typed them, and when it was delivered. Another plugin's dialog isn't recorded. It's out of git unless you chose `--commit-register`.
 
 Once a day the first session to get there closes the decisions of sessions gone from the list as `abandoned` (their answers kept), and removes stray answer files and old temporary files.
 
@@ -132,25 +132,25 @@ plugins/fleet/
 └── tests/                       decisions.test (pure), fleet.test (the mod, with a stand-in for sessions typed by its contract), world.tsx
 ```
 
-What it writes, all in the project's `.claude/fleet/` (`fleet` keeps no store and nothing in your home folder):
+What it writes, all in the project's `<project>/.claude/fleet/` (`fleet` keeps no store and nothing in your home folder):
 
 | Path | What | Version |
 |---|---|---|
 | `config.json` | the template, `commitRegister` | `configFormat` (person data: only gains fields) |
-| `decisions/queue/D-<n>.json` | an open decision, written once by the session that asked | `format` |
-| `decisions/answers/D-<n>.<q>.json`, `….note.json`, `D-<n>.drop.json` | answers (no-clobber: the first wins), notes, drops | `format` |
-| `decisions/register/<YYYY-MM>/<id>.json` | closed decisions and recorded dialogs | `registerFormat` (person data) |
-| `decisions/last`, `decisions/prune/<day>`, `decisions/tmp/` | the last number handed out, the daily prune's marker, files about to be put in place | `format` |
+| `<project>/.claude/fleet/decisions/queue/D-<n>.json` | an open decision, written once by the session that asked | `format` |
+| `<project>/.claude/fleet/decisions/answers/D-<n>.<q>.json`, `….note.json`, `D-<n>.drop.json` | answers (no-clobber: the first wins), notes, drops | `format` |
+| `<project>/.claude/fleet/decisions/register/<YYYY-MM>/<id>.json` | closed decisions and recorded dialogs | `registerFormat` (person data) |
+| `<project>/.claude/fleet/decisions/last`, `<project>/.claude/fleet/decisions/prune/<day>`, `<project>/.claude/fleet/decisions/tmp/` | the last number handed out, the daily prune's marker, files about to be put in place | `format` |
 
 A session whose `fleet` meets another `format` (a session still on an older or newer version) acts on nothing and says to restart (`u`); a `config.json` from a newer `fleet` is left untouched. The rules: [`.claude/rules/fleet-wire-format.md`](../../.claude/rules/fleet-wire-format.md).
 
 ## Turning it off
 
-In a project: `claude plugin disable fleet@mcavuoti --scope local` (or remove the `fleet@mcavuoti` line from `.claude/settings.local.json`), then restart its sessions. `.claude/fleet/` stays with your register: delete it, or move it to the Trash, if you don't want it.
+In a project: `claude plugin disable fleet@mcavuoti --scope local` (or remove the `fleet@mcavuoti` line from `<project>/.claude/settings.local.json`), then restart its sessions. `<project>/.claude/fleet/` stays with your register: delete it, or move it to the Trash, if you don't want it.
 
 ## Develop
 
-- Try the repository's copy in throwaway sessions that load both plugins for that session only, with `sessions`' files pointed elsewhere, in a test folder with `.claude/fleet/` (run `/fleet init` there once):
+- Try the repository's copy in throwaway sessions that load both plugins for that session only, with `sessions`' files pointed elsewhere, in a test folder with `<project>/.claude/fleet/` (run `/fleet init` there once):
   ```sh
   claude --bg --model claude-haiku-5-5 --settings '{"env":{"CLAUDE_CODE_PLUGIN_DIRS":"/path/to/claude-plugins/plugins/sessions:/path/to/claude-plugins/plugins/fleet","SESSIONS_DATA_DIR":"/tmp/t/data","SESSIONS_JOBS_DIR":"/tmp/t/jobs","SESSIONS_DAEMON_LOG":"/tmp/t/daemon.log"},"enabledPlugins":{"sessions@inline":true,"fleet@inline":true,"sessions@mcavuoti":false}}' -n "TEST A" "<a prompt that calls mcp__fleet__decide>"
   ```
