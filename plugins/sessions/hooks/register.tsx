@@ -113,6 +113,7 @@ import {
   tellPrompt,
   tellIdIn,
   type TellState,
+  addSpend,
   dayOf,
   dueWaits,
   howLong,
@@ -120,8 +121,13 @@ import {
   isStale,
   parseQuietHours,
   sentToday,
+  spendBurst,
+  spendIsHigh,
+  spendLine,
+  spendText,
   waitText,
   type QuietHours,
+  type SpendAlert,
   type Wait,
   FORMAT,
   NOTICE_MARKER,
@@ -315,9 +321,9 @@ function debugLine($: any, text: string) {
 // session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
 // marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts), collapsed (the
 // sections the person folded, by id), needsSince:<id> (since when a plugin's mark says it needs the person: since, and
-// at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), pushCount
-// (the notifications sent today: day, count), lastPush (the last one: at, text, from, and what the phone and the
-// notification channel answered).
+// at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
+// (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
+// from, and what the phone and the notification channel answered).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
@@ -477,7 +483,7 @@ async function prune($: any) {
     keys = await $.store.keys()
   } catch {}
   for (const k of keys) {
-    const m = k.match(/^(state|seen|title|waiting|restarted|reopened|needsSince|pushed):(.+)$/)
+    const m = k.match(/^(state|seen|title|waiting|restarted|reopened|needsSince|pushed|spend):(.+)$/)
     if (m?.[2] && !alive.has(m[2])) ids.add(m[2])
   }
   let files: string[] = []
@@ -989,6 +995,49 @@ async function pushWaits($: any) {
   }
 }
 
+// This session's spend against its own usual hour (SpendLedger in state.ts), on every beat. The ledger is kept in the
+// store, spend:<sessionId>, written with each sample (every 5 minutes); what it answers goes into the session's record
+// (spendAlert: every panel draws its line) while the spend runs high
+let ledger: unknown = undefined
+let ledgerFor = ''
+async function watchSpend($: any, usd: number | undefined, windows: RateLimit[], previous: SessionState, now: number): Promise<SpendAlert | undefined> {
+  if (ledgerFor !== myId) {
+    ledger = await storeGet($, `spend:${myId}`)
+    ledgerFor = myId
+  }
+  const next = addSpend(ledger, usd, windows, now)
+  ledger = next.ledger
+  if (next.sampled) await storeSet($, `spend:${myId}`, next.ledger)
+  const b = spendBurst(next.ledger, now)
+  const was = previous.spendAlert
+  if (!b || !spendIsHigh(b, !!was)) return undefined
+  const cents = (x: number) => Math.round(x * 100) / 100
+  const since = was?.since ?? now
+  return { since, hour: cents(b.hour), usual: cents(b.usual), rise: b.rise === null ? null : Math.round(b.rise), kind: next.ledger.kind, notified: was?.notified === true || since === spendNotified }
+}
+
+// The person hears once while this session's spend runs high: it's marked as notified in its record (and here, in case
+// a write of the record raced it)
+let notifyingSpend = false
+let spendNotified = 0
+async function notifySpend($: any) {
+  if (notifyingSpend) return
+  notifyingSpend = true
+  try {
+    const e = await readState($, myId)
+    const alert = e?.spendAlert
+    if (!e || !alert || alert.notified || alert.since === spendNotified) return
+    const own = lastList.find(s => s.sessionId === myId)
+    const name = projectRows.find(f => f.current)?.title ?? String(own?.name || own?.id || myShortId())
+    if (!(await notifyOnce($, async () => true, () => spendText(name, alert, spendOf(e).mode)))) return
+    spendNotified = alert.since
+    const now = (await readState($, myId)) ?? e
+    if (now.spendAlert?.since === alert.since) await storeSet($, `state:${myId}`, { ...now, spendAlert: { ...now.spendAlert, notified: true } })
+  } finally {
+    notifyingSpend = false
+  }
+}
+
 async function refresh($: any) {
   const list = await officialList($)
   if (typeof list === 'string') {
@@ -1053,6 +1102,8 @@ async function refresh($: any) {
     }
     const waitFrom = Math.min(color === 'red' && waitingSince ? waitingSince : Infinity, needsSince ?? Infinity)
     if (Number.isFinite(waitFrom)) waits.push({ sessionId: s.sessionId, title, since: waitFrom })
+    // Running high (its own mod says so, SpendAlert): a line under the row, before another plugin's
+    const hot = e?.spendAlert && color !== 'gray' ? spendLine(e.spendAlert, spend.mode) : ''
     fresh.push({
       sessionId: s.sessionId,
       id: s.id ?? null,
@@ -1074,6 +1125,7 @@ async function refresh($: any) {
       // What it spent so far, from what it published itself: only for a running session on an API account
       usd: color !== 'gray' && spend.mode === 'api' ? spend.usd : null,
       ...marked,
+      ...(hot ? { line: marked.line ? `${hot} · ${marked.line}` : hot, tint: 'warning' as const } : {}),
       depth: 0,
       folded: false,
       helpers,
@@ -1941,6 +1993,8 @@ async function publishUsage($: any) {
   const agent = agentFor === myId ? myAgent : undefined
   const root = myCwd
   const previous = (await readState($, myId)) ?? {}
+  const now = await $.clock.now()
+  const spendAlert = await watchSpend($, spend.usd, spend.limits, previous, now)
   const same =
     previous.model === model &&
     previous.context === context &&
@@ -1948,9 +2002,9 @@ async function publishUsage($: any) {
     previous.agent === agent &&
     previous.root === root &&
     previous.usd === spend.usd &&
-    JSON.stringify(previous.limits ?? []) === JSON.stringify(spend.limits)
-  if (same) return
-  await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? (await $.clock.now()), model, context, version, agent, root, usd: spend.usd, limits: spend.limits })
+    JSON.stringify(previous.limits ?? []) === JSON.stringify(spend.limits) &&
+    JSON.stringify(previous.spendAlert) === JSON.stringify(spendAlert)
+  if (!same) await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? now, model, context, version, agent, root, usd: spend.usd, limits: spend.limits, spendAlert })
 }
 
 // After restarting with u from its own panel, the notice is shown when the window reconnects: at startup nobody is
@@ -2176,7 +2230,11 @@ async function rebind($: any) {
   await storeSet($, `state:${id}`, existing ?? { created: previous?.created ?? now, model: previous?.model, context: undefined, version: previous?.version, agent: previous?.agent, root: previous?.root })
   const seen = await storeGet($, `seen:${old}`)
   if (seen && !(await storeGet($, `seen:${id}`))) await storeSet($, `seen:${id}`, seen)
-  for (const k of ['state', 'seen', 'title', 'waiting', 'restarted', 'needsSince', 'pushed']) await storeDelete($, `${k}:${old}`)
+  // What it spends an hour is the process's, whatever the conversation: its ledger carries over
+  if (ledgerFor === old) ledgerFor = id
+  const spent = await storeGet($, `spend:${old}`)
+  if (spent && !(await storeGet($, `spend:${id}`))) await storeSet($, `spend:${id}`, spent)
+  for (const k of ['state', 'seen', 'title', 'waiting', 'restarted', 'needsSince', 'pushed', 'spend']) await storeDelete($, `${k}:${old}`)
   await runSafe($, ['rm', '-f', `${dataDir}/alive/${old}`, `${dataDir}/inbox/${old}`])
   // A regular session is named by its session id in sections.json (sid:<id>): its section moves to the new id. A
   // background one keeps its short id, and its section
@@ -2244,7 +2302,7 @@ async function announceUpdate($: any) {
 }
 
 // /sessions status, about telling the person: the options as they apply, today's count, the last notification any
-// session sent and what each channel answered
+// session sent and what each channel answered, and this session's spend against its usual hour
 async function notificationsText($: any, now: number): Promise<string> {
   const when = waitPushMs > 0 ? `a push once a session waits ${howLong(waitPushMs)}` : 'no push for waiting sessions (waitPushMinutes 0)'
   const quiet = quietHours ? `, none ${quietHoursText}` : quietHoursText ? `, quiet hours “${quietHoursText}” not understood (write them as 22-7)` : ''
@@ -2255,6 +2313,8 @@ async function notificationsText($: any, now: number): Promise<string> {
       ? ` · last, ${howLong(now - Number(last.at))} ago from ${String(last.from)}: “${String(last.text)}” (phone: ${String(last.phone)}${last.notification ? `; notification: ${String(last.notification)}` : ''})`
       : ''
   const lines = [`Notifications: ${when}${quiet}, ${count}${lastText}`]
+  const burst = ledgerFor === myId && ledger ? spendBurst(ledger as any, now) : null
+  lines.push(`Spend: ${burst ? `this session spent ${formatUsd(burst.hour)} in the last hour at list price, usually ${formatUsd(burst.usual)}` : "not enough history yet to judge this session's spend against its usual hour"}`)
   lines.push(staleMs > 0 ? `⧗ on rows working, or done and unseen, for ${howLong(staleMs)}` : 'No ⧗ on rows (staleMinutes 0)')
   return lines.join('\n')
 }
@@ -2559,7 +2619,7 @@ async function start($: any) {
       bg(runWakes($))
       bg(checkTells($))
     })
-    // The person is told (pushWaits) from this timer only, never from a hook of a turn
+    // The person is told (pushWaits, notifySpend) from these timers only, never from a hook of a turn
     $.clock.every(3000, () => {
       bg(refresh($).then(() => pushWaits($)))
     })
@@ -2572,6 +2632,7 @@ async function start($: any) {
         await beat($).catch(() => {})
         await readAgent($)
         await publishUsage($)
+        bg(notifySpend($))
         await updateInPlace($)
       })().catch(() => {})
     })

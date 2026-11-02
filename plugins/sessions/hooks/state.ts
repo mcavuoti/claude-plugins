@@ -17,7 +17,7 @@ export const HEARTBEAT_VERSION = '0.10.0'
 // model: short model name; context: % of the context used; version: the Claude version the session runs; agent: the
 // agent it runs as (`claude --agent`), null for none; root: the project root its panel uses; usd: what it has cost so
 // far at list price (as /cost says); limits: the account's rate-limit windows its last response reported (empty off a
-// subscription)
+// subscription); spendAlert: it's spending far above its own usual hour (SpendAlert), while it lasts
 export type SessionState = {
   created?: number
   turnStarted?: number
@@ -32,6 +32,7 @@ export type SessionState = {
   root?: string
   usd?: number
   limits?: RateLimit[]
+  spendAlert?: SpendAlert
 }
 
 // What a session spends, read per session and never assumed: on a subscription its responses report rate-limit windows
@@ -64,9 +65,11 @@ export function formatUsd(usd: number): string {
 }
 
 // The account's windows, as the line above the prompt shows them: "5h 12% · 7d 43%"
+export function windowLabel(kind: string): string {
+  return kind === 'five_hour' ? '5h' : kind === 'seven_day' ? '7d' : kind === 'spend_limit' ? 'limit' : kind.replace(/_/g, ' ')
+}
 export function limitsText(limits: readonly RateLimit[]): string {
-  const label = (kind: string) => (kind === 'five_hour' ? '5h' : kind === 'seven_day' ? '7d' : kind === 'spend_limit' ? 'limit' : kind.replace(/_/g, ' '))
-  return limits.map(l => `${label(l.kind)} ${Math.round(l.percent)}%`).join(' · ')
+  return limits.map(l => `${windowLabel(l.kind)} ${Math.round(l.percent)}%`).join(' · ')
 }
 
 // Short time for the right-hand column: now, 3m, 2h, 1d
@@ -1106,4 +1109,98 @@ export function isStale(r: { color: Color; background: boolean }, since: number 
   if (!(threshold > 0) || !since) return false
   if (r.color !== 'blue' && !(r.color === 'yellow' && r.background)) return false
   return now - since >= threshold
+}
+
+// What a session spends an hour, measured against its own usual hour (hours vary a lot between sessions, so a global
+// threshold would be noise). Each session keeps its own ledger in the store, spend:<sessionId>: its cost at list price
+// as /cost says (on a subscription too, where it's what its tokens would cost: a measure, not a bill) added up into a
+// running total (a cost that went down, after a /clear or a restart, counts again from there), and samples of
+// [when, total, the account's window %]: every 5 minutes for the last 70 minutes, and the first of each hour for the
+// 25 hours before. kind: which window the % is (five_hour when there is one, else seven_day, else the first)
+export type SpendLedger = { last: number; total: number; kind: string; samples: [number, number, number][] }
+const SAMPLE_EVERY = 300000
+export function addSpend(previous: unknown, usd: number | undefined, limits: readonly RateLimit[], now: number): { ledger: SpendLedger; sampled: boolean } {
+  const p = previous as Partial<SpendLedger> | null | undefined
+  const samples = Array.isArray(p?.samples) ? p.samples.filter(s => Array.isArray(s) && s.length === 3 && s.every(Number.isFinite)) : []
+  const last = Number.isFinite(p?.last) ? Number(p?.last) : 0
+  const total = Number.isFinite(p?.total) ? Number(p?.total) : 0
+  const cost = Number.isFinite(usd) ? Number(usd) : last
+  const window = limits.find(l => l.kind === 'five_hour') ?? limits.find(l => l.kind === 'seven_day') ?? limits[0]
+  const kind = window?.kind ?? (typeof p?.kind === 'string' ? p.kind : '')
+  const next = total + (cost >= last ? cost - last : cost)
+  const newest = samples[samples.length - 1]
+  const sampled = !newest || now - newest[0] >= SAMPLE_EVERY
+  const all = sampled ? [...samples, [now, next, window?.percent ?? -1] as [number, number, number]] : samples
+  // Thinned: everything from the last 70 minutes, the first sample of each hour before that, nothing past 25 hours
+  const hours = new Set<number>()
+  const kept = all.filter(([at]) => {
+    if (now - at <= 4200000) return true
+    if (now - at > 90000000) return false
+    const hour = Math.floor(at / 3600000)
+    if (hours.has(hour)) return false
+    hours.add(hour)
+    return true
+  })
+  return { ledger: { last: cost, total: next, kind, samples: kept }, sampled }
+}
+
+// The last hour against the usual one: hour, what it spent in the last hour; usual, the median of its past active hours
+// (it spent something) over the last day; rise, how much the account's window rose in the last hour (null off a
+// subscription, or when the window reset). null: not enough history to judge (an hour, and three active hours before)
+export type SpendBurst = { hour: number; usual: number; rise: number | null }
+export function spendBurst(l: SpendLedger, now: number): SpendBurst | null {
+  const at = (t: number) => {
+    let found: [number, number, number] | undefined
+    for (const s of l.samples) if (s[0] <= t) found = s
+    return found
+  }
+  const hourAgo = at(now - 3600000)
+  if (!hourAgo) return null
+  const active: number[] = []
+  for (let k = 1; k <= 24; k++) {
+    const a = at(now - k * 3600000)
+    const b = at(now - (k + 1) * 3600000)
+    if (!a || !b || a === b) continue
+    if (a[1] - b[1] > 0.005) active.push(a[1] - b[1])
+  }
+  if (active.length < 3) return null
+  const sorted = active.sort((x, y) => x - y)
+  const mid = Math.floor(sorted.length / 2)
+  const usual = sorted.length % 2 ? (sorted[mid] ?? 0) : ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2
+  const newest = l.samples[l.samples.length - 1]
+  const rise = newest && newest[2] >= 0 && hourAgo[2] >= 0 && newest[2] >= hourAgo[2] ? newest[2] - hourAgo[2] : null
+  return { hour: l.total - hourAgo[1], usual, rise }
+}
+
+// Far above its usual hour: at least SPEND_FACTOR times it, and at least SPEND_FLOOR_USD at list price (small sums
+// aren't worth a word). Once marked, it stays so until it falls below half of both
+export const SPEND_FACTOR = 4
+export const SPEND_FLOOR_USD = 3
+export function spendIsHigh(b: SpendBurst | null, marked: boolean): boolean {
+  if (!b) return false
+  const k = marked ? 0.5 : 1
+  return b.hour >= SPEND_FLOOR_USD * k && b.hour >= SPEND_FACTOR * b.usual * k
+}
+
+// What a session publishes while its spend runs high (SessionState.spendAlert): since when, the last hour and the usual
+// one at list price, the window's rise (null off a subscription), its kind, and whether the person was notified
+export type SpendAlert = { since: number; hour: number; usual: number; rise: number | null; kind: string; notified: boolean }
+// The line under its row and the notification: dollars on an API account; on a subscription (where dollars aren't
+// billed) how many times its usual hour, and how much the account's window rose meanwhile
+function spendParts(a: SpendAlert): { times: string; window: string } {
+  return {
+    times: a.usual > 0 ? `${Math.round(a.hour / a.usual)}×` : 'far above',
+    window: a.rise !== null && a.kind ? `${windowLabel(a.kind)} +${Math.round(a.rise)}% this hour` : '',
+  }
+}
+export function spendLine(a: SpendAlert, mode: 'subscription' | 'api' | 'unknown'): string {
+  const p = spendParts(a)
+  if (mode === 'subscription') return `spending ${p.times} its usual hour${p.window ? ` · ${p.window}` : ''}`
+  return `${formatUsd(a.hour)} in the last hour · usually ${formatUsd(a.usual)}`
+}
+export function spendText(name: string, a: SpendAlert, mode: 'subscription' | 'api' | 'unknown'): string {
+  const who = `“${Array.from(name).slice(0, 60).join('')}”`
+  const p = spendParts(a)
+  if (mode === 'subscription') return `${who} is spending ${p.times} its usual hour${p.window ? ` (${p.window})` : ''}: check it isn't looping`
+  return `${who} spent ${formatUsd(a.hour)} in the last hour, usually ${formatUsd(a.usual)}: check it isn't looping`
 }
