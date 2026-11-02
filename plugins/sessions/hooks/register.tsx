@@ -2562,7 +2562,7 @@ function sessionsApi($: any): Sessions {
       } catch (err) {
         return { ok: false, reason: 'busy', detail: `couldn't write the marks: ${String(err).slice(0, 120)}` }
       }
-      return { ok: true }
+      return Object.keys(v.rejected).length ? { ok: true, rejected: v.rejected } : { ok: true }
     },
   }
 }

@@ -163,8 +163,10 @@ export type Sessions = {
    * stopped, one closed for lack of memory while memory is still short. `reason` goes to the debug log */
   wake?: (input: { ref: SessionsRef; reason: string }) => Promise<SessionsResult & { state?: 'running' | 'queued' | 'refused' }>
   /** 0.12.0. Marks rows in every session's panel for `ttlMs` (at most 600000, 10 minutes): call again to keep them.
-   * Each call replaces the marks this session of `source` set before; empty `rows` clears them */
-  setMarks?: (input: { source: string; rows: Record<SessionsRef, SessionsMark>; ttlMs: number }) => Promise<SessionsResult>
+   * Each call replaces the marks this session of `source` set before; empty `rows` clears them. rejected (0.13.1): the
+   * rows left out for breaking a limit (a key that isn't a ref, a badge over 3 columns, a status line over 60
+   * characters…), by ref, with why; the call's other rows are set and it answers ok */
+  setMarks?: (input: { source: string; rows: Record<SessionsRef, SessionsMark>; ttlMs: number }) => Promise<SessionsResult & { rejected?: Record<SessionsRef, string> }>
 }
 export type SessionsMethod = keyof Sessions
 

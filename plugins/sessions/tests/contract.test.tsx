@@ -298,11 +298,15 @@ test('setMarks: checked, kept per source and session for ttlMs, drawn in the pan
   expect(await reason({ ...ok, ttlMs: 600001 })).toBe('invalid: ttlMs is 1 to 600000 (10 minutes)')
   expect(await reason({ ...ok, ttlMs: 0 })).toContain('invalid')
   expect(await reason({ ...ok, source: 'me' })).toContain('refused')
-  expect(await reason({ ...ok, rows: { aaaaaaaa: { badge: 'four' } } })).toBe('invalid: a badge is up to 3 columns')
-  expect(await reason({ ...ok, rows: { aaaaaaaa: { tint: 'red' } } })).toContain('invalid: a tint is one of')
-  expect(await reason({ ...ok, rows: { aaaaaaaa: { line: 'x'.repeat(61) } } })).toContain('invalid: a status line')
-  expect(await reason({ ...ok, rows: { 'not a ref': {} } })).toContain('invalid')
   expect(await reason({ ...ok, rows: [] })).toContain('invalid')
+  // A row that breaks a limit is left out alone, with why; the others are set
+  const rejected = async (rows: unknown) => (await call($, 'setMarks', { ...ok, rows })).rejected
+  expect(await rejected({ aaaaaaaa: { badge: 'four' } })).toEqual({ aaaaaaaa: 'a badge is up to 3 columns' })
+  expect((await rejected({ aaaaaaaa: { tint: 'red' } })).aaaaaaaa).toContain('a tint is one of')
+  expect((await rejected({ 'not a ref': {} }))['not a ref']).toContain("isn't a ref")
+  const mixed = await call($, 'setMarks', { ...ok, rows: { aaaaaaaa: { badge: '$' }, bbbbbbbb: { line: `budget used up ($0.02 today): /fleet budget "TEST Business Plan" +n` } } })
+  expect(mixed).toEqual({ ok: true, rejected: { bbbbbbbb: 'a status line is up to 60 characters on one line' } })
+  expect(w.store.get(`marks:probe:${SID}`)).toMatchObject({ rows: { aaaaaaaa: { badge: '$' } } })
   // Before the mod has started here too: the session's own id names them
   expect(await call($, 'setMarks', ok)).toEqual({ ok: true })
   expect(w.store.get(`marks:probe:${SID}`)).toEqual({ at: w.clock.now(), until: w.clock.now() + 60000, rows: { aaaaaaaa: { badge: '?2' } } })

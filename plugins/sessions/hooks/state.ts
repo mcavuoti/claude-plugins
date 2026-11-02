@@ -933,7 +933,9 @@ export type RowMark = { badge: string; tint: SessionsTint | ''; line: string; ne
 export const NO_MARK: RowMark = { badge: '', tint: '', line: '', needsPerson: false }
 const TINTS: readonly SessionsTint[] = ['error', 'warning', 'suggestion', 'success', 'inactive']
 
-export function checkMarks(input: any): { ok: true; source: string; rows: Record<string, SessionsMark>; ttlMs: number } | (SessionsResult & { ok: false }) {
+// A row that breaks a limit is left out alone, with why (rejected, by ref): the call's other rows are set. What the
+// whole call gets wrong (its source, ttlMs, rows that aren't an object or more than 200) refuses it
+export function checkMarks(input: any): { ok: true; source: string; rows: Record<string, SessionsMark>; ttlMs: number; rejected: Record<string, string> } | (SessionsResult & { ok: false }) {
   const s = checkSource(input?.source)
   if (!s.ok) return s
   const invalid = (detail: string) => ({ ok: false as const, reason: 'invalid' as const, detail })
@@ -944,18 +946,24 @@ export function checkMarks(input: any): { ok: true; source: string; rows: Record
   const entries = Object.entries(given)
   if (entries.length > 200) return invalid('at most 200 rows')
   const rows: Record<string, SessionsMark> = {}
-  for (const [ref, m] of entries as [string, any][]) {
-    if (!isRef(ref)) return invalid(`${ref} isn't a ref (a short id or sid:<sessionId>)`)
-    if (!m || typeof m !== 'object') return invalid(`the mark of ${ref} is an object`)
+  const rejected: Record<string, string> = {}
+  const problem = (ref: string, m: any): string => {
+    if (!isRef(ref)) return "it isn't a ref (a short id or sid:<sessionId>)"
+    if (!m || typeof m !== 'object') return 'a mark is an object'
     const badge = typeof m.badge === 'string' ? m.badge.trim() : m.badge
-    if (badge !== undefined && (typeof badge !== 'string' || displayWidth(badge) > 3 || /\p{Cc}/u.test(badge))) return invalid('a badge is up to 3 columns')
-    if (m.tint !== undefined && !TINTS.includes(m.tint)) return invalid(`a tint is one of ${TINTS.join(', ')}`)
+    if (badge !== undefined && (typeof badge !== 'string' || displayWidth(badge) > 3 || /\p{Cc}/u.test(badge))) return 'a badge is up to 3 columns'
+    if (m.tint !== undefined && !TINTS.includes(m.tint)) return `a tint is one of ${TINTS.join(', ')}`
     const line = typeof m.line === 'string' ? m.line.trim().replace(/\s+/g, ' ') : m.line
-    if (line !== undefined && (typeof line !== 'string' || Array.from(line).length > 60 || /\p{Cc}/u.test(line))) return invalid('a status line is up to 60 characters on one line')
-    if (m.needsPerson !== undefined && typeof m.needsPerson !== 'boolean') return invalid('needsPerson is true or false')
+    if (line !== undefined && (typeof line !== 'string' || Array.from(line).length > 60 || /\p{Cc}/u.test(line))) return 'a status line is up to 60 characters on one line'
+    if (m.needsPerson !== undefined && typeof m.needsPerson !== 'boolean') return 'needsPerson is true or false'
     rows[ref] = { ...(badge ? { badge } : {}), ...(m.tint ? { tint: m.tint } : {}), ...(line ? { line } : {}), ...(m.needsPerson ? { needsPerson: true } : {}) }
+    return ''
   }
-  return { ok: true, source: input.source, rows, ttlMs }
+  for (const [ref, m] of entries as [string, any][]) {
+    const why = problem(ref, m)
+    if (why) rejected[Array.from(ref).slice(0, 80).join('')] = why
+  }
+  return { ok: true, source: input.source, rows, ttlMs, rejected }
 }
 
 // What each row shows: the newest mark set on it wins, and it needs the person if any mark says so. Expired ones count
