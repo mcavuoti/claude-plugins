@@ -144,6 +144,11 @@ export const linux: Platform = {
     return m ? Number(m[1]) > 1.5 * 1024 * 1024 : null
   },
 
+  // /usr/bin/python3 is the usual one here: no stub asks for anything first
+  async pythonUsable() {
+    return true
+  },
+
   text: {
     switchNeedsWindow: 'To switch, open this session with ccc (the launcher lets the panel switch that window)',
     agentsNeedsWindow: 'To open the agent view, open this session with ccc (the launcher lets the panel switch that window)',

@@ -156,7 +156,7 @@ A plain `→` can't go to the panel only when the prompt is empty, the way `←`
 
 ## For other plugins
 
-The mod adds `$.sessions` to the API other mods see (api 1): what this session is (its short id, name, project root, the agent it runs as), the state of other sessions by short id or name, sections of their own in the panel with sessions under a parent, starting a session (`--agent`, `--settings`), waking one retired for being idle, and marks on rows (a badge, a status line, "needs you"). It spends no tokens. A plugin lists `sessions` under `dependencies` in its `plugin.json`, calls only (it never hooks `sessions.*` events or reads the mod's files), and checks what's served with `contract()` first. How to call it and how it changes: [`docs/plugin-contract.md`](docs/plugin-contract.md); the types: [`types/index.d.ts`](types/index.d.ts).
+The mod adds `$.sessions` to the API other mods see (api 1): what this session is (its short id, name, project root, the agent it runs as), the state of other sessions by short id or name, sections of their own in the panel with sessions under a parent, starting a session (`--agent`, `--settings`), waking one retired for being idle, and marks on rows (a badge, a status line, "needs you"). It spends no tokens (the mod's only turns are [`ccc tell`](#telling-a-session-from-a-script)'s, in a background session you opted in). A plugin lists `sessions` under `dependencies` in its `plugin.json`, calls only (it never hooks `sessions.*` events or reads the mod's files), and checks what's served with `contract()` first. How to call it and how it changes: [`docs/plugin-contract.md`](docs/plugin-contract.md); the types: [`types/index.d.ts`](types/index.d.ts).
 
 ## Debug logs
 

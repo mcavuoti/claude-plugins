@@ -617,17 +617,15 @@ async function processVersion($: any, pid: number): Promise<string> {
 
 // Tokens spent: usage.py (next to this file) reads them from the conversation logs; it reads only what's new since the
 // previous run (its cache is in <data>/usage) and several sessions can run it at once.
-// It needs python3: on a Mac without the developer tools, /usr/bin/python3 pops up a prompt to install them, so there
-// that one isn't used without them (on Linux /usr/bin/python3 is the usual one)
+// It needs a python3 that runs without bothering the person (platform.pythonUsable: on a Mac without the developer
+// tools, /usr/bin/python3 pops up a prompt to install them)
 const USAGE_READER = `${(import.meta as any).dir}/usage.py`
 let python: string | null | undefined
 async function usablePython($: any): Promise<string | null> {
   if (python !== undefined) return python
   const r = await runSafe($, ['/bin/sh', '-lc', 'command -v python3'])
   const path = r.exitCode === 0 ? r.stdout.trim() : ''
-  if (!path) return (python = null)
-  const mac = (await runSafe($, ['uname', '-s'])).stdout.trim() === 'Darwin'
-  if (mac && path === '/usr/bin/python3' && (await runSafe($, ['xcode-select', '-p'])).exitCode !== 0) return (python = null)
+  if (!path || !(await platform.pythonUsable(sys($), path))) return (python = null)
   return (python = path)
 }
 

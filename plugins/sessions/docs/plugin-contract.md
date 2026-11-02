@@ -1,6 +1,6 @@
 # `$.sessions`: the contract for other plugins (api 1)
 
-From 0.11.0 the `sessions` mod adds a noun to `$` that other plugins call: what this session is, the state of other sessions, and sections in the panel; from 0.12.0 also starting and waking sessions, and marks on rows. It never spends tokens and never talks to the model. Its types are written in one place, [`types/index.d.ts`](../types/index.d.ts) (from `SessionsApi` down); this page says how to use it and how it changes, and doesn't repeat the shapes.
+From 0.11.0 the `sessions` mod adds a noun to `$` that other plugins call: what this session is, the state of other sessions, and sections in the panel; from 0.12.0 also starting and waking sessions, and marks on rows. Its methods never spend tokens nor talk to the model (the mod's one turn of its own is `ccc tell`'s, which hands a script's text to a background session the person opted in). Its types are written in one place, [`types/index.d.ts`](../types/index.d.ts) (from `SessionsApi` down); this page says how to use it and how it changes, and doesn't repeat the shapes.
 
 ## Depending on it
 

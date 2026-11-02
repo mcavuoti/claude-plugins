@@ -141,6 +141,11 @@ export const macos: Platform = {
     return r.exitCode === 0 && level > 0 ? level === 1 : null
   },
 
+  // /usr/bin/python3 without the developer tools is a stub that pops up a prompt to install them
+  async pythonUsable(run, path) {
+    return path !== '/usr/bin/python3' || (await run(['xcode-select', '-p'])).exitCode === 0
+  },
+
   text: {
     switchNeedsWindow: 'To switch, use the panel from the Terminal window showing this session',
     agentsNeedsWindow: 'To open the agent view, use the panel from the Terminal window showing this session',

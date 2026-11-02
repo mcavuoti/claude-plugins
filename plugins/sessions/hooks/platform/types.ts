@@ -42,6 +42,9 @@ export type Platform = {
   processCwd(run: Run, pid: string): Promise<string>
   // Whether memory is normal, with the signal Claude's background service uses to close sessions; null if unknown
   memoryNormal(run: Run): Promise<boolean | null>
+  // Whether the python3 found on the PATH (its path) can run without bothering the person (a system stub that asks to
+  // install something first can't)
+  pythonUsable(run: Run, path: string): Promise<boolean>
   // Notices whose advice depends on how windows work on this system
   text: {
     switchNeedsWindow: string
