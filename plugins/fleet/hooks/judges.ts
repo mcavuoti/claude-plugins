@@ -748,7 +748,7 @@ export function belowAgreement(s: AreaStats | undefined, c: JudgeConfig): boolea
 
 /** The words for an area going live, or the refusal: it hasn't earned it, and --force wasn't given */
 export function liveWords(area: string, check: { ok: boolean; why: string }, force: boolean, c: JudgeConfig): { ok: boolean; text: string } {
-  if (!check.ok && !force) return { ok: false, text: `Not turned live: ${area} ${check.why}. /fleet stats ${area} shows it; /fleet judges live ${area} --force "why" turns it on anyway, recorded as forced.` }
+  if (!check.ok && !force) return { ok: false, text: `Not turned live: ${area}: ${check.why}. /fleet stats ${area} shows it; /fleet judges live ${area} --force "why" turns it on anyway, recorded as forced.` }
   return {
     ok: true,
     text: [

@@ -5137,7 +5137,10 @@ async function statsCommand($: any, area: string): Promise<string> {
   ]
   const { records } = await queueRecords($)
   let open = 0
-  for (const r of records) if (r.kind === undefined && (await exists($, judgeFile(r.id)))) open++
+  for (const r of records) {
+    const f = r.kind === undefined ? await readJudge($, r.id) : null
+    if (f && !f.gated) open++
+  }
   if (area) {
     const key = area === 'none' ? NO_AREA : area
     const s = stats.get(key)
@@ -5687,6 +5690,7 @@ async function intakeSpendToday($: any, now: number): Promise<{ usd: number; rec
  * overrules, and an area that went back to shadow by itself */
 async function judgeBriefLines($: any, since: number, offsetMin: number): Promise<string[]> {
   const { records, overrules } = await registerAll($)
+  const overruled = new Set(overrules.map(o => o.id))
   const lines: string[] = []
   for (const r of records) {
     const j = r.judge
@@ -5694,7 +5698,7 @@ async function judgeBriefLines($: any, since: number, offsetMin: number): Promis
     const where = r.area ? ` (area ${r.area})` : ''
     if (j.answered?.length) {
       const cites = [...new Set(j.verdicts.filter(v => j.answered?.includes(v.q)).flatMap(v => v.cites))]
-      lines.push(`the judge answered ${r.id}${where} for you, citing ${cites.join(', ')}: /fleet overrule ${r.id} <answer> corrects it`)
+      lines.push(`the judge answered ${r.id}${where} for you, citing ${cites.join(', ')}${overruled.has(r.id) ? '' : `: /fleet overrule ${r.id} <answer> corrects it`}`)
     }
     if (j.sentBack) lines.push(`the judge sent ${r.id}${where} back to ${r.asker?.name || 'its asker'}: ${r.why ?? 'malformed'}`)
   }

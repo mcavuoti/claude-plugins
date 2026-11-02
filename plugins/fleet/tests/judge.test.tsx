@@ -180,7 +180,7 @@ test('live: an area turned on by the person (forced); an exact repeat answered b
   await startSession($, w)
   // Not earned: refused, unless forced (recorded); only the person turns an area live
   expect(await fleet($, 'judges live storage', { kind: 'plugin', name: 'other' })).toContain('Only the person turns an area live')
-  expect(await fleet($, 'judges live storage')).toBe('Not turned live: storage it has 0 proposals (it needs 30 proposals and 90% agreement on what the judge decided). /fleet stats storage shows it; /fleet judges live storage --force "why" turns it on anyway, recorded as forced.')
+  expect(await fleet($, 'judges live storage')).toBe('Not turned live: storage: it has 0 proposals (it needs 30 proposals and 90% agreement on what the judge decided). /fleet stats storage shows it; /fleet judges live storage --force "why" turns it on anyway, recorded as forced.')
   expect(await fleet($, 'judges live hosting')).toContain("hosting isn't one of the project's tags (storage, ui)")
   const on1 = await fleet($, 'judges live storage --force "trying it"')
   expect(on1).toContain('Area storage is live (forced: it has 0 proposals')
@@ -254,7 +254,7 @@ test('overrule: the asker hears it once, the correction is case law ahead of the
   expect(await fleet($, 'stats storage')).toContain('1) a) SQLite citing D-1 (an exact repeat): answered live, you overruled it')
   const brief = await fleet($, 'brief')
   expect(brief).toContain('2. What changed: the judges')
-  expect(brief).toContain('   - the judge answered D-2 (area storage) for you, citing D-1: /fleet overrule D-2 <answer> corrects it')
+  expect(brief).toContain('   - the judge answered D-2 (area storage) for you, citing D-1\n')
   expect(brief).toContain('   - you overruled the judge on D-2 (area storage): "the queue runs it"')
   expect(brief).toContain('   - area storage went back to shadow at ')
   const judges = await fleet($, 'judges')
