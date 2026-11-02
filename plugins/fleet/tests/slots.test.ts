@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { holderKey, leaseMinutes, parseSlots, sameHolder, sweepSlots, takeVerdict, type Holder, type Lease, type Waiter } from '../hooks/slots'
+import { holderKey, leaseMinutes, parseSlots, renewVerdict, sameExpired, sameHolder, sweepSlots, takeVerdict, waiterGone, type Holder, type Lease, type Waiter } from '../hooks/slots'
 
 // Slots' pure parts: slots.json, what a take gets (its own lease extended, a free one, or a place in line), and the
 // sweeper's part (leases that ran out back, free ones to the first in line)
@@ -45,4 +45,22 @@ test("the sweeper's part: leases that ran out go back, free ones go to the first
   expect(r.expired.map(l => l.holder.name)).toEqual(['Tester 1'])
   expect(r.grants.map(g => [g.waiter.holder.name, g.n])).toEqual([['Tester 2', 0]])
   expect(sweepSlots({ spec: SPEC, leases: [lease(0, A, NOW + 1000)], waiters: [waiter(B, NOW)], now: NOW }).grants).toEqual([])
+})
+
+test('a renewal while others wait holds it no longer than a lease from when it was taken; waiters gone or a day old leave the line', () => {
+  const held = { ...lease(0, A, NOW + 10 * 60000), at: NOW - 15 * 60000 }
+  // Nobody waits: any length, up to the pool's lease
+  expect(renewVerdict({ spec: SPEC, lease: held, minutes: 30, now: NOW, waiting: 0 })).toEqual({ until: NOW + 30 * 60000, capped: false })
+  // Someone waits: capped at 30 min since it was taken, and refused once it's there
+  expect(renewVerdict({ spec: SPEC, lease: held, minutes: 30, now: NOW, waiting: 1 })).toEqual({ until: NOW + 15 * 60000, capped: true })
+  expect(renewVerdict({ spec: SPEC, lease: { ...held, until: NOW + 15 * 60000 }, minutes: 30, now: NOW, waiting: 1 })).toEqual({ refused: true, cap: NOW + 15 * 60000 })
+  expect(renewVerdict({ spec: SPEC, lease: held, minutes: 5, now: NOW, waiting: 1 })).toEqual({ until: NOW + 5 * 60000, capped: false })
+  expect(waiterGone({ state: 'gone', mtimeMs: NOW, now: NOW })).toBe('its session is gone')
+  expect(waiterGone({ state: 'idle', mtimeMs: NOW - 25 * 3600000, now: NOW })).toBe('it has waited over a day without taking again')
+  expect(waiterGone({ state: null, mtimeMs: NOW - 3600000, now: NOW })).toBe(null)
+  // Taken back only if it's the very lease that ran out
+  const ran = lease(0, A, NOW - 1)
+  expect(sameExpired(ran, ran, NOW)).toBe(true)
+  expect(sameExpired({ ...ran, at: NOW, until: NOW + 60000, holder: B }, ran, NOW)).toBe(false)
+  expect(sameExpired(null, ran, NOW)).toBe(false)
 })

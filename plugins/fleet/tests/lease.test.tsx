@@ -94,3 +94,25 @@ test('a pool of one: a second taker waits; the sweeper takes back the lease that
   const after: any = await $.tool.call({ tool: 'Bash', command: 'true' } as any)
   expect((after.context ?? []).join('\n')).toContain('fleet: your lease on sim ran out and fleet took it back.')
 })
+
+test('while another waits a renewal doesn’t jump the line; a waiter whose session is gone leaves it', WITH_SESSIONS, async ($, on) => {
+  const me = { sessionId: SID, ref: REF, name: 'Tester 1' }
+  const w = project(on, {
+    [`${SLOTS}/0.json`]: JSON.stringify({ format: 1, slot: 'sim', n: 0, holder: me, at: NOW - 25 * 60000, until: NOW + 5 * 60000, why: 'my run' }),
+    [`${SLOTS}/waiting/bbbbbbbb.json`]: JSON.stringify({ format: 1, slot: 'sim', holder: OTHER, at: NOW - 60000, why: 'its run' }),
+  })
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Tester 1', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'Tester 1', 'idle'), bbbbbbbb: row('bbbbbbbb', 'Tester 2', 'idle') } })
+  await startSession($, w)
+  await tick(w)
+  // Held 25 of its 30 minutes, and Tester 2 waits: not extended past the lease's length
+  const r = await slot($, { action: 'take', slot: 'sim', minutes: 30 })
+  expect(r.result).toMatch(/^1 waits for sim, and you've held it since \d\d:\d\d, as long as a lease lasts \(30 min\): it isn't extended, and goes to the first in line at \d\d:\d\d\./)
+  expect(json(w, `${SLOTS}/0.json`).until).toBe(NOW + 5 * 60000)
+  // Tester 2's session is gone: the sweeper drops it from the line, and the lease extends again
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Tester 1', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'Tester 1', 'idle') } })
+  for (let i = 0; i < 31; i++) await tick(w)
+  expect(under(w, `${SLOTS}/waiting`)).toEqual([])
+  expect(w.logs.some(l => l.includes('slot sim: Tester 2 out of line (its session is gone)'))).toBe(true)
+  expect((await slot($, { action: 'take', slot: 'sim', minutes: 30 })).result).toMatch(/^You hold sim \(1 of 1\) until \d\d:\d\d now\. Release it/)
+  expect(json(w, `${SLOTS}/0.json`).until).toBeGreaterThan(NOW + 25 * 60000)
+})

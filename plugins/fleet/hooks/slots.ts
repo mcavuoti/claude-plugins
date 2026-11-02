@@ -95,6 +95,31 @@ export function takeVerdict(p: { spec: SlotSpec; leases: readonly Lease[]; waite
   return { kind: 'wait', place: ahead + 1 }
 }
 
+/** How far a holder's take extends its lease. While others wait, never past leaseMin since it first took it (a
+ * renewal doesn't jump the line): capped there, or refused when it's there already */
+export function renewVerdict(p: { spec: SlotSpec; lease: Lease; minutes: number; now: number; waiting: number }): { until: number; capped: boolean } | { refused: true; cap: number } {
+  const until = p.now + p.minutes * 60000
+  if (!p.waiting) return { until, capped: false }
+  const cap = p.lease.at + p.spec.leaseMin * 60000
+  if (until <= cap) return { until, capped: false }
+  return cap > p.lease.until ? { until: cap, capped: true } : { refused: true, cap }
+}
+
+/** A waiter fleet drops from the line, and why: its session is gone, or its place is a day old (a session that still
+ * wants it takes again, which renews its place); null to keep it */
+export const WAITER_MAX_MS = 24 * 3600000
+export function waiterGone(p: { state: string | null; mtimeMs: number | null; now: number }): string | null {
+  if (p.state === 'gone') return 'its session is gone'
+  if (p.mtimeMs !== null && p.now - p.mtimeMs > WAITER_MAX_MS) return 'it has waited over a day without taking again'
+  return null
+}
+
+/** Whether a lease moved aside to be taken back is the very one that ran out (the same take, still past its time): a
+ * fresh lease published at its number meanwhile is put back, never removed */
+export function sameExpired(claimed: Lease | null, planned: Lease, now: number): boolean {
+  return !!claimed && claimed.until <= now && claimed.at === planned.at && claimed.n === planned.n && sameHolder(claimed.holder, planned.holder)
+}
+
 /** The sweeper's part: leases that ran out, and the waiters a free lease goes to (oldest first) */
 export function sweepSlots(p: { spec: SlotSpec; leases: readonly Lease[]; waiters: readonly Waiter[]; now: number }): { expired: Lease[]; grants: { waiter: Waiter; n: number }[] } {
   const expired = p.leases.filter(l => l.until <= p.now)

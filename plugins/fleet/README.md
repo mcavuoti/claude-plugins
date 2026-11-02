@@ -391,9 +391,9 @@ The `proposal` template has three: the business plan (the planner), the proposal
 { "slotsFormat": 1, "slots": { "lab": { "count": 2, "leaseMin": 30, "what": "the test machines" } } }
 ```
 
-- **`mcp__fleet__slot`**, in a background session: `take` (with `slot`, `why`, `minutes`) gives a lease that runs out (taken again, it's extended); with none free, the session waits in line and is told so. `release` gives it back; `list` shows the pools.
-- **The line goes first**: a freed lease goes to the first in line (the releaser hands it on at once; the sweeper every minute), who hears "lab is yours now" at its next step, or as a nudge (not held by the wakes' window), or is woken when retired. A newcomer takes one only when more are free than wait ahead of it.
-- **Leases run out**: the sweeper takes back one past its time; its holder hears it was taken back.
+- **`mcp__fleet__slot`**, in a background session: `take` (with `slot`, `why`, `minutes`) gives a lease that runs out (taken again, it's extended; while others wait, never past `leaseMin` from when it was taken, so a renewal doesn't jump the line: release it when done, and taking it again puts you in line); with none free, the session waits in line and is told so. `release` gives it back; `list` shows the pools.
+- **The line goes first**: a freed lease goes to the first in line (the releaser hands it on at once; the sweeper every minute), who hears "lab is yours now" at its next step, or as a nudge (not held by the wakes' window), or is woken when retired. A newcomer takes one only when more are free than wait ahead of it. The sweeper drops from the line a waiter whose session is gone, or that has waited a day without taking again.
+- **Leases run out**: the sweeper takes back one past its time, claiming it first (moved aside, and removed only if it's still the one that ran out: a fresh lease someone published at its number goes back); its holder hears it was taken back.
 - `/fleet status` shows each pool, who holds what until when, and who waits; the brief lists who waits.
 
 ## Changes to command-level files

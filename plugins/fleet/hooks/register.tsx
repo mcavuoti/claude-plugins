@@ -225,7 +225,7 @@ import {
   type IntakeSource,
   type IntakeState,
 } from './intake'
-import { SLOTS_FORMAT, SLOT_DESCRIPTION, SLOT_SCHEMA, holderKey, leaseMinutes, newSlots, parseLease as parseSlotLease, parseSlots, parseWaiter, sameHolder, slotHolderWords, sweepSlots, takeVerdict, type Holder, type Lease, type SlotSpec, type Waiter } from './slots'
+import { SLOTS_FORMAT, SLOT_DESCRIPTION, SLOT_SCHEMA, holderKey, leaseMinutes, newSlots, parseLease as parseSlotLease, parseSlots, parseWaiter, renewVerdict, sameExpired, sameHolder, slotHolderWords, sweepSlots, takeVerdict, waiterGone, type Holder, type Lease, type SlotSpec, type Waiter } from './slots'
 import {
   HEARTBEAT_STALE_MS,
   ROSTER_FORMAT,
@@ -3206,14 +3206,23 @@ async function slotCall($: any, e: any): Promise<any> {
   for (let tries = 0; tries < 3; tries++) {
     const v = takeVerdict({ spec, leases: leases.map(x => x.lease), waiters: waiters.map(x => x.waiter), me: holder, now })
     if (v.kind === 'renew') {
-      const l: Lease = { ...v.lease, until: now + minutes * 60000, ...(why ? { why } : {}) }
+      // While others wait, a renewal never holds it past a lease's length since it was taken: it doesn't jump the line
+      const others = waiters.filter(w => !sameHolder(w.waiter.holder, holder)).length
+      const r = renewVerdict({ spec, lease: v.lease, minutes, now, waiting: others })
+      if ('refused' in r) return { result: `${others} wait${others === 1 ? 's' : ''} for ${name}, and you've held it since ${clock(v.lease.at, me.offsetMin)}, as long as a lease lasts (${spec.leaseMin} min): it isn't extended, and goes to the first in line at ${clock(v.lease.until, me.offsetMin)}. Release it as soon as you're done (mcp__fleet__slot release); taking it again then puts you in line.` }
+      const l: Lease = { ...v.lease, until: r.until, ...(why ? { why } : {}) }
       await replace($, slotDir(name, `${v.lease.n}.json`), json(l))
       await update($, slotTold, m => ({ ...m, [leaseKey(l)]: now }))
-      return { result: `You hold ${name} (${v.lease.n + 1} of ${spec.count}) until ${clock(l.until, me.offsetMin)} now. Release it with mcp__fleet__slot release as soon as you're done.` }
+      return { result: `You hold ${name} (${v.lease.n + 1} of ${spec.count}) until ${clock(l.until, me.offsetMin)} now${r.capped ? ` (no later: ${others} wait${others === 1 ? 's' : ''} for it, and a lease lasts ${spec.leaseMin} min from when you took it)` : ''}. Release it with mcp__fleet__slot release as soon as you're done.` }
     }
     if (v.kind === 'grant') {
       const old = leases.find(x => x.lease.n === v.n)
-      if (old) await remove($, [old.path])
+      // One that ran out, taken back only if it's still that one (claimed by moving it aside)
+      if (old && !(await takeBack($, old, now))) {
+        leases = await leasesOf($, name)
+        waiters = await waitersOf($, name)
+        continue
+      }
       await run($, ['mkdir', '-p', slotDir(name)])
       const lease: Lease = { format: FORMAT, slot: name, n: v.n, holder, at: now, until: now + minutes * 60000, ...(why ? { why } : {}) }
       if ((await publish($, slotDir(name, `${v.n}.json`), json(lease))) === 'ok') {
@@ -3240,19 +3249,53 @@ async function slotCall($: any, e: any): Promise<any> {
   return { result: `${name}: others took the free ones meanwhile; call mcp__fleet__slot take again.` }
 }
 
+/** A lease that ran out, taken back: moved aside first (whoever moves it gets it), then removed only when it's the one
+ * that ran out (the same take, still past its time); a fresh one published at its number meanwhile goes back */
+async function takeBack($: any, x: { lease: Lease; path: string }, now: number): Promise<boolean> {
+  const tmp = dec(`tmp/${now}-${EPOCH}-${++tmpCount}`)
+  if ((await run($, ['mv', x.path, tmp])).exitCode !== 0) return false
+  if (sameExpired(parseSlotLease(await readText($, tmp), FORMAT), x.lease, now)) {
+    await remove($, [tmp])
+    return true
+  }
+  await run($, ['ln', tmp, x.path])
+  await remove($, [tmp])
+  return false
+}
+
 // The leases that ran out go back; a free one goes to the first in line, claimed by moving its waiting file (whoever
-// moves it first grants it). The sweeper's, every minute; and the releaser's at once
-async function grantWaiters($: any, spec: SlotSpec): Promise<number> {
+// moves it first grants it). The sweeper's, every minute (it drops from the line first a waiter whose session is gone,
+// or that waited a day without taking again); and the releaser's at once
+async function grantWaiters($: any, spec: SlotSpec, prune = false): Promise<number> {
   const now = await $.clock.now()
   const leases = await leasesOf($, spec.name)
-  const waiters = await waitersOf($, spec.name)
+  let waiters = await waitersOf($, spec.name)
+  if (prune && waiters.length) {
+    const refs = [...new Set(waiters.map(w => w.waiter.holder.ref).filter((r): r is string => !!r && !r.startsWith('sid:')))]
+    const st = refs.length && (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ refs })) : null
+    const kept: typeof waiters = []
+    for (const w of waiters) {
+      const state = st?.ready ? (st.rows.find((r: any) => r.ref === w.waiter.holder.ref)?.state ?? null) : null
+      const why = waiterGone({ state: state === null ? null : String(state), mtimeMs: await mtimeOf($, w.path), now })
+      if (!why) {
+        kept.push(w)
+        continue
+      }
+      await remove($, [w.path])
+      log($, `slot ${spec.name}: ${slotHolderWords(w.waiter.holder)} out of line (${why})`)
+    }
+    waiters = kept
+  }
   const plan = sweepSlots({ spec, leases: leases.map(x => x.lease), waiters: waiters.map(x => x.waiter), now })
+  const back = new Set<Lease>()
   for (const x of plan.expired) {
     const f = leases.find(l => l.lease === x)
-    if (!f) continue
-    await remove($, [f.path])
+    if (!f || !(await takeBack($, f, now))) continue
+    back.add(x)
     log($, `slot ${spec.name}: ${slotHolderWords(x.holder)}'s lease ran out: taken back`)
   }
+  // A lease that ran out but couldn't be taken back (another session took it first) isn't free here
+  if (plan.expired.some(x => !back.has(x))) return 0
   let granted = 0
   for (const g of plan.grants) {
     const wf = waiters.find(w => w.waiter === g.waiter)
@@ -3271,7 +3314,7 @@ async function grantWaiters($: any, spec: SlotSpec): Promise<number> {
 
 async function sweepSlotsNow($: any) {
   sweep.slotsDirty = false
-  for (const spec of await loadSlots($)) await grantWaiters($, spec)
+  for (const spec of await loadSlots($)) await grantWaiters($, spec, true)
 }
 
 /** What this session hears of its slots: one given to it from the line (urgent: a nudge for it doesn't wait for the
