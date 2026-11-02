@@ -1,9 +1,9 @@
 {
   "name": "fleet",
-  "version": "0.2.1",
-  "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost; a write of a shared file that changed since the session read it is refused once with who changed it, and the session hears of such changes at its next step; records cited by version (R-12@4) make their citers suspect when revised, a write citing a stale version is refused once, and the project's check scripts run as its linters",
+  "version": "0.3.0",
+  "description": "Per project: a roster of permanent background sessions started with /fleet up from a template, each seeded, budgeted and placed in the panel; they ask you without stopping and you answer from any session with /fleet, at no token cost; a stale write of a shared file is refused once and changes are told at the next step; records cited by version turn their citers suspect when revised; command-level files (charter, roster, requirements) change only when you apply a drafted change",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
   "types": "./types/index.d.ts",
-  "dependencies": [{ "name": "sessions", "version": ">=0.11.0" }]
+  "dependencies": [{ "name": "sessions", "version": ">=0.12.0" }]
 }
