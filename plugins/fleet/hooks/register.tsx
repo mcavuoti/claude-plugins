@@ -6693,7 +6693,7 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
     'Their questions show with /fleet in any session of the project, and as "? n for you · /fleet" above the prompt.',
     'problem' in parsed
       ? parsed.problem
-      : `Shared files (world.json): ${parsed.world.paths.length ? globList(parsed.world.paths) : 'none'}. A session's write of one that changed since it read it is refused once with who changed it, and it hears of such changes at its next step. /fleet world changes the list.`,
+      : `Shared files (world.json): ${parsed.world.paths.length ? globList(parsed.world.paths) : 'none'}. A session's write of one that changed since it read it is refused once with who changed it, and it hears of such changes at its next step. /fleet world changes the list.${worldCommitWords(parsed.world)}`,
     config.commitRegister
       ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git.'
       : 'decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
@@ -6704,6 +6704,13 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   ]
     .filter(Boolean)
     .join('\n')
+}
+
+/** What init says of the world commit, when world.json turns it on (proposal's does) */
+function worldCommitWords(w: WorldConfig): string {
+  const c = w.commit as { everyMin?: unknown } | null | undefined
+  const every = c && typeof c === 'object' && typeof c.everyMin === 'number' && c.everyMin > 0 ? c.everyMin : null
+  return every ? ` World commits are on: every ${every} min the sweeper commits the shared files that changed, only them, and never pushes (world.json's "commit"; take it out to turn them off).` : ''
 }
 
 async function fleetCommand($: any, e: any): Promise<string> {

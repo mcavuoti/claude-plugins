@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { BAND, DEC, FAKE_LOG, FAKE_SESSIONS, FLEET, GOLDEN, HOME, REF, ROOT, SID, TWO_QUESTIONS, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
+import { BLANK as BLANK_TEMPLATE, BAND, DEC, FAKE_LOG, FAKE_SESSIONS, FLEET, GOLDEN, HOME, REF, ROOT, SID, TWO_QUESTIONS, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 
 // The person answers, then the asker's 2 s tick submits the answers once its session is idle
@@ -371,4 +371,12 @@ test('plan B: /fleet init takes the sessions key out of settings.local.json, bac
   const status = await fleet($, 'status')
   expect(status).toContain('plan B: sessions@m 0.13.0 is installed for this project alone')
   expect(status).not.toContain('enables sessions@m for this project too')
+})
+
+test('/fleet init says when the template turns world commits on', WITH_SESSIONS, async ($, on) => {
+  const HOURLY = { ...BLANK_TEMPLATE, 'fleet/world.json': JSON.stringify({ worldFormat: 1, paths: ['notes/**'], commit: { everyMin: 60 } }) }
+  const w = world(on, { fleet: false, background: false, templates: { hourly: HOURLY } })
+  await startSession($, w)
+  expect(await fleet($, 'init hourly')).toContain('World commits are on: every 60 min the sweeper commits the shared files that changed, only them, and never pushes')
+  expect(await fleet($, 'init')).toContain('World commits are on')
 })

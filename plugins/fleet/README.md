@@ -119,7 +119,7 @@ The one update at user scope reaches every project that turned `fleet` on, unles
 > /fleet up --wave 1                      the leads and owners of the first wave
 ```
 
-The chief is a role of the template, not code of `fleet`: it asks through `mcp__fleet__decide` (numbered questions, its recommendation marked, at most four at a time), so you answer from any session whenever you come by. With `solo` there's no chief: you write the charter yourself and talk to each owner directly.
+The chief is a role of the template, not code of `fleet`: it asks through `mcp__fleet__decide` (numbered questions, its recommendation marked, at most four at a time), so you answer from any session whenever you come by. With `solo` there's no chief: you write the charter yourself and talk to each owner directly. To talk to any instance, open it from the panel (Enter) or with `ccc "<name>"`: a prompt you type there is yours, so a change it files in that turn is applied as it's filed (unless the conversation read outside content).
 
 Before the first wave, check what an unattended fleet needs:
 
@@ -137,9 +137,9 @@ Before the first wave, check what an unattended fleet needs:
 | `blank` | nothing: the shared files are `<project>/notes/` and `<project>/docs/`, and the roster has no instances yet |
 | `solo` | three owners sharing `<project>/notes/`, no chief: you talk to each one directly |
 | `software` | a codebase: a chief, an integrator, owners per area (children of the integrator), a reviewer and a janitor, coordinating through the board and the spec (command-level) |
-| `proposal` | research and convergence: a chief, a requirements owner (the requirements are command-level), an integrator who owns the proposal, researchers outside, inside and on the market, a lead proof of concept with its specialists, testers taking board items, a verifier, a janitor and a business-plan owner, in three waves |
+| `proposal` | research and convergence: a chief, a requirements owner (the requirements are command-level), an integrator who owns the proposal, researchers outside, inside and on the market, a lead proof of concept with its specialists, testers taking board items, a verifier, a janitor and a business-plan owner, in three waves; its shared files are committed every hour ([the world commit](#the-world-commit)) |
 
-A template is a folder (`templates/<name>/` in the plugin, or your own under the folder `FLEET_TEMPLATES_DIR` names, looked in first): `template.json` (`templateFormat`, a description, the folders to create, the next steps), `fleet/` (copied into `<project>/.claude/fleet/`: `roster.json`, `world.json`, `charter.md`, `interview.md`, `seeds/<role>.md`) and `agents/` (copied into `<project>/.claude/agents/`: one role file per role). Domain words live only in templates; `fleet`'s code knows roles, paths, ids and versions.
+A template is a folder (`templates/<name>/` in the plugin, or your own under the folder `FLEET_TEMPLATES_DIR` names, looked in first): `template.json` (`templateFormat`, a description, the folders to create, the next steps), `fleet/` (copied into `<project>/.claude/fleet/`: `roster.json`, `world.json`, `charter.md`, `interview.md`, `seeds/<role>.md`, and what else the template ships: `outbound.json`, `slots.json`, `proposal`'s `channels/` and `pollers/`) and `agents/` (copied into `<project>/.claude/agents/`: one role file per role). Domain words live only in templates; `fleet`'s code knows roles, paths, ids and versions.
 
 It also writes:
 
@@ -150,7 +150,7 @@ It also writes:
 - `<project>/.claude/fleet/events/` and `<project>/.claude/fleet/reads/`: the landings on shared files, and what each session read of them;
 - `<project>/.claude/fleet/state/`: the records' versions, the suspects, the check results, the sweeper's lease, the stamps of the command-level files ([below](#records-and-pins));
 - `<project>/.claude/fleet/instances/`: each instance's settings file and its heartbeat, spend and nudges;
-- `.gitignore`: keeps `<project>/.claude/fleet/decisions/`, `<project>/.claude/fleet/events/`, `<project>/.claude/fleet/reads/`, `<project>/.claude/fleet/state/` and `<project>/.claude/fleet/instances/` out of git (`state/` has a `.gitignore` of its own too). `/fleet init --commit-register` sets `commitRegister` and commits the register (`<project>/.claude/fleet/decisions/register/`) with the project, the rest of `<project>/.claude/fleet/decisions/` still ignored. The roster, the world, the charter, the seeds and the role files are the project's: commit them if you like.
+- `.gitignore`: keeps `<project>/.claude/fleet/decisions/`, `<project>/.claude/fleet/events/`, `<project>/.claude/fleet/reads/`, `<project>/.claude/fleet/state/`, `<project>/.claude/fleet/instances/`, `<project>/.claude/fleet/inbox/` and `<project>/.claude/fleet/intake/` out of git (`state/` has a `.gitignore` of its own too). `/fleet init --commit-register` sets `commitRegister` and commits the register (`<project>/.claude/fleet/decisions/register/`) with the project, the rest of `<project>/.claude/fleet/decisions/` still ignored. The roster, the world, the charter, the seeds and the role files are the project's: commit them if you like.
 
 Running it again only adds what's missing and brings `.gitignore` in line with `config.json`. A session in a subfolder of the project uses the nearest `<project>/.claude/fleet/` above it (an instance, the one its settings name); your home folder is never a project. Sessions that were already running join within a minute.
 
@@ -668,7 +668,7 @@ One session of the project does the project-wide work, at no token cost: the fir
 
 ## The world commit
 
-Off by default; `"commit": { "everyMin": 60 }` in `world.json` turns it on. Every 60 minutes the sweeper commits the shared files that changed, and only them: it adds those paths and commits them with `--only` and the message `fleet: world 2026-11-02 14:00`, so whatever else you staged stays staged and out of it. It skips when nothing changed, outside a repository, while the index is locked, without a `user.name` and `user.email`, and when the project is a linked worktree; it never pushes. Claude runs a plugin's commands with the repository's hooks off, so the project's commit hooks don't run for it.
+Off by default, on in the `proposal` template (`/fleet init` says so); `"commit": { "everyMin": 60 }` in `world.json` turns it on, and taking it out turns it off. Every 60 minutes the sweeper commits the shared files that changed, and only them: it adds those paths and commits them with `--only` and the message `fleet: world 2026-11-02 14:00`, so whatever else you staged stays staged and out of it. It skips when nothing changed, outside a repository, while the index is locked, without a `user.name` and `user.email`, and when the project is a linked worktree; it never pushes. Claude runs a plugin's commands with the repository's hooks off, so the project's commit hooks don't run for it.
 
 ## Worktrees
 
