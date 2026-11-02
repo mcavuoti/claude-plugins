@@ -19,7 +19,7 @@ leaves the charter or the roster unclear.
 10. Principals: who besides the person may direct the work, and in what scope (a request for a change from a
    principal's address is drafted for the person to confirm; anyone else's is a proposal).
 11. Confidentiality: what must never leave this machine or reach a third party.
-12. The person's own places: their SSH hosts (a dev machine that holds the code and runs simulations), the git remotes
+12. The person's own places: their SSH hosts (a dev machine that holds the code and runs the long jobs), the git remotes
     pushes may go to, their addresses. They go in outbound.json, so the fleet's sends there need no draft; anything
     else is drafted for the person to approve (by default, nobody but the person).
 13. Cadence: how often each kind of owner lands something; quiet hours; time zone.

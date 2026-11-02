@@ -1,5 +1,5 @@
-// Pure logic of slots (tested in tests/slots.test.ts): the project's scarce resources (a pool of simulator licenses,
-// a machine), counted in <project>/.claude/fleet/slots.json, a command-level file. A session takes one with
+// Pure logic of slots (tested in tests/slots.test.ts): the project's scarce resources (a pool of test machines,
+// an access), counted in <project>/.claude/fleet/slots.json, a command-level file. A session takes one with
 // mcp__fleet__slot for a while (a lease that runs out); with none free it waits in line, and the sweeper hands a freed
 // one to the first in line and takes back the leases that ran out. Nothing is held but the slot: a session that waits
 // does other work or ends its turn. No `$` here.

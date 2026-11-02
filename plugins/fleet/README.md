@@ -237,7 +237,7 @@ The owner's rule: only outside sources mark a session, and the mark doesn't trav
 
 ### Resources
 
-Something only you can get (a license, a PDK, an access, a machine, more budget) is asked apart from questions of taste: `mcp__fleet__decide` with `kind: "resource"`, `what`, `why`, and optionally `cost`, `byWhen` and `alternatives`. `/fleet` and the brief list it; you get it outside and answer **`/fleet <n> done "where it is"`**, or **`/fleet <n> no "why"`**. The asker hears it with your note.
+Something only you can get (a license, an access, a machine, more budget) is asked apart from questions of taste: `mcp__fleet__decide` with `kind: "resource"`, `what`, `why`, and optionally `cost`, `byWhen` and `alternatives`. `/fleet` and the brief list it; you get it outside and answer **`/fleet <n> done "where it is"`**, or **`/fleet <n> no "why"`**. The asker hears it with your note.
 
 ### Cadence and fresh periods
 
@@ -375,11 +375,11 @@ The `proposal` template has three: the business plan (the planner), the proposal
 `<project>/.claude/fleet/slots.json` (command-level, `slotsFormat`) counts what can't be shared freely:
 
 ```json
-{ "slotsFormat": 1, "slots": { "sim": { "count": 2, "leaseMin": 30, "what": "the simulator licenses" } } }
+{ "slotsFormat": 1, "slots": { "lab": { "count": 2, "leaseMin": 30, "what": "the test machines" } } }
 ```
 
 - **`mcp__fleet__slot`**, in a background session: `take` (with `slot`, `why`, `minutes`) gives a lease that runs out (taken again, it's extended); with none free, the session waits in line and is told so. `release` gives it back; `list` shows the pools.
-- **The line goes first**: a freed lease goes to the first in line (the releaser hands it on at once; the sweeper every minute), who hears "sim is yours now" at its next step, or as a nudge (not held by the wakes' window), or is woken when retired. A newcomer takes one only when more are free than wait ahead of it.
+- **The line goes first**: a freed lease goes to the first in line (the releaser hands it on at once; the sweeper every minute), who hears "lab is yours now" at its next step, or as a nudge (not held by the wakes' window), or is woken when retired. A newcomer takes one only when more are free than wait ahead of it.
 - **Leases run out**: the sweeper takes back one past its time; its holder hears it was taken back.
 - `/fleet status` shows each pool, who holds what until when, and who waits; the brief lists who waits.
 
