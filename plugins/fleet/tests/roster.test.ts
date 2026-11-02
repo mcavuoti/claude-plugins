@@ -21,6 +21,7 @@ import {
   seesFleet,
   settingsFor,
   slugOf,
+  usd,
   wakeUsd,
   wakeVerdict,
   wakesOf,
@@ -170,6 +171,7 @@ test("budgets: today's spend from the session's cost; 80% warns, 100% is over; t
   expect(budgetState(4, 5)).toBe('warn')
   expect(budgetState(5, 5)).toBe('over')
   expect(budgetState(500, null)).toBe('ok')
+  expect([usd(0), usd(0.002), usd(0.25), usd(12.4)]).toEqual(['$0.00', '$0.002', '$0.25', '$12'])
   const lifts = { format: 1, day: '2026-11-02', instances: { lead: 9 }, project: 60 }
   expect(capFor(5, lifts, '2026-11-02', 'lead')).toBe(9)
   expect(capFor(5, lifts, '2026-11-03', 'lead')).toBe(5)

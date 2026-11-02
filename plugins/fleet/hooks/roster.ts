@@ -399,8 +399,10 @@ export function forecastOf(instances: readonly Instance[], wakes: { perDay: numb
   return { caps, wakesUsd, unpriced }
 }
 
+/** Dollars as the person reads them: cents, a tenth of a cent below one cent (a tiny budget is still seen), whole
+ * dollars from ten */
 export function usd(n: number): string {
-  return `$${n < 10 ? n.toFixed(2) : n.toFixed(0)}`
+  return `$${n >= 10 ? n.toFixed(0) : n > 0 && n < 0.01 ? n.toFixed(3) : n.toFixed(2)}`
 }
 
 // ---- Budgets: each instance's spend per day (its own fleet turns the session's cost deltas into it) ----

@@ -2577,6 +2577,8 @@ async function heartbeat($: any) {
     agent: inst.agent,
     agentType,
     bound,
+    // How it knew its name: env, its settings' FLEET_INSTANCE (probe E1); name, its session's name
+    boundBy: envInstance ? 'env' : 'name',
     ...(bindWhy ? { why: bindWhy } : {}),
     sessionId,
     ref: jobRef,
