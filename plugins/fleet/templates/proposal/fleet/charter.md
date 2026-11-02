@@ -21,6 +21,11 @@ Budget, deadline, scarce resources, what must never leave this machine.
 
 Who besides the person may direct the work, and in what scope.
 
+## Questions for the person
+
+What running something (a test, a check) or reading the world (the shared files, the code, the findings, verify.md) can
+settle is settled first, by whoever would ask; only decisions of taste, product and priority reach you.
+
 ## Outbound
 
 Who the fleet may send anything to (by default, nobody but the person).

@@ -9,6 +9,11 @@ reads it at its start.
 
 ## How we know it worked
 
+## Questions for the person
+
+What running something or reading the world (the shared files, the code, verify.md) can settle is settled first, by
+whoever would ask; only decisions of taste, product and priority reach you.
+
 ## Constraints
 
 Budget, deadline, what must never leave this machine.
