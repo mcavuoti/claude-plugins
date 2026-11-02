@@ -12,11 +12,12 @@ In `plugins/sessions`:
 | Files | What | Edit from |
 |---|---|---|
 | `hooks/register.tsx`, `hooks/state.ts`, `hooks/visor.sh`, `hooks/launcher.py`, `hooks/usage.py`, `statusline/`, `setup/` | shared: the panel, its data and actions, the launcher (`ccc`), token usage, the status line, the setup | either |
+| `types/index.d.ts`, `docs/plugin-contract.md`, `tests/contract.test.tsx` | the API other plugins call (`$.sessions`): its types, how it evolves, its golden method list | either |
 | `hooks/platform/types.ts` | the contract: what each system has to provide (windows, processes, memory) | either, together with both implementations |
 | `hooks/platform/macos.ts` | macOS: Terminal.app through AppleScript, `ioreg`, `lsof`, `sysctl` | a Mac |
 | `hooks/platform/linux.ts` | Linux: windows found by process and switched through the launcher, `wmctrl`/`xdotool`, terminal emulators, `/proc` | Linux |
 | `extras/macos/` | macOS only extras | a Mac |
-| `tests/panel.test.tsx` | shared logic and drawing | either |
+| `tests/panel.test.tsx`, `tests/rows.test.tsx`, `tests/start.test.tsx` (with `tests/world.tsx`) | shared logic and drawing, what the rows show, how the mod starts | either |
 | `tests/macos.test.tsx`, `tests/linux.test.tsx` | each platform's pure parts (they run on both systems) | its system |
 
 Rules:
@@ -32,7 +33,8 @@ Rules:
 `.claude/rules/` holds rules that Claude Code reads only when it works on matching files, so they apply on any computer without anyone opening this file:
 
 - `platform-code.md` (files in `plugins/*/hooks/platform/`): edit each platform file from its own system, and the rest of the rules above.
-- `sessions-wire-format.md` (the `sessions` mod's code): shared files and notices carry a format version, a mismatch is harmless and visible, and every location is overridable for tests.
+- `sessions-wire-format.md` (the `sessions` mod's code): shared files and notices carry a format version, a mismatch is harmless and visible, person data has its own version, and every location is overridable for tests.
+- `plugin-contract.md` (the `sessions` contract files): `$.sessions` is written once in `types/index.d.ts`, changes only by adding within an api, and its methods follow a few rules (one plain-data argument, work before the start, never submit, ask or focus).
 
 A rule that should apply only to some files goes there, with `paths:` in its front matter; what applies to every task in the repository goes in a `CLAUDE.md`.
 
@@ -45,4 +47,4 @@ A rule that should apply only to some files goes there, with `paths:` in its fro
 
 ## Shared formats
 
-Sessions running the `sessions` mod share stored data, files in its data folder and notices, and the launcher (`ccc`) reads and writes the same files. There's no compatibility code for older versions: after an update every session is restarted. Instead, every shared file and notice carries `format=<n>` (`FORMAT` in `hooks/state.ts`, `hooks/launcher.py`, `hooks/visor.sh` and `hooks/usage.py`): change a format and raise it everywhere in the same commit. A reader that meets another format acts on nothing and tells the person to restart the sessions. Store keys are English; a stored value that changes meaning gets a new key. Every location can be pointed elsewhere for tests (`SESSIONS_DATA_DIR`, `SESSIONS_JOBS_DIR`, `SESSIONS_DAEMON_LOG`, `SESSIONS_CLAUDE`, `SESSIONS_PLUGIN_VERSION`/`SESSIONS_PLUGIN_SINCE`), so a test session never touches the files of the sessions you use. Details: `.claude/rules/sessions-wire-format.md`.
+Sessions running the `sessions` mod share stored data, files in its data folder and notices, and the launcher (`ccc`) reads and writes the same files. There's no compatibility code for older versions: after an update every session is restarted. Instead, every shared file and notice carries `format=<n>` (`FORMAT` in `hooks/state.ts`, `hooks/launcher.py`, `hooks/visor.sh` and `hooks/usage.py`): change a format and raise it everywhere in the same commit. A reader that meets another format acts on nothing and tells the person to restart the sessions. What the person chose and keeps (`sections.json`) has its own version (`sectionsFormat`), changes only by adding fields and is never silently ignored. Store keys are English; a stored value that changes meaning gets a new key. The API other plugins call (`$.sessions`) has its own version, `SessionsApi`: see `plugins/sessions/docs/plugin-contract.md`. Every location can be pointed elsewhere for tests (`SESSIONS_DATA_DIR`, `SESSIONS_JOBS_DIR`, `SESSIONS_DAEMON_LOG`, `SESSIONS_CLAUDE`, `SESSIONS_PLUGIN_VERSION`/`SESSIONS_PLUGIN_SINCE`), so a test session never touches the files of the sessions you use. Details: `.claude/rules/sessions-wire-format.md`.
