@@ -66,7 +66,9 @@ test('a derived document goes stale when a cited record is revised; its owner he
   // Once: no second nudge for the same state
   for (let i = 0; i < 100; i++) await tick(w)
   expect(w.submits.length).toBe(2)
-  expect(await fleet($, 'brief')).toContain('   - stale: plan/business-plan.md (businessplan, owned by planner): R-1@1 (now v2) moved since it cited them')
+  const brief = await fleet($, 'brief')
+  expect(brief).toContain('   - stale: plan/business-plan.md (businessplan, owned by planner): R-1@1 (now v2) moved since it cited them')
+  expect(brief).not.toContain('   - suspect: plan/business-plan.md')
   // It refreshes it, citing R-1 as it is now: no longer stale
   await $.tool.call({ tool: 'Read', file_path: `${ROOT}/req/R-1.md` } as any)
   await $.tool.call({ tool: 'Read', file_path: `${ROOT}/plan/business-plan.md` } as any)

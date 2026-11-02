@@ -5101,7 +5101,8 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     levelOf: p => levelOf(p, wc, insensitive),
     blocked: {
       blocks,
-      suspects: worldOn() ? directSuspects().map(s => ({ line: suspectLine(s, me), who: whoName(s.owner) })) : [],
+      // A stale derived document has its own line (below): not a suspect line too
+      suspects: worldOn() ? directSuspects().filter(s => !(flagged.suspects?.derived ?? []).some(d => d.path === s.path)).map(s => ({ line: suspectLine(s, me), who: whoName(s.owner) })) : [],
       failing: worldOn() ? failing().map(f => ({ path: f.path, check: f.check, message: f.message, who: whoName(f.owner) })) : [],
       cadence,
       noFleet,
@@ -5171,7 +5172,7 @@ async function outsideStatus($: any): Promise<string[]> {
     if (off && off !== 'off (world.json has no intake)') lines.push(`intake: ${off}`)
     else if (intakeCfg) {
       const st = await readWire<IntakeState>($, stateDir('intake.json'))
-      const inbox = intakeRun.inbox || (await names($, inboxDir())).filter(n => n !== 'latest' && !n.startsWith('.')).length
+      const inbox = intakeRun.inbox
       lines.push(
         `intake: on, records in ${intakeCfg.folder}/ (${intakeCfg.model}, at most ${intakeCfg.perSourceHour} items a source an hour and ${usd(intakeCfg.usdDay)} a day); today ${st && st.day === today(now) ? `${st.records} record(s), ${st.noise} noise, ${st.failed} unreadable, ${st.calls} call(s), ${usd(st.usd)}` : 'nothing yet'}; ${sweep.holding ? `inbox: ${inbox} waiting` : 'the sweeper reads the inbox'}${intakeRun.newer ? `; ${intakeRun.newer} from a newer poller (update fleet)` : ''}${intakeRun.problem ? ` (${intakeRun.problem})` : ''}`,
       )
@@ -5301,8 +5302,8 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
       ? parsed.problem
       : `Shared files (world.json): ${parsed.world.paths.length ? globList(parsed.world.paths) : 'none'}. A session's write of one that changed since it read it is refused once with who changed it, and it hears of such changes at its next step. /fleet world changes the list.`,
     config.commitRegister
-      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/, state/ and instances/ stay out of git.'
-      : 'decisions/, events/, reads/, state/ and instances/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
+      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git.'
+      : 'decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
     ...next,
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
   ]
