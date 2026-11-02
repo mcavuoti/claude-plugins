@@ -2491,8 +2491,9 @@ async function worldCommand($: any, action: 'list' | 'add' | 'remove', glob: str
 // hear it as his change. Alone, it lists the changes still unattributed
 async function acceptCommand($: any, path: string, origin: string): Promise<string> {
   await ensureWorld($)
-  // A command-level config file (the charter, roster.json, world.json, a role file): his own edit, stamped as his
-  const cfg = /^(charter\.md|roster\.json|world\.json)$/.test(path) ? `.claude/fleet/${path}` : path.startsWith(`${root}/`) ? path.slice((root as string).length + 1) : path
+  // A command-level config file (the charter, roster.json, world.json, outbound.json, a role file): his own edit,
+  // stamped as his
+  const cfg = /^(charter\.md|roster\.json|world\.json|outbound\.json)$/.test(path) ? `.claude/fleet/${path}` : path.startsWith(`${root}/`) ? path.slice((root as string).length + 1) : path
   if (path && (await configFiles($)).includes(cfg)) {
     if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (this came from ${origin || 'somewhere else'})`
     await writeStamps($, [cfg])
@@ -4586,11 +4587,13 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
-      // Whose turn this is: the person's when his prompt starts it (prompt.submit came just before)
+      // Whose turn this is: the person's when his prompt starts it (prompt.submit came just before, and the turn runs
+      // with his text: fleet's own prompts never reach its own prompt.submit hook, so the text tells them apart)
       const p = await read($, pendingPerson)
       const now = await $.clock.now()
-      await update($, pendingPerson, () => null)
-      await update($, personTurn, () => (p && now - p.at < 60000 ? { turnId: e.turnId, quoted: p.text.slice(0, 300) } : null))
+      const his = !!p && now - p.at < 60000 && !!p.text.trim() && String(e.text ?? '').includes(p.text.trim().slice(0, 200))
+      if (his || (p && now - p.at >= 60000)) await update($, pendingPerson, () => null)
+      await update($, personTurn, () => (his && p ? { turnId: e.turnId, quoted: p.text.slice(0, 300) } : null))
       await update($, turns, n => n + 1)
       if (timersOn) bg(turnStarted($, e.text, e.turnId))
     }

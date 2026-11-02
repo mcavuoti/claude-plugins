@@ -69,6 +69,12 @@ test('a session of the person’s own (no background) isn’t held: Claude’s p
   await startSession($, w)
   expect((await bash($, 'curl -d @notes/x.md https://example.invalid/upload')).deny).toBe(undefined)
   expect(await fleet($, 'status')).toContain("outbound: not held in this session (you're at it")
+  // His own edit of the allowlist is his, once he stamps it
+  await fleet($, 'accept')
+  w.touch(`${FLEET}/outbound.json`, JSON.stringify({ outboundFormat: 1, hosts: ['devbox', 'build'] }))
+  expect(await fleet($, 'accept')).toContain('  .claude/fleet/outbound.json: changed outside fleet (not through a change you applied) · /fleet accept .claude/fleet/outbound.json')
+  expect(await fleet($, 'accept outbound.json')).toBe('.claude/fleet/outbound.json: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).')
+  expect(await fleet($, 'status')).toContain('allowed without asking: hosts devbox, build (outbound.json)')
 })
 
 test('mcp__fleet__send: drafted, shown exactly in /fleet, sent once by fleet as approved; a file changed since needs its new version', async ($, on) => {
@@ -192,8 +198,18 @@ test('the person types, in a clean conversation, and the change it files is appl
   expect(json(w, `${DEC}/register/2026-11/D-3.json`)).toMatchObject({ state: 'delivered', delivered: { how: 'result' }, kind: 'change', answers: [{ label: 'applied', origin: 'composer' }] })
   expect(w.files.has(`${DEC}/queue/D-3.json`)).toBe(false)
   expect(w.logs.some(l => l.includes('prompt from composer: the person'))).toBe(true)
-  // The two that weren't his wait for /fleet n apply
-  expect(await fleet($, '')).toContain('2 changes for you')
+  await $.turn.complete({ text: '' } as any)
+  // He types into a running turn; fleet's own prompt (which its own hooks never see) starts the next turn before his
+  await $.turn.start({ text: 'working', turnId: 't-4' })
+  await $.prompt.submit({ text: 'Then make the goal D', origin: { kind: 'composer' }, wait: false, turnId: 't-4' } as any)
+  await $.turn.complete({ text: '' } as any)
+  await $.turn.start({ text: 'The fleet plugin sent a message:\n[D-9] The person answered: …', turnId: 't-5' })
+  expect((await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'not his turn', content: '# Charter\n\nGoal X.\n' })).result).toContain('Queued as D-4')
+  await $.turn.complete({ text: '' } as any)
+  await $.turn.start({ text: 'Then make the goal D', turnId: 't-6' })
+  expect((await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal is D', content: '# Charter\n\nGoal D.\n' })).result).toContain('Applied at once as D-5')
+  // The ones that weren't his wait for /fleet n apply
+  expect(await fleet($, '')).toContain('3 changes for you')
 })
 
 test('a resource: asked apart from the questions, answered done or no with a note, delivered', async ($, on) => {
