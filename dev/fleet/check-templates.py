@@ -3,7 +3,9 @@
 
 A cheap check of the data, run by dev/fleet/ci.sh: the JSON files parse and carry their versions, every role of the
 roster has its role file with fleet's tools in it (without them they'd be hidden from the instance), every instance's
-role, section and parent exist, and every role has its seed. /fleet up --dry-run lints a project's own roster fully.
+role, section and parent exist, and every role has its seed. Sections are the person's across projects, so across the
+templates one id has one title and order, and two ids never share an order. /fleet up --dry-run lints a project's own
+roster fully.
 """
 import json
 import re
@@ -12,6 +14,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parents[2] / 'plugins/fleet/templates')
 problems = []
+# A section's id → (title, order, where), across every template
+section_seen = {}
 
 
 def say(where, what):
@@ -67,6 +71,18 @@ for t in templates:
         say(t / 'fleet/roster.json', 'no rosterFormat')
     roles = roster.get('roles', {})
     sections = {s.get('id') for s in roster.get('sections', [])}
+    for s in roster.get('sections', []):
+        where = f"{t / 'fleet/roster.json'} (section {s.get('id')})"
+        if not isinstance(s.get('order'), int):
+            say(where, 'give it an order (a whole number from 201) no other template uses')
+            continue
+        seen = section_seen.get(s.get('id'))
+        if seen and (seen[0], seen[1]) != (s.get('title'), s.get('order')):
+            say(where, f'{seen[2]} has it as "{seen[0]}", order {seen[1]}: one id is one section, with one title and order')
+        clash = [k for k, v in section_seen.items() if k != s.get('id') and v[1] == s.get('order')]
+        if clash:
+            say(where, f'its order {s.get("order")} is also section {clash[0]}\'s ({section_seen[clash[0]][2]})')
+        section_seen.setdefault(s.get('id'), (s.get('title'), s.get('order'), t.name))
     instances = roster.get('instances', [])
     names = [i.get('name', '').lower() for i in instances]
     for name in {n for n in names if names.count(n) > 1}:

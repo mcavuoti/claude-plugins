@@ -1,9 +1,9 @@
 {
   "rosterFormat": 1,
   "sections": [
-    { "id": "front", "title": "Front" },
-    { "id": "areas", "title": "Areas" },
-    { "id": "checks", "title": "Checks" }
+    { "id": "front", "title": "Front", "order": 201 },
+    { "id": "areas", "title": "Areas", "order": 220 },
+    { "id": "checks", "title": "Checks", "order": 221 }
   ],
   "roles": {
     "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24 },

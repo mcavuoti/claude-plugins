@@ -78,6 +78,11 @@ test("instances: the role's fields under the instance's, sections in order after
   const [chief, lead, a] = instancesOf(roster())
   expect(chief).toMatchObject({ name: 'Chief', slug: 'chief', agent: 'chief', model: 'opus', usdDay: 10, wave: 1, section: { id: 'front', title: 'Front', order: 201 }, parent: null, seed: 'seeds/chief.md' })
   expect(lead).toMatchObject({ slug: 'lead', model: 'sonnet', effort: 'high', usdDay: 5, brief: 'You lead.', section: { order: 202 } })
+  // A section's own order (the templates give each of theirs one no other template uses); a bad one falls back
+  const own = roster()
+  own.sections = (own.sections ?? []).map((s, i) => ({ ...s, order: i ? 150 : 230 }))
+  const [c2, l2] = instancesOf(own)
+  expect([c2?.section?.order, l2?.section?.order]).toEqual([230, 202])
   expect(a).toMatchObject({ slug: 'area-a', model: 'haiku', effort: 'high', usdDay: 2, wave: 2, parent: 'Lead', settings: { env: { A: '1', B: '2' } } })
   expect(slugOf('  Área B / 2 ')).toBe('area-b-2')
   expect(mergeSettings({ a: { x: 1 }, l: ['p'] }, { a: { y: 2 }, l: ['p', 'q'], s: 'v' })).toEqual({ a: { x: 1, y: 2 }, l: ['p', 'q'], s: 'v' })

@@ -1,13 +1,13 @@
 {
   "rosterFormat": 1,
   "sections": [
-    { "id": "front", "title": "Front" },
-    { "id": "spec", "title": "Requirements" },
-    { "id": "research", "title": "Research" },
-    { "id": "work", "title": "Proofs of concept" },
-    { "id": "test", "title": "Tests" },
-    { "id": "integration", "title": "Proposal" },
-    { "id": "checks", "title": "Checks" }
+    { "id": "front", "title": "Front", "order": 201 },
+    { "id": "spec", "title": "Requirements", "order": 210 },
+    { "id": "research", "title": "Research", "order": 211 },
+    { "id": "work", "title": "Proofs of concept", "order": 212 },
+    { "id": "test", "title": "Tests", "order": 213 },
+    { "id": "integration", "title": "Proposal", "order": 214 },
+    { "id": "checks", "title": "Checks", "order": 221 }
   ],
   "roles": {
     "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24, "subscribe": { "kinds": ["resource"] } },

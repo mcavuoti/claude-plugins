@@ -1,6 +1,6 @@
 {
   "rosterFormat": 1,
-  "sections": [{ "id": "owners", "title": "Owners" }],
+  "sections": [{ "id": "owners", "title": "Owners", "order": 230 }],
   "roles": {
     "owner": { "agent": "owner", "model": "sonnet", "budget": { "usdDay": 5 }, "cadenceH": 24 }
   },

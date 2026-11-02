@@ -58,7 +58,7 @@ export type InstanceSpec = Overrides & { name: string; role: string; section?: s
 export type Zone = { permissions?: Permissions; settings?: Record<string, unknown> }
 export type Roster = {
   rosterFormat: number
-  sections?: { id: string; title: string }[]
+  sections?: { id: string; title: string; order?: number }[]
   zones?: Record<string, Zone>
   roles: Record<string, RoleSpec>
   instances: InstanceSpec[]
@@ -177,9 +177,16 @@ function num(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
 }
 
+/** A section's place in the panel: its own order (a whole number from SECTION_ORDER: the templates give theirs orders
+ * no other template uses, since sections are the person's across projects), else after fleet's "Asking you" by its
+ * place in the roster */
+export function sectionOrder(v: unknown, i: number): number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= SECTION_ORDER && v <= 9999 ? v : SECTION_ORDER + i
+}
+
 /** The roster's instances as /fleet up starts them (an instance whose role is missing is left out: the lints say so) */
 export function instancesOf(r: Roster): Instance[] {
-  const sections = new Map((Array.isArray(r.sections) ? r.sections : []).map((s, i) => [String(s?.id), { id: String(s?.id), title: String(s?.title || s?.id), order: SECTION_ORDER + i }]))
+  const sections = new Map((Array.isArray(r.sections) ? r.sections : []).map((s, i) => [String(s?.id), { id: String(s?.id), title: String(s?.title || s?.id), order: sectionOrder(s?.order, i) }]))
   const out: Instance[] = []
   for (const spec of r.instances) {
     if (!isObject(spec) || typeof spec.name !== 'string' || typeof spec.role !== 'string') continue
