@@ -36,6 +36,13 @@ the desktop (X11 or Wayland) and the terminal app.
     in; a badge and a status line line up with the other rows; `⚙1` while a session runs a background shell.
 14. **ccc tell from cron or a systemd timer:** `/sessions tell on` in a background session, then from a job with no
     terminal, `ccc tell <its id> "ping"`: it prints `queued` and a status file, and the session takes it as a turn of its
-    own (the status file then says `delivered`).
+    own (the status file then says `delivered`). `ccc tell --wait <its id> "ping"` waits and prints `delivered`.
+15. **ccc section:** with one window showing a session of the project, `ccc section A` from another terminal in the
+    project folder puts that session in section A (the panels draw it within 3 s); with two windows showing sessions of
+    the project it asks for `--session <name>`.
+16. **Notifications:** set `waitPushMinutes` to 1 in `/config`, have a background session ask you something (a
+    question, a permission) and leave it waiting: about two minutes later you get one notification naming it, through
+    your terminal's notifications (kitty, Ghostty) or your `Notification` hooks, and none after that for the same wait.
+    `/sessions status` says what PushNotification and the notification channel answered.
 
 Anything off: note what you pressed, what the window showed, and the output of `ps -A -o pid=,tty=,command= | grep -E 'claude|visor'`.

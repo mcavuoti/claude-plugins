@@ -1,6 +1,6 @@
 # sessions
 
-A Claude Code mod (a plugin built on function hooks) that adds a side panel to every session with the sessions of the current project: what each one is doing, switching between them in a single terminal window, stopping, restarting and renaming them, grouping them in sections, and what you're spending. It also keeps background sessions with Remote Control alive while you drive them from your phone, ships a status line, lets scripts hand a session a turn ([`ccc tell`](#telling-a-session-from-a-script)), and gives other plugins an API to it ([`$.sessions`](#for-other-plugins)).
+A Claude Code mod (a plugin built on function hooks) that adds a side panel to every session with the sessions of the current project: what each one is doing, switching between them in a single terminal window, stopping, restarting and renaming them, grouping them in sections, and what you're spending. It also keeps background sessions with Remote Control alive while you drive them from your phone, tells you when a session has waited for you too long or spends far above its usual ([notifications](#notifications)), ships a status line, lets scripts hand a session a turn ([`ccc tell`](#telling-a-session-from-a-script)), and gives other plugins an API to it ([`$.sessions`](#for-other-plugins)).
 
 Tested on macOS (Terminal.app) with Claude Code 2.1.289 to 2.1.316. On Linux it switches windows through its launcher instead of driving the terminal app; that mode was tested on macOS, and on a real Linux desktop it still needs the short check in [`dev/sessions/linux-checklist.md`](../../dev/sessions/linux-checklist.md) (see [Linux](#linux)).
 
@@ -61,6 +61,7 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
 | `ccc --new` | This window, even if the project is open in another one: the top session not shown anywhere else (or the Name prompt if they all are). |
 | `ccc --agents` | Claude's agent view for this folder. |
 | `ccc tell <name\|id> "text"` | Hands that background session the text, as a turn of its own when it's idle (see [Telling a session from a script](#telling-a-session-from-a-script)). No window opens. |
+| `ccc section <title>` | Puts the session this project's window shows in one of your sections, as `/sessions section` does inside it: `-` takes it out, no title says which one it's in, `--session <name\|id>` names another session of the project. No window opens. |
 
 - **On arrival** the panel has the keyboard, on the row after the session you're in, as when you switch with Enter: Enter again hops on. A session waiting on a question or a permission keeps it: you land on the question.
 - **The Name prompt** (an empty folder, or only stopped sessions) lists the stopped sessions with numbers: a number or a name reopens one, a new name starts a background session in the project folder and opens it once its panel is up (`Starting “name”…`). Enter on an empty line, or Ctrl+C, goes back to the shell; nothing is created until you type a name.
@@ -75,8 +76,10 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
 - **Opt-in, per session:** `/sessions tell on` in that session (`/sessions tell off` turns it off; `/sessions tell` says which). Without it every request is refused. A regular session (plain `claude`, with you at it) can't opt in.
 - **4 KB at most.** Send pointers, not outside text: "new mail, id 4412: read it with the mail tool" rather than the mail itself. What a script passes on is untrusted (anyone can mail you), and the session should fetch it with its own tools, where its usual checks apply.
 - **A status file** for every request, `~/.claude/mods/sessions-data/tell/<id>/<request>.status`, with `state=`: `queued` (waiting for the session to be idle), `delivered` (its turn started), `held` (you stopped the session with Esc, and Claude refuses plugin prompts until you type in it: it goes once you do), or `refused` with `reason=`. `ccc tell` prints the state it sees within 2 s and the file's path, and exits 1 when refused.
+- **`--wait`** (or `--wait=<seconds>`, 300 by default) waits for the outcome instead: it prints the final state and exits 0 when delivered, 1 when refused, 3 when held, and 4 when the time ran out with the request still queued (it stays queued). A stopped session it wakes counts its wake in the wait.
+- **At most 6 requests a minute, and 60 an hour,** reach one session: the rest are refused, saying when to try again, so a script gone wrong can't flood it.
 - **A stopped session** that Claude's background service retired for being idle is woken first (`claude respawn`, asked of a session whose panel runs, under the same rules as `$.sessions.wake`); one you stopped, or closed for lack of memory while memory is still short, is refused. A session whose panel isn't running is refused too (`u` restarts it).
-- `ccc tell` itself runs the enabled plugin's launcher like `ccc` does, so the job's `PATH` needs `claude` and `python3` (cron and launchd give a short one: set `PATH`, or `SESSIONS_CLAUDE` to claude's full path). A session named `tell` can't be opened with `ccc tell`: use `ccc` and its Name prompt, or its id.
+- `ccc tell` itself runs the enabled plugin's launcher like `ccc` does, so the job's `PATH` needs `claude` and `python3` (cron and launchd give a short one: set `PATH`, or `SESSIONS_CLAUDE` to claude's full path). A session named `tell` (or `section`) can't be opened with `ccc tell` (`ccc section`): use `ccc` and its Name prompt, or its id.
 
 ## What it does
 
@@ -86,7 +89,7 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
   - yellow: finished and you haven't looked yet;
   - green: idle and seen;
   - gray: stopped.
-- **Sections**: `/sessions section <title>` in a session puts it in a section of yours (made the first time; `Renders` and `renders` are the same one), `/sessions section -` takes it out (a section of yours with nobody left in it goes), `/sessions section` says which one it's in and `/sessions sections` lists them all. Other plugins can make sections of their own (`<plugin>:<name>`) and put sessions in them, but never move one you placed. The panel shows the sessions in no section first, then each section under its title (dim, and the arrows skip it), only when two or more groups have rows: a project that uses no sections looks as it always did. Sections are kept in `~/.claude/mods/sessions-data/sections.json` and apply to the session in every project; a session that's gone from the list leaves its section.
+- **Sections**: `/sessions section <title>` in a session puts it in a section of yours (made the first time; `Renders` and `renders` are the same one), `/sessions section -` takes it out (a section of yours with nobody left in it goes), `/sessions section` says which one it's in and `/sessions sections` lists them all. From a shell in the project folder, `ccc section <title>` does the same for the session the project's window shows. Other plugins can make sections of their own (`<plugin>:<name>`) and put sessions in them, but never move one you placed. The panel shows the sessions in no section first, then each section under its title (dim, and the arrows skip it), only when two or more groups have rows: a project that uses no sections looks as it always did. Sections are kept in `~/.claude/mods/sessions-data/sections.json` and apply to the session in every project; a session that's gone from the list leaves its section.
 - **Marks from other plugins**: a short badge after a session's name (`?2`) and a status line under it ("doing X / blocked on Y"), which another plugin sets and refreshes; they go by themselves within 10 minutes once it stops. `/sessions status` says whose they are.
 - **Under their parent**: another plugin can put a session under another one (a helper under the session it works for): it's drawn right under it, two columns in, in the parent's section, while the parent is in the list.
 - **Folding a section** (`c`): `c` on a session folds its section into one line, `▸ Renders · 4 · 1 waiting for you`; Enter (or `c`) on that line unfolds it. Only sections with a title fold, and nothing folds while `f` shows only who's waiting. Which sections are folded is remembered for every session.
@@ -94,6 +97,8 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
 - **Waiting for you** (`f`): only the sessions waiting for you (red, or marked by another plugin as needing you), with a line above them, `Waiting for you · 3 of 17`; `f` again shows them all. It's remembered for every session, so you can hop through them with Enter. Who's in the list is taken when you turn it on and whenever you're not in the panel: one you answered stays, in its new color, until you leave; `f` twice takes it again without leaving.
 - **Spend**, read from each session (never assumed): on a subscription, the line above the prompt shows each of the account's windows that it reports, once (`7d 43%`; the 5-hour one too when there's one); on an API account (no windows), each row shows what its session has cost so far, as `/cost` says, and a line under the legend the project's total, `$4.80 est. spent here so far (list price)`. A session that hasn't answered yet shows neither.
 - **⚙n after a name**: that background session has n things running in the background beside its turn (subagents, background shells), as Claude's background service counts them: a session that looks idle may still be working.
+- **⧗ before the time**: that session has been working for an hour or more (`⧗2h`: maybe a loop), or it's a background session whose answer has waited unseen that long. Dim, in the time's column: nothing moves for it. The hour is an option ([Notifications](#notifications)).
+- **A warning line under a row**, `$6.00 in the last hour · usually $0.50` (on a subscription, `spending 12× its usual hour · 7d +3% this hour`): that session spends far above its own usual hour (see [Notifications](#notifications)). Nothing is stopped.
 - **The session you're in** is highlighted with a bar on the left. You can select it with the arrows like the others (even when it's the only one), to restart or rename it; Enter there does nothing, and `s` won't stop it (that would leave you without a window).
 - **Switching sessions in the same window**: Enter on a row. On arrival, the other session's panel already has the keyboard, so you can hop through several with Enter. If the other session is already open in another window, that window comes to the front. Windows switch in place when they were opened with `ccc` (or by the panel); from a window opened another way (`claude attach` typed by hand), Enter opens the session in a new window next to it. A regular session (plain `claude`, not a background one) lives in its own window: Enter brings that window up, and if it runs somewhere the panel can't reach (tmux, another app), it tells you.
 - **`!` after a name**: that session's panel isn't running (its mod never started, or it runs another version of the mod). Nothing is sent to it, questions about it are asked here, and `u` restarts it.
@@ -109,6 +114,22 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
 - **Status line** (after `/sessions setup`): model · effort · folder · git branch · context % · cost.
 - **Closing the panel**: close it yourself (its ✕ or close key, or `/sessions` while it has the keyboard) and it stays closed, in this session and in every session that starts afterwards, until you open it again with `/sessions` or the button on the line above the prompt (`shift+→` then Enter, or a click). What you chose wins: arriving with `ccc` or Enter then lands on the prompt instead of the panel.
 - Above each session's prompt, one line (and after it whatever other mods draw there): how many sessions are waiting for you (red) or have something unseen (yellow), the account's windows on a subscription, and when the panel isn't shown, why: `panel closed · /sessions to open`, or `panel hidden: window too narrow · /sessions to show` (Claude draws a panel the mod opened on its own only from 144 columns, 110 once you've opened it yourself; one you open with `/sessions` shows at any width).
+
+## Notifications
+
+The panel tells you, at most once each, when a session of the project has waited for you too long, and when a session spends far above its usual hour. It never stops anything, and it costs no tokens.
+
+- **Waiting too long**: once a session has waited for you (red: a question or a permission, or marked by another plugin as needing you) for 10 minutes, you're told once for that wait, with the sessions' names only: `“Release notes” has been waiting for you for 10 min`. When several are due at once, one notification names the first and counts the others. The next wait of the same session counts again.
+- **Spending far above its usual hour**: each session measures what it spends an hour (its cost at list price, as `/cost` says; on a subscription that's a measure of its tokens, not a bill) against its own usual hour, the median of its active hours over the last day. Four times that and $3 or more marks its row (above) and tells you once, until it falls below half of both: `“Data pipeline” spent $6.00 in the last hour, usually $0.50: check it isn't looping`. It needs a few hours of history to judge.
+- **How it reaches you**: first Claude's PushNotification, which goes to your phone when the session sending it has Remote Control and you're away from the computer (Claude doesn't send it while you're at it); otherwise a notification through your own channel (your `preferredNotifChannel` setting, and your `Notification` hooks), which depends on the terminal: Claude's channels are iTerm2, kitty, Ghostty and the terminal bell (a bell, no text); in another terminal, such as Terminal.app, only your `Notification` hooks get it. Whichever session of the project gets there first sends it, a session with Remote Control a minute before the others, so it comes once and from one that can reach the phone. `/sessions status` says what the last one said and what each channel answered.
+- **Options** (`/config`, or `"pluginConfigs": {"sessions@mcavuoti": {"options": {…}}}` in `~/.claude/settings.json`):
+
+| Option | Default | Does |
+|---|---|---|
+| `waitPushMinutes` | 10 | minutes a session waits for you before you're told (0: never) |
+| `quietHours` | none | no notifications in these local hours, written as `22-7` or `22:30-07:00` |
+| `notificationsPerDay` | 5 | the most notifications a day, of both kinds together (0: none) |
+| `staleMinutes` | 60 | minutes before the ⧗ (0: never) |
 
 ## Keys
 
@@ -129,7 +150,7 @@ With the panel focused (`shift+→` after the setup, `ctrl+x Tab`, or `/sessions
 | `p` | tokens for all of Claude or just this project |
 | ← or Esc | back to the prompt |
 
-`/sessions` opens the panel with the keyboard (or closes it, if it has it). `/sessions section <title>`, `/sessions section -` and `/sessions sections` put this session in a section, take it out, and list them (see Sections above). `/sessions tell on` (`off`) lets scripts hand this session text with `ccc tell`. `/sessions status` says whether the mod runs in this session and what started it (`session.start`, or the first draw, prompt or notice when that never came), the session's id and project folder, the mod's version and whether it's the installed copy or a folder copy, when it last wrote its heartbeat, which sessions of the project have no running panel, the API it serves other plugins, and its sections.
+`/sessions` opens the panel with the keyboard (or closes it, if it has it). `/sessions section <title>`, `/sessions section -` and `/sessions sections` put this session in a section, take it out, and list them (see Sections above). `/sessions tell on` (`off`) lets scripts hand this session text with `ccc tell`. `/sessions status` says whether the mod runs in this session and what started it (`session.start`, or the first draw, prompt or notice when that never came), the session's id and project folder, the mod's version and whether it's the installed copy or a folder copy, when it last wrote its heartbeat, which sessions of the project have no running panel, the API it serves other plugins, its sections, the notifications sent today and the last one, and this session's spend against its usual hour.
 
 A plain `→` can't go to the panel only when the prompt is empty, the way `←` goes to the agent view: that `←` is built into the prompt box, and Claude's key bindings can't be conditioned on an empty prompt. Hence `shift+→`.
 
@@ -214,7 +235,7 @@ plugins/sessions/
 ├── .claude-plugin/plugin.json    name, version, where the state types are
 ├── hooks/
 │   ├── hooks.json                which module Claude loads
-│   ├── register.tsx              the mod: data, panel, switching, Stop, Restart, Rename, New, pinning, usage
+│   ├── register.tsx              the mod: data, panel, switching, Stop, Restart, Rename, New, pinning, usage, notifications
 │   ├── state.ts                  pure logic: colors, versions, pins, bars, sums, windows from ps (tested)
 │   ├── platform/                 what differs by system: windows, processes, memory
 │   │   ├── types.ts              the contract each system provides
@@ -222,7 +243,7 @@ plugins/sessions/
 │   │   ├── linux.ts              processes + launcher, wmctrl/xdotool, terminal emulators, /proc
 │   │   └── index.ts              picks one when a session starts
 │   ├── visor.sh                  the launcher that runs in each window
-│   ├── launcher.py               what ccc opens: the top session, one window per project, the Name prompt; ccc tell
+│   ├── launcher.py               what ccc opens: the top session, one window per project, the Name prompt; ccc tell, ccc section
 │   └── usage.py                  the token usage reader
 ├── statusline/statusline.sh      the status line
 ├── setup/setup.sh                the one-time setup (/sessions setup)
@@ -230,7 +251,7 @@ plugins/sessions/
 ├── extras/macos/claude-bg-launcher   optional macOS launcher for background sessions
 ├── types/index.d.ts              $.sessions, the API for other plugins, and the mod's state types (the validator wants them here)
 ├── docs/plugin-contract.md       how other plugins call $.sessions, and how it changes
-├── tests/                        automated tests: shared logic and drawing (panel.test), what the rows show (rows.test), how the mod starts (start.test), ccc tell in the session (tell.test), $.sessions (contract.test), each platform's pure parts; world.tsx is the world they run in
+├── tests/                        automated tests: shared logic and drawing (panel.test), what the rows show (rows.test), how the mod starts (start.test), ccc tell in the session (tell.test), notifications, ⧗ and spend (alerts.test), $.sessions (contract.test), each platform's pure parts; world.tsx is the world they run in
 └── tsconfig.json
 ```
 
@@ -284,3 +305,4 @@ Claude's background service keeps a pre-started Claude process ready (a "spare")
 - **The `$` built in `engine.create` can't be handed to a function** (the validator refuses it), and `$.env.get` takes a variable's name written out: a noun's methods reach `$` through closures over it. A method's calls run inside the calling plugin's hook.
 - **The line above the prompt is shared**: a mod that answers its `ui.render` without `await next(e)` hides what Claude and other mods draw there. In `claude plugin test` nothing draws it beneath the mods: the test answers that `ui.render` itself.
 - **The agent view's hidden pre-started session isn't in `claude agents --json`**: a cleanup of the data of sessions missing from the list must spare sessions with a fresh heartbeat.
+- **A mod can send PushNotification itself**: `$.tool.call({ tool: 'PushNotification', message, status: 'proactive' })` from the mod's own timer needs no permission and opens no dialog (checked with no viewer attached, and with a question pending), answers in a few ms with `pushSent`, `localSent` and `disabledReason` (`user_present` while you're at the computer: "this terminal is active"), and puts no row in the conversation, so the model never sees it (the transcript gets a `tools-used` row only, and the tool isn't loaded for the model). Not checked here: that it reaches the phone with Remote Control on. `$.ui.notify` in a background session answered `no-channel` in a terminal that has no notifications, with or without a viewer attached.
