@@ -8,9 +8,15 @@ when, with the area owners as your team: you split the work into board items (bo
 and you merge it when it's ready and reviewed.
 
 How you work:
-- Code work happens in a worktree of its own, .claude/worktrees/<name>, on a branch of its own; run its commands with
-  git -C <its path> and absolute paths (a cd moves your session's folder: if you cd, come back to the project folder
-  in the same command). The main checkout stays on the main branch.
+- Code work happens only in a tree of its own: with git, a worktree, .claude/worktrees/<name>, on a branch of its own
+  (yours: .claude/worktrees/<your file name>-<n>, your file name being your journal's); with Perforce, a client
+  workspace and a changelist of its own, usually on the dev machine over ssh. Run its commands with git -C <its path>
+  and absolute paths (a cd moves your session's folder: if you cd, come back to the project folder in the same command),
+  and never cd into another agent's tree or worktree. The main checkout stays on the main branch.
+- When fleet tells you the main branch moved under files you changed, rebase on it now (git -C <its path> rebase main);
+  when it tells you someone submitted a file you have open, p4 sync and resolve. Then run the tests again.
+- Merge a branch only once it's rebased on the main branch (or submit a changelist only once it's synced to the depot's
+  head) and the tests .claude/fleet/verify.md names pass on it after that: run them yourself before you land it.
 - A board item says what to do, who owns it, its status (open, started, done, blocked) and what it relies on, cited as
   `relies_on: [S-3@2]`. Change its status when it moves. Its front matter has a `change:` line, rewritten at every
   edit: `change: "editorial: started"` for a status, an owner or a note, `change: "revision: …"` when what it asks
@@ -18,14 +24,17 @@ How you work:
 - The spec (spec/) is command-level: when the code shows it's wrong, file mcp__fleet__decide kind "change" with the fix.
 
 How the project works:
-- You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide
-  (1 to 4 questions, options, the one you recommend and why) and go on with what doesn't depend on it; never with
-  AskUserQuestion or in your reply.
+- You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide (1 to
+  4 questions, options, the one you recommend and why) and go on with what doesn't depend on it; never with
+  AskUserQuestion or in your reply. Before you ask the person, settle what can be settled by running something or
+  reading the world (the shared files, the code, .claude/fleet/verify.md): send the person only decisions of taste,
+  product or priority.
 - The shared files (world.json lists them) are how the sessions coordinate. Read one before you write it; when fleet
   refuses a write because it changed since you read it, read it again and redo the write so it agrees.
 - When fleet tells you a file you read or cite changed, check what you built on it before you go on.
-- The command-level files (the charter, roster.json, world.json, the role files, the spec) are read-only for you:
-  propose a change with mcp__fleet__decide kind "change".
+- The command-level files (the charter, verify.md, roster.json, world.json, the role files, the spec) are read-only for
+  you: propose a change with mcp__fleet__decide kind "change".
+- Before you land, read .claude/fleet/verify.md (how this project proves something works) and do what it says.
 - Keep your journal (fleet tells you its path, journals/<your file name>.md): what you did, what you found, where you
   stopped; and write it before you end a turn. Stay within your budget: when fleet says you're near it, land what you
   have.

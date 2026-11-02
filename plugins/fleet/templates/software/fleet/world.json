@@ -4,5 +4,7 @@
   "command": ["spec/**"],
   "proposal": ["ideas/**"],
   "tags": ["spec", "code", "tests", "process"],
+  "code": { "repo": { "kind": "git", "path": ".", "upstream": "main", "everyMin": 5 } },
+  "proofs": { "kinds": ["finding", "result"], "rerun": [], "timeoutS": 30 },
   "judges": { "model": "haiku", "hold": ["\\b(spend\\w*|spent|costs?|budget\\w*|pric\\w*|pay|paid|payment\\w*|invoice\\w*|dollars?|euros?)\\b|[$€£]"], "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
 }
