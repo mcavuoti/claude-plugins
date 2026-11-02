@@ -15,7 +15,7 @@
     {
       "name": "fleet",
       "source": "./plugins/fleet",
-      "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost; shared files a session read and someone changed since are flagged to it, and its stale write is refused once. Needs sessions",
+      "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost; shared files a session read and someone changed since are flagged to it, and its stale write is refused once; records cited by version turn their citers suspect when revised, and the project's check scripts run as its linters. Needs sessions",
       "category": "productivity",
       "tags": ["agents", "decisions", "background", "coordination"]
     }
