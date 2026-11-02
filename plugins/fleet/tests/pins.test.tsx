@@ -1,12 +1,11 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
-import { BAND, FAKE_SESSIONS, FLEET, REF, ROOT, SID, fleet, json, sessionsSay, startSession, under, world, type World } from './world'
+import { BAND, FLEET, REF, ROOT, SID, fleet, json, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // Records and pins in one session (TEST W), with the engine's file tools and shell standing in beneath fleet. Another
 // session (TEST R) lands a record as its fleet would: the file, its next version, its event
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const STATE = `${FLEET}/state`
 const R1 = `${ROOT}/req/R-1.md`
 const R2 = `${ROOT}/req/R-2.md`

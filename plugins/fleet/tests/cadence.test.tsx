@@ -1,13 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
-import { FAKE_LOG, FAKE_SESSIONS, FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, world, type World } from './world'
+import { FAKE_LOG, FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 import { OWNER } from './up.test'
 
 // An instance's cadence (a mark and one nudge when nothing landed in a period), its fresh periods (/clear and its
 // journal handed to the next conversation), and /fleet brief
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const HB = `${FLEET}/instances/owner-a`
 const CURRENT = { ready: true, ref: REF, sessionId: SID, name: 'Owner A', root: ROOT, background: true, agent: 'owner' }
 const HOUR = 3600000

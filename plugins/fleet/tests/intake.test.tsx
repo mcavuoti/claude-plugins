@@ -1,13 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 
 import { INTAKE_SYSTEM } from '../hooks/intake'
-import { FAKE_SESSIONS, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World } from './world'
+import { FAKE_SESSIONS, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 import { OWNER } from './up.test'
 
 // Intake from the mod's side: the sweeper reads what pollers dropped in the inbox, one model call each (the item as
 // data), writes the records itself, routes them by tags; an instance hears the pointers routed to it; the MCP adapter
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const INBOX = `${FLEET}/inbox/mail`
 const WORLD = {
   worldFormat: 1,

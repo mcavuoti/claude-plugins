@@ -86,6 +86,10 @@ export const FAKE_SESSIONS = {
   },
 }
 
+// The options of a test that loads the stand-in for sessions. 30 s rather than the kit's 5 s: these tests move the
+// mocked clock through many ticks, which takes longer than 5 s of real time on a slow or busy machine (the CI runners)
+export const WITH_SESSIONS = { plugins: [FAKE_SESSIONS], timeoutMs: 30000 }
+
 export type World = {
   files: Map<string, string>
   dirs: Set<string>

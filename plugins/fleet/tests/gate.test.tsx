@@ -1,12 +1,11 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
-import { FAKE_SESSIONS, FLEET, REF, ROOT, SID, fleet, json, sessionsSay, startSession, under, world, type World } from './world'
+import { FLEET, REF, ROOT, SID, fleet, json, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // The shared files (the world) in one session, with the engine's file tools and shell standing in beneath fleet.
 // Another session's landings are written as its fleet would write them: the file, then its event
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const PLAN = `${ROOT}/notes/plan.md`
 const TODO = `${ROOT}/notes/todo.md`
 const B_SID = 'bbbbbbbb-0000-0000-0000-000000000000'

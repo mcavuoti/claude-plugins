@@ -1,13 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 
-import { FAKE_LOG, FAKE_SESSIONS, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, world, type World } from './world'
+import { FAKE_LOG, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 import { OWNER } from './up.test'
 
 // Derived documents from the mod's side: a business plan citing two requirements turns stale when one is revised;
 // its owner hears it once the inputs are quiet (debounced), once, or is woken for it when retired; and a change whose
 // only authority is the plan it rests on is flagged and never applied as filed
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const PLANNER = OWNER.replace('name: owner', 'name: planner')
 const WORLD = { worldFormat: 1, paths: ['req/**', 'plan/**', 'journals/**'], command: ['req/**'], derived: { businessplan: { paths: ['plan/business-plan.md'], owner: 'planner', debounceMin: 5 } } }
 const ROSTER = {

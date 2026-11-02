@@ -1,29 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import {
-  BAND,
-  DEC,
-  FAKE_LOG,
-  FAKE_SESSIONS,
-  FLEET,
-  GOLDEN,
-  HOME,
-  REF,
-  ROOT,
-  SID,
-  TWO_QUESTIONS,
-  decide,
-  fleet,
-  json,
-  row,
-  sessionsSay,
-  startSession,
-  under,
-  world,
-  type World,
-} from './world'
+import { BAND, DEC, FAKE_LOG, FAKE_SESSIONS, FLEET, GOLDEN, HOME, REF, ROOT, SID, TWO_QUESTIONS, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 
 // The person answers, then the asker's 2 s tick submits the answers once its session is idle
 async function tick(w: World, ms = 2100) {

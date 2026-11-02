@@ -1,14 +1,13 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
-import { BAND, DEC, FAKE_LOG, FAKE_SESSIONS, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World } from './world'
+import { BAND, DEC, FAKE_LOG, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 import { OWNER, PROJECT } from './up.test'
 
 // The roster from an instance's side: this session is "Owner A" (its settings gave it FLEET_INSTANCE), a background
 // session running as the owner role. Its binding, heartbeat and seed; the gate on command-level files; the `change`
 // decision from filing to applying; its budget; its nudges
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const INSTANCE = { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Owner A', FLEET_ROLE: 'owner' }
 const HB = `${FLEET}/instances/owner-a`
 const B_SID = 'bbbbbbbb-0000-0000-0000-000000000000'

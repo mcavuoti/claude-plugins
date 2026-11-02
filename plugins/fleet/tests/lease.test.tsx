@@ -1,11 +1,10 @@
 import { expect, test } from 'claude-code/testing'
 
-import { FAKE_SESSIONS, FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, under, world, type World } from './world'
+import { FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // Slots from the mod's side: mcp__fleet__slot takes a lease of a pool of one, a second taker waits in line, the
 // sweeper takes back a lease that ran out and gives it to the first in line, who hears it at its next step
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const NOW = Date.UTC(2026, 10, 2, 12, 0, 0)
 const SLOTS = `${FLEET}/state/slots/sim`
 const OTHER = { sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', ref: 'bbbbbbbb', name: 'Tester 2' }

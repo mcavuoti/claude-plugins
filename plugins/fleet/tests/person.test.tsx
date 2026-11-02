@@ -1,12 +1,11 @@
 import { expect, test } from 'claude-code/testing'
 
-import { DEC, FAKE_SESSIONS, FLEET, ROOT, fleet, json, sessionsSay, startSession, world, type World } from './world'
+import { DEC, FLEET, ROOT, fleet, json, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 
 // The person channel from the mod's side: the sweeper sends what waits for him and the closed list of alerts through
 // his channel, within its caps (a command he stamped gets the text on its standard input; a push goes through
 // PushNotification); and the model's own PushNotification is refused in the project's background sessions
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const NOW = Date.UTC(2026, 10, 2, 12, 0, 0)
 
 async function tick(w: World, ms = 2100) {

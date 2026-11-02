@@ -1,13 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 
 import { JUDGE_SYSTEM } from '../hooks/judges'
-import { DEC, FAKE_SESSIONS, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World } from './world'
+import { DEC, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // The judges from the mod's side, in shadow: the asking session's fleet judges each choice once its ticket is out (the
 // gates and the exact repeats with no model; one call for the rest), /fleet shows the proposal, the person answers as
 // always, the register keeps whether he agreed, /fleet stats counts it; and the person's taste, recorded
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const PAST = Date.UTC(2026, 10, 1, 9, 0, 0)
 const DB = { question: 'Which database for the cache?', options: [{ label: 'SQLite', description: 'one file, no server' }, { label: 'Redis' }], recommended: 'Redis', why: 'the queue runs it' }
 const COLOR = { question: 'Which color for the warning band?', options: [{ label: 'Amber' }, { label: 'Red' }], recommended: 'Red', why: 'it stands out' }

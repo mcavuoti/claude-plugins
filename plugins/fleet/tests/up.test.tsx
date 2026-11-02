@@ -1,11 +1,10 @@
 import { expect, test } from 'claude-code/testing'
 
-import { FAKE_LOG, FAKE_SESSIONS, FLEET, HOME, ROOT, fleet, json, row, sessionsSay, startSession, world, type World } from './world'
+import { FAKE_LOG, FLEET, HOME, ROOT, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 
 // The roster from the person's side: /fleet init <template>, /fleet up (--dry-run), down, remove, budget, worktrees,
 // and the sweeper's marks and wakes. The instances' own side is in instance.test.tsx
 
-const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
 const STATE = `${FLEET}/state`
 export const OWNER = '---\nname: owner\ndescription: owns a part of the notes\ntools: Read, Write, Edit, mcp__fleet__*\n---\nYou own a part of the notes.\n'
 export const ROSTER = {
