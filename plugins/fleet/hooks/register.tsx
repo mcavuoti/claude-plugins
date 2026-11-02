@@ -1935,7 +1935,7 @@ async function outboundOf($: any, e: any, c: OutboundConfig): Promise<{ sends: S
   return { sends: r.send ? [r.send] : [], how: 'tool', outside: r.outside ? `${String(e.tool)}` : null }
 }
 
-const NETWORK = /\b(curl|wget|scp|rsync|sftp|ssh|git|gh|mail|mailx|sendmail|mutt|nc|ncat|netcat)\b/
+const NETWORK = /\b(curl|wget|scp|rsync|sftp|ssh|git|gh|glab|mail|mailx|sendmail|mutt|nc|ncat|netcat|ftp|lftp|smbclient|rclone|gsutil)\b|\b(npm|yarn|pnpm|cargo|poetry)\b.*\bpublish\b|\btwine\b.*\bupload\b|\bgem\b.*\bpush\b|\b(docker|podman)\b.*\bpush\b|\baws\b.*\bs3(api)?\b|\b(gcloud|az)\b.*\bstorage\b|\/dev\/(tcp|udp)\//
 
 /** The gate, in a background session: a call that sends outside is refused (never in the person's own sessions, where
  * he's at the keyboard and Claude's own permission prompts are his). On an error, a call that may reach the network

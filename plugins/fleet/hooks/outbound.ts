@@ -13,9 +13,11 @@
 //   tools.free takes them out;
 // - in a Bash command (each part of a pipeline or list, $(…), bash -c, and what ssh runs on the other side):
 //   curl and wget with data or an upload, scp, rsync and sftp to a host, ssh to a host, git push and git send-email,
-//   gh's create, comment, edit, upload and review (and gh api with a method or fields), mail, sendmail and nc; and the
-//   commands outbound.json's commands names. A program or script that sends by itself isn't seen: the models' own
-//   guardrails and the person's permission settings are the rest.
+//   gh's create, comment, edit, upload and review (and gh api with a method or fields) and glab's, mail, sendmail and
+//   nc; a package's publish (npm, yarn, pnpm, cargo, twine, poetry, gem), docker and podman push, an upload to cloud
+//   storage (aws s3, gsutil, gcloud storage, az storage blob, rclone to a remote), ftp, lftp and smbclient, and a
+//   redirection to /dev/tcp or /dev/udp; and the commands outbound.json's commands names. A program or script that
+//   sends by itself isn't seen: the models' own guardrails and the person's permission settings are the rest.
 
 /** Person data: outbound.json. It only gains fields, and a write keeps the fields it doesn't know */
 export const OUTBOUND_FORMAT = 1
@@ -148,8 +150,9 @@ export function remoteAllowed(name: string | null, url: string | null, c: Outbou
 
 // ---- What a call sends ----
 
-/** One way content would leave: what it is (for the person and the model), where to, and the files it sends */
-export type Send = { what: string; to: string[]; files: string[] }
+/** One way content would leave: what it is (for the person and the model), where to, and the files it sends; hosts:
+ * the hosts it goes to, when the command names them (what `/fleet <n> send --allow` adds to outbound.json) */
+export type Send = { what: string; to: string[]; files: string[]; hosts?: string[] }
 /** A git push whose remote has to be looked up (its URL) before it's known whether it leaves */
 export type Push = { remote: string | null; cwd: string | null; words: string[] }
 
@@ -243,8 +246,9 @@ export function classifyMcp(tool: string, input: Record<string, unknown>, c: Out
 // ---- Bash: the simple commands a line runs ----
 
 /** The simple commands of a shell line, each as its words (quotes taken off), with what $(…), `…`, bash -c and eval
- * run as commands of their own. Redirections and their targets are left out. A best effort, not a shell */
-export function commandsOf(line: string, depth = 0): string[][] {
+ * run as commands of their own. Redirections and their targets are left out of the words; targets, when given, gets
+ * the targets (a file, /dev/tcp/host/port). A best effort, not a shell */
+export function commandsOf(line: string, depth = 0, targets: string[] = []): string[][] {
   const out: string[][] = []
   if (depth > 4) return out
   let seg: string[] = []
@@ -255,8 +259,10 @@ export function commandsOf(line: string, depth = 0): string[][] {
   const bodies: string[] = []
   const endWord = () => {
     if (inWord) {
-      if (skip) skip = false
-      else seg.push(word)
+      if (skip) {
+        skip = false
+        targets.push(word)
+      } else seg.push(word)
     }
     word = ''
     inWord = false
@@ -299,7 +305,7 @@ export function commandsOf(line: string, depth = 0): string[][] {
         }
         if (line[j] === '$' && line[j + 1] === '(') {
           const s = sub(j + 1)
-          out.push(...commandsOf(s.inner, depth + 1))
+          out.push(...commandsOf(s.inner, depth + 1, targets))
           word += `$(${s.inner})`
           j = s.end + 1
           continue
@@ -307,7 +313,7 @@ export function commandsOf(line: string, depth = 0): string[][] {
         if (line[j] === '`') {
           const end = line.indexOf('`', j + 1)
           const inner = line.slice(j + 1, end < 0 ? line.length : end)
-          out.push(...commandsOf(inner, depth + 1))
+          out.push(...commandsOf(inner, depth + 1, targets))
           word += `\`${inner}\``
           j = end < 0 ? line.length : end + 1
           continue
@@ -329,7 +335,7 @@ export function commandsOf(line: string, depth = 0): string[][] {
     }
     if ((ch === '$' || ch === '<' || ch === '>') && line[i + 1] === '(') {
       const s = sub(i + 1)
-      out.push(...commandsOf(s.inner, depth + 1))
+      out.push(...commandsOf(s.inner, depth + 1, targets))
       word += `${ch}(${s.inner})`
       inWord = true
       i = s.end + 1
@@ -338,7 +344,7 @@ export function commandsOf(line: string, depth = 0): string[][] {
     if (ch === '`') {
       const end = line.indexOf('`', i + 1)
       const inner = line.slice(i + 1, end < 0 ? line.length : end)
-      out.push(...commandsOf(inner, depth + 1))
+      out.push(...commandsOf(inner, depth + 1, targets))
       word += `\`${inner}\``
       inWord = true
       i = end < 0 ? line.length : end + 1
@@ -406,10 +412,15 @@ export function commandsOf(line: string, depth = 0): string[][] {
         i = j
         continue
       }
-      if (line[j] === '&') {
+      if (line[j] === '&' && /[\d-]/.test(line[j + 1] ?? '')) {
+        // A copy of a descriptor (2>&1, >&-)
         j++
         while (j < line.length && /[\d-]/.test(line[j] as string)) j++
-      } else skip = true
+      } else {
+        // A file: >file, and >&file (both outputs to it)
+        if (line[j] === '&') j++
+        skip = true
+      }
       i = j
       continue
     }
@@ -432,12 +443,12 @@ export function commandsOf(line: string, depth = 0): string[][] {
     const cmd = baseName(w[0] ?? '')
     if (SHELLS.includes(cmd)) {
       const k = w.findIndex((x, n) => n > 0 && /^-[a-z]*c[a-z]*$/.test(x))
-      if (k > 0 && w[k + 1] !== undefined) more.push(...commandsOf(w[k + 1] as string, depth + 1))
+      if (k > 0 && w[k + 1] !== undefined) more.push(...commandsOf(w[k + 1] as string, depth + 1, targets))
       else if (!w.slice(1).some(x => !x.startsWith('-')) || w.includes('-s')) script = true
-    } else if (cmd === 'eval' && w.length > 1) more.push(...commandsOf(w.slice(1).join(' '), depth + 1))
+    } else if (cmd === 'eval' && w.length > 1) more.push(...commandsOf(w.slice(1).join(' '), depth + 1, targets))
     else if (cmd === 'ssh') script = true
   }
-  if (script) for (const b of bodies) more.push(...commandsOf(b, depth + 1))
+  if (script) for (const b of bodies) more.push(...commandsOf(b, depth + 1, targets))
   return [...out, ...more]
 }
 
@@ -526,6 +537,43 @@ const SFTP_VALUE = /^-[PiFobBcDlRSJX]$/
 const GIT_GLOBAL_VALUE = /^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path)$/
 const GH_VALUE = /^(-X|--method|-f|-F|--field|--raw-field|--input|-H|--header|--hostname|-R|--repo|-t|--title|-b|--body|-B|--base|-q|--jq|--template|-p|--preview)$/
 const NC_VALUE = /^-[psiIOqTwXx]$/
+const PKG_VALUE = /^(-w|-C|--(registry|tag|access|otp|workspace|filter|dir|userconfig|cache|prefix|loglevel|provenance-file|publish-branch|report-summary))$/
+const CARGO_VALUE = /^(-p|-j|-F|-Z|--(index|registry|token|package|manifest-path|target|target-dir|jobs|features|config|color|lockfile-path))$/
+const TWINE_VALUE = /^(-r|-u|-p|-c|-i|--(repository|repository-url|username|password|comment|identity|sign-with|config-file|client-cert|cert))$/
+const POETRY_VALUE = /^(-r|-u|-p|-C|-P|--(repository|username|password|cert|client-cert|dist-dir|directory|project))$/
+const GEM_VALUE = /^(-k|-p|--(host|key|otp|http-proxy))$/
+const DOCKER_VALUE = /^(-H|-c|-l|-t|-f|-o|--(host|context|config|log-level|tlscacert|tlscert|tlskey|platform|tag|file|output|build-arg|target|cache-from|cache-to|secret|label|progress|builder|network|ssh|iidfile|metadata-file|build-context|annotation|attest|add-host|creds|authfile|cert-dir|format|compression-format|sign-by|digestfile|retry|retry-delay))$/
+const AWS_VALUE = /^--(profile|region|endpoint-url|output|query|ca-bundle|cli-read-timeout|cli-connect-timeout|color|exclude|include|acl|storage-class|content-type|content-encoding|content-language|content-disposition|cache-control|grants|sse|sse-c|sse-c-key|sse-kms-key-id|metadata|metadata-directive|expires|expected-size|website-redirect|source-region|bucket|key|body|page-size|cli-input-json|cli-input-yaml|checksum-algorithm|request-payer|tagging)$/
+const GSUTIL_VALUE = /^-[ohuiajLszx]$/
+const GCLOUD_VALUE = /^--(project|account|configuration|billing-project|impersonate-service-account|verbosity|format|filter|storage-class|predefined-acl|cache-control|content-type|content-encoding|content-disposition|content-language|custom-metadata|exclude|manifest-path|encryption-key|decryption-keys|additional-headers)$/
+// az: every long option takes a value but these
+const AZ_VALUE = /^(-[cfsdon]|--(?!(overwrite|dryrun|no-progress|validate-content|debug|verbose|only-show-errors|help|recursive)$)[a-z][a-z-]*)$/
+const RCLONE_VALUE = /^--(config|exclude|include|filter|filter-from|exclude-from|include-from|files-from|max-age|min-age|max-size|min-size|transfers|checkers|bwlimit|log-file|log-level|backup-dir|suffix|order-by|max-transfer|cutoff-mode|stats|tpslimit|user-agent|header|header-upload|compare-dest|copy-dest|max-depth|retries|low-level-retries|timeout|contimeout)$/
+const FTP_VALUE = /^-[oPqrsTux]$/
+const LFTP_VALUE = /^-[eupcf]$/
+const SMB_VALUE = /^(-[UWcApIOmnsDTlRtdbLM]|--(user|workgroup|command|authentication-file|port|ip-address|socket-options|max-protocol|netbiosname|configfile|directory|tar|debuglevel|log-basename|list|message|name-resolve))$/
+const TAR_VALUE = /^(-[fCbTXgVKNLH]|--(file|directory|exclude|files-from|exclude-from|transform|xform|owner|group|mode|mtime|label|newer|after-date|newer-mtime|blocking-factor|use-compress-program|format|level|index-file|exclude-tag))$/
+
+/** The registry an image name names (registry.example.com/x:1, localhost:5000/x); null when it names none (docker's
+ * own default is docker.io, podman's is its configuration's) */
+export function registryOf(image: string): string | null {
+  const i = image.indexOf('/')
+  if (i < 0) return null
+  const first = image.slice(0, i)
+  return first.includes('.') || first.includes(':') || first === 'localhost' ? cleanHost(first) : null
+}
+
+/** An rclone remote a path names (remote:path, :backend:path), or null for a local path */
+function rcloneRemote(x: string): string | null {
+  const m = /^(:?[\w.-]+):/.exec(x)
+  return m ? (m[1] as string) : null
+}
+
+/** The host of a //server/share (or \\server\share) */
+function shareHost(x: string): string | null {
+  const m = /^(?:\/\/|\\\\)([^/\\]+)/.exec(x)
+  return m ? cleanHost(m[1] as string) : null
+}
 
 function remoteTarget(x: string): boolean {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(x)) return !/^file:/i.test(x)
@@ -542,7 +590,16 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
   const sends: Send[] = []
   const pushes: Push[] = []
   const reads: string[] = []
-  for (const raw of commandsOf(line)) {
+  // A send to a host the command names (held unless outbound.json allows it), or to one it doesn't (always held)
+  const toHost = (what: string, host: string | null, unknown: string, files: string[] = []): void => {
+    if (host && hostAllowed(host, c)) return
+    sends.push({ what, to: [host ?? unknown], files, ...(host ? { hosts: [host] } : {}) })
+  }
+  const locals = (xs: readonly string[]): string[] => xs.map(localFile).filter((v): v is string => !!v)
+  const of = (files: readonly string[]): string => (files.length ? ` of ${files.join(', ')}` : '')
+  const targets: string[] = []
+  const archived: string[] = []
+  for (const raw of commandsOf(line, 0, targets)) {
     const w = stripPrefixes(raw)
     if (!w.length) continue
     const cmd = baseName(w[0] as string)
@@ -568,7 +625,7 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       const hosts = urls.map(u => hostOf(u)).filter((h): h is string => h !== null)
       const away = hosts.filter(h => !hostAllowed(h, c))
       if (data.length || /^(POST|PUT|PATCH)$/.test(method)) {
-        if (away.length || !hosts.length) sends.push({ what: `curl sending data${files.length ? ` (${files.join(', ')})` : ''}`, to: away.length ? away : ['an address fleet can’t read'], files })
+        if (away.length || !hosts.length) sends.push({ what: `curl sending data${files.length ? ` (${files.join(', ')})` : ''}`, to: away.length ? away : ['an address fleet can’t read'], files, ...(away.length ? { hosts: away } : {}) })
       } else reads.push(...away)
       continue
     }
@@ -579,7 +636,7 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       const files = opts.filter(o => /^--(post-file|body-file)$/.test(o.name) && o.value).map(o => o.value as string)
       const away = args.map(u => hostOf(u)).filter((h): h is string => h !== null && !hostAllowed(h, c))
       if (data.length || /^(POST|PUT|PATCH)$/.test(method)) {
-        if (away.length || !args.length) sends.push({ what: `wget sending data${files.length ? ` (${files.join(', ')})` : ''}`, to: away.length ? away : ['an address fleet can’t read'], files })
+        if (away.length || !args.length) sends.push({ what: `wget sending data${files.length ? ` (${files.join(', ')})` : ''}`, to: away.length ? away : ['an address fleet can’t read'], files, ...(away.length ? { hosts: away } : {}) })
       } else reads.push(...away)
       continue
     }
@@ -589,15 +646,13 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       const dest = args[args.length - 1] as string
       if (!remoteTarget(dest) && !/::/.test(dest)) continue
       const host = /^rsync:\/\//i.test(dest) ? hostOf(dest) : /::/.test(dest) ? cleanHost(dest.slice(0, dest.indexOf('::'))) : hostOf(dest)
-      if (hostAllowed(host, c)) continue
-      const files = args.slice(0, -1).map(localFile).filter((v): v is string => !!v)
-      sends.push({ what: `${cmd} of ${files.length ? files.join(', ') : 'files'}`, to: [host ?? dest], files })
+      const files = locals(args.slice(0, -1))
+      toHost(`${cmd} of ${files.length ? files.join(', ') : 'files'}`, host, dest, files)
       continue
     }
     if (cmd === 'sftp') {
       const { args } = operands(rest, SFTP_VALUE)
-      const host = args[0] ? hostOf(args[0]) : null
-      if (args[0] && !hostAllowed(host, c)) sends.push({ what: 'sftp', to: [host ?? (args[0] as string)], files: [] })
+      if (args[0]) toHost('sftp', hostOf(args[0]), args[0])
       continue
     }
     if (cmd === 'ssh') {
@@ -605,7 +660,7 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       const dest = args[0]
       if (!dest) continue
       const host = hostOf(dest)
-      if (!hostAllowed(host, c)) sends.push({ what: `ssh${args.length > 1 ? ' running a command' : ''}`, to: [host ?? dest], files: [] })
+      if (!hostAllowed(host, c)) toHost(`ssh${args.length > 1 ? ' running a command' : ''}`, host, dest)
       else if (args.length > 1) {
         // What runs on the person's own machine goes through the same rules
         const inner = classifyBash(args.slice(1).join(' '), c)
@@ -637,14 +692,15 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       }
       continue
     }
-    if (cmd === 'gh') {
+    if (cmd === 'gh' || cmd === 'glab') {
+      // GitHub's CLI, and GitLab's with the same verbs (and note, its comment)
       const { args, opts } = operands(rest, GH_VALUE)
-      const host = (opts.find(o => o.name === '--hostname')?.value ?? 'github.com').toLowerCase()
+      const host = (opts.find(o => o.name === '--hostname')?.value ?? (cmd === 'gh' ? 'github.com' : 'gitlab.com')).toLowerCase()
       if (hostAllowed(host, c)) continue
       const [group = '', verb = ''] = args
-      const writes = ['create', 'comment', 'edit', 'upload', 'review']
+      const writes = ['create', 'comment', 'edit', 'upload', 'review', ...(cmd === 'glab' ? ['note'] : [])]
       const api = group === 'api' && (opts.some(o => /^(-f|-F|--field|--raw-field|--input)$/.test(o.name)) || /^(POST|PUT|PATCH|DELETE)$/i.test(opts.find(o => o.name === '-X' || o.name === '--method')?.value ?? ''))
-      if (api || writes.includes(verb)) sends.push({ what: `gh ${[group, verb].filter(Boolean).join(' ')}`, to: [host], files: [] })
+      if (api || writes.includes(verb)) sends.push({ what: `${cmd} ${[group, verb].filter(Boolean).join(' ')}`, to: [host], files: [], hosts: [host] })
       continue
     }
     if (cmd === 'mail' || cmd === 'mailx' || cmd === 'sendmail' || cmd === 'mutt') {
@@ -656,10 +712,159 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
     if (cmd === 'nc' || cmd === 'ncat' || cmd === 'netcat') {
       const { args, opts } = operands(rest, NC_VALUE)
       if (opts.some(o => o.name === '-l' || o.name === '--listen')) continue
-      const host = args[0] ? hostOf(args[0]) : null
-      if (args[0] && !hostAllowed(host, c)) sends.push({ what: cmd, to: [host ?? (args[0] as string)], files: [] })
+      if (args[0]) toHost(cmd, hostOf(args[0]), args[0])
+      continue
+    }
+    // Package registries. The host is known only when the command names it: otherwise .npmrc, package.json or the
+    // tool's own configuration decides, which an instance may have written
+    if (cmd === 'npm' || cmd === 'pnpm' || cmd === 'yarn') {
+      const { args, opts } = operands(rest, PKG_VALUE)
+      const berry = cmd === 'yarn' && args[0] === 'npm'
+      if ((berry ? args[1] : args[0]) !== 'publish' || opts.some(o => o.name === '--dry-run')) continue
+      const registry = opts.find(o => o.name === '--registry')?.value
+      const files = locals(args.slice(berry ? 2 : 1))
+      toHost(`${cmd} publish${of(files)}`, registry ? hostOf(registry) : null, `the registry ${cmd} is set to`, files)
+      continue
+    }
+    if (cmd === 'cargo') {
+      const { args, opts } = operands(rest, CARGO_VALUE)
+      if (args.find(a => !a.startsWith('+')) !== 'publish' || opts.some(o => o.name === '--dry-run')) continue
+      const index = opts.find(o => o.name === '--index')?.value
+      toHost('cargo publish', index ? hostOf(index) : null, 'the registry cargo is set to')
+      continue
+    }
+    if (cmd === 'twine' || cmd === 'poetry' || cmd === 'gem') {
+      const { args, opts } = operands(rest, cmd === 'twine' ? TWINE_VALUE : cmd === 'poetry' ? POETRY_VALUE : GEM_VALUE)
+      const verb = cmd === 'twine' ? 'upload' : cmd === 'poetry' ? 'publish' : 'push'
+      if (args[0] !== verb || opts.some(o => o.name === '--dry-run')) continue
+      // poetry's --repository is a name of its configuration, not an address
+      const url = cmd === 'poetry' ? undefined : opts.find(o => o.name === (cmd === 'twine' ? '--repository-url' : '--host'))?.value
+      const files = cmd === 'poetry' ? [] : locals(args.slice(1))
+      toHost(`${cmd} ${verb}${of(files)}`, url ? hostOf(url) : null, cmd === 'gem' ? 'the gem server gem is set to' : `the package index ${cmd} is set to`, files)
+      continue
+    }
+    // Container images: the registry is the image name's (docker's default is docker.io)
+    if (cmd === 'docker' || cmd === 'podman') {
+      const { args, opts } = operands(rest, DOCKER_VALUE)
+      let images: string[]
+      let dest: string | undefined
+      if (args[0] === 'push') [images, dest] = [args.slice(1, 2), args[2]]
+      else if (args[0] === 'image' && args[1] === 'push') [images, dest] = [args.slice(2, 3), args[3]]
+      else if ((args[0] === 'build' || (args[0] === 'buildx' && args[1] === 'build')) && opts.some(o => o.name === '--push' || (/^(-o|--output)$/.test(o.name) && /type=registry|push=true/.test(o.value ?? '')))) {
+        images = opts.filter(o => o.name === '-t' || o.name === '--tag').map(o => o.value ?? '').filter(Boolean)
+      } else continue
+      // podman push IMAGE DESTINATION: a transport, which may stay on this machine
+      if (cmd === 'podman' && dest) {
+        if (/^(dir|oci|oci-archive|docker-archive|containers-storage):/i.test(dest)) continue
+        images = [dest.replace(/^docker:\/\//i, '')]
+      }
+      if (!images.length) toHost(`${cmd} push`, null, `the registry ${cmd} is set to`)
+      for (const image of images) toHost(`${cmd} push of ${image}`, registryOf(image) ?? (cmd === 'docker' ? 'docker.io' : null), `the registry ${cmd} is set to`)
+      continue
+    }
+    // Cloud storage: an upload to a bucket (the bucket's own host, or the endpoint the command names)
+    if (cmd === 'aws') {
+      const { args, opts } = operands(rest, AWS_VALUE)
+      const [service = '', sub = ''] = args
+      if (opts.some(o => o.name === '--dryrun')) continue
+      let bucket: string | null = null
+      let files: string[] = []
+      if (service === 's3' && /^(cp|mv|sync)$/.test(sub)) {
+        const paths = args.slice(2)
+        const dest = paths.slice(1).find(p => /^s3:\/\//i.test(p))
+        if (!dest) continue
+        bucket = /^s3:\/\/([^/]+)/i.exec(dest)?.[1] ?? null
+        files = locals(paths.filter(p => !/^s3:\/\//i.test(p)))
+      } else if (service === 's3api' && sub === 'put-object') {
+        bucket = opts.find(o => o.name === '--bucket')?.value ?? null
+        files = locals([opts.find(o => o.name === '--body')?.value ?? ''])
+      } else continue
+      const endpoint = opts.find(o => o.name === '--endpoint-url')?.value
+      toHost(`aws ${service} ${sub}${of(files)}`, endpoint ? hostOf(endpoint) : bucket ? cleanHost(`${bucket}.s3.amazonaws.com`) : null, 'a bucket fleet can’t read', files)
+      continue
+    }
+    if (cmd === 'gsutil' || cmd === 'gcloud') {
+      const { args, opts } = operands(rest, cmd === 'gsutil' ? GSUTIL_VALUE : GCLOUD_VALUE)
+      let a = args
+      if (cmd === 'gcloud') {
+        if (a[0] === 'alpha' || a[0] === 'beta') a = a.slice(1)
+        if (a[0] !== 'storage') continue
+        a = a.slice(1)
+      }
+      const [sub = '', ...paths] = a
+      if (!/^(cp|mv|rsync)$/.test(sub) || opts.some(o => o.name === '--dry-run' || (cmd === 'gsutil' && sub === 'rsync' && o.name === '-n'))) continue
+      const dest = paths.slice(1).find(p => /^gs:\/\//i.test(p))
+      if (!dest) continue
+      const bucket = /^gs:\/\/([^/]+)/i.exec(dest)?.[1] ?? null
+      const files = locals(paths.filter(p => !/^gs:\/\//i.test(p)))
+      toHost(`${cmd === 'gsutil' ? 'gsutil' : 'gcloud storage'} ${sub}${of(files)}`, bucket ? cleanHost(`${bucket}.storage.googleapis.com`) : null, 'a bucket fleet can’t read', files)
+      continue
+    }
+    if (cmd === 'az') {
+      const { args, opts } = operands(rest, AZ_VALUE)
+      if (args[0] !== 'storage' || args[1] !== 'blob' || !/^upload/.test(args[2] ?? '') || opts.some(o => o.name === '--dryrun')) continue
+      const value = (re: RegExp) => opts.find(o => re.test(o.name))?.value ?? null
+      const url = value(/^--(blob-url|account-url|blob-endpoint)$/)
+      const conn = value(/^--connection-string$/) ?? ''
+      const endpoint = /BlobEndpoint=([^;]+)/i.exec(conn)?.[1]
+      const account = value(/^--account-name$/) ?? /AccountName=([^;]+)/i.exec(conn)?.[1] ?? null
+      const host = url ? hostOf(url) : endpoint ? hostOf(endpoint) : account ? cleanHost(`${account}.blob.core.windows.net`) : null
+      const files = locals(opts.filter(o => /^(-f|--file|-s|--source)$/.test(o.name)).map(o => o.value ?? ''))
+      toHost(`az storage blob ${args[2]}${of(files)}`, host, 'a storage account fleet can’t read', files)
+      continue
+    }
+    if (cmd === 'rclone') {
+      // To a remote of its configuration (remote:path): what it is lives in rclone.conf, so no host is known
+      const { args, opts } = operands(rest, RCLONE_VALUE)
+      const [sub = '', ...paths] = args
+      if (!/^(copy|copyto|sync|move|moveto|rcat)$/.test(sub) || opts.some(o => o.name === '--dry-run' || o.name === '-n')) continue
+      const dest = (sub === 'rcat' ? paths : paths.slice(1)).find(p => rcloneRemote(p) !== null)
+      if (!dest) continue
+      const files = sub === 'rcat' ? [] : locals(paths.filter(p => rcloneRemote(p) === null))
+      sends.push({ what: `rclone ${sub}${of(files)}`, to: [`the rclone remote ${rcloneRemote(dest)}`], files })
+      continue
+    }
+    // File transfer and shares
+    if (cmd === 'ftp') {
+      const { args, opts } = operands(rest, FTP_VALUE)
+      // ftp -u URL file…: an upload; otherwise the host it opens
+      const up = opts.find(o => o.name === '-u')?.value
+      const site = up ?? args[0]
+      toHost('ftp', site ? hostOf(site) : null, 'a host fleet can’t read', up ? locals(args) : [])
+      continue
+    }
+    if (cmd === 'lftp') {
+      const { args, opts } = operands(rest, LFTP_VALUE)
+      const script = opts.filter(o => o.name === '-c' || o.name === '-e').map(o => o.value ?? '').join(';')
+      const site = args[0] ?? /(?:^|[;\s])open\s+(?:-[a-z]\s+\S+\s+)*([^\s;]+)/i.exec(script)?.[1]
+      toHost('lftp', site ? hostOf(site) : null, 'a host fleet can’t read')
+      continue
+    }
+    if (cmd === 'smbclient') {
+      const { args, opts } = operands(rest, SMB_VALUE)
+      const service = args.find(a => shareHost(a) !== null)
+      const message = opts.find(o => o.name === '-M' || o.name === '--message')?.value
+      // smbclient -L host only lists the shares
+      if (!service && !message) continue
+      toHost('smbclient', service ? shareHost(service) : message ? cleanHost(message) : null, 'a host fleet can’t read')
+      continue
+    }
+    // An archive made on a line that sends: its sources are what goes out (tar czf - notes | ssh far 'cat > x')
+    if (cmd === 'tar' || cmd === 'bsdtar' || cmd === 'gtar') {
+      const words = rest[0] && /^[A-Za-z]+$/.test(rest[0]) ? [`-${rest[0]}`, ...rest.slice(1)] : rest
+      const { args, opts } = operands(words, TAR_VALUE)
+      if (!opts.some(o => o.name === '-c' || o.name === '--create')) continue
+      const dir = opts.find(o => o.name === '-C' || o.name === '--directory')?.value?.replace(/\/+$/, '')
+      for (const f of locals(args)) archived.push(dir && !f.startsWith('/') ? (f === '.' ? dir : `${dir}/${f}`) : f)
     }
   }
+  // A redirection to /dev/tcp/<host>/<port> (or /dev/udp/…): the shell opens the connection itself
+  for (const t of targets) {
+    const m = /^\/dev\/(tcp|udp)\/([^/]+)\/[^/]+$/.exec(t)
+    if (m) toHost(`a redirection to /dev/${m[1]}`, cleanHost(m[2] as string), t)
+  }
+  const first = sends[0]
+  if (first && archived.length) first.files = [...new Set([...first.files, ...archived])]
   return { sends, pushes, reads: [...new Set(reads)] }
 }
 
