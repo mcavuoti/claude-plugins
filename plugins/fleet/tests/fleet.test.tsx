@@ -108,7 +108,8 @@ test('decide answers at once with a ticket and queues the record; refuses subage
   const bad = await decide($, { questions: [{ question: 'Which?', options: [{ label: 'A' }, { label: 'B' }], recommended: 'C', why: 'x' }] })
   expect(bad.deny).toContain('recommended must be one of the option labels')
   expect(under(w, `${DEC}/queue`)).toEqual(['D-1.json', 'D-2.json'])
-  // Nothing left in tmp/
+  // Nothing left in tmp/ once the beat each decide starts has run
+  await w.clock.settle()
   expect(under(w, `${DEC}/tmp`)).toEqual([])
 })
 

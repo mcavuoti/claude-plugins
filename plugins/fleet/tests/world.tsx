@@ -82,6 +82,14 @@ export type World = {
   messages: { value: unknown[] }
   // What the engine draws beneath fleet above the prompt
   band: { value: string }
+  // Every prompt that entered, with the context hooks attached on the way down
+  prompts: { text: string; context: readonly string[] }[]
+  // What a Bash command does to the files (the stand-in for the shell)
+  bash: { value: (command: string) => void }
+  // Runs as the engine's Write or Edit starts, after fleet's gate (another session landing just then)
+  beforeTool: { value: (tool: string) => void }
+  // Writes a file as another program would (an editor, a script, another session): bumps its time
+  touch: (path: string, text: string) => void
 }
 
 export type WorldOptions = {
@@ -89,6 +97,12 @@ export type WorldOptions = {
   background?: boolean
   // The project already has .claude/fleet/
   fleet?: boolean
+  // world.json's globs, when the project has one (fleet only)
+  worldPaths?: string[]
+  // The volume ignores case (the real path has the disk's case, as on APFS)
+  insensitive?: boolean
+  // Symbolic links: link path → where it leads (absolute)
+  links?: Record<string, string>
   env?: Record<string, string>
   files?: Record<string, string>
 }
@@ -119,6 +133,22 @@ export function world(on: On, options: WorldOptions = {}): World {
   if (options.fleet !== false) {
     addFile(`${FLEET}/config.json`, '{ "configFormat": 1, "template": "blank", "commitRegister": false }\n')
     for (const d of ['queue', 'answers', 'register', 'tmp', 'prune']) dirs.add(`${DEC}/${d}`)
+    if (options.worldPaths) addFile(`${FLEET}/world.json`, JSON.stringify({ worldFormat: 1, paths: options.worldPaths }))
+  }
+  // Where a path lands: . and .. folded, links followed, and on a volume that ignores case the disk's own spelling
+  const links = options.links ?? {}
+  const real = (path: string): string | undefined => {
+    const out: string[] = []
+    for (const s of path.split('/')) {
+      if (s === '' || s === '.') continue
+      if (s === '..') out.pop()
+      else out.push(s)
+    }
+    let p = `/${out.join('/')}`
+    for (const [link, to] of Object.entries(links)) if (p === link || p.startsWith(`${link}/`)) p = to + p.slice(link.length)
+    if (files.has(p) || dirs.has(p)) return p
+    if (options.insensitive) return [...files.keys(), ...dirs].find(x => x.toLowerCase() === p.toLowerCase())
+    return undefined
   }
   const id = { value: SID }
   const root = { value: ROOT }
@@ -154,11 +184,20 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('fs.exists', (_, e) => ({ value: files.has(e.path) || dirs.has(e.path) }))
   on('fs.list', (_, e) => {
     if (!dirs.has(e.path)) throw new Error(`ENOENT: ${e.path}`)
-    const prefix = `${e.path}/`
-    const entries = [...files.keys()]
-      .filter(p => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
-      .map(p => ({ name: p.slice(prefix.length), kind: 'file' as const, size: 1, mtimeMs: mtimes.get(p) ?? 0, isLink: false }))
+    const prefix = e.path === '/' ? '/' : `${e.path}/`
+    const below = (p: string) => p.startsWith(prefix) && p.length > prefix.length && !p.slice(prefix.length).includes('/')
+    const entries = [
+      ...[...files.keys()].filter(below).map(p => ({ name: p.slice(prefix.length), kind: 'file' as const, size: (files.get(p) as string).length, mtimeMs: mtimes.get(p) ?? 0, isLink: false })),
+      ...[...dirs].filter(below).map(p => ({ name: p.slice(prefix.length), kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })),
+    ]
     return { value: entries }
+  })
+  on('fs.stat', (_, e) => {
+    const p = real(e.path)
+    if (p === undefined) throw new Error(`ENOENT: ${e.path}`)
+    const file = files.get(p)
+    const stat = file !== undefined ? { kind: 'file' as const, size: file.length, mtimeMs: mtimes.get(p) ?? 0, isLink: false } : { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }
+    return { value: e.resolve ? { ...stat, realPath: p } : stat }
   })
   on('process.run', (_, e) => {
     const argv = [...e.argv]
@@ -185,7 +224,13 @@ export function world(on: On, options: WorldOptions = {}): World {
       return ok
     }
     if (cmd === 'rm') {
-      for (const p of args.filter(a => a !== '-f')) files.delete(p)
+      const recursive = args.some(a => /^-\w*r/.test(a))
+      for (const p of args.filter(a => !a.startsWith('-'))) {
+        files.delete(p)
+        if (!recursive) continue
+        for (const f of [...files.keys()]) if (f.startsWith(`${p}/`)) files.delete(f)
+        for (const d of [...dirs]) if (d === p || d.startsWith(`${p}/`)) dirs.delete(d)
+      }
       return ok
     }
     if (cmd === 'mkdir') {
@@ -202,11 +247,52 @@ export function world(on: On, options: WorldOptions = {}): World {
     commands.push(e.name)
     return { value: { command: e.name } }
   })
+  const prompts: { text: string; context: readonly string[] }[] = []
   on('prompt.submit', (_, e) => {
     // What fleet submits (the person's own prompts in a test just enter)
-    if (e.origin?.kind !== 'plugin') return { text: e.text }
+    if (e.origin?.kind !== 'plugin') {
+      prompts.push({ text: e.text, context: e.context ?? [] })
+      return { text: e.text, context: e.context ?? [] }
+    }
     submits.push(e.text)
     return answerSubmit.value(e.text) as any
+  })
+  // The engine's file tools and shell, beneath fleet's hooks
+  const bash = { value: (_command: string): void => {} }
+  const beforeTool = { value: (_tool: string): void => {} }
+  // A write's time: the clock's, a little later than the write before it (two writes in one test tick still differ)
+  let bump = 0
+  const touch = (path: string, text: string) => {
+    addFile(path, text)
+    mtimes.set(path, clock.now() + ++bump / 1000)
+  }
+  on('tool.call', { tool: 'Read' }, (_, e) => {
+    const text = files.get(real(e.file_path) ?? e.file_path)
+    if (text === undefined) return { isError: true, result: undefined, text: `File does not exist: ${e.file_path}` }
+    const lines = text.split('\n').length
+    return { result: { type: 'text', file: { filePath: e.file_path, content: text, numLines: lines, startLine: 1, totalLines: lines } }, text }
+  })
+  on('tool.call', { tool: 'Write' }, (_, e) => {
+    beforeTool.value('Write')
+    const path = real(e.file_path) ?? e.file_path
+    const before = files.get(path)
+    touch(path, e.content)
+    return { result: { type: before === undefined ? 'create' : 'update', filePath: e.file_path, content: e.content, structuredPatch: [], originalFile: before ?? null }, text: `The file ${e.file_path} has been updated successfully.` }
+  })
+  on('tool.call', { tool: 'Edit' }, (_, e) => {
+    beforeTool.value('Edit')
+    const path = real(e.file_path) ?? e.file_path
+    const before = files.get(path)
+    if (before === undefined || !before.includes(e.old_string)) return { isError: true, result: undefined, text: 'String to replace not found in file.' }
+    touch(path, before.replace(e.old_string, e.new_string))
+    return {
+      result: { filePath: e.file_path, oldString: e.old_string, newString: e.new_string, originalFile: before, structuredPatch: [], userModified: false, replaceAll: false },
+      text: `The file ${e.file_path} has been updated successfully.`,
+    }
+  })
+  on('tool.call', { tool: 'Bash' }, (_, e) => {
+    bash.value(e.command)
+    return { result: { stdout: '', stderr: '', interrupted: false }, text: '' }
   })
   on('ui.log', (_, e) => {
     logs.push(String(e.text))
@@ -217,7 +303,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band }
+  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

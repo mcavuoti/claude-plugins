@@ -1,0 +1,264 @@
+import { expect, test } from 'claude-code/testing'
+
+import { hashText, hourFolder } from '../hooks/changes'
+import { FAKE_SESSIONS, FLEET, REF, ROOT, SID, fleet, json, sessionsSay, startSession, under, world, type World } from './world'
+
+// The shared files (the world) in one session, with the engine's file tools and shell standing in beneath fleet.
+// Another session's landings are written as its fleet would write them: the file, then its event
+
+const WITH_SESSIONS = { plugins: [FAKE_SESSIONS] }
+const PLAN = `${ROOT}/notes/plan.md`
+const TODO = `${ROOT}/notes/todo.md`
+const B_SID = 'bbbbbbbb-0000-0000-0000-000000000000'
+const B = { sessionId: B_SID, agentId: null, ref: 'bbbbbbbb', name: 'TEST B' }
+const CURRENT = { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null } }
+const WHEN = '\\d\\d:\\d\\d'
+
+async function tick(w: World, ms = 2100) {
+  await w.clock.advance(ms)
+  await w.clock.settle()
+}
+
+// A session with the world notes/**, past its first scan (the baseline)
+async function begin($: any, w: World) {
+  sessionsSay(w, CURRENT)
+  await startSession($, w)
+  await tick(w, 1100)
+}
+
+let n = 0
+function landByB(w: World, path: string, text: string, tool = 'Edit') {
+  const before = w.files.get(path)
+  w.touch(path, text)
+  const at = w.clock.now()
+  const name = `${at}-bbbbbbbb-${++n}.json`
+  const event = { format: 1, at, path: path.slice(ROOT.length + 1), from: before === undefined ? null : hashText(before), to: hashText(text), via: 'tool', tool, blind: false, by: B }
+  w.touch(`${FLEET}/events/${hourFolder(at)}/${name}`, JSON.stringify(event))
+  w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: name }))
+}
+
+function events(w: World): any[] {
+  return [...w.files.keys()]
+    .filter(p => p.startsWith(`${FLEET}/events/`) && /\/\d{4}-\d{2}-\d{2}\/\d{2}\/[^/]+\.json$/.test(p))
+    .map(p => JSON.parse(w.files.get(p) as string))
+    .sort((a, b) => a.at - b.at)
+}
+
+function mine(w: World): any[] {
+  return events(w).filter(e => e.by?.sessionId === SID || (e.via === 'outside' && e.by === null))
+}
+
+async function call($: any, input: Record<string, unknown>): Promise<any> {
+  return $.tool.call(input as any)
+}
+
+test('a stale write is refused once with who changed it and when; the thread heard it at its next step; after a Read it lands as an event', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n' } })
+  await begin($, w)
+  expect((await call($, { tool: 'Read', file_path: PLAN })).context).toBe(undefined)
+  landByB(w, PLAN, 'plan v2 from B\n')
+  await tick(w)
+  // The next step carries the digest, once, with path, who and when (never the content)
+  const step = await call($, { tool: 'Bash', command: 'ls' })
+  expect(step.context.join('\n')).toMatch(new RegExp(`^fleet: a shared file you read has changed since you read it\\. Read it again before you rely on it or write it:\\n- notes/plan\\.md: changed at ${WHEN} by TEST B \\(Edit\\)$`))
+  expect(step.context.join('\n')).not.toContain('plan v2')
+  expect((await call($, { tool: 'Bash', command: 'ls' })).context).toBe(undefined)
+  // The stale write is refused, and nothing is written
+  const refused = await call($, { tool: 'Write', file_path: PLAN, content: 'plan v1 and mine\n' })
+  expect(refused.deny).toMatch(new RegExp(`^fleet: notes/plan\\.md changed at ${WHEN} by TEST B \\(Edit\\), after you read it\\. Read it again, then redo this write so it agrees with that change`))
+  expect(w.files.get(PLAN)).toBe('plan v2 from B\n')
+  // After the re-read it lands, as this session's event
+  await call($, { tool: 'Read', file_path: PLAN })
+  const landed = await call($, { tool: 'Edit', file_path: PLAN, old_string: 'from B', new_string: 'from B, and mine' })
+  expect(landed.deny).toBe(undefined)
+  expect(w.files.get(PLAN)).toBe('plan v2 from B, and mine\n')
+  const ev = mine(w)
+  expect(ev.length).toBe(1)
+  expect(ev[0]).toMatchObject({ format: 1, path: 'notes/plan.md', via: 'tool', tool: 'Edit', blind: false, from: hashText('plan v2 from B\n'), to: hashText('plan v2 from B, and mine\n'), by: { sessionId: SID, agentId: null, ref: REF, name: 'TEST A' } })
+  expect(json(w, `${FLEET}/events/latest`).last).toMatch(/-aaaaaaaa-\d+\.json$/)
+  // What this session read is in its reads file, for /fleet status elsewhere and a restart
+  await tick(w, 1100)
+  expect(json(w, `${FLEET}/reads/${SID}.json`)).toMatchObject({ format: 1, sessionId: SID, name: 'TEST A', threads: { main: { 'notes/plan.md': { v: hashText('plan v2 from B, and mine\n') } } } })
+})
+
+test('the gate tells once: a file never read is refused once, then passes; a new file and a file outside the world pass', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [`${ROOT}/src/a.ts`]: 'x\n' } })
+  await begin($, w)
+  const first = await call($, { tool: 'Write', file_path: PLAN, content: 'all new\n' })
+  expect(first.deny).toBe("fleet: notes/plan.md is a shared file of this project and you haven't read it in this conversation. Read it first, then redo this write so it keeps what's there (this write was not made).")
+  const again = await call($, { tool: 'Write', file_path: PLAN, content: 'all new\n' })
+  expect(again.deny).toBe(undefined)
+  expect(w.files.get(PLAN)).toBe('all new\n')
+  expect((await call($, { tool: 'Write', file_path: `${ROOT}/notes/ideas/new.md`, content: 'idea\n' })).deny).toBe(undefined)
+  expect((await call($, { tool: 'Write', file_path: `${ROOT}/src/a.ts`, content: 'y\n' })).deny).toBe(undefined)
+  expect(mine(w).map(e => [e.path, e.from === null])).toEqual([
+    ['notes/plan.md', false],
+    ['notes/ideas/new.md', true],
+  ])
+})
+
+test("each thread answers for itself: a helper's read doesn't count for the main thread, and a helper's reads go when it ends", WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n' } })
+  await begin($, w)
+  await call($, { tool: 'Read', file_path: PLAN, agentId: 'a1' })
+  expect((await call($, { tool: 'Write', file_path: PLAN, content: 'main\n' })).deny).toContain("you haven't read it")
+  expect((await call($, { tool: 'Write', file_path: PLAN, content: 'helper\n', agentId: 'a1' })).deny).toBe(undefined)
+  const ev = mine(w)
+  expect(ev[0].by).toMatchObject({ sessionId: SID, agentId: 'a1' })
+  await tick(w, 1100)
+  expect(Object.keys(json(w, `${FLEET}/reads/${SID}.json`).threads)).toEqual(['a1'])
+  await $.turn.complete({ answer: 'done', durationMs: 5, isAborted: false, turnId: 't-a1', reason: 'answer', agentId: 'a1' } as any)
+  await tick(w, 1100)
+  expect(Object.keys(json(w, `${FLEET}/reads/${SID}.json`).threads)).toEqual([])
+})
+
+test('paths are placed where they land: a case alias on a volume that ignores case, a link, a new file in a new folder', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], insensitive: true, links: { [`${ROOT}/n`]: `${ROOT}/notes` }, files: { [PLAN]: 'plan v1\n' } })
+  await begin($, w)
+  await call($, { tool: 'Read', file_path: `${ROOT}/NOTES/Plan.md` })
+  landByB(w, PLAN, 'plan v2\n')
+  await tick(w)
+  expect((await call($, { tool: 'Write', file_path: '/Users/x/PROJ/Notes/PLAN.md', content: 'x\n' })).deny).toContain('fleet: notes/plan.md changed at')
+  expect((await call($, { tool: 'Write', file_path: `${ROOT}/n/plan.md`, content: 'x\n' })).deny).toBe(undefined)
+  expect((await call($, { tool: 'Write', file_path: '/Users/x/PROJ/Notes/New/x.md', content: 'x\n' })).deny).toBe(undefined)
+  expect(mine(w).map(e => e.path)).toEqual(['notes/plan.md', 'notes/New/x.md'])
+})
+
+test('a Bash command that writes a world file lands blind: an event of its thread, a line when it replaced a change it had not read', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [TODO]: 'todo v1\n' } })
+  await begin($, w)
+  await call($, { tool: 'Read', file_path: PLAN })
+  landByB(w, PLAN, 'plan v2 from B\n')
+  await tick(w)
+  w.bash.value = command => {
+    if (command.startsWith('printf')) w.touch(PLAN, 'written by a command\n')
+  }
+  const r = await call($, { tool: 'Bash', command: "printf 'written by a command\\n' > notes/plan.md" })
+  expect(r.context.join('\n')).toMatch(new RegExp(`fleet: your command changed notes/plan\\.md, which changed at ${WHEN} by TEST B \\(Edit\\) after you read it\\. Read notes/plan\\.md and check that change is still there\\.`))
+  const ev = mine(w)
+  expect(ev[0]).toMatchObject({ path: 'notes/plan.md', via: 'bash', tool: 'Bash', blind: true, from: hashText('plan v2 from B\n'), to: hashText('written by a command\n'), by: { sessionId: SID } })
+  // Its own command's result counts as read for the thread that ran it; so does a cat of one file
+  expect((await call($, { tool: 'Edit', file_path: PLAN, old_string: 'command', new_string: 'command, then edited' })).deny).toBe(undefined)
+  await call($, { tool: 'Bash', command: 'cat notes/todo.md' })
+  expect((await call($, { tool: 'Write', file_path: TODO, content: 'todo v2\n' })).deny).toBe(undefined)
+  // A command that writes nothing of the world records nothing
+  w.bash.value = () => w.touch(`${ROOT}/build.log`, 'ok\n')
+  await call($, { tool: 'Bash', command: 'make' })
+  expect(mine(w).map(e => e.via)).toEqual(['bash', 'tool', 'tool'])
+})
+
+test('a change made outside fleet is found by the scan, recorded once and heard; /fleet accept stamps it as the person’s', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [TODO]: 'todo v1\n' } })
+  await begin($, w)
+  await call($, { tool: 'Read', file_path: PLAN })
+  w.touch(PLAN, 'edited in an editor\n')
+  await tick(w, 10000)
+  expect(mine(w)).toEqual([])
+  await tick(w, 10000)
+  const ev = mine(w)
+  expect(ev).toEqual([expect.objectContaining({ path: 'notes/plan.md', via: 'outside', blind: true, by: null, to: hashText('edited in an editor\n') })])
+  expect(under(w, `${FLEET}/events/claims`).length).toBe(1)
+  const step = await call($, { tool: 'Bash', command: 'ls' })
+  expect(step.context.join('\n')).toMatch(new RegExp(`- notes/plan\\.md: changed at ${WHEN} outside fleet \\(an editor, a script, or a session without fleet\\)`))
+  expect(await fleet($, 'accept')).toContain('notes/plan.md: changed at')
+  expect(await fleet($, 'accept notes/plan.md', { kind: 'plugin', name: 'other' })).toContain('Only the person')
+  expect(await fleet($, 'accept notes/plan.md')).toContain('notes/plan.md: its current version (changed at')
+  expect(mine(w).map(e => e.via)).toEqual(['outside', 'accept'])
+  expect(events(w).at(-1)).toMatchObject({ via: 'accept', path: 'notes/plan.md', by: { person: true, sessionId: SID }, to: hashText('edited in an editor\n') })
+  expect(await fleet($, 'accept notes/plan.md')).toContain('yours already')
+  expect(await fleet($, 'accept')).toContain('No change made outside fleet waits')
+  // Told once already: the stamp doesn't make a second digest line
+  expect((await call($, { tool: 'Bash', command: 'ls' })).context).toBe(undefined)
+  landByB(w, TODO, 'todo from B\n')
+  await tick(w)
+  expect(await fleet($, 'accept notes/todo.md')).toMatch(/notes\/todo\.md: its current version is from TEST B \(Edit\) at \d\d:\d\d: nothing to stamp/)
+  expect(await fleet($, 'accept src/x.ts')).toContain("isn't a shared file of this project")
+})
+
+test('a prompt that starts a turn carries the main thread’s digest, once; nothing when nothing it read changed', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n' } })
+  await begin($, w)
+  await call($, { tool: 'Read', file_path: PLAN })
+  const submit = (text: string) => $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false } as any)
+  await submit('first')
+  landByB(w, PLAN, 'plan v2\n')
+  await tick(w)
+  await submit('second')
+  await submit('third')
+  expect(w.prompts.map(p => [p.text, p.context.length])).toEqual([
+    ['first', 0],
+    ['second', 1],
+    ['third', 0],
+  ])
+  expect(w.prompts[1]?.context[0]).toMatch(/notes\/plan\.md: changed at \d\d:\d\d by TEST B \(Edit\)/)
+})
+
+test('an edit that waited while another landing came in lands on top of it, and says so', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'line one\nline two\n' } })
+  await begin($, w)
+  await call($, { tool: 'Read', file_path: PLAN })
+  w.beforeTool.value = () => {
+    w.beforeTool.value = () => {}
+    landByB(w, PLAN, 'line one\nline two\nline three from B\n')
+  }
+  const r = await call($, { tool: 'Edit', file_path: PLAN, old_string: 'line one', new_string: 'line ONE' })
+  expect(r.context.join('\n')).toMatch(new RegExp(`fleet: your edit of notes/plan\\.md landed on top of a change that came in at ${WHEN} by TEST B \\(Edit\\) while your edit waited`))
+  expect(mine(w)[0]).toMatchObject({ overwrote: true, from: hashText('line one\nline two\nline three from B\n') })
+})
+
+test('/fleet world lists, adds and removes globs, typed by the person; /fleet init writes the default; a newer world.json turns the world off', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { fleet: false, background: false, files: { [`${ROOT}/specs/a.md`]: 'a\n' } })
+  await startSession($, w)
+  expect(await fleet($, 'init')).toContain('Shared files (world.json): `notes/**`, `docs/**`.')
+  expect(json(w, `${FLEET}/world.json`)).toEqual({ worldFormat: 1, paths: ['notes/**', 'docs/**'] })
+  expect(w.files.get(`${FLEET}/.gitignore`)).toContain('\nevents/\nreads/\n')
+  expect(await fleet($, 'world')).toContain('`notes/**`, `docs/**`')
+  expect(await fleet($, 'world add specs', { kind: 'plugin', name: 'other' })).toContain('Only the person')
+  expect(await fleet($, 'world add specs')).toContain('Added `specs/**`')
+  expect(await fleet($, 'world remove docs/**')).toContain('`notes/**`, `specs/**`')
+  expect(await fleet($, 'world add ../x')).toContain("can't have . or ..")
+  expect(json(w, `${FLEET}/world.json`)).toEqual({ worldFormat: 1, paths: ['notes/**', 'specs/**'] })
+  // The world of a newer fleet: left alone, said, and nothing is gated
+  w.touch(`${FLEET}/world.json`, '{"worldFormat": 2, "paths": ["notes/**"]}')
+  await tick(w)
+  expect(await fleet($, 'status')).toContain('world: world.json is from a newer fleet (worldFormat 2): restart this session (u)')
+  w.touch(PLAN, 'v1\n')
+  expect((await call($, { tool: 'Write', file_path: PLAN, content: 'v2\n' })).deny).toBe(undefined)
+  expect(await fleet($, 'world add docs/**')).toContain('newer fleet')
+})
+
+test('/fleet status: the world, the latest changes, and who is behind, in this session and the others', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [TODO]: 'todo v1\n' } })
+  await begin($, w)
+  await call($, { tool: 'Read', file_path: PLAN })
+  w.touch(`${FLEET}/reads/cccccccc-0000-0000-0000-000000000000.json`, JSON.stringify({ format: 1, sessionId: 'cccccccc-0000-0000-0000-000000000000', ref: 'cccccccc', name: 'TEST C', at: w.clock.now(), threads: { main: { 'notes/todo.md': { v: hashText('todo v0\n'), at: 1 }, 'notes/plan.md': { v: hashText('plan v1\n'), at: 1 } } } }))
+  landByB(w, PLAN, 'plan v2\n')
+  await tick(w)
+  const s = await fleet($, 'status')
+  expect(s).toContain('world: `notes/**` (world.json)')
+  expect(s).toMatch(/recent changes \(newest first\):\n {2}notes\/plan\.md: changed at \d\d:\d\d by TEST B \(Edit\)/)
+  expect(s).toContain('behind (read a version that has changed since):')
+  expect(s).toMatch(/ {2}this session: notes\/plan\.md, changed at \d\d:\d\d by TEST B \(Edit\)/)
+  expect(s).toMatch(/ {2}TEST C: notes\/plan\.md, changed at/)
+  expect(s).toContain('  TEST C: notes/todo.md')
+  expect(s).toContain('formats: files 1, register 1, config 1, world 1')
+})
+
+test('after a restart the reads come back from the file; a /clear forgets them', WITH_SESSIONS, async ($, on) => {
+  const reads = { format: 1, sessionId: SID, ref: REF, name: 'TEST A', at: 1, threads: { main: { 'notes/plan.md': { v: hashText('plan v1\n'), at: 1 } } } }
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [`${FLEET}/reads/${SID}.json`]: JSON.stringify(reads) } })
+  await begin($, w)
+  expect((await call($, { tool: 'Write', file_path: PLAN, content: 'plan v2\n' })).deny).toBe(undefined)
+  await $.session.end({ reason: 'clear', sessionId: SID } as any)
+  await w.clock.settle()
+  expect(w.files.has(`${FLEET}/reads/${SID}.json`)).toBe(false)
+  expect((await call($, { tool: 'Write', file_path: PLAN, content: 'plan v3\n' })).deny).toContain("you haven't read it")
+})
+
+test('fleet fails open: a world.json it can’t read gates nothing, and says why', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { files: { [PLAN]: 'plan v1\n', [`${FLEET}/world.json`]: 'not json' } })
+  await begin($, w)
+  expect((await call($, { tool: 'Write', file_path: PLAN, content: 'v2\n' })).deny).toBe(undefined)
+  expect(await fleet($, 'status')).toContain("world: world.json isn't valid JSON")
+  expect(events(w)).toEqual([])
+})

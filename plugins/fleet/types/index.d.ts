@@ -5,6 +5,9 @@
  * (a hot reload loses the copy that waited on the submit) */
 export type FleetInflight = { at: number; epoch: string }
 
+/** A world file as one thread last read it (or wrote it): the version, when, and the newest version it was told of */
+export type FleetRead = { v: string; at: number; told?: string }
+
 declare module 'claude-code' {
   interface PluginState {
     fleet: {
@@ -25,6 +28,10 @@ declare module 'claude-code' {
       listing: string[]
       /** The section fleet last put this session in ('fleet:asking', 'none'; '' not known yet) */
       section: string
+      /** What each thread of this session read of the world: 'main' or a helper's agentId → path → the read */
+      reads: Record<string, Record<string, FleetRead>>
+      /** The version each thread's write of a path was refused at once already (the gate tells once): thread → path */
+      warned: Record<string, Record<string, string>>
     }
   }
 }

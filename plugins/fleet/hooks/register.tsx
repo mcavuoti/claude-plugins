@@ -1,7 +1,51 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { FleetInflight } from '../types'
+import type { FleetInflight, FleetRead } from '../types'
+import {
+  KEEP_DAYS,
+  WORLD_FORMAT,
+  acceptable,
+  addGlob,
+  ancestorsOf,
+  bashReadTarget,
+  caseProbe,
+  changeLine,
+  changedPaths,
+  clock,
+  digestItems,
+  digestText,
+  eventName,
+  gateText,
+  globBase,
+  globList,
+  globRegex,
+  hashText,
+  hourFolder,
+  inWorld,
+  isEvent,
+  newWorld,
+  newer,
+  oldDays,
+  overwroteText,
+  parseReads,
+  parseWorld,
+  placeable,
+  relOf,
+  removeGlob,
+  staleOf,
+  statVersion,
+  verdict,
+  whoText,
+  windowFolders,
+  worldText,
+  type ChangeEvent,
+  type Me,
+  type ReadsFile,
+  type Snapshot,
+  type Who,
+  type WorldConfig,
+} from './changes'
 import {
   ASKING_SECTION,
   CONFIG_FORMAT,
@@ -52,9 +96,11 @@ import {
 
 // fleet, per project: a background session asks the person with mcp__fleet__decide and goes on working; the person
 // answers from any session of the project with /fleet (no tokens), and the asking session's fleet hands the answer to
-// its model as a prompt of its own once it's idle. The project's .claude/fleet/ folder holds everything (decisions.ts
-// lists the files); fleet keeps no store. Other sessions are named, and their state read, only through $.sessions
-// (calls only: fleet never hooks a sessions.* event nor reads its files).
+// its model as a prompt of its own once it's idle. And the project's shared files (the world, world.json): a thread's
+// write of one that changed since it read it is refused once with who changed it and when, and the thread hears of such
+// changes at its next step (changes.ts). The project's .claude/fleet/ folder holds everything (decisions.ts lists the
+// files); fleet keeps no store. Other sessions are named, and their state read, only through $.sessions (calls only:
+// fleet never hooks a sessions.* event nor reads its files).
 
 // $.state survives a hot reload of this module (module variables don't): what the delivery depends on lives there
 const held = atom({ plugin: 'fleet', key: 'held' } as const, 0)
@@ -66,6 +112,8 @@ const busy = atom({ plugin: 'fleet', key: 'busy' } as const, false)
 const idleSince = atom({ plugin: 'fleet', key: 'idleSince' } as const, 0)
 const listing = atom({ plugin: 'fleet', key: 'listing' } as const, [] as string[])
 const section = atom({ plugin: 'fleet', key: 'section' } as const, '')
+const reads = atom({ plugin: 'fleet', key: 'reads' } as const, {} as Record<string, Record<string, FleetRead>>)
+const warned = atom({ plugin: 'fleet', key: 'warned' } as const, {} as Record<string, Record<string, string>>)
 
 // This copy of the module: a hot reload makes a new one and drops the old one's timers and the submits it waited on
 const EPOCH = Math.random().toString(36).slice(2, 10)
@@ -307,7 +355,7 @@ async function start($: any) {
     .register({
       name: 'fleet',
       description: 'The questions background sessions of this project are waiting on: /fleet lists them, /fleet 1a 2b answers them. /fleet help for the rest',
-      argumentHint: '[1a 2b | note <n> <text> | drop <n> [why] | status | init | help]',
+      argumentHint: '[1a 2b | note <n> <text> | drop <n> [why] | status | world | accept <path> | init | help]',
       immediate: true,
     })
     .catch(() => {})
@@ -321,6 +369,7 @@ async function start($: any) {
           const r = await findRoot($)
           if (!r) return
           root = r
+          worldReady = null
           look.cancel()
           timers($)
           if (jobRef && !offered) await offer($)
@@ -338,6 +387,8 @@ function timers($: any) {
     $.clock.after(0, () => bg(rebuild($)))
     $.clock.every(2000, () => bg(deliver($)))
   }
+  $.clock.after(0, () => bg(startWorld($)))
+  $.clock.every(2000, () => bg(worldTick($)))
   $.clock.every(10000, () => bg(beat($)))
   $.clock.after(1000, () => bg(beat($)))
 }
@@ -655,6 +706,8 @@ async function beat($: any) {
   const n = heldCount(records, present)
   if ((await read($, held)) !== n) await update($, held, () => n)
   if (jobRef) await keepSection($, records, present)
+  await refreshName($)
+  await scanWorld($).catch(err => log($, `world scan: ${String(err).slice(0, 200)}`))
   await maybePrune($, records)
 }
 
@@ -707,6 +760,735 @@ async function maybePrune($: any, records: QueueRecord[]) {
   await old(dec('answers'), HOUR, n => queued.has(parseAnswerName(n)?.id ?? ''))
   await old(dec('tmp'), 24 * HOUR, () => false)
   await old(dec('prune'), 7 * 24 * HOUR, () => false)
+  await pruneWorld($, now)
+}
+
+// ---- The world: the project's shared files, and "changed since you read it" (changes.ts) ----
+
+// world.json's globs (null: no world.json, or one this fleet can't use: worldProblem says why), the project's real
+// folder and whether its volume ignores case. Module state: a hot reload reads them again
+let world: { globs: string[]; res: RegExp[]; mtimeMs: number } | null = null
+let worldProblem = ''
+let worldReady: Promise<void> | null = null
+let realRoot = ''
+let insensitive = false
+// The events of the trailing window seen so far (name → when seen), the newest per world path, and how many came from
+// a fleet with another format
+const seen = new Map<string, number>()
+const latest = new Map<string, ChangeEvent>()
+// The last landings of the window, newest last, for /fleet status
+const recent: ChangeEvent[] = []
+let otherEvents = 0
+let latestMark = -1
+let pulling: Promise<void> | null = null
+let eventCount = 0
+// The world as this session's scan last saw it, and the changes nobody's event explains yet (recorded as outside
+// changes when they stay so for a scan)
+const known = new Map<string, { mtimeMs: number; size: number; v: string | null }>()
+const unexplained = new Map<string, { v: string | null; since: number }>()
+let baselined = false
+let worldStarted = false
+let tooBig = false
+let bashRunning = 0
+let readsTimer = false
+// This session as other sessions' digests name it, from $.sessions every 10 s
+let myName: string | null = null
+let myRef: string | null = null
+// A world past this many files isn't scanned after each command (the scan every 10 s still runs)
+const MAX_WORLD_FILES = 5000
+const MiB4 = 4 * 1024 * 1024
+
+function eventsDir(sub = ''): string {
+  return `${root}/.claude/fleet/events${sub ? `/${sub}` : ''}`
+}
+function readsPath(sessionId: string): string {
+  return `${root}/.claude/fleet/reads/${sessionId}.json`
+}
+
+/** The world is on in a session that started fleet (not claude -p), in a project whose world.json has globs */
+function worldOn(): boolean {
+  return started && !!root && !!realRoot && !!world && world.globs.length > 0
+}
+
+function ensureWorld($: any): Promise<void> {
+  if (!worldReady) {
+    worldReady = (async () => {
+      await locate($)
+      if (root) await locateWorld($)
+    })().catch(() => {})
+  }
+  return worldReady
+}
+
+async function locateWorld($: any) {
+  if (!realRoot) {
+    try {
+      realRoot = String((await $.fs.stat(root as string, { resolve: true })).realPath ?? '').replace(/\/+$/, '')
+    } catch {}
+    if (!realRoot) return
+    // A volume that ignores case answers the project folder spelled in another case with the folder itself (C12: on
+    // APFS the real path has the disk's case; on ext4 the other spelling isn't there)
+    const probe = caseProbe(realRoot)
+    if (probe) {
+      try {
+        insensitive = (await $.fs.stat(probe, { resolve: true })).realPath === realRoot
+      } catch {
+        insensitive = false
+      }
+    }
+  }
+  await loadWorld($)
+}
+
+// world.json, read again when its modification time moves
+async function loadWorld($: any) {
+  const path = `${fleetDir()}/world.json`
+  let st: any
+  try {
+    st = await $.fs.stat(path)
+  } catch {
+    world = null
+    worldProblem = ''
+    return
+  }
+  if (world && st.mtimeMs === world.mtimeMs) return
+  const t = await readText($, path)
+  const p = t === null ? { problem: "world.json can't be read" } : parseWorld(t)
+  const before = world?.globs.join('\n')
+  if ('problem' in p) {
+    if (worldProblem !== p.problem) log($, p.problem)
+    world = null
+    worldProblem = p.problem
+    return
+  }
+  worldProblem = ''
+  world = { globs: p.world.paths, res: p.world.paths.map(g => globRegex(g, insensitive)), mtimeMs: st.mtimeMs }
+  if (before !== world.globs.join('\n')) {
+    // Other globs: what's in the world now is the new baseline, not a change
+    known.clear()
+    unexplained.clear()
+    baselined = false
+    tooBig = false
+    log($, `world: ${world.globs.join(', ') || 'no globs'}`)
+  }
+}
+
+// Where a path lands: an existing one at its real path, a new one at its nearest existing folder's real path plus the
+// rest (C12: a missing file or folder can't be stat'ed). null: it can't be placed, and fleet lets it be
+async function place($: any, path: string): Promise<string | null> {
+  if (!placeable(path)) return null
+  try {
+    const s = await $.fs.stat(path, { resolve: true })
+    if (s.realPath) return String(s.realPath)
+  } catch {}
+  for (const { dir, rest } of ancestorsOf(path)) {
+    let s: any
+    try {
+      s = await $.fs.stat(dir, { resolve: true })
+    } catch {
+      continue
+    }
+    return s.realPath ? `${String(s.realPath).replace(/\/+$/, '')}/${rest}` : null
+  }
+  return null
+}
+
+/** A world file a tool names: its path relative to the project, and where it is; null for anything else */
+async function worldFile($: any, path: unknown): Promise<{ rel: string; abs: string } | null> {
+  if (typeof path !== 'string' || !path) return null
+  await ensureWorld($)
+  if (!worldOn()) return null
+  const given = path.startsWith('/') ? path : `${String(await $.session.cwd()).replace(/\/+$/, '')}/${path}`
+  const abs = await place($, given)
+  if (!abs) return null
+  const rel = relOf(abs, realRoot, insensitive)
+  return rel !== null && inWorld(rel, (world as { res: RegExp[] }).res) ? { rel, abs } : null
+}
+
+/** A file's version: the hash of its text, or its size and time past 4 MiB; null when it isn't there */
+async function versionOf($: any, abs: string): Promise<{ v: string | null; mtimeMs: number; size: number }> {
+  let st: any
+  try {
+    st = await $.fs.stat(abs)
+  } catch {
+    return { v: null, mtimeMs: 0, size: 0 }
+  }
+  if (st.kind !== 'file') return { v: null, mtimeMs: 0, size: 0 }
+  const size = Number(st.size)
+  const mtimeMs = Number(st.mtimeMs)
+  if (size > MiB4) return { v: statVersion(size, mtimeMs), mtimeMs, size }
+  const t = await readText($, abs)
+  return { v: t === null ? statVersion(size, mtimeMs) : hashText(t), mtimeMs, size }
+}
+
+async function meNow($: any): Promise<Me> {
+  const now = await $.clock.now()
+  return { sessionId: String(await $.session.id()), offsetMin: -new Date(now).getTimezoneOffset() }
+}
+
+async function whoAmI($: any, thread: string): Promise<Who> {
+  // The name comes from sessions once it has read the list: early in a session, ask again
+  if (!myName) await refreshName($)
+  return { sessionId: String(await $.session.id()), agentId: thread === 'main' ? null : thread, ref: myRef ?? jobRef, name: myName }
+}
+
+function threadOf(e: any): string {
+  return typeof e.agentId === 'string' && e.agentId ? e.agentId : 'main'
+}
+
+async function refreshName($: any) {
+  if (!(await has($, 'current'))) return
+  const c = await race<Current>($, () => $.sessions.current())
+  if (c?.ready) {
+    myName = c.name || null
+    myRef = c.ref
+  }
+}
+
+// ---- Events ----
+
+// The event files of the trailing window not seen yet (the current hour and the one before; 25 hours at the start)
+function pullEvents($: any, hours = 2): Promise<void> {
+  if (pulling) return pulling
+  pulling = (async () => {
+    const now = await $.clock.now()
+    for (const folder of windowFolders(now, hours)) {
+      const dir = eventsDir(folder)
+      for (const name of await names($, dir)) {
+        if (!name.endsWith('.json') || seen.has(name)) continue
+        const t = await readText($, `${dir}/${name}`)
+        if (t === null) continue
+        let v: any
+        try {
+          v = JSON.parse(t)
+        } catch {
+          continue
+        }
+        seen.set(name, now)
+        if (!isEvent(v)) {
+          if (v && v.format !== FORMAT) otherEvents++
+          continue
+        }
+        if (newer(latest.get(v.path), v)) latest.set(v.path, v)
+        remember(v)
+      }
+    }
+    for (const [name, at] of seen) if (now - at > 3 * HOUR) seen.delete(name)
+  })()
+    .catch(() => {})
+    .finally(() => {
+      pulling = null
+    })
+  return pulling
+}
+
+function remember(e: ChangeEvent) {
+  recent.push(e)
+  recent.sort((a, b) => a.at - b.at)
+  if (recent.length > 50) recent.splice(0, recent.length - 50)
+}
+
+// events/latest moved (another session landed something): read the new events. Every 2 s, at each tool step, and on
+// the engine's FileChanged for it
+async function eventsTick($: any) {
+  if (!worldOn()) return
+  let m = 0
+  try {
+    m = Number((await $.fs.stat(`${eventsDir()}/latest`)).mtimeMs)
+  } catch {
+    return
+  }
+  if (m === latestMark) return
+  latestMark = m
+  await pullEvents($)
+}
+
+// One landing: published once under a name of its own in the current hour's folder, then events/latest rewritten so
+// every session's watcher fires
+async function writeEvent($: any, ev: Omit<ChangeEvent, 'format' | 'at'> & { at?: number }): Promise<ChangeEvent | null> {
+  const sid8 = String(await $.session.id()).slice(0, 8)
+  for (let tries = 0; tries < 5; tries++) {
+    const now = await $.clock.now()
+    const e: ChangeEvent = { format: FORMAT, ...ev, at: ev.at ?? now }
+    const name = eventName(now, sid8, ++eventCount)
+    const r = await publish($, `${eventsDir(hourFolder(now))}/${name}`, json(e))
+    if (r === 'exists') continue
+    if (r === 'failed') {
+      log($, `couldn't write the event of ${e.path}`)
+      return null
+    }
+    seen.set(name, now)
+    if (newer(latest.get(e.path), e)) latest.set(e.path, e)
+    remember(e)
+    try {
+      await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: name }))
+    } catch {}
+    log($, `${e.path}: ${e.via}${e.tool ? ` (${e.tool})` : ''}${e.blind ? ', landed blind' : ''}${e.overwrote ? ', over a change' : ''}`)
+    return e
+  }
+  return null
+}
+
+// ---- What each thread read ----
+
+async function setRead($: any, thread: string, rel: string, v: string | null) {
+  const now = await $.clock.now()
+  await update($, reads, m => {
+    const mine = { ...(m[thread] ?? {}) }
+    if (v === null) delete mine[rel]
+    else mine[rel] = { v, at: now, told: v }
+    return { ...m, [thread]: mine }
+  })
+  await update($, warned, m => (m[thread]?.[rel] === undefined ? m : { ...m, [thread]: omit(m[thread] as Record<string, string>, [rel]) }))
+  saveReadsSoon($)
+}
+
+async function noteRead($: any, thread: string, abs: unknown) {
+  const w = await worldFile($, abs)
+  if (!w) return
+  const { v } = await versionOf($, w.abs)
+  if (v !== null) await setRead($, thread, w.rel, v)
+}
+
+// reads/<sessionId>.json, a second after a change (for /fleet status in other sessions, and after a restart)
+function saveReadsSoon($: any) {
+  if (readsTimer) return
+  readsTimer = true
+  $.clock.after(1000, () =>
+    bg(
+      (async () => {
+        readsTimer = false
+        await saveReads($)
+      })(),
+    ),
+  )
+}
+
+async function saveReads($: any) {
+  if (!worldOn()) return
+  const sessionId = String(await $.session.id())
+  const file: ReadsFile = { format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: await $.clock.now(), threads: await read($, reads) }
+  if (!(await replace($, readsPath(sessionId), json(file)))) {
+    await run($, ['mkdir', '-p', `${fleetDir()}/reads`])
+    await replace($, readsPath(sessionId), json(file))
+  }
+}
+
+// A helper that finished takes its reads with it; a /clear starts a conversation that read nothing
+async function dropThread($: any, thread: string) {
+  await update($, reads, m => (m[thread] ? omit(m, [thread]) : m))
+  await update($, warned, m => (m[thread] ? omit(m, [thread]) : m))
+  saveReadsSoon($)
+}
+
+async function clearReads($: any, oldSessionId: string) {
+  await update($, reads, () => ({}))
+  await update($, warned, () => ({}))
+  if (root && oldSessionId) await remove($, [readsPath(oldSessionId)])
+}
+
+// ---- The digest: at a thread's next step (a tool result's context, C2) or with the next prompt ----
+
+/** The digest lines for one thread, and what marks them told (called once they're on their way) */
+async function digestFor($: any, thread: string): Promise<{ lines: string[]; told: () => Promise<void> }> {
+  const none = { lines: [], told: async () => {} }
+  if (!worldOn()) return none
+  await eventsTick($)
+  const mine = (await read($, reads))[thread]
+  if (!mine || !latest.size) return none
+  const me = await meNow($)
+  const items = digestItems(mine, latest, me)
+  if (!items.length) return none
+  return {
+    lines: [digestText(items, me)],
+    told: async () => {
+      await update($, reads, m => {
+        const t = { ...(m[thread] ?? {}) }
+        for (const i of items) if (t[i.path] && i.event.to !== null) t[i.path] = { ...(t[i.path] as FleetRead), told: i.event.to }
+        return { ...m, [thread]: t }
+      })
+      log($, `digest to ${thread}: ${items.map(i => i.path).join(', ')}`)
+      saveReadsSoon($)
+    },
+  }
+}
+
+/** A tool's result with the digest (and any other lines) for the model, when it can carry them */
+async function withLines($: any, r: any, thread: string, extra: string[] = []): Promise<any> {
+  if (!r || r.deny !== undefined || r.isError) return r
+  const d = await digestFor($, thread)
+  const lines = [...extra, ...d.lines]
+  if (!lines.length) return r
+  await d.told()
+  return { ...r, context: [...(r.context ?? []), ...lines] }
+}
+
+// ---- The gate: a Write, Edit or NotebookEdit of a world file this thread didn't read as it is now ----
+
+async function gate($: any, e: any, next: any) {
+  const w = await worldFile($, e.file_path ?? e.notebook_path)
+  if (!w) return next(e)
+  const thread = threadOf(e)
+  const cur = await versionOf($, w.abs)
+  const mine = (await read($, reads))[thread]?.[w.rel]
+  const said = (await read($, warned))[thread]?.[w.rel]
+  const v = verdict(mine, cur.v, said)
+  if (v !== 'pass') {
+    await pullEvents($)
+    const last = latest.get(w.rel)
+    const me = await meNow($)
+    await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: cur.v as string } }))
+    if (mine && cur.v) await update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } }))
+    log($, `refused once: ${e.tool} of ${w.rel} by ${thread} (${v})`)
+    return { deny: gateText(v, w.rel, last && last.to === cur.v ? last : null, cur.mtimeMs, me) }
+  }
+  const r = await next(e)
+  if (!r || r.deny !== undefined || r.isError) return r
+  const extra: string[] = []
+  try {
+    const after = await versionOf($, w.abs)
+    // The race: what the tool replaced, against the version validated here (another landing came in meanwhile)
+    const original = r.result?.originalFile ?? r.result?.original_file
+    const replaced = typeof original === 'string' ? hashText(original) : null
+    const raced = replaced !== null && cur.v !== null && cur.v.startsWith('h') && replaced !== cur.v
+    await pullEvents($)
+    const before = latest.get(w.rel)
+    await writeEvent($, { path: w.rel, from: replaced ?? cur.v, to: after.v, via: 'tool', tool: String(e.tool), blind: false, by: await whoAmI($, thread), ...(raced ? { overwrote: true } : {}) })
+    known.set(w.rel, { mtimeMs: after.mtimeMs, size: after.size, v: after.v })
+    unexplained.delete(w.rel)
+    await setRead($, thread, w.rel, after.v)
+    if (raced && before && before.to === replaced && before.by?.sessionId !== String(await $.session.id())) {
+      extra.push(overwroteText(w.rel, before, await meNow($), e.tool === 'Write' ? 'write' : 'edit'))
+    }
+  } catch (err) {
+    log($, `after ${e.tool} of ${w.rel}: ${String(err).slice(0, 200)}`)
+  }
+  return withLines($, r, thread, extra)
+}
+
+// ---- Bash: what it read, and what it wrote that the gate didn't see (found by comparing the world before and after) ----
+
+// The world's files with their size and time: the folders the globs start from, walked down (not into .git, nor
+// fleet's own folder); undefined past MAX_WORLD_FILES
+async function snapshot($: any): Promise<Snapshot | undefined> {
+  if (!world) return new Map()
+  const res = world.res
+  const bases = [...new Set(world.globs.map(globBase))]
+  const deep = world.globs.some(g => globBase(g) === '' && g.includes('/'))
+  const out: Snapshot = new Map()
+  let count = 0
+  const descend = (p: string) => {
+    if (p === '.git' || p === '.claude/fleet' || p.endsWith('/.git') || p.endsWith('/node_modules') || p === 'node_modules') return false
+    return deep || bases.some(b => b !== '' && (p === b || p.startsWith(`${b}/`) || b.startsWith(`${p}/`)))
+  }
+  const walk = async (rel: string, depth: number): Promise<boolean> => {
+    if (depth > 16) return true
+    let entries: any[] = []
+    try {
+      entries = await $.fs.list(rel ? `${realRoot}/${rel}` : realRoot)
+    } catch {
+      return true
+    }
+    for (const x of entries) {
+      const p = rel ? `${rel}/${x.name}` : String(x.name)
+      if (x.kind === 'dir') {
+        if (descend(p) && !(await walk(p, depth + 1))) return false
+      } else if (x.kind === 'file' && inWorld(p, res)) {
+        out.set(p, { mtimeMs: Number(x.mtimeMs), size: Number(x.size) })
+        if (++count > MAX_WORLD_FILES) return false
+      }
+    }
+    return true
+  }
+  if (!(await walk('', 0))) {
+    if (!tooBig) log($, `the world has more than ${MAX_WORLD_FILES} files: no scan after each command (world.json can narrow it)`)
+    tooBig = true
+    return undefined
+  }
+  return out
+}
+
+function knownSnapshot(): Snapshot {
+  return new Map([...known].map(([p, k]) => [p, { mtimeMs: k.mtimeMs, size: k.size }]))
+}
+
+// After a Bash command: every world file it changed is a landing of this thread, marked blind (it didn't go through
+// the gate: decision 3c flags it, never blocks). One whose newest change was someone else's after this thread read it
+// gets a line for the model
+async function afterBash($: any, thread: string, before: Snapshot, startedAt: number): Promise<string[]> {
+  const after = await snapshot($)
+  if (!after) return []
+  const changed = changedPaths(before, after)
+  if (!changed.length) return []
+  await pullEvents($)
+  const sessionId = String(await $.session.id())
+  const out: string[] = []
+  for (const rel of changed) {
+    const s = after.get(rel)
+    const v = s ? (await versionOf($, `${realRoot}/${rel}`)).v : null
+    const last = latest.get(rel)
+    const k = known.get(rel)
+    const settle = () => {
+      if (s) known.set(rel, { ...s, v })
+      else known.delete(rel)
+      unexplained.delete(rel)
+    }
+    // Someone's landing during the command, or only its time moved
+    if ((last && last.to === v && last.at >= startedAt - 1000) || (k && k.v === v && v !== null)) {
+      settle()
+      continue
+    }
+    const mine = (await read($, reads))[thread]?.[rel]
+    await writeEvent($, { path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'bash', tool: 'Bash', blind: true, by: await whoAmI($, thread) })
+    settle()
+    await setRead($, thread, rel, v)
+    if (last && last.by?.sessionId !== sessionId && last.to !== mine?.v) out.push(overwroteText(rel, last, await meNow($), 'command'))
+  }
+  return out
+}
+
+async function bashHook($: any, e: any, next: any) {
+  await ensureWorld($)
+  if (!worldOn()) return next(e)
+  const thread = threadOf(e)
+  let before: Snapshot | undefined
+  if (!tooBig) {
+    try {
+      before = await snapshot($)
+    } catch {}
+  }
+  const startedAt = await $.clock.now()
+  bashRunning++
+  let r: any
+  try {
+    r = await next(e)
+  } finally {
+    bashRunning--
+  }
+  const extra: string[] = []
+  try {
+    if (before) extra.push(...(await afterBash($, thread, before, startedAt)))
+    const target = bashReadTarget(String(e.command ?? ''))
+    if (target && r && !r.isError && r.deny === undefined) await noteRead($, thread, target)
+  } catch (err) {
+    log($, `after a Bash command: ${String(err).slice(0, 200)}`)
+  }
+  return withLines($, r, thread, extra)
+}
+
+// ---- Outside changes: every 10 s, the world against what this session last saw ----
+
+// A change nobody's event explains, still so a scan later, is recorded as outside fleet (an editor, a script, a session
+// without fleet), claimed no-clobber so that one session of the project records it
+async function scanWorld($: any) {
+  if (!worldOn() || bashRunning > 0) return
+  const snap = await snapshot($)
+  if (!snap) return
+  const now = await $.clock.now()
+  if (!baselined) {
+    for (const [rel, s] of snap) known.set(rel, { ...s, v: (await versionOf($, `${realRoot}/${rel}`)).v })
+    baselined = true
+    return
+  }
+  const changed = changedPaths(knownSnapshot(), snap)
+  if (!changed.length) return
+  await pullEvents($)
+  for (const rel of changed) {
+    const s = snap.get(rel)
+    const v = s ? (await versionOf($, `${realRoot}/${rel}`)).v : null
+    const k = known.get(rel)
+    const last = latest.get(rel)
+    const settle = () => {
+      if (s) known.set(rel, { ...s, v })
+      else known.delete(rel)
+      unexplained.delete(rel)
+    }
+    if ((k && k.v === v) || (last && last.to === v)) {
+      settle()
+      continue
+    }
+    const u = unexplained.get(rel)
+    if (!u || u.v !== v) {
+      unexplained.set(rel, { v, since: now })
+      continue
+    }
+    if (now - u.since < 4000) continue
+    const at = Math.floor(s?.mtimeMs ?? now)
+    const claim = `${eventsDir('claims')}/${hashText(`${rel}\n${v ?? 'removed'}\n${Math.floor(s?.mtimeMs ?? k?.mtimeMs ?? 0)}`).slice(1)}`
+    if ((await publish($, claim, json({ format: FORMAT, path: rel, at: now }))) === 'ok') {
+      await writeEvent($, { at: s ? at : now, path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'outside', blind: true, by: null })
+    }
+    settle()
+  }
+}
+
+// At the start, from the timers: the world, this session's reads after a restart, the events of the last day
+async function startWorld($: any) {
+  await ensureWorld($)
+  if (!world || worldStarted) return
+  worldStarted = true
+  await run($, ['mkdir', '-p', eventsDir(), `${fleetDir()}/reads`])
+  if (!(await exists($, `${eventsDir()}/latest`))) {
+    try {
+      await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: '' }))
+    } catch {}
+  }
+  if (!Object.keys(await read($, reads)).length) {
+    const t = await readText($, readsPath(String(await $.session.id())))
+    const p = t === null ? null : parseReads(t)
+    if (p && 'threads' in p && p.threads.main) await update($, reads, () => ({ main: p.threads.main as Record<string, FleetRead> }))
+  }
+  await refreshName($)
+  await pullEvents($, 25)
+}
+
+async function worldTick($: any) {
+  if (!root) return
+  if (!realRoot) {
+    // Set up after this session started (/fleet init here or in another session)
+    worldReady = null
+    await ensureWorld($)
+    if (!realRoot) return
+  }
+  await loadWorld($)
+  if (world && !worldStarted) await startWorld($)
+  await eventsTick($)
+}
+
+// The daily prune's part: event days and outside claims older than KEEP_DAYS, reads files not written since
+async function pruneWorld($: any, now: number) {
+  const days = oldDays(await names($, eventsDir()), now)
+  if (days.length) await run($, ['rm', '-rf', ...days.map(d => eventsDir(d))])
+  const old = async (dir: string) => {
+    let entries: any[] = []
+    try {
+      entries = await $.fs.list(dir)
+    } catch {}
+    await remove($, entries.filter(x => x.kind === 'file' && now - Number(x.mtimeMs) > KEEP_DAYS * 24 * HOUR).map(x => `${dir}/${x.name}`))
+  }
+  await old(eventsDir('claims'))
+  await old(`${fleetDir()}/reads`)
+}
+
+// ---- /fleet world, /fleet accept, and the world's part of /fleet status ----
+
+async function readWorldFile($: any): Promise<{ world: WorldConfig } | { problem: string } | null> {
+  const t = await readText($, `${fleetDir()}/world.json`)
+  return t === null ? null : parseWorld(t)
+}
+
+async function worldCommand($: any, action: 'list' | 'add' | 'remove', glob: string, origin: string): Promise<string> {
+  await ensureWorld($)
+  const p = await readWorldFile($)
+  if (p && 'problem' in p) return p.problem
+  if (action === 'list') {
+    if (!p) return 'No world.json here: /fleet world add <glob> starts one (for example /fleet world add notes/**), or /fleet init writes the default.'
+    const snap = p.world.paths.length ? await snapshot($) : new Map()
+    return [
+      `The world (shared files) of ${root}: ${p.world.paths.length ? globList(p.world.paths) : 'no globs'}`,
+      snap ? `${snap.size} file${snap.size === 1 ? '' : 's'} in it now.` : `more than ${MAX_WORLD_FILES} files in it: world.json can narrow it.`,
+      '/fleet world add <glob> and /fleet world remove <glob> change it (globs relative to the project: ** any folders, * within a name).',
+    ].join('\n')
+  }
+  if (origin !== 'composer') return `Only the person changes the world, typing /fleet world at a terminal (this came from ${origin || 'somewhere else'})`
+  let w = p ? p.world : { ...newWorld(), paths: [] }
+  let g = glob
+  if (action === 'add' && !/[*?{]/.test(g)) {
+    try {
+      if ((await $.fs.stat(`${root}/${g.replace(/\/+$/, '')}`)).kind === 'dir') g = `${g.replace(/\/+$/, '')}/**`
+    } catch {}
+  }
+  const changed = action === 'add' ? addGlob(w, g) : removeGlob(w, g)
+  if ('problem' in changed) return changed.problem
+  w = changed.world
+  await $.fs.write(`${fleetDir()}/world.json`, worldText(w))
+  world = null
+  await loadWorld($)
+  return `${action === 'add' ? 'Added' : 'Removed'} ${globList(['added' in changed ? String(changed.added) : g])}. The world is now: ${w.paths.length ? globList(w.paths) : 'nothing'} (world.json). Every session of the project follows within 2 s.`
+}
+
+// The person stamps a change made outside fleet (his editor, a script) as his: sessions that read an older version
+// hear it as his change. Alone, it lists the changes still unattributed
+async function acceptCommand($: any, path: string, origin: string): Promise<string> {
+  await ensureWorld($)
+  if (!worldOn()) return worldProblem || 'This project has no world (world.json): /fleet world add <glob> starts one.'
+  await pullEvents($)
+  const me = await meNow($)
+  if (!path) {
+    const out: string[] = []
+    for (const e of [...latest.values()].filter(x => x.via === 'outside').sort((a, b) => b.at - a.at)) {
+      if ((await versionOf($, `${realRoot}/${e.path}`)).v === e.to) out.push(`  ${e.path}: ${changeLine(e, me)} · /fleet accept ${e.path}`)
+    }
+    return out.length ? ['Changes made outside fleet, not stamped as yours yet:', ...out].join('\n') : 'No change made outside fleet waits to be stamped.'
+  }
+  if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (this came from ${origin || 'somewhere else'})`
+  const w = await worldFile($, path.startsWith('/') ? path : `${realRoot}/${path}`)
+  if (!w) return `${path} isn't a shared file of this project (the world: ${globList(world?.globs ?? [])})`
+  const cur = await versionOf($, w.abs)
+  const last = latest.get(w.rel) ?? null
+  const a = acceptable(last, cur.v)
+  if (a === 'missing') return `${w.rel} isn't there`
+  if (a === 'already') return `${w.rel}: its current version is yours already`
+  if (typeof a === 'object') return `${w.rel}: its current version is from ${whoText(a.by, me)} at ${clock(a.by.at, me.offsetMin)}: nothing to stamp`
+  const at = Math.max(Math.floor(cur.mtimeMs), (last?.at ?? 0) + 1)
+  const from = last && last.via === 'outside' ? last.from : (last?.to ?? null)
+  const ev = await writeEvent($, { at, path: w.rel, from, to: cur.v, via: 'accept', blind: false, by: { ...(await whoAmI($, 'main')), person: true } })
+  if (!ev) return `couldn't record it (${eventsDir()})`
+  known.set(w.rel, { mtimeMs: cur.mtimeMs, size: cur.size, v: cur.v })
+  unexplained.delete(w.rel)
+  return `${w.rel}: its current version (changed at ${clock(cur.mtimeMs, me.offsetMin)}) is recorded as yours. Sessions that read an older version hear it as your change.`
+}
+
+async function worldStatus($: any): Promise<string[]> {
+  if (!root) return []
+  await ensureWorld($)
+  if (worldProblem) return [`world: ${worldProblem}`]
+  if (!world) return ['world: none (no world.json): /fleet world add <glob> starts one']
+  if (!world.globs.length) return ['world: no globs in world.json (/fleet world add <glob>)']
+  if (!started) return [`world: ${globList(world.globs)} (not followed in this session: it isn't interactive)`]
+  await pullEvents($)
+  const me = await meNow($)
+  const lines = [`world: ${globList(world.globs)} (world.json)${tooBig ? `, more than ${MAX_WORLD_FILES} files: no scan after each command` : ''}`]
+  const last = recent.slice(-8).reverse()
+  lines.push(last.length ? 'recent changes (newest first):' : 'recent changes: none in the last day')
+  for (const e of last) lines.push(`  ${e.path}: ${changeLine(e, me)}${e.overwrote ? ', on top of a change it had not seen' : ''}`)
+  if (recent.length > 8) lines.push(`  and ${recent.length - 8} before them (${eventsDir()})`)
+  // Who is behind: every session's reads file (this one's from memory), against each file's version now
+  const versions = new Map<string, string | null>()
+  const current = async (rel: string) => {
+    if (!versions.has(rel)) versions.set(rel, (await versionOf($, `${realRoot}/${rel}`)).v)
+    return versions.get(rel)
+  }
+  const sessionId = String(await $.session.id())
+  const sessions: { name: string; threads: Record<string, Record<string, FleetRead>> }[] = [{ name: 'this session', threads: await read($, reads) }]
+  let other = 0
+  const now = await $.clock.now()
+  for (const name of await names($, `${fleetDir()}/reads`)) {
+    if (!name.endsWith('.json') || name === `${sessionId}.json`) continue
+    const p = parseReads((await readText($, `${fleetDir()}/reads/${name}`)) ?? '')
+    if (!p) continue
+    if ('otherFormat' in p) {
+      other++
+      continue
+    }
+    if (now - p.at > 24 * HOUR) continue
+    sessions.push({ name: p.name || p.ref || p.sessionId.slice(0, 8), threads: p.threads })
+  }
+  const behind: string[] = []
+  for (const s of sessions) {
+    for (const rel of new Set(Object.values(s.threads).flatMap(t => Object.keys(t)))) await current(rel)
+    const stale = staleOf(s.threads, rel => versions.get(rel))
+    for (const x of stale) {
+      const e = latest.get(x.path)
+      behind.push(`  ${s.name}${x.thread === 'main' ? '' : ` (helper ${x.thread.slice(0, 8)})`}: ${x.path}${e && e.to === versions.get(x.path) ? `, ${changeLine(e, me)}` : ''}`)
+    }
+  }
+  lines.push(behind.length ? 'behind (read a version that has changed since):' : 'behind: nobody (every session read the current version of what it read)', ...behind)
+  const outside: string[] = []
+  for (const e of latest.values()) if (e.via === 'outside' && (await current(e.path)) === e.to) outside.push(e.path)
+  if (outside.length) lines.push(`not stamped: ${outside.join(', ')} changed outside fleet: /fleet accept <path> stamps the change as yours`)
+  if (other || otherEvents) lines.push(`${other + otherEvents} file(s) from a fleet with another format: restart the sessions (u)`)
+  return lines
 }
 
 // ---- /fleet ----
@@ -905,8 +1687,9 @@ async function statusCommand($: any): Promise<string> {
       lines.push(`asked here: ${mine.length ? mine.join(', ') : 'nothing open'}${pending.length ? ` · being delivered: ${pending.join(', ')}` : ''}`)
       if (await read($, stopped)) lines.push('delivery: waiting for you to type something here (an Esc stopped this session)')
     }
+    lines.push(...(await worldStatus($)))
   }
-  lines.push(`formats: files ${FORMAT}, register ${REGISTER_FORMAT}, config ${CONFIG_FORMAT}`)
+  lines.push(`formats: files ${FORMAT}, register ${REGISTER_FORMAT}, config ${CONFIG_FORMAT}, world ${WORLD_FORMAT}`)
   return lines.join('\n')
 }
 
@@ -924,13 +1707,19 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
     config = p.config
   }
   if (commitRegister) config = { ...config, commitRegister: true }
-  const made = await run($, ['mkdir', '-p', ...['queue', 'answers', 'register', 'tmp', 'prune'].map(d => `${dir}/decisions/${d}`)])
+  const made = await run($, ['mkdir', '-p', ...['queue', 'answers', 'register', 'tmp', 'prune'].map(d => `${dir}/decisions/${d}`), `${dir}/events`, `${dir}/reads`])
   if (made.exitCode !== 0) return `couldn't create ${dir}: ${made.stderr.trim()}`
   if (before !== configText(config)) await $.fs.write(`${dir}/config.json`, configText(config))
   await $.fs.write(`${dir}/.gitignore`, gitignoreText(config.commitRegister))
+  // The world: written once with the default globs, then the person's (/fleet world add, remove)
+  const worldBefore = await readText($, `${dir}/world.json`)
+  const parsed = worldBefore === null ? null : parseWorld(worldBefore)
+  if (worldBefore === null) await $.fs.write(`${dir}/world.json`, worldText(newWorld()))
+  const globs = parsed && 'world' in parsed ? parsed.world.paths : worldBefore === null ? newWorld().paths : []
   const fresh = root === null
   root = here
   configProblem = ''
+  if (fresh) worldReady = null
   timers($)
   if (jobRef && !offered) await offer($).catch(() => {})
   log($, `init ${dir}`)
@@ -938,9 +1727,12 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
     `${fresh ? 'Set up' : 'Up to date'} in ${dir}/ (template blank).`,
     "Background sessions of this project get mcp__fleet__decide: they ask you without stopping, and the answer reaches them when they're idle.",
     'Their questions show with /fleet in any session of the project, and as "? n for you · /fleet" above the prompt.',
+    parsed && 'problem' in parsed
+      ? parsed.problem
+      : `Shared files (world.json): ${globs.length ? globList(globs) : 'none'}. A session's write of one that changed since it read it is refused once with who changed it, and it hears of such changes at its next step. /fleet world changes the list.`,
     config.commitRegister
-      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/ stays out of git.'
-      : 'decisions/ stays out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
+      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/ and reads/ stay out of git.'
+      : 'decisions/, events/ and reads/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
   ].join('\n')
 }
@@ -954,6 +1746,9 @@ async function fleetCommand($: any, e: any): Promise<string> {
   if (c.kind === 'init') return initCommand($, c.template, c.commitRegister)
   if (!root) return `Not set up in this project: /fleet init sets it up in ${await $.session.root()}`
   if (c.kind === 'list') return listCommand($)
+  // The world and accept are the person's own too, like answers (below): typed at a terminal
+  if (c.kind === 'world') return worldCommand($, c.action, c.glob, String(e.origin?.kind ?? ''))
+  if (c.kind === 'accept') return acceptCommand($, c.path, String(e.origin?.kind ?? ''))
   // Answers, notes and drops are the person's own: typed at a terminal (the model can't run a plugin's command, and
   // another plugin's $.command.run reads as plugin).
   // TODO(G7): accept 'bridge' (Remote Control from the phone) once it's checked that a command typed there runs here
@@ -1006,11 +1801,46 @@ export const register: Register = on => {
     return r
   })
 
-  // A /clear keeps this process and its $.state; the open decisions are read again from the files all the same
+  // A /clear keeps this process and its $.state; the open decisions are read again from the files all the same, and the
+  // new conversation has read nothing of the world
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' && timersOn && jobRef) $.clock.after(500, () => bg(rebuild($)))
+    if (e.reason === 'clear') bg(clearReads($, String(e.sessionId ?? '')))
     return next(e)
   })
+
+  // The engine's own watcher (C9, Q6-bg: it fires in a background session with no viewer, after /clear and compaction)
+  // on events/latest, so a landing reaches every session in under a second; the 2 s tick is the fallback
+  on('classic.SessionStart', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      await ensureWorld($)
+      if (!root) return r
+      return { ...r, watchPaths: [...(r?.watchPaths ?? []), `${eventsDir()}/latest`] }
+    } catch {
+      return r
+    }
+  }).catch(($, e, next) => next(e))
+
+  on('classic.FileChanged', async ($, e, next) => {
+    if (root && String(e.file_path).endsWith('/.claude/fleet/events/latest')) bg(eventsTick($))
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // The world's three hooks (changes.ts). They fail open: a fleet that errs lets the tool run as if it weren't there
+  on('tool.call', { tool: 'Read' }, async ($, e, next) => {
+    const r: any = await next(e)
+    if (!r || r.isError || r.deny !== undefined) return r
+    await ensureWorld($)
+    if (!worldOn()) return r
+    const thread = threadOf(e)
+    await noteRead($, thread, e.file_path)
+    return withLines($, r, thread)
+  }).catch(($, e, next) => next(e))
+
+  on('tool.call', { tool: ['Write', 'Edit', 'NotebookEdit'] }, async ($, e, next) => gate($, e, next)).catch(($, e, next) => next(e))
+
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => bashHook($, e, next)).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined && timersOn) bg(turnStarted($, e.text, e.turnId))
@@ -1028,16 +1858,24 @@ export const register: Register = on => {
         })(),
       )
     }
+    // A helper that finished takes its reads of the world with it
+    if (typeof e.agentId === 'string' && e.agentId) bg(dropThread($, e.agentId))
     return r
   })
 
-  // The person typed here: after an Esc, fleet may submit again
+  // The person typed here: after an Esc, fleet may submit again. And a prompt that starts a turn carries the main
+  // thread's digest (prompt.submit's context is in the turn's first request; an append there would not be)
   on('prompt.submit', async ($, e, next) => {
     if ((e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') && timersOn) {
       bg((async () => ((await read($, stopped)) ? update($, stopped, () => false) : null))())
     }
-    return next(e)
-  })
+    if (e.command || !worldOn()) return next(e)
+    const d = await digestFor($, 'main')
+    if (!d.lines.length) return next(e)
+    const r = await next({ ...e, context: [...(e.context ?? []), ...d.lines] })
+    if (r && r.drop === undefined) bg(d.told())
+    return r
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'mcp__fleet__decide' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT_REFUSAL }

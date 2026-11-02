@@ -3,6 +3,7 @@
 //
 // Files, all under <project>/.claude/fleet/ (the project folder is fleet's data folder):
 //   config.json                          person data (configFormat): the template and whether the register is committed
+//   world.json                           person data (worldFormat): the world, the globs of the shared files (changes.ts)
 //   .gitignore                           written by /fleet init from config.json
 //   decisions/queue/D-<n>.json           wire (format): an open decision, written once by the session that asked
 //   decisions/answers/D-<n>.<q>.json     wire: the answer to question q, published no-clobber (the first answer wins)
@@ -11,10 +12,15 @@
 //   decisions/register/YYYY-MM/<id>.json person data (registerFormat): every closed decision and recorded dialog
 //   decisions/last                       wire: the highest D-<n> handed out (a hint for the next one)
 //   decisions/prune/YYYY-MM-DD           wire: the session that publishes it runs that day's prune
-//   decisions/tmp/                       files about to be published or moved into place
+//   decisions/tmp/                       files about to be published or moved into place (events' too)
+//   events/YYYY-MM-DD/HH/<ms>-<sid8>-<n>.json  wire: one landing on a world file, written once by the session that saw it
+//   events/latest                        wire: the last event's name, rewritten by each writer; every session watches it
+//   events/claims/<hash>                 wire: an outside change claimed no-clobber, so one session records it
+//   reads/<sessionId>.json               wire: what that session's threads read of the world, written only by it
 // A reader that meets another format acts on nothing and says to restart (u): there is no code for older formats.
 
-/** The format of the wire files: queue/, answers/, last, prune/. Raise it when a key or its meaning changes */
+/** The format of the wire files: queue/, answers/, last, prune/, events/, reads/. Raise it when a key or its meaning
+ * changes */
 export const FORMAT = 1
 /** Person data: the register. It only gains fields, and a write keeps the fields it doesn't know */
 export const REGISTER_FORMAT = 1
@@ -263,6 +269,8 @@ export type Command =
   | { kind: 'drop'; target: string; why: string }
   | { kind: 'status' }
   | { kind: 'init'; template: string; commitRegister: boolean }
+  | { kind: 'world'; action: 'list' | 'add' | 'remove'; glob: string }
+  | { kind: 'accept'; path: string }
   | { kind: 'help' }
   | { kind: 'bad'; reason: string }
 
@@ -313,6 +321,15 @@ export function parseCommand(args: string): Command {
       if (!m) return { kind: 'bad', reason: 'write /fleet drop <n> [why] (or the decision, D-<n>)' }
       return { kind: 'drop', target: (m[1] as string).toUpperCase(), why: (m[2] as string).trim().replace(/^["“]|["”]$/g, '').slice(0, 300) }
     }
+    case 'world': {
+      const [action = '', glob = '', ...extra] = more
+      if (!action) return { kind: 'world', action: 'list', glob: '' }
+      const a = action.toLowerCase()
+      if ((a !== 'add' && a !== 'remove') || !glob || extra.length) return { kind: 'bad', reason: 'write /fleet world, /fleet world add <glob> or /fleet world remove <glob>' }
+      return { kind: 'world', action: a as 'add' | 'remove', glob }
+    }
+    case 'accept':
+      return { kind: 'accept', path: tail.replace(/^["']|["']$/g, '') }
   }
   const items = parseAnswers(line)
   return typeof items === 'string' ? { kind: 'bad', reason: items } : { kind: 'answer', items }
@@ -323,7 +340,9 @@ export const HELP = [
   '/fleet 1a 2b           answer them (also 1) a 2) b, or 3 "your words")',
   '/fleet note <n> <text> add a note for whoever asked question n',
   '/fleet drop <n> [why]  drop the decision of question n without answering it',
-  '/fleet status          what fleet does in this session',
+  '/fleet status          what fleet does in this session, the shared files, what changed and who is behind',
+  '/fleet world           the shared files (world.json); /fleet world add <glob>, /fleet world remove <glob>',
+  '/fleet accept [path]   stamp a change made outside fleet (your editor, a script) as yours; alone, lists them',
   '/fleet init            set fleet up in this project (.claude/fleet/)',
 ].join('\n')
 
@@ -388,9 +407,10 @@ export function parseConfig(textIn: string): { config: Config } | { problem: str
 }
 
 export function gitignoreText(commitRegister: boolean): string {
+  const runtime = "# What fleet's sessions write as they work: the landings on shared files, and what each session read\nevents/\nreads/\n"
   return commitRegister
-    ? '# Written by /fleet init from config.json ("commitRegister": true): the register is committed, the rest of decisions/ is not\ndecisions/*\n!decisions/register/\n'
-    : '# Written by /fleet init from config.json ("commitRegister": false): fleet\'s decisions and their register stay out of git\ndecisions/\n'
+    ? `# Written by /fleet init from config.json ("commitRegister": true): the register is committed, the rest of decisions/ is not\ndecisions/*\n!decisions/register/\n${runtime}`
+    : `# Written by /fleet init from config.json ("commitRegister": false): fleet's decisions and their register stay out of git\ndecisions/\n${runtime}`
 }
 
 // ---- AskUserQuestion, as the person answered it in the session ----
