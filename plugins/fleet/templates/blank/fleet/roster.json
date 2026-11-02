@@ -1,0 +1,7 @@
+{
+  "rosterFormat": 1,
+  "sections": [],
+  "roles": {},
+  "instances": [],
+  "wakes": { "everyMin": 60, "perDay": 8 }
+}

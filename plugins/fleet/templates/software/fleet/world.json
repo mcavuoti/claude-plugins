@@ -1,0 +1,5 @@
+{
+  "worldFormat": 1,
+  "paths": ["spec/**", "board/**", "docs/**", "notes/**", "journals/**"],
+  "command": ["spec/**"]
+}

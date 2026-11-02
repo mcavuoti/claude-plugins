@@ -1,0 +1,8 @@
+{
+  "templateFormat": 1,
+  "description": "three owners sharing notes/, no chief: you talk to each owner directly",
+  "folders": ["notes"],
+  "next": [
+    "Next: write the charter (.claude/fleet/charter.md) and change each owner's brief in roster.json to its part, then /fleet up --dry-run (the plan, the lints and the cost) and /fleet up to start the three owners."
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "rosterFormat": 1,
+  "sections": [{ "id": "owners", "title": "Owners" }],
+  "roles": {
+    "owner": { "agent": "owner", "model": "sonnet", "budget": { "usdDay": 5 }, "cadenceH": 24 }
+  },
+  "instances": [
+    { "name": "Owner A", "role": "owner", "section": "owners", "wave": 1, "brief": "You own the first part of notes/ the charter names." },
+    { "name": "Owner B", "role": "owner", "section": "owners", "wave": 1, "brief": "You own the second part of notes/ the charter names." },
+    { "name": "Owner C", "role": "owner", "section": "owners", "wave": 1, "brief": "You own the third part of notes/ the charter names." }
+  ],
+  "budget": { "usdDay": 15 },
+  "wakes": { "everyMin": 60, "perDay": 8 }
+}

@@ -1,0 +1,6 @@
+{
+  "worldFormat": 1,
+  "paths": ["req/**", "findings/**", "board/**", "poc/**", "proposal/**", "plan/**", "brief/**", "notes/**", "journals/**"],
+  "command": ["req/**"],
+  "commit": { "everyMin": 60 }
+}

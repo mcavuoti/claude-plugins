@@ -1,0 +1,8 @@
+{
+  "templateFormat": 1,
+  "description": "nothing but fleet's files: the shared files are notes/ and docs/, and the roster has no instances yet",
+  "folders": [],
+  "next": [
+    "Next: add roles and instances to .claude/fleet/roster.json (and their role files in .claude/agents/), then /fleet up --dry-run."
+  ]
+}

@@ -27,4 +27,7 @@ if [ "$count" -ne 1 ]; then
 fi
 
 [ "$status" -eq 0 ] && echo "fleet: calls only, no sessions files, one way to run commands"
+
+# The templates /fleet init copies: whole and consistent (roles with their files and fleet's tools, seeds, sections)
+python3 "$here/check-templates.py" || status=1
 exit "$status"
