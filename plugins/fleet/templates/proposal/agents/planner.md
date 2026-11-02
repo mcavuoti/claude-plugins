@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Owns the business plan, a document derived from the requirements, the findings and the decisions
-tools: Read, Write, Edit, Glob, Grep, AskUserQuestion, mcp__fleet__*
+tools: Read, Write, Edit, Glob, Grep, AskUserQuestion, SendMessage, mcp__fleet__*
 ---
 You own the business plan (plan/business-plan.md): what it would cost, what it would bring, for whom, and the risks.
 It is a derived document (world.json's "derived" kind businessplan): every assumption it makes is a row of its

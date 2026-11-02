@@ -487,6 +487,8 @@ test('plan B: /fleet init takes the sessions key out of settings.local.json, bac
   expect(said).toContain('sessions@m 0.13.0 is installed for this project alone (a local record)')
   expect(said).toContain('`claude plugin uninstall sessions@m --scope local`')
   expect(said).toContain('(fleet tried: Error: something went wrong)')
+  // The failed record's line is said once, with what fleet tried
+  expect(said.split('sessions@m 0.13.0 is installed for this project alone').length - 1).toBe(1)
   // Once the key is gone only the record is said; a second init keeps the first backup and uninstalls the record
   w.files.set(LOCAL, JSON.stringify({ enabledPlugins: { 'fleet@m': true, 'sessions@m': true } }))
   expect(await fleet($, 'status')).toContain('plan B: .claude/settings.local.json enables sessions@m for this project too')
@@ -502,6 +504,25 @@ test('plan B: /fleet init takes the sessions key out of settings.local.json, bac
   const after = await fleet($, 'status')
   expect(after).not.toContain('installed for this project alone')
   expect(after).not.toContain('enables sessions@m for this project too')
+})
+
+test('plan B: /fleet init leaves a local sessions copy alone when the user settings don’t enable sessions (the project would have none)', WITH_SESSIONS, async ($, on) => {
+  const LOCAL = `${ROOT}/.claude/settings.local.json`
+  const w = world(on, { fleet: false, background: false, env: { FLEET_CLAUDE: '/opt/x/claude' }, files: { [LOCAL]: JSON.stringify({ enabledPlugins: { 'fleet@m': true, 'sessions@m': true } }) } })
+  on('settings.read', (_, e) => (e.source === 'user' ? { value: { enabledPlugins: { 'sessions@m': false } } } : undefined) as any)
+  const uninstalls: string[] = []
+  w.exec.value = (argv, cwd) => {
+    if (argv[0] !== '/opt/x/claude') return undefined
+    const line = argv.slice(1).join(' ')
+    if (line === 'plugin list --json') return { exitCode: 0, stdout: JSON.stringify([{ id: 'sessions@m', version: '0.13.0', scope: 'local', enabled: true, projectPath: ROOT }]) }
+    if (line.startsWith('plugin uninstall')) uninstalls.push(cwd)
+    return undefined
+  }
+  await startSession($, w)
+  const said = await fleet($, 'init')
+  expect(uninstalls).toEqual([])
+  expect(json(w, LOCAL)).toEqual({ enabledPlugins: { 'fleet@m': true, 'sessions@m': true } })
+  expect(said).not.toContain('Uninstalled sessions@m')
 })
 
 test('/fleet init says when the template turns world commits on', WITH_SESSIONS, async ($, on) => {

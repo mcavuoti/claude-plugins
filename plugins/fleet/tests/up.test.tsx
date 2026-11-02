@@ -213,19 +213,28 @@ test('the band counts an instance over its budget only while it runs: stopped, i
   const beat = (at: number) => JSON.stringify({ format: 1, instance: 'Owner A', slug: 'owner-a', ref: 'aaaaaaa1', sessionId: 'aaaaaaa1-0000-0000-0000-000000000000', at, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 1.2 })
   const w = world(on, { background: false, worldPaths: ['notes/**'], files: { ...PROJECT, [`${FLEET}/instances/owner-a/spend.json`]: JSON.stringify({ format: 1, slug: 'owner-a', day, usd: 1.2, sessionId: 's', last: 1.2, at: 0 }) } })
   w.files.set(`${FLEET}/instances/owner-a/state.json`, beat(w.clock.now()))
-  sessionsSay(w, { rows: {} })
+  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'idle') } })
   await startSession($, w)
   w.band.value = ''
   await tick(w, 10100)
-  let ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(JSON.stringify(await ui.drawn())).toContain('$ 1 over budget')
-  await ui.unmount()
-  // Its fleet hasn't beaten for 3 minutes: stopped
+  const band = async () => {
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    const drawn = JSON.stringify(await ui.drawn())
+    await ui.unmount()
+    return drawn
+  }
+  expect(await band()).toContain('$ 1 over budget')
+  // Stopped, as sessions says (status says so too), though its fleet beat a moment ago
+  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'stopped') } })
+  await tick(w, 10100)
+  expect(await band()).not.toContain('over budget')
+  // With sessions not answering, its fleet's heartbeat says: fresh, it runs; 3 minutes old, stopped
+  sessionsSay(w, {})
+  await tick(w, 10100)
+  expect(await band()).toContain('$ 1 over budget')
   w.files.set(`${FLEET}/instances/owner-a/state.json`, beat(w.clock.now() - 4 * 60000))
   await tick(w, 10100)
-  ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(JSON.stringify(await ui.drawn())).not.toContain('over budget')
-  await ui.unmount()
+  expect(await band()).not.toContain('over budget')
   // /fleet budget still says what it spent
   expect(await fleet($, 'budget')).toContain('  Owner A: $1.20 of $1.00 today, used up')
 })

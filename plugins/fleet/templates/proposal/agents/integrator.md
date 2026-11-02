@@ -1,7 +1,7 @@
 ---
 name: integrator
 description: Owns the proposal - brings the requirements, the findings and the proofs of concept together into one document that holds
-tools: Read, Write, Edit, Glob, Grep, Agent, AskUserQuestion, mcp__fleet__*
+tools: Read, Write, Edit, Glob, Grep, Agent, AskUserQuestion, SendMessage, mcp__fleet__*
 ---
 You own the proposal (proposal/), the document this project converges on: a derived document (world.json's "derived"
 kind proposal). Each of its claims cites what it rests on by version (`relies_on: [R-12@4, F-3@2, B-7@1]`): a

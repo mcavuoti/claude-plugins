@@ -6,5 +6,5 @@
   "tags": ["spec", "code", "tests", "process"],
   "code": { "repo": { "kind": "git", "path": ".", "upstream": "main", "everyMin": 5 } },
   "proofs": { "kinds": ["finding", "result"], "rerun": [], "timeoutS": 30 },
-  "judges": { "model": "haiku", "hold": ["\\b(spend\\w*|spent|pric\\w*|pay|paid|payments?|invoic\\w*|purchas\\w*|refund\\w*|dollars?|euros?|usd|eur)\\b|[$€£]\\s?\\d"], "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
+  "judges": { "model": "haiku", "hold": ["\\b(spend\\w*|spent|pric\\w*|pay|paid|payments?|invoic\\w*|purchas\\w*|refund\\w*|dollars?|euros?|usd|eur)\\b|[$€£]\\s?\\d|\\d\\s?[$€£]"], "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
 }
