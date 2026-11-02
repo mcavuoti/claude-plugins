@@ -216,6 +216,37 @@ test('send --allow: a git push adds its remote’s URL; with no host to name, or
   expect(json(w, `${FLEET}/outbound.json`).hosts).toEqual(['devbox', 'other.invalid'])
 })
 
+test('a git push draft shows what it pushes: its commits the remote lacks and their diffstat, a new branch’s too', async ($, on) => {
+  const w = project(on)
+  const git: Record<string, { exitCode: number; stdout?: string }> = {
+    'rev-parse --abbrev-ref --symbolic-full-name @{push}': { exitCode: 0, stdout: 'origin/area-b/cli\n' },
+    'rev-parse --abbrev-ref HEAD': { exitCode: 0, stdout: 'area-b/cli\n' },
+    'remote get-url --push origin': { exitCode: 0, stdout: 'git@example.invalid:team/tally.git\n' },
+    'rev-parse --verify --quiet refs/remotes/origin/area-b/cli': { exitCode: 0, stdout: 'aaaaaaaa\n' },
+    'rev-parse --verify --quiet refs/remotes/origin/topic': { exitCode: 1 },
+    'log --oneline --no-decorate -n 21 origin/area-b/cli..area-b/cli': { exitCode: 0, stdout: 'a1b2c3d fix the parser\nb2c3d4e add the cli flag\n' },
+    'rev-list --count origin/area-b/cli..area-b/cli': { exitCode: 0, stdout: '2\n' },
+    'diff --stat=100 origin/area-b/cli...area-b/cli': { exitCode: 0, stdout: ' src/cli.ts   | 4 +++-\n src/parse.ts | 2 +-\n 2 files changed, 4 insertions(+), 2 deletions(-)\n' },
+    'log --oneline --no-decorate -n 21 topic --not --remotes=origin': { exitCode: 0, stdout: 'c3d4e5f start the topic\n' },
+    'rev-list --count topic --not --remotes=origin': { exitCode: 0, stdout: '1\n' },
+    'rev-list --reverse topic --not --remotes=origin': { exitCode: 0, stdout: 'c3d4e5f00000000\n' },
+    'rev-parse --verify --quiet c3d4e5f00000000^': { exitCode: 0, stdout: 'bbbbbbbb\n' },
+    'diff --stat=100 c3d4e5f00000000^ topic': { exitCode: 0, stdout: ' notes/x.md | 1 +\n 1 file changed, 1 insertion(+)\n' },
+  }
+  w.exec.value = argv => (argv[0] === 'git' && argv[1] === '-C' && argv[2] === ROOT ? (git[argv.slice(3).join(' ')] ?? { exitCode: 1 }) : undefined)
+  await startSession($, w)
+  const send = (command: string) => $.tool.call({ tool: 'mcp__fleet__send', to: 'origin', why: 'the release', command } as any)
+  expect(((await send('git push')) as any).result).toContain('Queued as D-1 for the person: git push to origin.')
+  await send('git push -u origin topic')
+  const list = await fleet($, '')
+  expect(list).toContain(
+    '1. Send outside: git push to origin\n   why: the release\n```sh\ngit push\n```\n   git push of area-b/cli to origin: 2 commits\n```\na1b2c3d fix the parser\nb2c3d4e add the cli flag\n```\n```\n src/cli.ts   | 4 +++-\n src/parse.ts | 2 +-\n 2 files changed, 4 insertions(+), 2 deletions(-)\n```',
+  )
+  expect(list).toContain('```sh\ngit push -u origin topic\n```\n   git push of topic to origin: 1 commit, a branch new there: every commit no branch of origin has\n```\nc3d4e5f start the topic\n```\n```\n notes/x.md | 1 +\n 1 file changed, 1 insertion(+)\n```')
+  // Every command it ran went through run(), from /
+  expect(w.runs.filter(r => r[0] === 'git').every(r => r[1] === '-C')).toBe(true)
+})
+
 test('a resource done with a note naming a host says how its first use gets through: the --allow line', WITH_SESSIONS, async ($, on) => {
   const w = project(on)
   await startSession($, w)

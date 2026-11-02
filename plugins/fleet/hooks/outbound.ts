@@ -1051,6 +1051,23 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
   return { sends, pushes, reads: [...new Set(reads)] }
 }
 
+/** The branches a git push names (its refspecs: src:dst, a + taken off; refs/heads/ taken off the destination), [] when
+ * it names none (the current branch goes), or null when it pushes every branch or tag (--all, --mirror, --tags). A
+ * deletion (:dst) sends nothing */
+export function pushRefs(words: readonly string[]): { local: string; remote: string }[] | null {
+  const p = operands(words, /^(-o|--push-option|--repo|--receive-pack|--exec)$/)
+  if (p.opts.some(o => /^--(all|mirror|branches|tags)$/.test(o.name))) return null
+  const specs = p.args.slice(p.opts.some(o => o.name === '--repo') ? 0 : 1)
+  return specs
+    .map(s => s.replace(/^\+/, ''))
+    .filter(s => s && !s.startsWith(':'))
+    .map(s => {
+      const i = s.indexOf(':')
+      const local = i < 0 ? s : s.slice(0, i)
+      return { local, remote: (i < 0 ? s : s.slice(i + 1)).replace(/^refs\/heads\//, '') }
+    })
+}
+
 /** The hosts a note names as places to reach (a resource's "done: ssh ci@vm.example …"): what follows ssh, sftp or
  * mosh, a user@host:path or host.domain:path target, and a URL other than the web's (ssh://, sftp://, ftp://, s3://…);
  * not this machine. A best effort: the person reads the hint it gives */

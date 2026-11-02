@@ -19,6 +19,7 @@ import {
   parseDraft,
   parseOutbound,
   patternOf,
+  pushRefs,
   recipientsOf,
   remoteAllowed,
   treeVersion,
@@ -155,6 +156,11 @@ test('Bash: what sends content outside, and what passes', () => {
   // git push: its remote is looked up afterwards
   expect(classifyBash('git -C sub push -u fork main', NONE).pushes).toEqual([{ remote: 'fork', cwd: 'sub', words: ['-u', 'fork', 'main'] }])
   expect(classifyBash('git push', NONE).pushes).toEqual([{ remote: null, cwd: null, words: [] }])
+  // The branches a push names: src:dst, none (the current one), every one
+  expect(pushRefs(['origin', 'area-b/cli'])).toEqual([{ local: 'area-b/cli', remote: 'area-b/cli' }])
+  expect(pushRefs(['-u', 'origin', '+HEAD:refs/heads/topic', ':old'])).toEqual([{ local: 'HEAD', remote: 'topic' }])
+  expect(pushRefs([])).toEqual([])
+  expect(pushRefs(['--all', 'origin'])).toBe(null)
   expect(classifyBash('git -c color.ui=always push origin', NONE).pushes).toHaveLength(1)
   // ... unless where it goes isn't its remote's URL: a url set on the line, --repo, another receive-pack
   expect(held('git -c remote.origin.pushurl=https://far.invalid/x.git push origin')).toEqual([{ what: 'git push with -c remote.origin.pushurl=https://far.invalid/x.git', to: ['origin'], files: [] }])

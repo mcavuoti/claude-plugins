@@ -26,6 +26,7 @@ import {
   parseDraft,
   parseOutbound,
   patternOf,
+  pushRefs,
   remoteAllowed,
   remoteName,
   sendWords,
@@ -4421,7 +4422,8 @@ async function fileOutbound($: any, e: any) {
     found = m ? [m] : []
   }
   const parts = s.tool ? mcpParts(s.tool) : null
-  const what = found.length ? [...new Set(found.map(x => x.what))].join('; ') : s.command !== undefined ? 'a command' : `${parts?.name} on ${parts?.server}`
+  const pushes = s.command !== undefined ? classifyBash(s.command, cfg).pushes.length : 0
+  const what = found.length ? [...new Set(found.map(x => x.what))].join('; ') : pushes ? 'git push' : s.command !== undefined ? 'a command' : `${parts?.name} on ${parts?.server}`
   // The files it sends: what the command names, and what the model listed
   const files: { path: string; v: string | null }[] = []
   for (const f of [...new Set([...found.flatMap(x => x.files), ...s.files])].slice(0, 20)) {
@@ -4487,6 +4489,8 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
       cut = true
       lines.push(`   and ${shown.more} more line${shown.more === 1 ? '' : 's'} in ${draftAbs}: read ${shown.more === 1 ? 'it' : 'them'} there, then /fleet ${n} send ${shortHash(hashNow)} sends it (a plain send doesn't, since this isn't all of it)`)
     }
+    // A git push: the commits it sends and their diffstat
+    if ('command' in call) lines.push(...(await pushShown($, call.command, o)))
   }
   for (const [k, f] of o.files.entries()) {
     const abs = shownPath(f.path)
@@ -4520,6 +4524,72 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
   lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin)})` : ''}`)
   return lines.join('\n')
+}
+
+// What /fleet shows of a git push: its commits (at most PUSH_COMMITS), its diffstat's files (at most PUSH_FILES) and
+// its summary line, for at most three pushes of three branches each
+const PUSH_COMMITS = 20
+const PUSH_FILES = 12
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+
+/** What a draft's git pushes send, under "git push of <branch> to <remote>": the commits the remote doesn't have
+ * (git log --oneline <remote>/<branch>..<branch>; for a branch new there, every commit no branch of that remote has)
+ * and their diffstat. Looked up from the draft's folder each time /fleet lists it, through run() */
+async function pushShown($: any, command: string, o: OutboundSpec): Promise<string[]> {
+  const pushes = classifyBash(command, newOutbound()).pushes.slice(0, 3)
+  if (!pushes.length) return []
+  const base = (await exists($, o.cwd)) ? o.cwd : (root as string)
+  const out: string[] = []
+  const rows = (s: string) => s.split('\n').map(x => x.trimEnd()).filter(x => x.trim())
+  for (const p of pushes) {
+    const dir = p.cwd ? (p.cwd.startsWith('/') ? p.cwd : `${base}/${p.cwd}`) : base
+    const git = (...args: string[]) => run($, ['git', '-C', dir, ...args])
+    const { name, url } = await remoteOf($, dir, p.remote)
+    const remote = name ?? url ?? p.remote ?? 'its remote'
+    const refs = pushRefs(p.words)
+    if (refs === null) {
+      out.push(`   git push of every branch or tag it names (${p.words.filter(x => /^--(all|mirror|branches|tags)$/.test(x)).join(' ')}) to ${remote}: fleet doesn't list those commits`)
+      continue
+    }
+    // None named: the current branch, to its push branch (@{push}) or its own name
+    let list = refs
+    if (!list.length) {
+      const head = (await git('rev-parse', '--abbrev-ref', 'HEAD')).stdout.trim() || 'HEAD'
+      const up = (await git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}')).stdout.trim()
+      list = [{ local: head, remote: name && up.startsWith(`${name}/`) ? up.slice(name.length + 1) : head }]
+    }
+    for (const ref of list.slice(0, 3)) {
+      const local = ref.local === 'HEAD' ? (await git('rev-parse', '--abbrev-ref', 'HEAD')).stdout.trim() || 'HEAD' : ref.local
+      const known = name !== null && (await git('rev-parse', '--verify', '--quiet', `refs/remotes/${name}/${ref.remote}`)).exitCode === 0
+      // What the remote lacks: past its branch; for a new branch, past every branch it has (all of it, for a URL)
+      const range = known ? [`${name}/${ref.remote}..${local}`] : name !== null ? [local, '--not', `--remotes=${name}`] : [local]
+      const head = `   git push of ${local}${ref.remote !== local ? ` (as ${ref.remote})` : ''} to ${remote}`
+      const log = await git('log', '--oneline', '--no-decorate', '-n', String(PUSH_COMMITS + 1), ...range)
+      if (log.exitCode !== 0) {
+        out.push(`${head}: fleet couldn't list its commits (${(rows(log.stderr)[0] ?? `exit ${log.exitCode}`).slice(0, 160)})`)
+        continue
+      }
+      const count = Number((await git('rev-list', '--count', ...range)).stdout.trim()) || rows(log.stdout).length
+      const fresh = known ? '' : name !== null ? `, a branch new there: every commit no branch of ${name} has` : ', every commit of it (fleet can’t tell what that remote has)'
+      if (!count) {
+        out.push(`${head}: no commit it doesn't have${fresh}`)
+        continue
+      }
+      out.push(`${head}: ${count} commit${count === 1 ? '' : 's'}${fresh}`, '```', ...rows(log.stdout).slice(0, PUSH_COMMITS), '```')
+      if (count > PUSH_COMMITS) out.push(`   and ${count - PUSH_COMMITS} more: git -C ${dir} log --oneline ${range.join(' ')}`)
+      // The diffstat: from where the remote's branch parts, or from before the oldest new commit
+      let from = `${name}/${ref.remote}...${local}`
+      if (!known) {
+        const oldest = rows((await git('rev-list', '--reverse', ...range)).stdout)[0] ?? ''
+        from = oldest && (await git('rev-parse', '--verify', '--quiet', `${oldest}^`)).exitCode === 0 ? `${oldest}^` : EMPTY_TREE
+      }
+      const stat = rows((await git('diff', '--stat=100', ...(known ? [from] : [from, local]))).stdout)
+      if (!stat.length) continue
+      const files = stat.slice(0, -1)
+      out.push('```', ...files.slice(0, PUSH_FILES), ...(files.length > PUSH_FILES ? [` … and ${files.length - PUSH_FILES} more files`] : []), stat[stat.length - 1] as string, '```')
+    }
+  }
+  return out
 }
 
 /** An outbound's files as they are now */
