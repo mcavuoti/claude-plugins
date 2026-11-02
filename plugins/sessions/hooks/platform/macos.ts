@@ -5,10 +5,13 @@ import type { Platform, Run } from './types'
 
 // Terminal.app via AppleScript: which window is in front, bring one forward, open a new one, read a screen.
 // The script's mode words (the first argument) are Spanish: "frente" = which window is in front, "leer" = read a tab's
-// contents, "traer" = bring a tab's window forward, "cerrar" = close the window (answers "ocupada" = busy, if the tab is
-// running something), "abrir" = open a new window with the same bounds
-const TERMINAL = `on run argv
+// contents, "traer" = bring a tab's window forward, "cerrar" = close the window, only when that tab is its only one
+// (answers "solapas" = it has other tabs, which stay as they are, or "ocupada" = busy, if the tab is running something),
+// "abrir" = open a new window with the same bounds. A Terminal that isn't running is never launched: every mode answers
+// "" then (a command inside the tell block would start it, and it would open a window)
+export const TERMINAL = `on run argv
   set modo to item 1 of argv
+  if application "Terminal" is not running then return ""
   tell application "Terminal"
     if modo is "frente" then
       if (count of windows) is 0 then return "no"
@@ -26,6 +29,7 @@ const TERMINAL = `on run argv
             return "ok"
           end if
           if modo is "cerrar" then
+            if (count of tabs of w) > 1 then return "solapas"
             if busy of tab i of w then return "ocupada"
             close w
             return "ok"
@@ -88,6 +92,8 @@ export const macos: Platform = {
     if (v.agentsViews.some(c => c.tty === front) && (await terminal(run, ['leer', front])).includes(`⟨${me.shortId}⟩`)) return front
     return null
   },
+
+  frontKnown: true,
 
   async windowInFront(run) {
     return parseFront(await terminal(run, ['frente']))

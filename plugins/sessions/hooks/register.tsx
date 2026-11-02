@@ -323,7 +323,8 @@ function debugLine($: any, text: string) {
 // sections the person folded, by id), needsSince:<id> (since when a plugin's mark says it needs the person: since, and
 // at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
 // (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
-// from, and what the phone and the notification channel answered).
+// from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
+// and the window in front, shared for 1.5 s by the seen check: at, windows / tty).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
@@ -400,28 +401,60 @@ async function switchInPlace($: any, target: WindowTarget, front: string): Promi
   return true
 }
 
-async function myWindows($: any): Promise<string[]> {
-  const v = await windows($)
+// The windows showing this session: its viewers, and a regular session's own window (a background session's process
+// has the background service's internal terminal, which isn't a window)
+function myWindowsIn(v: Windows): string[] {
   const list = [...(v.byId[myShortId()] ?? [])]
-  const own = myPid ? v.byPid[String(myPid)] : undefined
+  const own = myPid && !me().background ? v.byPid[String(myPid)] : undefined
   if (own) list.push(own)
   return list
 }
 
+async function myWindows($: any): Promise<string[]> {
+  return myWindowsIn(await windows($))
+}
+
+// The windows listing and the window in front, shared by every session for a moment: the seen check runs every 2 s in
+// each session with an answer nobody saw, and one ps and one question to Terminal then serve them all. Only for that
+// check: what acts on a window (closing a viewer, a switch) reads the listing right then
+const SHARED_MS = 1500
+async function sharedWindows($: any): Promise<Windows> {
+  const now = await $.clock.now()
+  const c = await storeGet($, 'windowsList')
+  if (c && now - Number(c.at) < SHARED_MS && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid) return c.windows as Windows
+  const v = await windows($)
+  await storeSet($, 'windowsList', { at: now, windows: v })
+  return v
+}
+
+async function sharedFront($: any): Promise<string | null> {
+  const now = await $.clock.now()
+  const c = await storeGet($, 'frontWindow')
+  if (c && now - Number(c.at) < SHARED_MS && (typeof c.tty === 'string' || c.tty === null)) return c.tty
+  const tty = await platform.windowInFront(sys($))
+  await storeSet($, 'frontWindow', { at: now, tty })
+  return tty
+}
+
 // Are you looking at me? Someone at the computer (the platform can tell on macOS: screen unlocked, recent input) and a
-// window in front with one of my viewers, or an agent view showing my tag. Where the front window can't be known
-// (Linux), a session counts as seen only when you type in it
+// window in front with one of my viewers, or an agent view showing my tag. A session shown in no window (most
+// background sessions) asks nothing: no question to Terminal, which a quit Terminal would also take as a reason to
+// start. Where the front window can't be known (Linux), a session counts as seen only when you type in it
 async function markSeenIfLooking($: any) {
+  if (!platform.frontKnown) return
   const finished = (await readState($, myId))?.finished ?? 0
   const seen = await seenAt($, myId)
   if (finished <= seen) return
-  const tty = await platform.windowInFront(sys($))
-  if (!tty || !(await platform.userPresent(sys($)))) return
-  let looking = (await myWindows($)).includes(tty)
-  if (!looking && (await windows($)).agentsViews.some(c => c.tty === tty)) {
+  const v = await sharedWindows($)
+  const mine = myWindowsIn(v)
+  if (mine.length === 0 && v.agentsViews.length === 0) return
+  const tty = await sharedFront($)
+  if (!tty) return
+  let looking = mine.includes(tty)
+  if (!looking && v.agentsViews.some(c => c.tty === tty)) {
     looking = (await platform.readWindow(sys($), tty)).includes(`⟨${myShortId()}⟩`)
   }
-  if (looking) await storeSet($, `seen:${myId}`, await $.clock.now())
+  if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
 
 // A single query every 3.5 s for all sessions: the first one that finds it stale refreshes it

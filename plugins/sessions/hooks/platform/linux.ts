@@ -81,6 +81,7 @@ export const linux: Platform = {
   },
 
   // There's no telling which window is in front, so a session counts as seen only when you type in it
+  frontKnown: false,
   async windowInFront() {
     return null
   },

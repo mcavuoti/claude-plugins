@@ -42,6 +42,10 @@ export type World = {
   bgError: { value: string }
   // macOS's memory pressure level (sysctl kern.memorystatus_vm_pressure_level): 1 normal, 4 critical
   memory: { value: string }
+  // What `ps -A -o pid=,tty=,command=` lists (no window by default), and what Terminal's AppleScript answers, by its
+  // mode words (frente, leer, traer, cerrar, abrir: hooks/platform/macos.ts; '' by default)
+  ps: { value: string }
+  terminal: { value: (args: string[]) => string }
   // What the mod asked to tell the person: the PushNotification calls' messages and $.ui.notify's texts, and what each
   // answers (by default, what a session gets with nobody away from the computer and no notifying terminal)
   pushes: string[]
@@ -77,6 +81,8 @@ export function world(on: On, options: WorldOptions = {}): World {
   const transcript = { value: options.transcript }
   const bgError = { value: '' }
   const memory = { value: '1' }
+  const ps = { value: '' }
+  const terminal = { value: (_args: string[]) => '' }
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
@@ -171,6 +177,8 @@ export function world(on: On, options: WorldOptions = {}): World {
     // The end of a file (the background service's log), as tail -n reads it
     if (argv[0] === 'tail') return files.has(argv.at(-1) ?? '') ? ok(files.get(argv.at(-1) ?? '')) : failed()
     if (argv[0] === 'sysctl') return ok(`${memory.value}\n`)
+    if (argv[0] === 'ps') return ok(ps.value)
+    if (argv[0] === 'osascript') return ok(terminal.value(argv.slice(2)))
     if (argv[0] === '/bin/claude' && argv[1] === '--bg' && bgError.value) return { value: { exitCode: 1, stdout: '', stderr: bgError.value, isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === '/bin/claude' && argv[1] === '--version') return ok('2.1.316 (Claude Code)')
     if (argv[0] === '/bin/claude' && argv[1] === 'plugin') return ok('[]')
@@ -215,7 +223,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

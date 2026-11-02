@@ -247,6 +247,36 @@ test('⚙n: what a running background session has going on in the background, as
   await again.unmount()
 })
 
+test('seen: a session shown in no window asks Terminal nothing; its viewer in front, with you at the computer, sees it', async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  await startSession($, w)
+  await w.clock.advance(6000)
+  // Unseen, but in no window: no AppleScript at all (a quit Terminal isn't started either)
+  expect(w.runs.some(a => a[0] === 'osascript')).toBe(false)
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  // Its viewer, in the window in front
+  w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  await w.clock.advance(2000)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+  expect(w.runs.filter(a => a[0] === 'osascript')).toHaveLength(1)
+})
+
+test('seen: what another session found a moment ago (the windows, the one in front) serves this one too', async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  await startSession($, w)
+  await w.clock.advance(6000)
+  // Another session listed the windows and asked Terminal a second ago: this one's next check runs neither
+  const ps = w.runs.filter(a => a[0] === 'ps').length
+  w.store.set('windowsList', { at: w.clock.now() + 1000, windows: { byId: { aaaaaaaa: ['/dev/ttys001'] }, byPid: {}, agentsViews: [], clients: {}, launchers: {} } })
+  w.store.set('frontWindow', { at: w.clock.now() + 1000, tty: '/dev/ttys001' })
+  await w.clock.advance(2000)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+  expect(w.runs.some(a => a[0] === 'osascript')).toBe(false)
+  expect(w.runs.filter(a => a[0] === 'ps').length).toBe(ps)
+})
+
 test('with the f filter, a child whose parent waits for nobody is drawn as any row, not indented under nothing', async ($, on) => {
   const sessionsList = list()
   sessionsList[2].status = 'waiting'

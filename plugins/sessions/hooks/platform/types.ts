@@ -18,6 +18,9 @@ export type Platform = {
   name: 'macos' | 'linux'
   // The window this session's panel was just used from (its terminal, "/dev/…"), or null
   windowShowingMe(run: Run, v: Windows, me: Me): Promise<string | null>
+  // Whether windowInFront can tell at all (false: it always answers null, and a session counts as seen only when you
+  // type in it): where it can't, the seen check runs no command
+  frontKnown: boolean
   // The window in front right now, for marking a session as seen; null where that can't be known
   windowInFront(run: Run): Promise<string | null>
   // Whether someone is at the computer (screen unlocked, recent input); true where that can't be known
