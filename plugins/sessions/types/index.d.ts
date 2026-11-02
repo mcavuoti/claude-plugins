@@ -150,7 +150,7 @@ export type Sessions = {
    * the parent is in the list (one level); absent or null, none */
   assignSection: (input: { source: string; ref: SessionsRef; section: string | null; parent?: SessionsRef | null }) => Promise<SessionsResult>
   // Methods added within api 1 after its first release (0.11.0) are optional: a copy older than the method lacks it.
-  // contract().methods says whether this one has it
+  // contract().methods says whether this one has it; then call it as $.sessions.start!(…) (the validator refuses ?.)
   /** 0.12.0. Starts a background session named `name` in the folder `cwd` (claude --bg -n, with `--agent` and
    * `--settings` when given; never a prompt). It's queued and started from sessions' own timer: find it afterwards
    * with status({ names }). Refused for a name already in that folder's project, a settings file outside `<cwd>/.claude/`

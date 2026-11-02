@@ -60,7 +60,7 @@ From 0.11.0 the `sessions` mod adds a noun to `$` that other plugins call: what 
 | wire `FORMAT` | `hooks/state.ts` and the launcher's files | a change to the files and notices sessions share among themselves (`.claude/rules/sessions-wire-format.md`) |
 | `sectionsFormat` | `SECTIONS_FORMAT` in `hooks/state.ts` | never in practice: sections only gain fields; a breaking change ships a one-time rewrite into a new key or file |
 
-1. **Within an api, changes only add**: new methods, new optional input fields, new output fields. Ignore output fields you don't know, and check `contract().methods` for a method newer than the api. A method added after the api's first release is optional in the type (`start?:`), since an older copy lacks it: call it as `$.sessions.start?.(…)` once `has()` said yes.
+1. **Within an api, changes only add**: new methods, new optional input fields, new output fields. Ignore output fields you don't know, and check `contract().methods` for a method newer than the api. A method added after the api's first release is optional in the type (`start?:`), since an older copy lacks it: once `has()` said yes, call it as `$.sessions.start!(…)` (the validator wants a plain call: it refuses `$.sessions.start?.(…)`).
 2. **A removal or a change of meaning raises `SessionsApi`** in one commit that also updates every plugin of this repository that calls it, and releases them together. There's no deprecation period: after an update every session is restarted.
 3. **One list of methods.** `METHODS` in `hooks/register.tsx` is what `contract()` serves; `satisfies Record<SessionsMethod, 1>` makes a method missing from the type, or one too many, fail the type check. The golden list in `tests/contract.test.tsx` fails when a method disappears.
 
