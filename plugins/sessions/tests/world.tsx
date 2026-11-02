@@ -37,6 +37,8 @@ export type World = {
   transcript: { value: string | undefined }
   // What claude --bg prints when it refuses to start a session ('': it starts it)
   bgError: { value: string }
+  // macOS's memory pressure level (sysctl kern.memorystatus_vm_pressure_level): 1 normal, 4 critical
+  memory: { value: string }
 }
 
 export type WorldOptions = {
@@ -65,6 +67,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const band = { value: '' }
   const transcript = { value: options.transcript }
   const bgError = { value: '' }
+  const memory = { value: '1' }
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
@@ -152,6 +155,9 @@ export function world(on: On, options: WorldOptions = {}): World {
       return ok()
     }
     if (argv[0] === '/bin/claude' && argv[1] === 'agents') return ok(JSON.stringify(list))
+    // The end of a file (the background service's log), as tail -n reads it
+    if (argv[0] === 'tail') return files.has(argv.at(-1) ?? '') ? ok(files.get(argv.at(-1) ?? '')) : failed()
+    if (argv[0] === 'sysctl') return ok(`${memory.value}\n`)
     if (argv[0] === '/bin/claude' && argv[1] === '--bg' && bgError.value) return { value: { exitCode: 1, stdout: '', stderr: bgError.value, isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === '/bin/claude' && argv[1] === '--version') return ok('2.1.316 (Claude Code)')
     if (argv[0] === '/bin/claude' && argv[1] === 'plugin') return ok('[]')
@@ -184,7 +190,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: undefined }
   })
   on('ui.log', () => ({ value: undefined }))
-  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError }
+  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

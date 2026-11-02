@@ -367,20 +367,24 @@ export function adoptAutoPins(pins: readonly string[], remote: Readonly<Record<s
   return { ids: pins.filter(id => remote[id] === true), released: [] }
 }
 
-// The sessions the background service closed for lack of memory and that are still closed, with when (ms). Comes from
-// its log (~/.claude/daemon.log): the last thing that happened to the session is a "retire <id>: … [low memory…]" and
-// it didn't start again afterwards ("claimed-spare" or "spawned"). If it was later closed for another reason (another
-// retire), it doesn't count
-export function closedForLowMemory(log: string): Record<string, number> {
-  const closed: Record<string, number> = {}
+// Why the background service's sessions that are still stopped stopped, and when (ms), from its log
+// (~/.claude/daemon.log). The service retires an idle session ("retire <id>: settled, idle 61m", or "idle-prompt"),
+// and closes idle ones when memory runs out ("retire <id>: … [low memory…]"); each retire is followed by the process
+// ending ("settled <id> (done)"). A process that ends with no retire before it was stopped some other way: by the
+// person (claude stop, the panel's s), or a crash. Starting again ("claimed-spare" or "spawned") clears the record
+export type StopReason = { at: number; why: 'idle' | 'low-memory' | 'stopped' }
+export function stopReasons(log: string): Record<string, StopReason> {
+  const out: Record<string, StopReason> = {}
   for (const line of log.split('\n')) {
-    const m = line.match(/^\[([^\]]+)\] \[bg\] bg (retire|claimed-spare|spawned) ([0-9a-f]{8})\b(.*)$/)
+    const m = line.match(/^\[([^\]]+)\] \[bg\] bg (retire|settled|claimed-spare|spawned) ([0-9a-f]{8})\b(.*)$/)
     if (!m) continue
     const [, when = '', event, id = '', rest = ''] = m
-    if (event === 'retire' && /\[low memory/.test(rest)) closed[id] = Date.parse(when) || 0
-    else delete closed[id]
+    const at = Date.parse(when) || 0
+    if (event === 'retire') out[id] = { at, why: /\[low memory/.test(rest) ? 'low-memory' : 'idle' }
+    else if (event === 'settled') out[id] ??= { at, why: 'stopped' }
+    else delete out[id]
   }
-  return closed
+  return out
 }
 
 // The times the mod reopened a session in the last 2 h (so it doesn't insist if memory fills up again)
@@ -777,12 +781,17 @@ export function checkSectionSpec(source: unknown, spec: any): { ok: true; sectio
   return { ok: true, section: { id, title, order: spec.order ?? 200, owner: source as string } }
 }
 
+// How other plugins name a session (refOf): a short id or sid:<sessionId>
+export function isRef(ref: unknown): ref is string {
+  return typeof ref === 'string' && /^(sid:)?[A-Za-z0-9_-]{1,80}$/.test(ref)
+}
+
 // A plugin putting a session in one of its own sections (or taking it out: null). Never over the person's choice nor
 // another plugin's. The answer is the file to write, or why not (ok: true when there's nothing to change)
 export function assignChange(file: SectionsFile, source: unknown, ref: unknown, section: unknown): { file: SectionsFile } | { result: SessionsResult } {
   const s = checkSource(source)
   if (!s.ok) return { result: s }
-  if (typeof ref !== 'string' || !/^(sid:)?[A-Za-z0-9_-]{1,80}$/.test(ref)) return { result: { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' } }
+  if (!isRef(ref)) return { result: { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' } }
   if (section !== null && typeof section !== 'string') return { result: { ok: false, reason: 'invalid', detail: 'section is a section id or null' } }
   if (section !== null && !section.startsWith(`${source}:`)) return { result: { ok: false, reason: 'refused', detail: `a plugin assigns only to its own sections ("${source}:<name>")` } }
   const view = sectionsView(file)

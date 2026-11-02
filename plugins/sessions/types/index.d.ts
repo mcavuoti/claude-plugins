@@ -137,6 +137,10 @@ export type Sessions = {
    * with status({ names }). Refused for a name already in that folder's project, a settings file outside `<cwd>/.claude/`
    * and the home folder; a folder Claude doesn't trust is said in this session when it's tried */
   start?: (input: { name: string; cwd: string; agent?: string; settings?: string }) => Promise<SessionsResult & { queued?: true }>
+  /** 0.12.0. Brings back a background session the background service retired for being idle (claude respawn, from
+   * sessions' own timer): `running` (nothing to do), `queued`, or `refused` with why: a regular session, one the person
+   * stopped, one closed for lack of memory while memory is still short. `reason` goes to the debug log */
+  wake?: (input: { ref: SessionsRef; reason: string }) => Promise<SessionsResult & { state?: 'running' | 'queued' | 'refused' }>
 }
 export type SessionsMethod = keyof Sessions
 

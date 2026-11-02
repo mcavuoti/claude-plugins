@@ -5,7 +5,7 @@ import {
   actionFromAnswer,
   reconcilePins,
   sparkline,
-  closedForLowMemory,
+  stopReasons,
   daysUpTo,
   paneWidth,
   buildNotice,
@@ -370,7 +370,7 @@ test('project: the root and its subfolders, but in the home folder only that fol
   expect(inProject('/Users/x/myapp', '/Users/x', '')).toBe(true)
 })
 
-test('reopen: only the ones whose last event was a closure for lack of memory', () => {
+test('why a session stopped: retired for being idle, closed for lack of memory, or stopped some other way, until it starts again', () => {
   const log = [
     '[2026-10-26T12:41:57.100Z] [bg] bg: low memory persists after shedding non-pinned — retiring pinned settled workers as a last resort',
     '[2026-10-26T12:41:57.273Z] [bg] bg retire dddddddd: settled, idle 38h [low memory, pinned]',
@@ -384,10 +384,16 @@ test('reopen: only the ones whose last event was a closure for lack of memory', 
     '[2026-10-26T13:20:00.000Z] [bg] bg retire bbbbbbbb: settled, idle 8h',
     'a line that is not in this format',
   ].join('\n')
-  expect(closedForLowMemory(log)).toEqual({ 'dddddddd': Date.parse('2026-10-26T12:41:57.273Z'), aaaaaaaa: Date.parse('2026-10-26T12:41:58.000Z') })
-  // Closed for memory and later again for another reason: not reopened
-  expect(closedForLowMemory(log + '\n[2026-10-26T14:00:00.000Z] [bg] bg retire dddddddd: stale-spare, idle 1h')['dddddddd']).toBe(undefined)
-  expect(closedForLowMemory('')).toEqual({})
+  expect(stopReasons(log)).toEqual({
+    dddddddd: { at: Date.parse('2026-10-26T12:41:57.273Z'), why: 'low-memory' },
+    aaaaaaaa: { at: Date.parse('2026-10-26T12:41:58.000Z'), why: 'low-memory' },
+    bbbbbbbb: { at: Date.parse('2026-10-26T13:20:00.000Z'), why: 'idle' },
+  })
+  // Closed for memory and later again for another reason: that reason is the one
+  expect(stopReasons(log + '\n[2026-10-26T14:00:00.000Z] [bg] bg retire dddddddd: idle-prompt, idle 1h').dddddddd?.why).toBe('idle')
+  // A process that ends with no retire before it was stopped some other way (the person, a crash)
+  expect(stopReasons(log + '\n[2026-10-26T14:00:00.000Z] [bg] bg claimed-spare cccccccc (fleet)\n[2026-10-26T15:00:00.000Z] [bg] bg settled cccccccc (killed)').cccccccc).toEqual({ at: Date.parse('2026-10-26T15:00:00.000Z'), why: 'stopped' })
+  expect(stopReasons('')).toEqual({})
 })
 
 test('reopen: only those from the last 2 h count towards the limit', () => {

@@ -19,6 +19,7 @@ const PROBE = {
         else if (m === 'defineSection') out = await $.sessions.defineSection(input)
         else if (m === 'assignSection') out = await $.sessions.assignSection(input)
         else if (m === 'start') out = await $.sessions.start(input)
+        else if (m === 'wake') out = await $.sessions.wake(input)
         return { text: JSON.stringify({ out }) }
       } catch (err) {
         return { text: JSON.stringify({ threw: String(err) }) }
@@ -54,7 +55,7 @@ test('contract: api 1 and its methods, also before the mod has started here', WI
   expect(c.api).toBe(1)
   expect(c.format).toBe(1)
   expect(typeof c.version).toBe('string')
-  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start'])
+  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake'])
 })
 
 test('current and status: not ready before the start, then this session and the others from the official list', WITH_PROBE, async ($, on) => {
@@ -227,4 +228,48 @@ test('start: checked, queued and started from the mod\'s own timer, with its age
   expect(await call($, 'start', { name: 'TEST v', cwd: ROOT })).toEqual({ ok: true, queued: true })
   await w.clock.advance(600)
   expect(w.toasts).toEqual([`Couldn't start “TEST v”: Claude doesn't trust ${ROOT} yet, so it can't start a session there in the background: run claude there once and accept its question`])
+})
+
+test('wake: only a background session the service retired for being idle is restarted; the rest is running or refused with why', WITH_PROBE, async ($, on) => {
+  const sessionsList = [
+    ...list(),
+    { id: 'dddddddd', sessionId: 'dddddddd-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', name: 'idle one' },
+    { id: 'eeeeeeee', sessionId: 'eeeeeeee-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', name: 'stopped one' },
+    { id: 'ffffffff', sessionId: 'ffffffff-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', name: 'memory one' },
+  ]
+  const w = world(on, { list: sessionsList })
+  w.files.set(
+    '/Users/x/daemon.log',
+    [
+      '[2026-10-26T10:00:00.000Z] [bg] bg retire dddddddd: settled, idle 61m',
+      '[2026-10-26T10:00:01.000Z] [bg] bg settled dddddddd (done)',
+      // Stopped by the person: the process ends with no retire before it
+      '[2026-10-26T10:00:02.000Z] [bg] bg settled eeeeeeee (killed)',
+      '[2026-10-26T10:00:03.000Z] [bg] bg retire ffffffff: settled, idle 38h [low memory, pinned]',
+    ].join('\n'),
+  )
+  expect((await call($, 'wake', { ref: 'dddddddd', reason: 'x' })).reason).toBe('not-ready')
+  await startSession($, w)
+  expect(await call($, 'wake', { ref: 'aaaaaaaa', reason: 'x' })).toEqual({ ok: true, state: 'running' })
+  const refused = async (ref: string) => {
+    const r = await call($, 'wake', { ref, reason: 'x' })
+    expect(r.state).toBe('refused')
+    return `${r.reason}: ${r.detail}`
+  }
+  expect(await refused(`sid:${REGULAR}`)).toBe('refused: “myapp-1f” is a regular session: it lives in its own window')
+  expect(await refused('zzzzzzzz')).toBe("refused: zzzzzzzz isn't in the session list")
+  expect(await refused('eeeeeeee')).toContain("wasn't retired for being idle")
+  // Closed for lack of memory: not while memory is short; once it's normal, yes
+  w.memory.value = '4'
+  expect(await refused('ffffffff')).toContain('memory is still short')
+  w.memory.value = '1'
+  expect(await call($, 'wake', { ref: 'ffffffff', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  expect((await call($, 'wake', { ref: 1, reason: 'x' })).reason).toBe('invalid')
+  const before = w.runs.length
+  expect(await call($, 'wake', { ref: 'dddddddd', reason: 'fleet: an answer to D-3' })).toEqual({ ok: true, state: 'queued' })
+  expect(await call($, 'wake', { ref: 'dddddddd', reason: 'again' })).toEqual({ ok: true, state: 'queued' })
+  // Nothing ran inside the call: the mod's timer restarts them, each once
+  expect(w.runs.slice(before).some(a => a[1] === 'respawn')).toBe(false)
+  await w.clock.advance(600)
+  expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['ffffffff', 'dddddddd'])
 })

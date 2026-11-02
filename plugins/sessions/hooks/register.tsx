@@ -50,7 +50,9 @@ import {
   paneWidth,
   buildNotice,
   sparkline,
-  closedForLowMemory,
+  stopReasons,
+  isRef,
+  type StopReason,
   colorOf,
   displayWidth,
   compareVersions,
@@ -722,13 +724,14 @@ async function reopenRetiredSessions($: any) {
     if (normalSince === undefined || now - normalSince < NORMAL_BEFORE_REOPEN) return
     const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
     if (r.exitCode !== 0) return
-    const closed = closedForLowMemory(r.stdout)
-    if (Object.keys(closed).length === 0) return
+    const closed = stopReasons(r.stdout)
+    if (!Object.values(closed).some(c => c.why === 'low-memory')) return
     const pinned = new Set((await pinsFromFile($)) ?? [])
     const list = await officialList($)
     if (typeof list === 'string') return
     for (const s of list) {
-      const when = typeof s.id === 'string' ? closed[s.id] : undefined
+      const c = typeof s.id === 'string' ? closed[s.id] : undefined
+      const when = c?.why === 'low-memory' ? c.at : undefined
       if (!when || s.pid || s.kind !== 'background' || !pinned.has(s.id)) continue
       // Memory has to have been normal since after the closure (if no pass saw it, since the closure)
       if (now - Math.max(when, normalSince) < NORMAL_BEFORE_REOPEN) continue
@@ -744,6 +747,55 @@ async function reopenRetiredSessions($: any) {
     }
   } finally {
     reopening = false
+  }
+}
+
+// Why a stopped session stopped, from the background service's log (stopReasons), read right then
+async function stopReasonOf($: any, id: string): Promise<StopReason | undefined> {
+  if (!daemonLog) return undefined
+  const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
+  return r.exitCode === 0 ? stopReasons(r.stdout)[id] : undefined
+}
+
+// Whether a session can be woken (another plugin's wake, ccc tell): running already, or stopped and wakeable. Only a
+// background session the service retired for being idle is woken, or one it closed for lack of memory once memory is
+// normal again. Never a regular session (it lives in its own window), one the person stopped, nor one closed for lack
+// of memory while memory is still short
+type WakeVerdict = { state: 'running' } | { state: 'refused'; detail: string } | { state: 'wake'; id: string; name: string }
+async function wakeVerdict($: any, ref: string): Promise<WakeVerdict> {
+  const s = lastList.find(x => refOf(x) === ref)
+  if (!s) return { state: 'refused', detail: `${ref} isn't in the session list` }
+  const name = String(projectRows.find(f => f.sessionId === s.sessionId)?.title ?? (s.name || s.id || ref))
+  if (s.kind !== 'background' || typeof s.id !== 'string') return { state: 'refused', detail: `“${name}” is a regular session: it lives in its own window` }
+  if (s.pid) return { state: 'running' }
+  const why = await stopReasonOf($, s.id)
+  if (why?.why === 'idle') return { state: 'wake', id: s.id, name }
+  if (why?.why === 'low-memory') {
+    if ((await platform.memoryNormal(sys($))) === true) return { state: 'wake', id: s.id, name }
+    return { state: 'refused', detail: `Claude closed “${name}” for lack of memory, and memory is still short` }
+  }
+  return { state: 'refused', detail: `“${name}” wasn't retired for being idle (it was stopped by you, or another way): Enter or u restarts it` }
+}
+
+// The sessions other plugins asked to wake ($.sessions.wake), from this mod's own 0.5 s timer: claude respawn, if
+// they're still stopped
+let wakes: { id: string; name: string; reason: string }[] = []
+let waking = false
+async function runWakes($: any) {
+  if (waking || wakes.length === 0) return
+  waking = true
+  try {
+    for (let w = wakes.shift(); w; w = wakes.shift()) {
+      const r = await run($, [claude, 'agents', '--json', '--all'])
+      const list = r.exitCode === 0 ? validateList(r.stdout) : []
+      if (Array.isArray(list) && list.some(s => s.id === w.id && s.pid)) continue
+      const done = await run($, [claude, 'respawn', w.id])
+      debugLine($, `wake “${w.name}” (${w.reason || 'no reason given'}): ${done.exitCode === 0 ? 'restarted' : 'failed'}`)
+      if (done.exitCode !== 0) $.ui.toast(`Couldn't wake “${w.name}”`)
+      await storeSet($, 'list', {})
+    }
+  } finally {
+    waking = false
   }
 }
 
@@ -1877,7 +1929,7 @@ async function sectionsList($: any): Promise<string> {
 // here: current and status answer ready: false, and the section methods find the data folder from the environment
 const SESSIONS_API: SessionsApi = 1
 // The methods this copy serves: a key missing from Sessions, or one too many, fails the type check
-const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1 } satisfies Record<SessionsMethod, 1>
+const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1 } satisfies Record<SessionsMethod, 1>
 // How long another plugin's call waits for the sections lock before answering busy (6 × 50 ms)
 const CALL_LOCK_TRIES = 6
 
@@ -1986,6 +2038,17 @@ function sessionsApi($: any): Sessions {
       launches.push({ ...l, root })
       return { ok: true, queued: true }
     },
+    wake: async input => {
+      const ref = input?.ref
+      if (!isRef(ref)) return { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' }
+      if (!ready()) return { ok: false, reason: 'not-ready', detail: "sessions hasn't read the session list in this session yet: try again in a few seconds" }
+      const v = await wakeVerdict($, ref)
+      if (v.state === 'running') return { ok: true, state: 'running' }
+      if (v.state === 'refused') return { ok: false, reason: 'refused', detail: v.detail, state: 'refused' }
+      const reason = typeof input?.reason === 'string' ? input.reason.trim().replace(/\s+/g, ' ').slice(0, 120) : ''
+      if (!wakes.some(w => w.id === v.id)) wakes.push({ id: v.id, name: v.name, reason })
+      return { ok: true, state: 'queued' }
+    },
   }
 }
 
@@ -2070,6 +2133,7 @@ async function start($: any) {
     $.clock.every(500, () => {
       bg(checkInbox($))
       bg(runLaunches($))
+      bg(runWakes($))
     })
     $.clock.every(3000, () => {
       bg(refresh($))
