@@ -1,4 +1,4 @@
-import type { Color, Period, UsageSummary } from '../types'
+import type { Color, Period, SessionsMember, SessionsResult, SessionsSection, UsageSummary } from '../types'
 
 // The format of everything the mod shares outside one session: the files in its data folder (heartbeats, the panel
 // order, inbox requests, the launcher's window files, the mirrored settings) and the notices between sessions. Each one
@@ -14,7 +14,8 @@ export const HEARTBEAT_VERSION = '0.10.0'
 // What each session's mod writes to the shared store under `state:<sessionId>`.
 // created: when the session's mod first started; turnStarted: when the current turn started; finished: when the last
 // turn finished; reason: why it finished; answer: last line of the answer; question: whether that line ends in "?";
-// model: short model name; context: % of the context used; version: the Claude version the session runs
+// model: short model name; context: % of the context used; version: the Claude version the session runs; agent: the
+// agent it runs as (`claude --agent`), null for none; root: the project root its panel uses
 export type SessionState = {
   created?: number
   turnStarted?: number
@@ -25,6 +26,8 @@ export type SessionState = {
   model?: string
   context?: number
   version?: string
+  agent?: string | null
+  root?: string
 }
 
 // Short time for the right-hand column: now, 3m, 2h, 1d
@@ -554,4 +557,229 @@ export function reloadDecision(c: ReloadCheck): 'reload' | 'wait' | 'no' {
   if (c.triedFor === v.version) return 'no'
   if (c.status !== 'idle' || c.tasks !== 0 || c.paneFocused || c.fieldOpen) return 'wait'
   return 'reload'
+}
+
+// How other plugins name a session (SessionsRef): the official short id of `claude agents`, which stays across /clear,
+// or sid:<sessionId> for a regular session, which has none
+export function refOf(s: { id?: unknown; sessionId: string }): string {
+  return typeof s.id === 'string' && s.id ? s.id : `sid:${s.sessionId}`
+}
+
+// The agent a session runs as (`claude --agent <name>`): Claude writes it as the first row of the session's transcript,
+// {"type":"agent-setting","agentSetting":"<name>"}. null when the first row is anything else
+export function agentFromTranscript(head: string): string | null {
+  const first = head.split('\n')[0] ?? ''
+  try {
+    const row = JSON.parse(first)
+    return row?.type === 'agent-setting' && typeof row.agentSetting === 'string' && row.agentSetting ? row.agentSetting : null
+  } catch {
+    return null
+  }
+}
+
+// Sections: <data>/sections.json, the person's data (what they chose, kept for good), so it has its own version,
+// sectionsFormat, apart from the wire FORMAT. It changes only by adding fields, and a write keeps the fields it doesn't
+// know. A file from a newer sessions (a higher sectionsFormat) is never read as if it were this one, nor rewritten: the
+// panel says so and asks for a restart.
+//   { "sectionsFormat": 1,
+//     "sections": [{ "id": "me:renders", "title": "Renders", "order": 100, "owner": "person" }],
+//     "members": { "aaaaaaaa": { "section": "me:renders", "by": "person" } } }
+// Section ids: me:<slug> for the person's own (/sessions section <title>), <plugin>:<name> for a plugin's. Members are
+// keyed by ref (refOf); one section per session
+export const SECTIONS_FORMAT = 1
+export type SectionsFile = { sectionsFormat: number; sections: any[]; members: Record<string, any>; [key: string]: unknown }
+export type SectionsView = { sections: SessionsSection[]; members: Record<string, SessionsMember> }
+export const NO_SECTIONS: SectionsView = { sections: [], members: {} }
+
+export function emptySectionsFile(): SectionsFile {
+  return { sectionsFormat: SECTIONS_FORMAT, sections: [], members: {} }
+}
+
+export function parseSectionsFile(text: string): { file: SectionsFile } | { problem: string } {
+  let d: any
+  try {
+    d = JSON.parse(text)
+  } catch {
+    return { problem: "sections.json isn't valid JSON: fix it or remove it" }
+  }
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return { problem: "sections.json isn't an object: fix it or remove it" }
+  const version = Number(d.sectionsFormat)
+  if (version > SECTIONS_FORMAT) return { problem: `sections.json is from a newer sessions (sectionsFormat ${version}): restart this session (u)` }
+  if (version !== SECTIONS_FORMAT) return { problem: `sections.json has no sectionsFormat ${SECTIONS_FORMAT}: fix it or remove it` }
+  return {
+    file: {
+      ...d,
+      sectionsFormat: SECTIONS_FORMAT,
+      sections: Array.isArray(d.sections) ? d.sections : [],
+      members: d.members && typeof d.members === 'object' && !Array.isArray(d.members) ? d.members : {},
+    },
+  }
+}
+
+export function sectionsFileText(file: SectionsFile): string {
+  return `${JSON.stringify(file, null, 2)}\n`
+}
+
+// What the file says, with anything malformed left out
+export function sectionsView(file: SectionsFile): SectionsView {
+  const sections: SessionsSection[] = []
+  for (const s of file.sections) {
+    if (typeof s?.id !== 'string' || !s.id.includes(':') || typeof s.title !== 'string' || sections.some(x => x.id === s.id)) continue
+    const owner = typeof s.owner === 'string' ? s.owner : s.id.startsWith('me:') ? 'person' : s.id.split(':')[0]
+    sections.push({ id: s.id, title: s.title, order: Number.isFinite(s.order) ? Number(s.order) : 200, owner })
+  }
+  const members: Record<string, SessionsMember> = {}
+  for (const [ref, m] of Object.entries(file.members)) {
+    if (typeof m?.section === 'string' && typeof m.by === 'string') members[ref] = { section: m.section, by: m.by }
+  }
+  return { sections, members }
+}
+
+export function upsertSection(file: SectionsFile, s: SessionsSection): SectionsFile {
+  const i = file.sections.findIndex(x => x?.id === s.id)
+  const sections = [...file.sections]
+  if (i < 0) sections.push({ ...s })
+  else sections[i] = { ...sections[i], ...s }
+  return { ...file, sections }
+}
+
+export function setMember(file: SectionsFile, ref: string, m: SessionsMember | null): SectionsFile {
+  const members = { ...file.members }
+  if (m) members[ref] = { ...(members[ref] ?? {}), ...m }
+  else delete members[ref]
+  return { ...file, members }
+}
+
+// The person's sections with nobody in them go: they exist only while the person keeps sessions there. A plugin's stay
+// until it drops them (they draw nothing while empty)
+export function dropEmptyPersonSections(file: SectionsFile): SectionsFile {
+  const used = new Set(Object.values(file.members).map((m: any) => m?.section))
+  const sections = file.sections.filter(s => !(typeof s?.id === 'string' && s.id.startsWith('me:') && !used.has(s.id)))
+  return sections.length === file.sections.length ? file : { ...file, sections }
+}
+
+// Members of sessions that are gone (no longer in the official list)
+export function pruneMembers(file: SectionsFile, keep: (ref: string) => boolean): SectionsFile {
+  const gone = Object.keys(file.members).filter(ref => !keep(ref))
+  if (gone.length === 0) return file
+  const members = { ...file.members }
+  for (const ref of gone) delete members[ref]
+  return dropEmptyPersonSections({ ...file, members })
+}
+
+// A section id's name part, from a title the person typed: "Big renders!" → "big-renders"
+export function slugOf(title: string): string {
+  return title
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40)
+    .replace(/-+$/, '')
+}
+
+// What another plugin may call itself (its plugin name): not the person's (me) nor this plugin's (sessions)
+function checkSource(source: unknown): SessionsResult {
+  if (typeof source !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(source)) return { ok: false, reason: 'invalid', detail: 'source must be your plugin name' }
+  if (source === 'me' || source === 'sessions') return { ok: false, reason: 'refused', detail: `"${source}" is reserved` }
+  return { ok: true }
+}
+
+// A plugin's section: its id must be <source>:<name>, so a plugin defines only its own. The title is kept as given (up
+// to 60 characters) and cut to fit when drawn
+export function checkSectionSpec(source: unknown, spec: any): { ok: true; section: SessionsSection } | (SessionsResult & { ok: false }) {
+  const s = checkSource(source)
+  if (!s.ok) return s
+  const id = typeof spec?.id === 'string' ? spec.id : ''
+  const colon = id.indexOf(':')
+  if (colon < 0) return { ok: false, reason: 'invalid', detail: `a section id is "${source}:<name>"` }
+  if (id.slice(0, colon) !== source) return { ok: false, reason: 'refused', detail: `a plugin defines only its own sections ("${source}:<name>")` }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/.test(id.slice(colon + 1))) return { ok: false, reason: 'invalid', detail: 'a section name is letters, digits, . _ or -, up to 48' }
+  const title = typeof spec?.title === 'string' ? spec.title.trim().replace(/\s+/g, ' ') : ''
+  if (!title || Array.from(title).length > 60) return { ok: false, reason: 'invalid', detail: 'a title is 1 to 60 characters' }
+  if (spec.order !== undefined && !Number.isFinite(spec.order)) return { ok: false, reason: 'invalid', detail: 'order is a number' }
+  return { ok: true, section: { id, title, order: spec.order ?? 200, owner: source as string } }
+}
+
+// A plugin putting a session in one of its own sections (or taking it out: null). Never over the person's choice nor
+// another plugin's. The answer is the file to write, or why not (ok: true when there's nothing to change)
+export function assignChange(file: SectionsFile, source: unknown, ref: unknown, section: unknown): { file: SectionsFile } | { result: SessionsResult } {
+  const s = checkSource(source)
+  if (!s.ok) return { result: s }
+  if (typeof ref !== 'string' || !/^(sid:)?[A-Za-z0-9_-]{1,80}$/.test(ref)) return { result: { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' } }
+  if (section !== null && typeof section !== 'string') return { result: { ok: false, reason: 'invalid', detail: 'section is a section id or null' } }
+  if (section !== null && !section.startsWith(`${source}:`)) return { result: { ok: false, reason: 'refused', detail: `a plugin assigns only to its own sections ("${source}:<name>")` } }
+  const view = sectionsView(file)
+  if (section !== null && !view.sections.some(x => x.id === section)) return { result: { ok: false, reason: 'invalid', detail: `no section ${section}: define it first` } }
+  const m = view.members[ref]
+  if (m?.by === 'person') {
+    const title = view.sections.find(x => x.id === m.section)?.title ?? m.section
+    return { result: { ok: false, reason: 'refused', detail: `the person put this session in “${title}”` } }
+  }
+  if (m && m.by !== source) return { result: { ok: false, reason: 'refused', detail: `${m.by} put this session in its section` } }
+  if (section === null) return m ? { file: setMember(file, ref, null) } : { result: { ok: true } }
+  if (m?.section === section) return { result: { ok: true } }
+  return { file: setMember(file, ref, { section, by: source as string }) }
+}
+
+// The person putting a session in a section of theirs, by title (/sessions section <title>): the section me:<slug> is
+// created if needed (order 100). The person's choice wins over any plugin's. null title: out of any section
+export function personAssign(file: SectionsFile, ref: string, title: string | null): { file: SectionsFile; section: SessionsSection | null } | { problem: string } {
+  if (title === null) return { file: dropEmptyPersonSections(setMember(file, ref, null)), section: null }
+  const clean = title.trim().replace(/\s+/g, ' ')
+  const slug = slugOf(clean)
+  if (!slug) return { problem: 'A section title needs a letter or a digit' }
+  if (Array.from(clean).length > 60) return { problem: 'A section title is up to 60 characters' }
+  const id = `me:${slug}`
+  const existing = sectionsView(file).sections.find(s => s.id === id)
+  const section = existing ?? { id, title: clean, order: 100, owner: 'person' }
+  const withSection = existing ? file : upsertSection(file, section)
+  return { file: dropEmptyPersonSections(setMember(withSection, ref, { section: id, by: 'person' })), section }
+}
+
+// The rows in display order: this project's sessions in no section first, then each section by order and then title;
+// inside each, the usual order (sortRows). Each row learns its section ('' for none) and that section's title
+export function groupRows<T extends { ref: string; color: Color; title: string }>(rows: readonly T[], view: SectionsView): (T & { section: string; sectionTitle: string })[] {
+  const byId = new Map(view.sections.map(s => [s.id, s]))
+  const groups = new Map<string, T[]>()
+  for (const r of rows) {
+    const m = view.members[r.ref]
+    const id = m && byId.has(m.section) ? m.section : ''
+    groups.set(id, [...(groups.get(id) ?? []), r])
+  }
+  const ids = [...groups.keys()]
+    .filter(id => id !== '')
+    .sort((a, b) => {
+      const x = byId.get(a) as SessionsSection
+      const y = byId.get(b) as SessionsSection
+      return x.order - y.order || x.title.localeCompare(y.title) || a.localeCompare(b)
+    })
+  return ['', ...ids].flatMap(id => sortRows(groups.get(id) ?? []).map(r => ({ ...r, section: id, sectionTitle: id ? (byId.get(id)?.title ?? '') : '' })))
+}
+
+// The header to draw above each row: a section's title where a section starts, only when two or more groups have rows
+// (so a project that uses no sections looks as it always did). Rows in no section never get one
+export function sectionHeaders(rows: readonly { section: string; sectionTitle: string }[]): (string | null)[] {
+  const many = new Set(rows.map(r => r.section)).size >= 2
+  return rows.map((r, i) => (many && r.section !== '' && (i === 0 || rows[i - 1]?.section !== r.section) ? r.sectionTitle : null))
+}
+
+// While the pane has the keyboard nothing moves (Claude follows the focus by position): the rows that were shown keep
+// their places and their sections, and new ones go at the end. Otherwise (or on a reflow the person asked for), the
+// layout as computed
+export function keepPlaces<T extends { sessionId: string; section: string; sectionTitle: string }>(layout: readonly T[], shown: readonly T[], frozen: boolean): T[] {
+  if (!frozen) return [...layout]
+  const before = shown.map(f => f.sessionId)
+  const previous = new Map(shown.map(f => [f.sessionId, f]))
+  const place = (f: T) => {
+    const i = before.indexOf(f.sessionId)
+    return i < 0 ? Number.MAX_SAFE_INTEGER : i
+  }
+  return layout
+    .map(f => {
+      const p = previous.get(f.sessionId)
+      return p ? { ...f, section: p.section, sectionTitle: p.sectionTitle } : f
+    })
+    .sort((a, b) => place(a) - place(b))
 }

@@ -50,6 +50,19 @@ import {
   debugLogName,
   adoptAutoPins,
   reloadDecision,
+  refOf,
+  agentFromTranscript,
+  groupRows,
+  sectionHeaders,
+  keepPlaces,
+  parseSectionsFile,
+  sectionsView,
+  sectionsFileText,
+  emptySectionsFile,
+  personAssign,
+  pruneMembers,
+  slugOf,
+  type SectionsView,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -552,4 +565,96 @@ test('updating in place: only to a newer version of the same install, once, and 
   expect(reloadDecision({ ...base, tasks: null })).toBe('wait')
   expect(reloadDecision({ ...base, paneFocused: true })).toBe('wait')
   expect(reloadDecision({ ...base, fieldOpen: true })).toBe('wait')
+})
+
+test('refs: the official short id, or sid:<sessionId> for a regular session (it has none)', () => {
+  expect(refOf({ id: 'aaaaaaaa', sessionId: 'aaaaaaaa-0000' })).toBe('aaaaaaaa')
+  expect(refOf({ sessionId: 'cccccccc-0000' })).toBe('sid:cccccccc-0000')
+  expect(refOf({ id: '', sessionId: 'cccccccc-0000' })).toBe('sid:cccccccc-0000')
+})
+
+test("agent: only a first row of type agent-setting names one", () => {
+  expect(agentFromTranscript('{"type":"agent-setting","agentSetting":"scout"}\n{"type":"user"}')).toBe('scout')
+  expect(agentFromTranscript('{"type":"user","message":{}}\n')).toBe(null)
+  expect(agentFromTranscript('{"type":"agent-setting"')).toBe(null)
+  expect(agentFromTranscript('')).toBe(null)
+})
+
+// Rows as groupRows needs them: a ref, a color and a title
+const row = (ref: string, color: 'red' | 'blue' | 'yellow' | 'green' | 'gray', title: string) => ({ sessionId: `${ref}-0000`, ref, color, title })
+const VIEW: SectionsView = {
+  sections: [
+    { id: 'me:renders', title: 'Renders', order: 100, owner: 'person' },
+    { id: 'probe:desk', title: 'Desk', order: 10, owner: 'probe' },
+    { id: 'me:alpha', title: 'Alpha', order: 100, owner: 'person' },
+  ],
+  members: {
+    bbbbbbbb: { section: 'me:renders', by: 'person' },
+    cccccccc: { section: 'probe:desk', by: 'probe' },
+    dddddddd: { section: 'me:alpha', by: 'person' },
+    eeeeeeee: { section: 'me:renders', by: 'person' },
+    // A member of a section that isn't defined counts as in none
+    ffffffff: { section: 'me:gone', by: 'person' },
+  },
+}
+
+test('sections: no section first with no header, then sections by order and title, each in the usual order', () => {
+  const rows = [row('aaaaaaaa', 'green', 'one'), row('bbbbbbbb', 'green', 'two'), row('cccccccc', 'blue', 'three'), row('dddddddd', 'gray', 'four'), row('eeeeeeee', 'red', 'five'), row('ffffffff', 'red', 'six')]
+  const g = groupRows(rows, VIEW)
+  expect(g.map(r => `${r.section}/${r.title}`)).toEqual(['/six', '/one', 'probe:desk/three', 'me:alpha/four', 'me:renders/five', 'me:renders/two'])
+  expect(sectionHeaders(g)).toEqual([null, null, 'Desk', 'Alpha', 'Renders', null])
+  // Only one group with rows: no headers at all, so a project that uses no sections looks as it always did
+  expect(sectionHeaders(groupRows(rows.slice(0, 1), VIEW))).toEqual([null])
+  expect(sectionHeaders(groupRows([rows[1], rows[4]] as any, VIEW))).toEqual([null, null])
+  // Everything in sections: every section gets its header
+  expect(sectionHeaders(groupRows([rows[1], rows[2]] as any, VIEW))).toEqual(['Desk', 'Renders'])
+  // No sections at all: the usual order
+  expect(groupRows(rows, { sections: [], members: {} }).map(r => r.title)).toEqual(sortRows(rows).map(r => r.title))
+})
+
+test('sections: while focused nothing moves, sections included; new rows go at the end; on leaving, the layout applies', () => {
+  const before = groupRows([row('aaaaaaaa', 'green', 'one'), row('bbbbbbbb', 'green', 'two')], { sections: [], members: {} })
+  // b turned red (it would go first) and was put in a section meanwhile; c is new
+  const now = groupRows([row('aaaaaaaa', 'green', 'one'), row('bbbbbbbb', 'red', 'two'), row('cccccccc', 'green', 'three')], VIEW)
+  const frozen = keepPlaces(now, before, true)
+  expect(frozen.map(r => [r.title, r.section])).toEqual([['one', ''], ['two', ''], ['three', 'probe:desk']])
+  expect(frozen[1]?.color).toBe('red')
+  expect(keepPlaces(now, before, false).map(r => r.title)).toEqual(['one', 'three', 'two'])
+})
+
+test('sections file: its own sectionsFormat, unknown fields kept, a newer one never read as this one', () => {
+  const text = JSON.stringify({ sectionsFormat: 1, later: 'kept', sections: [{ id: 'me:renders', title: 'Renders', order: 100, owner: 'person', color: 'kept' }], members: {} })
+  const parsed = parseSectionsFile(text)
+  if (!('file' in parsed)) throw new Error('should parse')
+  const p = personAssign(parsed.file, 'aaaaaaaa', 'renders')
+  if (!('file' in p)) throw new Error('should assign')
+  const back = JSON.parse(sectionsFileText(p.file))
+  expect(back.later).toBe('kept')
+  expect(back.sections[0].color).toBe('kept')
+  expect(back.members).toEqual({ aaaaaaaa: { section: 'me:renders', by: 'person' } })
+  expect((parseSectionsFile(JSON.stringify({ sectionsFormat: 2 })) as any).problem).toContain('newer sessions')
+  expect((parseSectionsFile('{nope') as any).problem).toContain("isn't valid JSON")
+  expect((parseSectionsFile('{}') as any).problem).toContain('sectionsFormat')
+  // Malformed entries are left out of what's read
+  const view = sectionsView({ sectionsFormat: 1, sections: [{ id: 'x' }, { id: 'me:a', title: 'A' }, { id: 'me:a', title: 'again' }], members: { r: { section: 1 }, s: { section: 'me:a', by: 'person' } } })
+  expect(view).toEqual({ sections: [{ id: 'me:a', title: 'A', order: 200, owner: 'person' }], members: { s: { section: 'me:a', by: 'person' } } })
+})
+
+test("sections: the person's own are made by title and go when the last session leaves them", () => {
+  const a = personAssign(emptySectionsFile(), 'aaaaaaaa', ' Big  renders! ')
+  if (!('file' in a)) throw new Error('should assign')
+  expect(a.section).toEqual({ id: 'me:big-renders', title: 'Big renders!', order: 100, owner: 'person' })
+  // The same title another way finds the same section, and keeps its first title
+  const b = personAssign(a.file, 'bbbbbbbb', 'BIG RENDERS')
+  if (!('file' in b)) throw new Error('should assign')
+  expect(sectionsView(b.file).sections).toHaveLength(1)
+  expect(b.section?.title).toBe('Big renders!')
+  const c = personAssign(b.file, 'aaaaaaaa', null)
+  const d = 'file' in c ? personAssign(c.file, 'bbbbbbbb', null) : c
+  expect('file' in d && sectionsView(d.file)).toEqual({ sections: [], members: {} })
+  expect((personAssign(emptySectionsFile(), 'aaaaaaaa', '!!!') as any).problem).toBeDefined()
+  expect(slugOf('Árbol de Renders')).toBe('arbol-de-renders')
+  // Members of sessions that are gone go, and so do the person's sections they leave empty
+  const pruned = pruneMembers(b.file, ref => ref === 'zzzzzzzz')
+  expect(sectionsView(pruned)).toEqual({ sections: [], members: {} })
 })

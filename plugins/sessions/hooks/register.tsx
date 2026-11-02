@@ -1,10 +1,40 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Color, PaneNote, Renaming, Row, Usage, UsageView } from '../types'
+import type {
+  Color,
+  PaneNote,
+  Renaming,
+  Row,
+  Sessions,
+  SessionsApi,
+  SessionsMethod,
+  SessionsResult,
+  SessionsStatus,
+  Usage,
+  UsageView,
+} from '../types'
 
 import {
   abbreviate,
+  agentFromTranscript,
+  assignChange,
+  emptySectionsFile,
+  groupRows,
+  keepPlaces,
+  NO_SECTIONS,
+  parseSectionsFile,
+  personAssign,
+  pruneMembers,
+  refOf,
+  sectionHeaders,
+  sectionsFileText,
+  sectionsView,
+  setMember,
+  checkSectionSpec,
+  upsertSection,
+  type SectionsFile,
+  type SectionsView,
   type Action,
   actionFromAnswer,
   reconcilePins,
@@ -96,6 +126,16 @@ let daemonLog = ''
 const PLUGIN_DIR = `${(import.meta as any).dir}/..`
 let modVersion = ''
 let lastList: any[] = []
+// When the official list was last read (0: not yet), and this project's rows as the last refresh built them, before
+// any layout (what $.sessions answers from)
+let listedAt = 0
+let projectRows: Row[] = []
+// The sections (sections.json) as the last refresh read them, and why they couldn't be read (shown as the notice)
+let sectionsNow: SectionsView = NO_SECTIONS
+let sectionsProblem = ''
+// The agent this session runs as (`claude --agent`), read once per session id from its transcript (agentFor)
+let myAgent: string | null = null
+let agentFor = ''
 // The row selected with the arrows (the session button's key, "s:<sessionId>") and the element that has the focus now
 let selectedRow: string | undefined
 let currentFocus: string | undefined
@@ -190,7 +230,8 @@ function debugLine($: any, text: string) {
 }
 
 // Data shared between sessions: the mod's official store ($.store), a JSON file managed by Claude. Keys:
-// state:<id> (SessionState), seen:<id> (seen at), title:<id> (title from the first prompt), waiting:<id> (waiting since),
+// state:<id> (SessionState: what each session publishes about itself), seen:<id> (seen at), title:<id> (title from the
+// first prompt), waiting:<id> (waiting since),
 // restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (cached session list),
 // installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
 // autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
@@ -374,6 +415,17 @@ async function prune($: any) {
     for (const k of keys.filter(k => k.endsWith(`:${id}`))) await storeDelete($, k)
     await runSafe($, ['rm', '-f', `${dataDir}/alive/${id}`, `${dataDir}/inbox/${id}`])
   }
+  // Section members of sessions no longer in the list (a regular one's stays while its heartbeat is fresh)
+  const sections = await readSectionsFile($)
+  if ('problem' in sections) return
+  const refs = new Set(list.map(refOf))
+  const sids = Object.keys(sections.file.members).filter(r => r.startsWith('sid:') && !refs.has(r))
+  const sidBeats = await readHeartbeats($, sids.map(r => r.slice(4)))
+  const keep = (ref: string) => {
+    const h = ref.startsWith('sid:') ? sidBeats[ref.slice(4)] : undefined
+    return refs.has(ref) || (!!h && now - h.at < 120000)
+  }
+  if (Object.keys(sections.file.members).some(r => !keep(r))) await changeSections($, file => ({ file: pruneMembers(file, keep) }))
 }
 
 // The version of a session whose own mod doesn't record it (no mod, or one that never started): the program its
@@ -475,19 +527,19 @@ async function pinsFromFile($: any): Promise<string[] | null> {
   }
 }
 
-// The same lock Claude takes to change pins.json: a pins.json.lock folder. If it was left behind by a process that got
-// cut off, after 5 s it's considered stale and removed (as Claude does). If it can't be taken within about 2 s, this
-// pass does nothing
-async function withLock($: any, file: string, body: () => Promise<void>) {
+// The same lock Claude takes to change pins.json: a pins.json.lock folder (sections.json uses one the same way). If it
+// was left behind by a process that got cut off, after 5 s it's considered stale and removed (as Claude does). If it
+// can't be taken within about 2 s (tries × 50 ms), this pass does nothing: false
+async function withLock($: any, file: string, body: () => Promise<void>, tries = 40): Promise<boolean> {
   const lock = `${file}.lock`
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < tries; i++) {
     if ((await runSafe($, ['mkdir', lock])).exitCode === 0) {
       try {
         await body()
       } finally {
         await runSafe($, ['rmdir', lock])
       }
-      return
+      return true
     }
     try {
       const st = await $.fs.stat(lock)
@@ -495,6 +547,70 @@ async function withLock($: any, file: string, body: () => Promise<void>) {
     } catch {}
     await $.clock.sleep(50)
   }
+  return false
+}
+
+// The mod's data folder, also before the mod has started here (another plugin can call $.sessions first): worked out
+// from the environment each time until the start sets it
+async function dataFolder($: any): Promise<string> {
+  if (dataDir) return dataDir
+  const h = (await $.env.get('HOME')) ?? ''
+  return (await $.env.get('SESSIONS_DATA_DIR')) || (h ? `${h}/.claude/mods/sessions-data` : '')
+}
+
+// sections.json (see SECTIONS_FORMAT in state.ts): missing is empty; one that can't be read, or from a newer sessions,
+// is a problem and is never rewritten
+async function readSectionsFile($: any): Promise<{ file: SectionsFile } | { problem: string }> {
+  const dir = await dataFolder($)
+  if (!dir) return { file: emptySectionsFile() }
+  const path = `${dir}/sections.json`
+  if (!(await exists($, path))) return { file: emptySectionsFile() }
+  try {
+    return parseSectionsFile(await $.fs.read(path))
+  } catch {
+    return { problem: "Couldn't read sections.json" }
+  }
+}
+
+// Changes sections.json under its lock, written whole to a separate file that then replaces it. change answers the new
+// file, or the answer to give without writing. Another plugin's call waits for the lock briefly (tries) and answers busy
+async function changeSections(
+  $: any,
+  change: (file: SectionsFile) => { file: SectionsFile } | { result: SessionsResult },
+  tries = 40,
+): Promise<SessionsResult> {
+  const dir = await dataFolder($)
+  if (!dir) return { ok: false, reason: 'not-ready', detail: 'no home folder to keep sections in' }
+  const path = `${dir}/sections.json`
+  let result: SessionsResult = { ok: false, reason: 'busy', detail: 'another session is changing sections.json: try again' }
+  await runSafe($, ['mkdir', '-p', dir])
+  await withLock(
+    $,
+    path,
+    async () => {
+      const current = await readSectionsFile($)
+      if ('problem' in current) {
+        result = { ok: false, reason: 'refused', detail: current.problem }
+        return
+      }
+      const next = change(current.file)
+      if ('result' in next) {
+        result = next.result
+        return
+      }
+      const temporary = `${path}.sessions-${myPid || 'mod'}-${await $.clock.now()}.tmp`
+      await $.fs.write(temporary, sectionsFileText(next.file))
+      if ((await runSafe($, ['mv', '-f', temporary, path])).exitCode !== 0) {
+        await runSafe($, ['rm', '-f', temporary])
+        result = { ok: false, reason: 'busy', detail: "couldn't write sections.json: try again" }
+        return
+      }
+      sectionsNow = sectionsView(next.file)
+      result = { ok: true }
+    },
+    tries,
+  )
+  return result
 }
 
 // Whether a background session has Remote Control: the service records its connection in the session's state
@@ -623,6 +739,7 @@ async function refresh($: any) {
     return
   }
   lastList = list
+  listedAt = await $.clock.now()
   const own = list.find(s => s.sessionId === myId)
   if (own?.pid) myPid = own.pid
   await followFolder($)
@@ -673,6 +790,9 @@ async function refresh($: any) {
       noPanel: !current && color !== 'gray' && hb === 'missing' && expectsHeartbeat(s, plugin, now),
       otherFormat: !current && color !== 'gray' && hb === 'other-format',
       reachable: current || (color !== 'gray' && hb === 'ok'),
+      ref: refOf(s),
+      section: '',
+      sectionTitle: '',
     })
   }
   installedVersion = newest
@@ -683,32 +803,34 @@ async function refresh($: any) {
     const mod = f.current ? modVersion : (beats[f.sessionId]?.version ?? '')
     f.outdated = (!!v && compareVersions(v, installedVersion) < 0) || (!!mod && !!modInstalled && compareVersions(mod, modInstalled) < 0)
   }
-  const sorted = sortRows(fresh)
-  await writeOrder($, sorted, now)
-  // Claude tracks the panel's focus by position, not by session: if rows move while you're in the panel, the highlight
-  // would jump to another session. With the keyboard in the panel the rows stay in place (new ones go at the end); on
-  // leaving they're sorted again. If one left the list, the focus goes back to its session (or the one next to it)
-  const focused = !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
-  const before = (await read($, rows)).map(f => f.sessionId)
-  const shown = focused
-    ? [...sorted].sort((a, b) => {
-        const place = (f: Row) => {
-          const i = before.indexOf(f.sessionId)
-          return i < 0 ? Number.MAX_SAFE_INTEGER : i
-        }
-        return place(a) - place(b)
-      })
-    : sorted
+  // The launcher opens the first row of the project's order: waiting, done, working, idle, whatever the sections
+  await writeOrder($, fresh, now)
+  projectRows = fresh
+  const sections = await readSectionsFile($)
+  sectionsNow = 'problem' in sections ? NO_SECTIONS : sectionsView(sections.file)
+  sectionsProblem = 'problem' in sections ? sections.problem : ''
+  await layout($, !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused)
+  await update($, notice, () => sectionsProblem)
+  await paneState($)
+  await adjustWidth($)
+  await prune($)
+}
+
+// The rows as the panel shows them: grouped in sections (groupRows). Claude tracks the panel's focus by position, not by
+// session: if rows move while you're in the panel, the highlight would jump to another session. So with the keyboard in
+// the panel nothing moves, sections and their members included (keepPlaces: new rows go at the end); on leaving, the
+// layout is applied. reflow: the person asked for a new layout right now. If a row left the list, the focus goes back to
+// its session (or the one next to it)
+async function layout($: any, focused: boolean, reflow = false) {
+  const shownBefore = await read($, rows)
+  const shown = keepPlaces(groupRows(projectRows, sectionsNow), shownBefore, focused && !reflow)
   await update($, rows, () => shown)
+  const before = shownBefore.map(f => f.sessionId)
   const after = shown.map(f => f.sessionId)
   if (focused && currentFocus?.startsWith('s:') && before.some(id => !after.includes(id))) {
     const id = currentFocus.slice(2)
     bg(focusSession($, after.includes(id) ? id : remainingNeighbor(before, id, after)))
   }
-  await update($, notice, () => '')
-  await paneState($)
-  await adjustWidth($)
-  await prune($)
 }
 
 // The panel stays closed once you close it yourself (its close mark or key, or /sessions): what you chose wins over
@@ -1378,7 +1500,20 @@ function truncate(text: string, width: number): string {
   return chars.length <= width ? text : `${chars.slice(0, Math.max(1, width - 1)).join('')}…`
 }
 
-// Each session publishes its model and the % of context used (the same as the status line), only if they changed
+// The agent this session runs as: the first row of its transcript (agentFromTranscript), which lives in
+// ~/.claude/projects/<folder>/<sessionId>.jsonl. Only its start is read. Once per session id (again after /clear); until
+// the transcript exists, on every beat
+async function readAgent($: any) {
+  if (!myId || !home || agentFor === myId) return
+  const script = 'for f in "$1"/*/"$2".jsonl; do if [ -f "$f" ]; then head -c 4096 "$f"; exit 0; fi; done; exit 1'
+  const r = await runSafe($, ['/bin/sh', '-c', script, 'sh', `${home}/.claude/projects`, myId])
+  if (r.exitCode !== 0) return
+  agentFor = myId
+  myAgent = agentFromTranscript(r.stdout)
+}
+
+// Each session publishes its model and the % of context used (the same as the status line), the agent it runs as and
+// its project root, only if they changed
 async function publishUsage($: any) {
   let model = ''
   let context: number | undefined
@@ -1390,9 +1525,11 @@ async function publishUsage($: any) {
   } catch {
     return
   }
+  const agent = agentFor === myId ? myAgent : undefined
+  const root = myCwd
   const previous = (await readState($, myId)) ?? {}
-  if (previous.model === model && previous.context === context && previous.version === version) return
-  await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? (await $.clock.now()), model, context, version })
+  if (previous.model === model && previous.context === context && previous.version === version && previous.agent === agent && previous.root === root) return
+  await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? (await $.clock.now()), model, context, version, agent, root })
 }
 
 // After restarting with u from its own panel, the notice is shown when the window reconnects: at startup nobody is
@@ -1485,6 +1622,11 @@ async function rebind($: any) {
   if (seen && !(await storeGet($, `seen:${id}`))) await storeSet($, `seen:${id}`, seen)
   for (const k of ['state', 'seen', 'title', 'waiting', 'restarted']) await storeDelete($, `${k}:${old}`)
   await runSafe($, ['rm', '-f', `${dataDir}/alive/${old}`, `${dataDir}/inbox/${old}`])
+  // A regular session is named by its session id in sections.json (sid:<id>): its section moves to the new id. A
+  // background one keeps its short id, and its section
+  const sections = await readSectionsFile($)
+  const member = 'problem' in sections ? undefined : sectionsView(sections.file).members[`sid:${old}`]
+  if (member) await changeSections($, file => ({ file: setMember(setMember(file, `sid:${old}`, null), `sid:${id}`, member) }))
   try {
     await beat($)
   } catch {}
@@ -1561,9 +1703,152 @@ async function statusText($: any): Promise<string> {
     `Session: ${myId} · project: ${myCwd}`,
     `Heartbeat: ${lastBeat ? `written ${ago(lastBeat)}` : 'not written'} (${dataDir}/alive)`,
     silent.length ? `No panel running in: ${silent.join(', ')}` : 'Every session of the project that should run a panel does',
+    `For other plugins: $.sessions api ${SESSIONS_API} · ${Object.keys(METHODS).join(', ')} (${ready() ? 'ready' : 'not ready yet'})`,
+    sectionsProblem ? `Sections: ${sectionsProblem}` : `Sections: ${sectionsNow.sections.length} (${dataDir}/sections.json)${myAgent ? ` · runs as agent ${myAgent}` : ''}`,
   ]
   if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)
   return lines.join('\n')
+}
+
+// /sessions section <title>: puts this session in a section of the person's (made if needed); "-" takes it out; nothing,
+// says which one it's in. The person's choice wins over any plugin's
+async function sectionCommand($: any, title: string): Promise<string> {
+  const own = lastList.find(s => s.sessionId === myId)
+  if (!active || !own) return "The panel hasn't read the session list yet: try again in a few seconds"
+  const ref = refOf(own)
+  if (!title) {
+    const m = sectionsNow.members[ref]
+    const s = m && sectionsNow.sections.find(x => x.id === m.section)
+    return `${s ? `This session is in “${s.title}”${m.by === 'person' ? '' : ` (put there by ${m.by})`}` : "This session isn't in a section"}. /sessions section <title> puts it in one of yours, /sessions section - takes it out, /sessions sections lists them`
+  }
+  let said = ''
+  const r = await changeSections($, file => {
+    const p = personAssign(file, ref, title === '-' ? null : title)
+    if ('problem' in p) {
+      said = p.problem
+      return { result: { ok: false, reason: 'invalid', detail: p.problem } }
+    }
+    said = p.section ? `This session is in “${p.section.title}” now` : 'This session is in no section now'
+    return { file: p.file }
+  })
+  if (!r.ok) return r.reason === 'busy' ? 'Another session is changing the sections: try again' : (r.detail ?? said)
+  bg(refresh($))
+  return said
+}
+
+// /sessions sections: every section, who made it and how many sessions it holds (in any project)
+async function sectionsList($: any): Promise<string> {
+  const file = await readSectionsFile($)
+  if ('problem' in file) return file.problem
+  const view = sectionsView(file.file)
+  const own = lastList.find(s => s.sessionId === myId)
+  const mine = own ? view.members[refOf(own)] : undefined
+  const count = (id: string) => Object.values(view.members).filter(m => m.section === id).length
+  const lines = [...view.sections]
+    .sort((a, b) => a.order - b.order || a.title.localeCompare(b.title))
+    .map(s => `${s.id === mine?.section ? '▌' : ' '} ${s.title} · ${count(s.id) === 1 ? '1 session' : `${count(s.id)} sessions`}${s.owner === 'person' ? '' : ` (${s.owner})`}`)
+  return [lines.length ? 'Sections:' : 'No sections yet.', ...lines, '/sessions section <title> puts this session in one of yours (made if needed); /sessions section - takes it out'].join('\n')
+}
+
+// ---- $.sessions: what other plugins call (types/index.d.ts, docs/plugin-contract.md) ----
+// Each method takes one plain-data argument and answers from memory or from sections.json. A method's calls run in the
+// calling plugin's hook (Claude lends it that hook's context), so none submits a prompt, asks or moves the focus, every
+// path is absolute and every command runs from a folder that exists (runSafe). They work before the mod has started
+// here: current and status answer ready: false, and the section methods find the data folder from the environment
+const SESSIONS_API: SessionsApi = 1
+// The methods this copy serves: a key missing from Sessions, or one too many, fails the type check
+const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1 } satisfies Record<SessionsMethod, 1>
+// How long another plugin's call waits for the sections lock before answering busy (6 × 50 ms)
+const CALL_LOCK_TRIES = 6
+
+function ready(): boolean {
+  return active && !!myId && listedAt > 0
+}
+
+let versionRead = ''
+async function ownVersion($: any): Promise<string> {
+  if (modVersion) return modVersion
+  if (!versionRead) {
+    try {
+      versionRead = String(JSON.parse(await $.fs.read(`${PLUGIN_DIR}/.claude-plugin/plugin.json`))?.version ?? '')
+    } catch {}
+  }
+  return versionRead
+}
+
+// A session of the official list as another plugin sees it
+async function statusOf($: any, s: any, now: number): Promise<SessionsStatus> {
+  const e = await readState($, s.sessionId)
+  const mine = s.sessionId === myId
+  const hb = mine ? 'ok' : s.pid ? heartbeatStatus((await readHeartbeats($, [s.sessionId]))[s.sessionId] ?? null, s.pid, now) : 'missing'
+  const shown = projectRows.find(f => f.sessionId === s.sessionId)?.title
+  return {
+    ref: refOf(s),
+    sessionId: s.sessionId,
+    name: shown ?? (typeof s.name === 'string' && s.name ? s.name : null),
+    state: s.status === 'busy' ? 'working' : s.status === 'waiting' ? 'waiting' : s.status === 'idle' ? 'idle' : 'stopped',
+    panel: hb === 'ok' ? 'ok' : hb === 'other-format' ? 'other-format' : 'none',
+    root: mine ? myCwd : typeof e?.root === 'string' ? e.root : null,
+    background: s.kind === 'background',
+    agent: mine ? (agentFor === myId ? myAgent : null) : typeof e?.agent === 'string' ? e.agent : null,
+  }
+}
+
+function sessionsApi($: any): Sessions {
+  return {
+    contract: async () => ({ api: SESSIONS_API, version: await ownVersion($), format: FORMAT, methods: Object.keys(METHODS) as SessionsMethod[] }),
+    current: async () => {
+      const own = ready() ? lastList.find(s => s.sessionId === myId) : undefined
+      return {
+        ready: ready(),
+        ref: own ? refOf(own) : null,
+        sessionId: myId,
+        name: projectRows.find(f => f.current)?.title ?? String(own?.name ?? ''),
+        root: myCwd,
+        background: own?.kind === 'background',
+        agent: agentFor === myId ? myAgent : null,
+      }
+    },
+    status: async input => {
+      if (!ready()) return { ready: false, rows: [] }
+      const strings = (x: unknown) => (Array.isArray(x) ? x.filter((v): v is string => typeof v === 'string').slice(0, 200) : [])
+      const now = await $.clock.now()
+      const out: SessionsStatus[] = []
+      const done = new Set<string>()
+      for (const ref of strings(input?.refs)) {
+        const s = lastList.find(x => refOf(x) === ref)
+        if (done.has(s?.sessionId ?? `gone:${ref}`)) continue
+        done.add(s?.sessionId ?? `gone:${ref}`)
+        out.push(s ? await statusOf($, s, now) : { ref, sessionId: null, name: null, state: 'gone', panel: 'none', root: null, background: false, agent: null })
+      }
+      for (const name of strings(input?.names)) {
+        for (const s of lastList.filter(x => x.name === name && !done.has(x.sessionId))) {
+          done.add(s.sessionId)
+          out.push(await statusOf($, s, now))
+        }
+      }
+      return { ready: true, rows: out }
+    },
+    sections: async () => {
+      const file = await readSectionsFile($)
+      if ('problem' in file) throw new Error(file.problem)
+      return sectionsView(file.file)
+    },
+    defineSection: async input => {
+      const v = checkSectionSpec(input?.source, input?.spec)
+      if (!v.ok) return v
+      return changeSections(
+        $,
+        file => {
+          const s = sectionsView(file).sections.find(x => x.id === v.section.id)
+          if (s && s.title === v.section.title && s.order === v.section.order && s.owner === v.section.owner) return { result: { ok: true } }
+          return { file: upsertSection(file, v.section) }
+        },
+        CALL_LOCK_TRIES,
+      )
+    },
+    assignSection: async input => changeSections($, file => assignChange(file, input?.source, input?.ref, input?.section), CALL_LOCK_TRIES),
+  }
 }
 
 // Starts the mod in this session, once (see `starting`). The steps that can fail go one by one, each on its own, so one
@@ -1656,6 +1941,7 @@ async function start($: any) {
       void (async () => {
         await rebind($)
         await beat($).catch(() => {})
+        await readAgent($)
         await publishUsage($)
         await updateInPlace($)
       })().catch(() => {})
@@ -1670,7 +1956,7 @@ async function start($: any) {
     active = true
     bg(refresh($))
     void recordTitle($).catch(() => {})
-    bg(publishUsage($))
+    bg(readAgent($).then(() => publishUsage($)))
     bg(pinRemoteSessions($))
   })
   await step('panel', async () => {
@@ -1683,8 +1969,9 @@ async function start($: any) {
   await step('command', () =>
     $.command.register({
       name: 'sessions',
-      description: 'Sessions panel: open, focus or close. /sessions status: is the mod running here. /sessions setup: status line, shortcuts and the ccc command',
-      argumentHint: '[status | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
+      description:
+        'Sessions panel: open, focus or close. /sessions section <title>: put this session in a section (- takes it out); /sessions sections: list them. /sessions status: is the mod running here. /sessions setup: status line, shortcuts and the ccc command',
+      argumentHint: '[section <title> | section - | sections | status | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
       immediate: true,
     }),
   )
@@ -1692,6 +1979,27 @@ async function start($: any) {
 
 export const register: Register = (on, options) => {
   debugLogs = options?.debugLogs === true
+  // $.sessions for other plugins (sessionsApi). Nothing else happens here: a throw at this step unloads the whole mod.
+  // Claude doesn't let the $ built here be handed to a function, so the methods get the few calls they make (files,
+  // commands, the clock, the environment, the store) through closures over it
+  on('engine.create', async (_, e, next) => {
+    const $ = await next(e)
+    const calls = {
+      // Only what dataFolder reads (Claude wants each variable's name written out)
+      env: { get: (key: string) => (key === 'HOME' ? $.env.get('HOME') : key === 'SESSIONS_DATA_DIR' ? $.env.get('SESSIONS_DATA_DIR') : Promise.resolve(undefined)) },
+      fs: {
+        read: (path: string) => $.fs.read(path),
+        write: (path: string, text: string) => $.fs.write(path, text),
+        exists: (path: string) => $.fs.exists(path),
+        stat: (path: string) => $.fs.stat(path),
+        list: (path: string) => $.fs.list(path),
+      },
+      process: { run: (argv: string[], init?: { stdin?: string; timeoutMs?: number; cwd?: string }) => $.process.run(argv, init) },
+      clock: { now: () => $.clock.now(), sleep: (ms: number) => $.clock.sleep(ms) },
+      store: { get: (key: string) => $.store.get(key) },
+    }
+    return { ...$, sessions: sessionsApi(calls) }
+  })
   // In a non-interactive run (claude -p) the mod does nothing. The start isn't awaited before next(e): a step that hangs
   // mustn't hold the session up
   on('session.start', async ($, e, next) => {
@@ -1800,6 +2108,8 @@ export const register: Register = (on, options) => {
       .split(/\s+/)
       .filter(Boolean)
     if (words[0] === 'status') return { text: await statusText($) }
+    if (words[0] === 'section') return { text: await sectionCommand($, words.slice(1).join(' ')) }
+    if (words[0] === 'sections') return { text: await sectionsList($) }
     if (words[0] === 'setup') {
       const allowed = /^--(dry-run|force-statusline|macos-launcher|statusline|keys|alias|all|help|shell=(bash|zsh|fish))$/
       const bad = words.slice(1).filter(w => !allowed.test(w))
@@ -1945,7 +2255,10 @@ export const register: Register = (on, options) => {
       }
     }
     const marks = list.some(f => f.noPanel || f.otherFormat)
-    const overflows = list.length + 6 + (note !== '' ? 1 : 0) > height
+    // A section's title above its first row, when two or more groups have rows: plain Text, which the focus ring skips
+    const headers = sectionHeaders(list)
+    const lines = list.length + headers.filter(h => h !== null).length
+    const overflows = lines + 6 + (note !== '' ? 1 : 0) > height
     // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
     // and a flexible spacer pushes the block down
@@ -1956,7 +2269,7 @@ export const register: Register = (on, options) => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      list.length + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + 5 <= room
+      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + 5 <= room
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
     // Columns: [▌][● ][name…][↑][◆][ model  ctx  time]; in narrow panels the model is left out
     // Rows use only the width they need: in the box above the prompt (small windows or not fullscreen) the panel takes
@@ -1996,11 +2309,14 @@ export const register: Register = (on, options) => {
         <Text> </Text>
         {note !== '' && <Text color="warning">{note}</Text>}
         {list.length === 0 && <Text dimColor>No other sessions in this folder.</Text>}
-        {list.map(f => {
+        {list.flatMap((f, i) => {
+          const header = headers[i]
+          const title = header ? [<Text key={`h:${f.section}`} dimColor>{` ${truncate(header, total - 1)}`}</Text>] : []
           // The session you're in: the theme's soft background and a bar in Claude's color. It's selected with the
           // arrows like the others (for u and r, even if it's the only one in the list); Enter there doesn't jump anywhere
           if (f.current) {
-            return (
+            return [
+              ...title,
               <Box key={`row:${f.sessionId}`} flexDirection="row" backgroundColor="userMessageBackground">
                 <Text color="claude">▌</Text>
                 <Text color={TINT[f.color]}>●</Text>
@@ -2019,10 +2335,11 @@ export const register: Register = (on, options) => {
                 {mark(f)}
                 <Text>{f.pinned ? '◆' : ' '}</Text>
                 <Text dimColor>{padRight(info(f), total - 4 - nameWidth).slice(1)}</Text>
-              </Box>
-            )
+              </Box>,
+            ]
           }
-          return (
+          return [
+            ...title,
             <Box key={`row:${f.sessionId}`} flexDirection="row">
               <Text> </Text>
               <Text color={TINT[f.color]}>●</Text>
@@ -2042,8 +2359,8 @@ export const register: Register = (on, options) => {
               {mark(f)}
               <Text>{f.pinned ? '◆' : ' '}</Text>
               <Text dimColor>{info(f).slice(1)}</Text>
-            </Box>
-          )
+            </Box>,
+          ]
         })}
         {/* The New and Rename fields go below the rows: above them, opening or closing shifted the rows by one, and since
             Claude tracks the focus by position, what you typed landed on another row or the focus ended up on d: Day */}
