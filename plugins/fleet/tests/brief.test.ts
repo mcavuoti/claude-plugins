@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { checkResource, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, preAnswer, resourceDelivery } from '../hooks/authority'
-import { briefText, chiefLines, type BriefFacts } from '../hooks/brief'
+import { briefText, chiefLines, closedLine, type BriefFacts } from '../hooks/brief'
 import { globList, type ChangeEvent } from '../hooks/changes'
 import { cadenceOf, freshDue, handoffText, hoursText, instancesOf, journalTail, lintRoster } from '../hooks/roster'
 
@@ -96,6 +96,7 @@ test('the brief: the five sections in order, provenance, levels, the window; and
     needs: [{ id: 'D-2', kind: 'outbound', what: 'curl sending data to example.invalid', who: 'Owner B', at: NOW - HOUR }],
     waiting: 1,
     events: [ev('notes/a.md', NOW - 2 * HOUR), ev('notes/a.md', NOW - HOUR, { outside: true }), ev('req/R-1.md', NOW - 3 * HOUR, { via: 'answer', by: { ...by('x'), person: true } }), ev('proposals/P-1.md', NOW - HOUR), ev('notes/old.md', NOW - 25 * HOUR)],
+    closed: [],
     levelOf: p => (p.startsWith('req/') ? 'command' : p.startsWith('proposals/') ? 'proposal' : 'owner'),
     blocked: { blocks: [], suspects: [{ line: 'board/B-7.md (B-7) cites R-1@1, and R-1 is at v2', who: 'Owner B' }], failing: [], cadence: [{ name: 'Owner C', hours: 7, cadenceH: 6 }], noFleet: ['Tester'], down: [], stale: [] },
     spend: { project: { usd: 1.5, cap: 20 }, instances: [{ name: 'Owner B', usd: 1.5, cap: 2, state: 'ok' }], forecast: { caps: 10, wakesUsd: 0.4 }, windows: [{ kind: 'seven_day', percentUsed: 12 }] },
@@ -117,4 +118,12 @@ test('the brief: the five sections in order, provenance, levels, the window; and
   expect(briefText(facts, ['Send D-2 first.'])).toContain("The chief's notes:\n   Send D-2 first.")
   const empty = briefText({ ...facts, needs: [], waiting: 0, events: [], blocked: { blocks: [], suspects: [], failing: [], cadence: [], noFleet: [], down: [], stale: [] }, spend: { project: null, instances: [], forecast: null, windows: [] } })
   expect(empty).toContain('1. Nothing needs you.\n\n2. No shared file changed.\n\n3. Nothing is blocked or stale.\n\n4. Spend: no roster, and no window reading yet\n\n5. No new inputs or ideas.')
+  // What was carried out: a change applied (as filed, or by his apply), an outbound sent
+  const applied = closedLine({ id: 'D-7', kind: 'change', change: { path: '.claude/fleet/charter.md', summary: 'scope' }, answers: [{ label: 'applied', pre: true, session: 'TEST B' }] }, 'TEST B')
+  expect(applied).toBe('.claude/fleet/charter.md: D-7 applied as filed: the person typed it to TEST B in TEST B ("scope")')
+  const sent = closedLine({ id: 'D-1', kind: 'outbound', outbound: { what: 'curl sending data', to: 'example.invalid' }, answers: [{ label: 'sent', text: 'it failed (exit 6)' }] }, 'TEST A')
+  expect(sent).toBe('went out: curl sending data to example.invalid, D-1 sent by fleet as the person approved (it failed (exit 6))')
+  expect(closedLine({ id: 'D-3', kind: 'outbound', outbound: { what: 'scp', to: 'x' }, answers: [{ label: 'rejected' }] }, 'TEST A')).toBe(null)
+  const both = briefText({ ...facts, closed: [{ id: 'D-7', at: NOW - HOUR, line: applied as string }, { id: 'D-1', at: NOW - 2 * HOUR, line: sent as string }] })
+  expect(both).toContain('2. What changed: 2 shared files, 2 decisions carried out\n   - .claude/fleet/charter.md: D-7 applied as filed')
 })

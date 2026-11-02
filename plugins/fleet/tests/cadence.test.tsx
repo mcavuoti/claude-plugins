@@ -139,7 +139,7 @@ test('the sweeper marks an instance quiet past its cadence and wakes a retired o
   await run(8)
   const marks = calls(w, 'setMarks')
   expect(marks.length).toBeGreaterThan(0)
-  expect(marks[marks.length - 1].rows.aaaaaaa1).toEqual({ badge: '◷', tint: 'warning', line: 'nothing landed in 3 h (its cadence is 2 h)' })
+  expect(marks[marks.length - 1].rows.aaaaaaa1).toEqual({ badge: '◷', tint: 'warning', line: 'nothing landed in 3 h (cadence 2 h)' })
   expect(calls(w, 'wake')).toEqual([{ ref: 'ccccccc1', reason: 'fleet: nothing landed in its cadence period' }])
   await run(8)
   expect(calls(w, 'wake').length).toBe(1)

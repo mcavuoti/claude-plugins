@@ -19,6 +19,8 @@ export type BriefFacts = {
   waiting: number
   /** The landings of the window, any order (the newest per file is shown) */
   events: ChangeEvent[]
+  /** The decisions closed in the window that changed something or sent something: a change applied, an outbound sent */
+  closed: { id: string; at: number; line: string }[]
   levelOf: (path: string) => Level
   blocked: {
     blocks: { id: string; who: string; at: number; blocks: string }[]
@@ -79,7 +81,10 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   if (f.waiting) out.push(`   ${f.waiting} answered, not delivered yet`)
   // 2. What changed, and who changed it
   const shared = newestPerFile(f.events, f).filter(e => !['information', 'proposal'].includes(f.levelOf(e.path)))
-  out.push('', shared.length ? `2. What changed: ${shared.length} shared file${shared.length === 1 ? '' : 's'}` : '2. No shared file changed.')
+  const closed = [...f.closed].filter(c => c.at >= f.since).sort((a, b) => b.at - a.at)
+  const counts = [shared.length ? `${shared.length} shared file${shared.length === 1 ? '' : 's'}` : '', closed.length ? `${closed.length} decision${closed.length === 1 ? '' : 's'} carried out` : ''].filter(Boolean)
+  out.push('', counts.length ? `2. What changed: ${counts.join(', ')}` : '2. No shared file changed.')
+  for (const c of closed.slice(0, SHOWN)) out.push(`   - ${c.line}`)
   for (const e of shared.slice(0, SHOWN)) out.push(eventLine(e, f))
   if (shared.length > SHOWN) out.push(`   - and ${shared.length - SHOWN} more: /fleet status lists the last changes`)
   // 3. Blocked, stale, suspect, quiet, without fleet
@@ -110,6 +115,21 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   if (ideas.length > SHOWN) out.push(`   - and ${ideas.length - SHOWN} more`)
   if (chief.length) out.push('', "The chief's notes:", ...chief.map(l => `   ${l}`))
   return out.join('\n')
+}
+
+/** A closed decision's line for the brief, when it changed or sent something: a change applied (by the person's apply,
+ * or as filed because he typed the turn), an outbound sent by fleet or by the person himself; null otherwise */
+export function closedLine(r: { id: string; kind?: string; change?: { path: string; summary: string }; outbound?: { what: string; to: string }; answers: ({ label?: string; text?: string; session?: string; pre?: true } | null)[] }, asker: string): string | null {
+  const a = r.answers[0]
+  if (!a) return null
+  if (r.kind === 'change' && r.change && a.label === 'applied') {
+    const how = a.pre ? `as filed: the person typed it to ${asker}${a.session ? ` in ${a.session}` : ''}` : `by the person's apply${a.session ? ` in ${a.session}` : ''}`
+    return `${r.change.path}: ${r.id} applied ${how} ("${r.change.summary}")`
+  }
+  if (r.kind === 'outbound' && r.outbound && (a.label === 'sent' || a.label === 'done')) {
+    return `went out: ${r.outbound.what} to ${r.outbound.to}, ${r.id} ${a.label === 'sent' ? `sent by fleet as the person approved (${a.text ?? 'done'})` : 'sent by the person himself'}`
+  }
+  return null
 }
 
 /** The chief's lines, from its reply: at most five, none empty, each at most 300 characters */

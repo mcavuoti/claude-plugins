@@ -79,7 +79,7 @@ export type AnswerFile = { format: number; id: string; q: number; label?: string
 export type NoteFile = { format: number; id: string; q: number; text: string; origin: string; at: number }
 export type DropFile = { format: number; id: string; why?: string; origin: string; session: string; at: number }
 /** One question's outcome in the register: the option picked or the text typed, and any note */
-export type Outcome = { label?: string; text?: string; note?: string; origin?: string; session?: string; at?: number }
+export type Outcome = { label?: string; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true }
 export type RegisterState = 'delivered' | 'dropped' | 'abandoned' | 'answered' | 'not answered'
 export type RegisterRecord = {
   registerFormat: number

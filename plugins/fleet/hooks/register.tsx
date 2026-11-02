@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { FleetInflight, FleetMark, FleetRead } from '../types'
 import { OUTSIDE_TOOLS, checkResource, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, markWords, preAnswer, resourceDelivery, resourceTicket, type OutsideMark, type ResourceSpec } from './authority'
-import { CHIEF_PROMPT, briefText, chiefLines, type BriefFacts, type BriefNeed } from './brief'
+import { CHIEF_PROMPT, briefText, chiefLines, closedLine, type BriefFacts, type BriefNeed } from './brief'
 import {
   OUTBOUND_FORMAT,
   SEND_DESCRIPTION,
@@ -603,7 +603,7 @@ async function outcomesOf($: any, r: QueueRecord, present: ReadonlySet<string>) 
       if (p && 'value' in p) {
         const a = p.value
         // A choice has a label or a text; a change's answer may have both (applied, and how; stale, and why)
-        o = { ...(a.label !== undefined ? { label: a.label } : { text: a.text ?? '' }), ...(a.label !== undefined && a.text !== undefined ? { text: a.text } : {}), origin: a.origin, session: a.session, at: a.at }
+        o = { ...(a.label !== undefined ? { label: a.label } : { text: a.text ?? '' }), ...(a.label !== undefined && a.text !== undefined ? { text: a.text } : {}), origin: a.origin, session: a.session, at: a.at, ...(a.pre ? { pre: true as const } : {}) }
       } else skew = true
     }
     if (o && present.has(noteName(r.id, q))) {
@@ -3393,8 +3393,11 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   if ('command' in call) {
     const cwd = (await exists($, o.cwd)) ? o.cwd : (root as string)
     const r = await run($, ['/bin/sh', '-c', call.command], { cwd, timeoutMs: 120000 })
-    const out = (r.stdout || r.stderr).trim().split('\n')[0]?.slice(0, 200) ?? ''
-    result = `${r.exitCode === 0 ? 'it ran' : `it failed (exit ${r.exitCode})`}${out ? `: ${out}` : ''}`
+    // What it said: its output's first line when it ran, its error's last line (curl's progress meter comes first)
+    const rows = (s: string) => s.split(/[\r\n]+/).map(x => x.trim()).filter(Boolean)
+    const ok = r.exitCode === 0
+    const out = ((ok ? rows(r.stdout)[0] : rows(r.stderr).pop()) ?? (ok ? rows(r.stderr).pop() : rows(r.stdout).pop()) ?? '').slice(0, 200)
+    result = `${ok ? 'it ran' : `it failed (exit ${r.exitCode})`}${out ? `: ${out}` : ''}`
   } else {
     const parts = mcpParts(call.tool) as { server: string; name: string }
     let res: any
@@ -3600,7 +3603,7 @@ async function rosterTick($: any) {
       if (!fresh && now - (noFleetSince.get(running.ref) ?? now) >= 90000) marks[running.ref] = { badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true }
       else if (isDown) marks[running.ref] = { badge: '↓', tint: 'inactive', line: 'down (/fleet down): s in the panel stops it' }
       else if (b?.state === 'over') marks[running.ref] = { badge: '$', tint: 'error', line: `budget used up (${usd(b.usd)} today): /fleet budget "${inst.name}" +n`, needsPerson: true }
-      else if (fresh && cad?.due) marks[running.ref] = { badge: '◷', tint: 'warning', line: `nothing landed in ${hoursText(cad.hours)} (its cadence is ${hoursText(inst.cadenceH ?? 0)})` }
+      else if (fresh && cad?.due) marks[running.ref] = { badge: '◷', tint: 'warning', line: `nothing landed in ${hoursText(cad.hours)} (cadence ${hoursText(inst.cadenceH ?? 0)})` }
       else if (b?.state === 'warn') marks[running.ref] = { badge: '$', tint: 'warning', line: `budget: ${usd(b.usd)} of ${usd(b.cap ?? budgetCache.project.cap ?? 0)} today` }
       continue
     }
@@ -4235,10 +4238,23 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     needs.push({ id: r.id, kind: r.kind ?? 'choice', what, who, at: r.at, ...(r.blocks ? { blocks: r.blocks } : {}), ...(r.outside ? { outside: markText(r.outside, me.offsetMin) } : {}) })
     if (r.blocks && now - r.at >= HOUR) blocks.push({ id: r.id, who, at: r.at, blocks: r.blocks })
   }
-  // 2 and 5. The landings, by level (world.json)
+  // 2 and 5. The landings, by level (world.json); and the decisions carried out (a change applied, an outbound sent),
+  // from the register of this month and the one before
   const wf = await readWorldFile($)
   const wc = wf && 'world' in wf ? wf.world : null
   const events = worldOn() ? await eventsSince($, since) : []
+  const closed: BriefFacts['closed'] = []
+  for (const m of [monthOf(now), monthBefore(monthOf(now))]) {
+    for (const name of (await names($, dec(`register/${m}`))).filter(n => /^D-\d+\.json$/.test(n)).slice(-500)) {
+      let r: RegisterRecord | null = null
+      try {
+        r = JSON.parse((await readText($, dec(`register/${m}/${name}`))) ?? 'null')
+      } catch {}
+      if (!r || r.closedAt < since || (r.kind !== 'change' && r.kind !== 'outbound')) continue
+      const line = closedLine(r, r.asker?.name || r.asker?.ref || 'a session')
+      if (line) closed.push({ id: r.id, at: r.closedAt, line })
+    }
+  }
   // 3. Suspects, failing checks; the roster's instances: quiet past their cadence, without fleet, down, behind
   if (worldOn()) await loadFlags($)
   const cadence: BriefFacts['blocked']['cadence'] = []
@@ -4280,6 +4296,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     needs,
     waiting,
     events,
+    closed,
     levelOf: p => levelOf(p, wc, insensitive),
     blocked: {
       blocks,
