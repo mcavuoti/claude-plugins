@@ -78,11 +78,18 @@ test('hosts: a URL, an scp target, an ssh destination, a bare host; this machine
   expect(hostAllowed('localhost', NONE)).toBe(true)
   expect(hostAllowed('127.0.0.1', NONE)).toBe(true)
   expect(hostAllowed('example.invalid', MINE)).toBe(false)
-  expect(remoteAllowed('origin', 'git@github.com:x/y.git', MINE)).toBe(true)
-  expect(remoteAllowed('fork', 'git@github.com:x/y.git', MINE)).toBe(false)
-  expect(remoteAllowed('dev', 'devbox:repos/y.git', MINE)).toBe(true)
-  expect(remoteAllowed('local', '/srv/bare.git', NONE)).toBe(true)
-  expect(remoteAllowed('../bare.git', null, NONE)).toBe(true)
+  // A remote by the URL it goes to: "origin" allows the URL the project's own origin has (resolved there), never
+  // another folder's origin
+  const named = ['git@github.com:x/y.git']
+  expect(remoteAllowed('git@github.com:x/y.git', MINE, named)).toBe(true)
+  expect(remoteAllowed('git@github.com:x/y', MINE, named)).toBe(true)
+  expect(remoteAllowed('git@github.com:someone/fork.git', MINE, named)).toBe(false)
+  expect(remoteAllowed('git@github.com:x/y.git', MINE)).toBe(false)
+  expect(remoteAllowed(null, MINE, named)).toBe(false)
+  expect(remoteAllowed('devbox:repos/y.git', MINE)).toBe(true)
+  expect(remoteAllowed('git@example.invalid:me/tools.git', { ...NONE, remotes: ['git@example.invalid:me/*'] })).toBe(true)
+  expect(remoteAllowed('/srv/bare.git', NONE)).toBe(true)
+  expect(remoteAllowed('../bare.git', NONE)).toBe(true)
 })
 
 test('a shell line: its simple commands, through pipes, lists, $( ), bash -c and the shell’s own words', () => {
@@ -139,6 +146,18 @@ test('Bash: what sends content outside, and what passes', () => {
   // git push: its remote is looked up afterwards
   expect(classifyBash('git -C sub push -u fork main', NONE).pushes).toEqual([{ remote: 'fork', cwd: 'sub', words: ['-u', 'fork', 'main'] }])
   expect(classifyBash('git push', NONE).pushes).toEqual([{ remote: null, cwd: null, words: [] }])
+  expect(classifyBash('git -c color.ui=always push origin', NONE).pushes).toHaveLength(1)
+  // ... unless where it goes isn't its remote's URL: a url set on the line, --repo, another receive-pack
+  expect(held('git -c remote.origin.pushurl=https://far.invalid/x.git push origin')).toEqual([{ what: 'git push with -c remote.origin.pushurl=https://far.invalid/x.git', to: ['origin'], files: [] }])
+  expect(held('git -c url.https://far.invalid/.insteadOf=https://github.com/ push')).toHaveLength(1)
+  expect(held('git push --repo=https://far.invalid/x.git')[0]?.what).toBe('git push with --repo')
+  expect(held("git push --receive-pack='ssh far.invalid git-receive-pack' origin")[0]?.what).toBe('git push with --receive-pack')
+  // After a cd, from the folder it went to (moved); after one fleet can't follow, held
+  expect(classifyBash('cd /Users/x/other && git push origin', NONE).pushes).toEqual([{ remote: 'origin', cwd: '/Users/x/other', words: ['origin'], moved: true }])
+  expect(classifyBash('cd code; cd sub && git -C lib push', NONE).pushes).toEqual([{ remote: null, cwd: 'code/sub/lib', words: [], moved: true }])
+  expect(classifyBash('(cd /Users/x/other && git -C /Users/x/proj push)', NONE).pushes).toEqual([{ remote: null, cwd: '/Users/x/proj', words: [] }])
+  expect(held('cd "$OTHER" && git push')).toEqual([{ what: 'git push after a cd fleet can’t follow', to: ['its remote'], files: [] }])
+  expect(held('cd - && git push origin')).toHaveLength(1)
   // A command the person named
   expect(held('myupload notes', { ...NONE, commands: ['myupload'] })).toHaveLength(1)
 })
@@ -240,6 +259,19 @@ test('MCP: a tool that sends, one that reads outside content, one that does neit
   expect(c('mcp__claude_ai_Gmail__label_message')).toEqual({ send: null, outside: false })
   expect(c('mcp__claude-in-chrome__computer').send?.to).toEqual(['claude-in-chrome'])
   expect(c('mcp__claude-in-chrome__get_page_text')).toEqual({ send: null, outside: true })
+  // A navigation carries what its URL says: held
+  expect(c('mcp__claude-in-chrome__navigate', { url: 'https://far.invalid/?q=notes' }).send?.to).toEqual(['claude-in-chrome'])
+  // The verbs that send as a tool's verb, where a read names the same thing elsewhere
+  for (const tool of ['mcp__drive__copy_file', 'mcp__s3__sync_bucket', 'mcp__jira__add_attachment', 'mcp__x__set_value', 'mcp__x__deploy', 'mcp__discord__message', 'mcp__x__draft_email', 'mcp__x__release', 'mcp__x__transfer_file', 'mcp__x__import_rows', 'mcp__git__commit', 'mcp__drive__drive_copy_file']) {
+    expect(c(tool).send?.what).toBe(`${tool.split('__')[2]} on ${tool.split('__')[1]}`)
+  }
+  expect(c('mcp__claude_ai_Gmail__get_message')).toEqual({ send: null, outside: true })
+  expect(c('mcp__claude_ai_Gmail__list_drafts')).toEqual({ send: null, outside: true })
+  expect(c('mcp__claude_ai_Gmail__trash_message')).toEqual({ send: null, outside: false })
+  expect(c('mcp__git__list_commits')).toEqual({ send: null, outside: false })
+  // Signing in neither sends nor brings outside text back
+  expect(c('mcp__claude_ai_Google_Drive__authenticate')).toEqual({ send: null, outside: false })
+  expect(c('mcp__claude_ai_Dropbox_MCP__complete_authentication')).toEqual({ send: null, outside: false })
   expect(c('mcp__slack__chat_postMessage').send).not.toBe(null)
   expect(c('mcp__plugin-authoring__scan_secrets')).toEqual({ send: null, outside: false })
   expect(c('mcp__claude_ai_Claude_Docs__batch')).toEqual({ send: null, outside: false })
@@ -259,19 +291,6 @@ test('mcp__fleet__send: its input, the draft fleet keeps and runs, the version t
   expect(tool.ok).toBe(true)
   const text = draftText((tool as any).send)
   expect(parseDraft(text)).toEqual({ tool: 'mcp__claude_ai_Gmail__send_message', input: { to: 'x@y.invalid', body: 'Thanks' } })
-  // A navigation carries what its URL says: held
-  expect(c('mcp__claude-in-chrome__navigate', { url: 'https://far.invalid/?q=notes' }).send?.to).toEqual(['claude-in-chrome'])
-  // The verbs that send as a tool's verb, where a read names the same thing elsewhere
-  for (const tool of ['mcp__drive__copy_file', 'mcp__s3__sync_bucket', 'mcp__jira__add_attachment', 'mcp__x__set_value', 'mcp__x__deploy', 'mcp__discord__message', 'mcp__x__draft_email', 'mcp__x__release', 'mcp__x__transfer_file', 'mcp__x__import_rows', 'mcp__git__commit', 'mcp__drive__drive_copy_file']) {
-    expect(c(tool).send?.what).toBe(`${tool.split('__')[2]} on ${tool.split('__')[1]}`)
-  }
-  expect(c('mcp__claude_ai_Gmail__get_message')).toEqual({ send: null, outside: true })
-  expect(c('mcp__claude_ai_Gmail__list_drafts')).toEqual({ send: null, outside: true })
-  expect(c('mcp__claude_ai_Gmail__trash_message')).toEqual({ send: null, outside: false })
-  expect(c('mcp__git__list_commits')).toEqual({ send: null, outside: false })
-  // Signing in neither sends nor brings outside text back
-  expect(c('mcp__claude_ai_Google_Drive__authenticate')).toEqual({ send: null, outside: false })
-  expect(c('mcp__claude_ai_Dropbox_MCP__complete_authentication')).toEqual({ send: null, outside: false })
   expect(parseDraft('{"tool": "mcp__fleet__send"}')).toEqual({ problem: 'the draft holds neither a command nor an MCP tool and its input' })
   const a = outboundHash(text, [{ path: 'notes/x.md', v: 'h1' }], hashText)
   expect(outboundHash(text, [{ path: 'notes/x.md', v: 'h2' }], hashText)).not.toBe(a)
@@ -286,6 +305,7 @@ test('mcp__fleet__send: its input, the draft fleet keeps and runs, the version t
   const long = checkSend({ to: `${'a'.repeat(299)}\u{1F600}`, why: `${'b'.repeat(299)}\u{1F600}`, command: 'x', blocks: `${'c'.repeat(199)}\u{1F600}` })
   expect(long).toEqual({ ok: true, send: { to: 'a'.repeat(299), why: 'b'.repeat(299), command: 'x', files: [], blocks: 'c'.repeat(199) } })
   expect(checkResource({ what: `${'d'.repeat(199)}\u{1F600}`, why: 'w' })).toEqual({ ok: true, resource: { what: 'd'.repeat(199), why: 'w' } })
+  expect(outboundRefusal([{ what: 'scp of x', to: ['far.invalid'], files: ['x'] }], 'command', true)).toContain('This session was started from a background session of the project (it inherited CLAUDE_JOB_DIR or FLEET_INSTANCE), and nobody is at it: say in your result what should go out, where and why, and the session that started you drafts it with mcp__fleet__send')
   expect(outboundRefusal([{ what: 'curl sending data (notes/x.md)', to: ['example.invalid'], files: ['notes/x.md'] }], 'command')).toContain(
     "fleet: this command would send the project's content outside it (curl sending data (notes/x.md) to example.invalid), which needs the person's approval, so it was not run. If it should go out, draft it with mcp__fleet__send",
   )

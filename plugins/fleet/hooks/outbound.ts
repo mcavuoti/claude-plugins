@@ -163,14 +163,26 @@ export function recipientAllowed(address: string, c: OutboundConfig): boolean {
   return !!a && c.recipients.some(r => matches(a, r.trim()))
 }
 
-/** A git remote a push may go to: a local path (nothing leaves), a remote or URL on the list, or a URL on a host the
- * person allows */
-export function remoteAllowed(name: string | null, url: string | null, c: OutboundConfig): boolean {
-  const u = url ?? (name && /[:/]/.test(name) ? name : null)
-  if (u !== null && hostOf(u) === null) return true
-  if (name && c.remotes.some(r => matches(name, r))) return true
-  if (u && c.remotes.some(r => matches(u, r))) return true
-  return !!u && hostAllowed(hostOf(u), c)
+/** An entry of remotes that names a remote (origin, team-*) rather than giving a URL or a path */
+export function remoteName(entry: string): boolean {
+  return !/[:/\\@]/.test(entry) && !entry.startsWith('.')
+}
+
+function sameRemote(a: string, b: string): boolean {
+  const norm = (u: string) => u.trim().toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '')
+  return norm(a) === norm(b)
+}
+
+/** A git remote a push may go to, by the URL it goes to: a local path (nothing leaves), a URL on the list, the URL of
+ * one of the project's remotes the list names (named: resolved once, in the project's own repository, so a name
+ * allows where the project's remote of that name goes, never whatever another folder calls by it), or a URL on a host
+ * the person allows. Its URL unknown: held */
+export function remoteAllowed(url: string | null, c: OutboundConfig, named: readonly string[] = []): boolean {
+  if (!url) return false
+  if (hostOf(url) === null) return true
+  if (named.some(u => sameRemote(u, url))) return true
+  if (c.remotes.some(r => !remoteName(r) && matches(url, r))) return true
+  return hostAllowed(hostOf(url), c)
 }
 
 // ---- What a call sends ----
@@ -178,8 +190,9 @@ export function remoteAllowed(name: string | null, url: string | null, c: Outbou
 /** One way content would leave: what it is (for the person and the model), where to, and the files it sends; hosts:
  * the hosts it goes to, when the command names them (what `/fleet <n> send --allow` adds to outbound.json) */
 export type Send = { what: string; to: string[]; files: string[]; hosts?: string[] }
-/** A git push whose remote has to be looked up (its URL) before it's known whether it leaves */
-export type Push = { remote: string | null; cwd: string | null; words: string[] }
+/** A git push whose remote has to be looked up (its URL) before it's known whether it leaves: from its folder (-C, or a
+ * cd before it on the line: moved) */
+export type Push = { remote: string | null; cwd: string | null; words: string[]; moved?: true }
 
 // ---- MCP tools ----
 
@@ -189,11 +202,15 @@ const WRITES = new Set([
   'send', 'post', 'publish', 'upload', 'share', 'reply', 'forward', 'create', 'update', 'write', 'put', 'comment', 'submit', 'invite',
   'tweet', 'append', 'insert', 'edit', 'respond', 'notify', 'upsert', 'patch', 'push', 'save', 'input', 'type', 'fill', 'execute',
 ])
+// Words that send as the tool's verb, its first word fleet knows (copy_file, add_attachment, draft_email, message),
+// but are things a read names elsewhere (get_message, list_drafts, list_commits)
+const LEADING_WRITES = new Set(['add', 'set', 'sync', 'copy', 'deploy', 'release', 'message', 'draft', 'transfer', 'import', 'commit'])
 const READS = new Set([
   'get', 'list', 'search', 'read', 'fetch', 'query', 'find', 'describe', 'view', 'download', 'export', 'lookup', 'check', 'count',
   'show', 'status', 'scan', 'inspect', 'preview', 'suggest', 'resolve', 'info', 'browse', 'context', 'select', 'screenshot', 'console',
   'network',
 ])
+// Signing in sends nothing of the project and brings no outside text back
 const NEUTRAL = new Set([
   'delete', 'remove', 'trash', 'untrash', 'archive', 'unarchive', 'mark', 'unmark', 'label', 'unlabel', 'apply', 'close', 'resize',
   'switch', 'stop', 'cancel', 'star', 'unstar', 'mute', 'snooze', 'pin', 'unpin', 'complete', 'authenticate',
@@ -202,15 +219,11 @@ const NEUTRAL = new Set([
 /** The words of a tool's name: send_message → send, message; createDraft → create, draft */
 export function nameWords(name: string): string[] {
   return name
-// Words that send as the tool's verb, its first word fleet knows (copy_file, add_attachment, draft_email, message),
-// but are things a read names elsewhere (get_message, list_drafts, list_commits)
-const LEADING_WRITES = new Set(['add', 'set', 'sync', 'copy', 'deploy', 'release', 'message', 'draft', 'transfer', 'import', 'commit'])
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .split(/[^A-Za-z0-9]+/)
     .map(w => w.toLowerCase())
     .filter(Boolean)
 }
-// Signing in sends nothing of the project and brings no outside text back
 
 /** mcp__<server>__<tool> split; null for anything else */
 export function mcpParts(tool: string): { server: string; name: string } | null {
@@ -706,6 +719,9 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
   // The line's environment (an export earlier on it, VAR=x alone) and the sends it points elsewhere
   const lineVars: string[] = []
   const envSends: Send[] = []
+  // Where a cd on the line went (relative to the session's folder), and whether one went where fleet can't follow
+  let cdTo: string | null = null
+  let cdLost = false
   for (const raw of commandsOf(line, 0, targets)) {
     const own: string[] = []
     const w = stripPrefixes(raw, own)
@@ -732,6 +748,14 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
     }
     if (c.commands.some(x => x === cmd)) {
       sends.push({ what: cmd, to: ['outside'], files: [] })
+      continue
+    }
+    // Where a cd on the line goes, for a push after it (its folder decides its remote)
+    if (cmd === 'cd' || cmd === 'pushd' || cmd === 'popd') {
+      const to = cmd === 'popd' ? undefined : rest.find(x => x === '-' || !x.startsWith('-'))
+      if (!to || to === '-' || /[$`]/.test(to) || to.startsWith('~')) cdLost = true
+      else if (to.startsWith('/')) [cdTo, cdLost] = [to, false]
+      else if (!cdLost) cdTo = cdTo === null ? to : `${cdTo.replace(/\/+$/, '')}/${to}`
       continue
     }
     if (cmd === 'curl') {
@@ -799,9 +823,14 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       // The global options stop at the subcommand
       let k = 0
       let cwd: string | null = null
+      // A configuration given on the line that can send a push elsewhere (a url, its rewrite, a push url, an ssh
+      // command, a proxy)
+      const set: string[] = []
       while (k < rest.length && (rest[k] as string).startsWith('-')) {
         const x = rest[k] as string
         if (x === '-C') cwd = rest[k + 1] ?? null
+        if (x === '-c' && /url|insteadof|sshcommand|proxy|receivepack/i.test(rest[k + 1] ?? '')) set.push(`-c ${rest[k + 1]}`)
+        if (x.startsWith('--config-env')) set.push(x)
         k += GIT_GLOBAL_VALUE.test(x) ? 2 : 1
       }
       const sub = rest[k]
@@ -810,7 +839,20 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
         const p = operands(after, /^(-o|--push-option|--repo|--receive-pack|--exec)$/)
         if (p.opts.some(o => o.name === '-n' || o.name === '--dry-run')) continue
         const repo = p.opts.find(o => o.name === '--repo')?.value ?? p.args[0] ?? null
-        pushes.push({ remote: repo, cwd, words: after })
+        // Where it goes isn't the remote's URL: held whatever the remote (--repo, another receive-pack, a url set here)
+        const other = [...set, ...p.opts.filter(o => /^--(repo|receive-pack|exec)$/.test(o.name)).map(o => o.name)]
+        if (other.length) {
+          sends.push({ what: `git push with ${other.join(', ')}`, to: [repo ?? 'its remote'], files: [] })
+          continue
+        }
+        // After a cd: from the folder it went to (one fleet can't follow, or one out of the project, is held)
+        const absolute = cwd?.startsWith('/') ?? false
+        if (cdLost && !absolute) {
+          sends.push({ what: 'git push after a cd fleet can’t follow', to: [repo ?? 'its remote'], files: [] })
+          continue
+        }
+        const dir = cdTo !== null && !absolute ? (cwd ? `${cdTo.replace(/\/+$/, '')}/${cwd}` : cdTo) : cwd
+        pushes.push({ remote: repo, cwd: dir, words: after, ...(cdTo !== null && !absolute ? { moved: true as const } : {}) })
       } else if (sub === 'send-email') {
         const p = operands(after, /^(--to|--cc|--bcc|--from|--in-reply-to|--subject|--smtp-server|--smtp-user|--smtp-server-port|--identity)$/)
         const to = p.opts.filter(o => /^--(to|cc|bcc)$/.test(o.name) && o.value).map(o => o.value as string)
@@ -1048,8 +1090,15 @@ export function sendWords(sends: readonly Send[]): string {
   return [...new Set(parts)].join('; ')
 }
 
-/** What the model reads when its call is held: it wasn't made, and how it goes out with the person's approval */
-export function outboundRefusal(sends: readonly Send[], how: 'command' | 'tool'): string {
+/** What the model reads when its call is held: it wasn't made, and how it goes out with the person's approval. child: a
+ * session started from a background session's Bash, which can't draft it: the session that started it does */
+export function outboundRefusal(sends: readonly Send[], how: 'command' | 'tool', child = false): string {
+  if (child) {
+    return [
+      `fleet: this ${how === 'command' ? 'command' : 'call'} would send the project's content outside it (${sendWords(sends)}), which needs the person's approval, so it was not ${how === 'command' ? 'run' : 'made'}.`,
+      "This session was started from a background session of the project (it inherited CLAUDE_JOB_DIR or FLEET_INSTANCE), and nobody is at it: say in your result what should go out, where and why, and the session that started you drafts it with mcp__fleet__send for the person. Don't send it another way.",
+    ].join(' ')
+  }
   return [
     `fleet: this ${how === 'command' ? 'command' : 'call'} would send the project's content outside it (${sendWords(sends)}), which needs the person's approval, so it was not ${how === 'command' ? 'run' : 'made'}.`,
     `If it should go out, draft it with mcp__fleet__send: to, why (one line), and the exact ${how === 'command' ? 'command' : 'call (mcp_tool, the tool’s name, and input)'} as you'd have run it (and files, any other file whose content it sends).`,

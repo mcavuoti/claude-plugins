@@ -27,6 +27,7 @@ import {
   parseOutbound,
   patternOf,
   remoteAllowed,
+  remoteName,
   sendWords,
   treeVersion,
   widenOutbound,
@@ -393,6 +394,9 @@ let startedInTree = ''
 // It stays across /clear and restarts, so it names the asker of a decision
 let jobRef: string | null = null
 let jobDir = ''
+// A session started from a background session's Bash (a claude -p it ran): CLAUDE_JOB_DIR is there, inherited, and its
+// state.json names the other session
+let inheritedJob = false
 // An instance of the roster: the root and the name /fleet up put in its settings (FLEET_ROOT, FLEET_INSTANCE), and the
 // role it runs as (classic.SessionStart's agent_type, or sessions' current().agent)
 let envRoot = ''
@@ -584,7 +588,10 @@ async function backgroundRef($: any): Promise<string | null> {
     try {
       const s = JSON.parse(state)
       const id = String(await $.session.id())
-      if (s && (s.sessionId || s.resumeSessionId) && s.sessionId !== id && s.resumeSessionId !== id) return null
+      if (s && (s.sessionId || s.resumeSessionId) && s.sessionId !== id && s.resumeSessionId !== id) {
+        inheritedJob = true
+        return null
+      }
     } catch {}
   }
   return ref
@@ -1956,6 +1963,50 @@ async function folderOf($: any, dir: string | null): Promise<string> {
   return dir.startsWith('/') ? dir : `${cwd}/${dir}`
 }
 
+/** Whether a folder is the project's or in it (its . and .. folded) */
+function inProject(dir: string): boolean {
+  const out: string[] = []
+  for (const s of dir.split('/')) {
+    if (s === '' || s === '.') continue
+    if (s === '..') out.pop()
+    else out.push(s)
+  }
+  const d = `/${out.join('/')}`
+  return [root, realRoot].some(r => !!r && (d === r || d.startsWith(`${r}/`)))
+}
+
+// The URLs the name entries of outbound.json's remotes have (origin, team-*), per folder they were resolved in, for
+// the outbound.json read: resolved once
+let namedCache: { c: OutboundConfig; byDir: Map<string, string[]> } | null = null
+
+/** What the name entries of remotes allow: the push URLs those remotes have in the project's own repository, and in
+ * the push's folder when it's in the project (a repository inside it, such as code/). A remote another folder names
+ * so allows nothing by its name */
+async function namedRemotes($: any, c: OutboundConfig, dir: string): Promise<string[]> {
+  const entries = c.remotes.filter(remoteName)
+  if (!entries.length) return []
+  if (namedCache?.c !== c) namedCache = { c, byDir: new Map() }
+  const cache = namedCache
+  const out: string[] = []
+  for (const d of [...new Set([realRoot || (root as string), ...(inProject(dir) ? [dir] : [])])]) {
+    let urls = cache.byDir.get(d)
+    if (!urls) {
+      urls = []
+      const globbed = entries.some(n => /[*?]/.test(n))
+      const all = globbed ? await run($, ['git', '-C', d, 'remote']) : null
+      const listed = all && all.exitCode === 0 ? all.stdout.split('\n').map(x => x.trim()).filter(Boolean) : []
+      const names = [...new Set([...entries.filter(n => !/[*?]/.test(n)), ...listed.filter(r => entries.some(n => matches(r, n)))])]
+      for (const n of names) {
+        const u = await run($, ['git', '-C', d, 'remote', 'get-url', '--push', n])
+        if (u.exitCode === 0) urls.push(...u.stdout.split('\n').map(x => x.trim()).filter(Boolean))
+      }
+      cache.byDir.set(d, urls)
+    }
+    out.push(...urls)
+  }
+  return out
+}
+
 /** A push's remote: its name and URL (git remote get-url --push); the name from @{push}, else the only remote, else
  * origin. A remote given as a URL or a path is its own URL */
 async function remoteOf($: any, cwd: string, remote: string | null): Promise<{ name: string | null; url: string | null }> {
@@ -1981,8 +2032,14 @@ async function outboundOf($: any, e: any, c: OutboundConfig): Promise<{ sends: S
     const r = classifyBash(String(e.command ?? ''), c)
     const sends = [...r.sends]
     for (const p of r.pushes) {
-      const { name, url } = await remoteOf($, await folderOf($, p.cwd), p.remote)
-      if (!remoteAllowed(name, url, c)) sends.push({ what: `git push to ${name ?? 'a remote'}`, to: [url ?? name ?? 'a remote fleet can’t read'], files: [] })
+      const dir = await folderOf($, p.cwd)
+      // After a cd out of the project: another repository's push, held
+      if (p.moved && !inProject(dir)) {
+        sends.push({ what: 'git push after a cd out of the project', to: [p.remote ?? 'its remote'], files: [] })
+        continue
+      }
+      const { name, url } = await remoteOf($, dir, p.remote)
+      if (!remoteAllowed(url, c, await namedRemotes($, c, dir))) sends.push({ what: `git push to ${name ?? 'a remote'}`, to: [url ?? name ?? 'a remote fleet can’t read'], files: [] })
     }
     return { sends, how: 'command', outside: r.reads.length ? `a command that read ${r.reads.slice(0, 3).join(', ')}` : null }
   }
@@ -1993,6 +2050,12 @@ async function outboundOf($: any, e: any, c: OutboundConfig): Promise<{ sends: S
 
 const NETWORK = /\b(curl|wget|scp|rsync|sftp|ssh|git|gh|glab|mail|mailx|sendmail|mutt|nc|ncat|netcat|ftp|lftp|smbclient|rclone|gsutil)\b|\b(npm|yarn|pnpm|cargo|poetry)\b.*\bpublish\b|\btwine\b.*\bupload\b|\bgem\b.*\bpush\b|\b(docker|podman)\b.*\bpush\b|\baws\b.*\bs3(api)?\b|\b(gcloud|az)\b.*\bstorage\b|\/dev\/(tcp|udp)\//
 
+/** Whether the gate holds in this session: a background session, or one started from a background session's Bash (it
+ * inherited CLAUDE_JOB_DIR, which names the other session, or an instance's FLEET_INSTANCE): nobody is at it either */
+function gateHolds(): boolean {
+  return !!jobRef || inheritedJob || !!envInstance
+}
+
 /** The gate, in a background session: a call that sends outside is refused (never in the person's own sessions, where
  * he's at the keyboard and Claude's own permission prompts are his). On an error, a call that may reach the network
  * is refused too: the one hard line doesn't open because fleet erred */
@@ -2001,12 +2064,12 @@ async function outboundGate($: any, e: any): Promise<{ held: { deny: string } | 
   try {
     const c = await outboundConfig($)
     const o = await outboundOf($, e, c)
-    if (!jobRef || !o.sends.length) return { held: null, outside: o.outside }
-    log($, `held: ${e.tool} sending outside (${sendWords(o.sends).slice(0, 200)}) by ${threadOf(e)}`)
-    return { held: { deny: outboundRefusal(o.sends, o.how) }, outside: null }
+    if (!gateHolds() || !o.sends.length) return { held: null, outside: o.outside }
+    log($, `held: ${e.tool} sending outside (${sendWords(o.sends).slice(0, 200)}) by ${threadOf(e)}${jobRef ? '' : ' (a session started from a background session)'}`)
+    return { held: { deny: outboundRefusal(o.sends, o.how, !jobRef) }, outside: null }
   } catch (err) {
     log($, `outbound check: ${String(err).slice(0, 200)}`)
-    if (!jobRef) return { held: null, outside: null }
+    if (!gateHolds()) return { held: null, outside: null }
     const risky = e.tool === 'Bash' ? NETWORK.test(String(e.command ?? '')) : true
     return {
       held: risky ? { deny: `fleet couldn't check whether this sends the project's content outside (${String(err).slice(0, 120)}), so it was not ${e.tool === 'Bash' ? 'run' : 'made'}. If it should go out, draft it with mcp__fleet__send; the person approves it and fleet runs it.` } : null,
@@ -2018,7 +2081,7 @@ async function outboundGate($: any, e: any): Promise<{ held: { deny: string } | 
 /** When a gate's hook threw before the call ran: in a background session of a fleet project, a call that may reach the
  * network is refused (an MCP tool, or a command naming one of the network commands); null lets it run */
 function heldOnError(e: any): { deny: string } | null {
-  if (!jobRef || !root) return null
+  if (!gateHolds() || !root) return null
   const tool = String(e?.tool ?? '')
   const risky = tool === 'Bash' ? NETWORK.test(String(e?.command ?? '')) : tool.startsWith('mcp__') && !tool.startsWith('mcp__fleet__')
   return risky ? { deny: "fleet couldn't check whether this sends the project's content outside, so it was not run. If it should go out, draft it with mcp__fleet__send; the person approves it and fleet runs it." } : null
@@ -4650,8 +4713,9 @@ async function allowOf($: any, call: { command: string } | { tool: string; input
   const remotes: string[] = []
   const base = (await exists($, o.cwd)) ? o.cwd : (root as string)
   for (const p of r.pushes) {
-    const { name, url } = await remoteOf($, p.cwd ? (p.cwd.startsWith('/') ? p.cwd : `${base}/${p.cwd}`) : base, p.remote)
-    if (remoteAllowed(name, url, c)) continue
+    const dir = p.cwd ? (p.cwd.startsWith('/') ? p.cwd : `${base}/${p.cwd}`) : base
+    const { name, url } = await remoteOf($, dir, p.remote)
+    if (remoteAllowed(url, c, await namedRemotes($, c, dir))) continue
     if (url) remotes.push(url)
     else rest.push(`the remote ${name ?? 'of the push'}`)
   }
@@ -6588,7 +6652,7 @@ async function statusCommand($: any): Promise<string> {
     const oc = await outboundConfig($)
     const allowed = [oc.hosts.length ? `hosts ${oc.hosts.join(', ')}` : '', oc.remotes.length ? `remotes ${oc.remotes.join(', ')}` : '', oc.recipients.length ? `recipients ${oc.recipients.join(', ')}` : ''].filter(Boolean)
     lines.push(
-      `outbound: ${jobRef ? 'a call that would send the project’s content outside is held here, for the person to approve as a draft (mcp__fleet__send)' : "not held in this session (you're at it: Claude's own permission prompts are yours); held in the project's background sessions"}; allowed without asking: ${allowed.length ? allowed.join('; ') : 'nothing but this machine'} (outbound.json${outboundProblem ? `: ${outboundProblem}` : ''})`,
+      `outbound: ${jobRef ? 'a call that would send the project’s content outside is held here, for the person to approve as a draft (mcp__fleet__send)' : gateHolds() ? 'a call that would send the project’s content outside is held here: this session was started from a background session (it inherited CLAUDE_JOB_DIR or FLEET_INSTANCE), and the one that started it drafts it' : "not held in this session (you're at it: Claude's own permission prompts are yours); held in the project's background sessions"}; allowed without asking: ${allowed.length ? allowed.join('; ') : 'nothing but this machine'} (outbound.json${outboundProblem ? `: ${outboundProblem}` : ''})`,
     )
     const mark = await read($, outside)
     lines.push(mark ? `this conversation read outside content (${markText(mark, (await meNow($)).offsetMin)}): a change it files waits for /fleet <n> apply, until /clear` : 'this conversation read nothing from outside')
