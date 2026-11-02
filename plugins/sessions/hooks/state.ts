@@ -767,11 +767,23 @@ export function setMember(file: SectionsFile, ref: string, m: SessionsMember | n
   return { ...file, members }
 }
 
-// The person's sections with nobody in them go: they exist only while the person keeps sessions there. A plugin's stay
-// until it drops them (they draw nothing while empty)
+// The person's sections with nobody in them go: they exist only while the person keeps sessions there. A plugin's go
+// once they stay empty (emptyPluginSections, dropSections: the cleanup drops one that two of its passes found empty, so
+// a section just defined, waiting for its first member, stays)
 export function dropEmptyPersonSections(file: SectionsFile): SectionsFile {
   const used = new Set(Object.values(file.members).map((m: any) => m?.section))
   const sections = file.sections.filter(s => !(typeof s?.id === 'string' && s.id.startsWith('me:') && !used.has(s.id)))
+  return sections.length === file.sections.length ? file : { ...file, sections }
+}
+
+export function emptyPluginSections(file: SectionsFile): string[] {
+  const used = new Set(Object.values(file.members).map((m: any) => m?.section))
+  return file.sections.filter(s => typeof s?.id === 'string' && !s.id.startsWith('me:') && !used.has(s.id)).map(s => String(s.id))
+}
+
+export function dropSections(file: SectionsFile, ids: readonly string[]): SectionsFile {
+  if (ids.length === 0) return file
+  const sections = file.sections.filter(s => !ids.includes(s?.id))
   return sections.length === file.sections.length ? file : { ...file, sections }
 }
 
@@ -867,16 +879,25 @@ export function personAssign(file: SectionsFile, ref: string, title: string | nu
 // The rows in display order: this project's sessions in no section first, then each section by order and then title;
 // inside each, the usual order (sortRows). A session with a parent in the list goes right under it, in the parent's
 // section, indented (depth 1), among its siblings in the usual order. One level: a parent that has a parent in the list
-// itself makes no children (they're drawn as any other row). Each row learns its section ('' for none), that section's
-// title and its depth
-export function groupRows<T extends { ref: string; color: Color; title: string }>(rows: readonly T[], view: SectionsView): (T & { section: string; sectionTitle: string; depth: number })[] {
+// itself makes no children (they're drawn as any other row). A parent that waits for the person (red, or marked as
+// needing them) and sits in another section than the child's own (one a plugin moved it to while it asks, say) doesn't
+// take the child along: the child isn't the one waiting, so it's drawn as any row of its own section. Each row learns
+// its section ('' for none), that section's title and its depth
+export function groupRows<T extends { ref: string; color: Color; title: string; needsPerson?: boolean }>(rows: readonly T[], view: SectionsView): (T & { section: string; sectionTitle: string; depth: number })[] {
   const byId = new Map(view.sections.map(s => [s.id, s]))
-  const listed = new Set(rows.map(r => r.ref))
+  const byRef = new Map(rows.map(r => [r.ref, r]))
+  const sectionOf = (ref: string): string => {
+    const m = view.members[ref]
+    return m && byId.has(m.section) ? m.section : ''
+  }
   const parentOf = (ref: string): string => {
     const p = view.members[ref]?.parent
-    if (!p || p === ref || !listed.has(p)) return ''
+    const parent = p && p !== ref ? byRef.get(p) : undefined
+    if (!p || !parent) return ''
     const grand = view.members[p]?.parent
-    return grand && grand !== p && listed.has(grand) ? '' : p
+    if (grand && grand !== p && byRef.has(grand)) return ''
+    const waits = parent.color === 'red' || parent.needsPerson === true
+    return waits && sectionOf(p) !== sectionOf(ref) ? '' : p
   }
   const groups = new Map<string, T[]>()
   const children = new Map<string, T[]>()
@@ -886,8 +907,7 @@ export function groupRows<T extends { ref: string; color: Color; title: string }
       children.set(p, [...(children.get(p) ?? []), r])
       continue
     }
-    const m = view.members[r.ref]
-    const id = m && byId.has(m.section) ? m.section : ''
+    const id = sectionOf(r.ref)
     groups.set(id, [...(groups.get(id) ?? []), r])
   }
   const ids = [...groups.keys()]

@@ -746,6 +746,30 @@ test('children: under their parent, in its section, one level; a parent not in t
   expect(loop.map(r => r.depth)).toEqual([0, 0])
 })
 
+test("children: a parent that waits for the person in another section (a plugin's \"Asking you\") leaves them in their own", () => {
+  const view: SectionsView = {
+    sections: [
+      { id: 'probe:asking', title: 'Asking you', order: 5, owner: 'probe' },
+      { id: 'probe:poc', title: 'Proofs', order: 10, owner: 'probe' },
+    ],
+    members: {
+      aaaaaaaa: { section: 'probe:asking', by: 'probe' },
+      bbbbbbbb: { section: 'probe:poc', by: 'probe', parent: 'aaaaaaaa' },
+      cccccccc: { section: 'probe:poc', by: 'probe' },
+    },
+  }
+  const drawn = (lead: ReturnType<typeof row> & { needsPerson?: boolean }) =>
+    groupRows([lead, row('bbbbbbbb', 'green', 'poc a'), row('cccccccc', 'green', 'poc b')], view).map(r => `${r.section}/${'  '.repeat(r.depth)}${r.title}`)
+  // Asking (marked as needing the person, or red): the child isn't the one waiting
+  expect(drawn({ ...row('aaaaaaaa', 'blue', 'lead'), needsPerson: true })).toEqual(['probe:asking/lead', 'probe:poc/poc a', 'probe:poc/poc b'])
+  expect(drawn(row('aaaaaaaa', 'red', 'lead'))).toEqual(['probe:asking/lead', 'probe:poc/poc a', 'probe:poc/poc b'])
+  // Not waiting: under it, in its section, as before
+  expect(drawn(row('aaaaaaaa', 'blue', 'lead'))).toEqual(['probe:asking/lead', 'probe:asking/  poc a', 'probe:poc/poc b'])
+  // Waiting in the child's own section: still under it
+  const same = groupRows([row('aaaaaaaa', 'red', 'lead'), row('bbbbbbbb', 'green', 'poc a')], { ...view, members: { ...view.members, aaaaaaaa: { section: 'probe:poc', by: 'probe' } } })
+  expect(same.map(r => r.depth)).toEqual([0, 1])
+})
+
 test('children and folds stay put while focused: a row keeps its indent and fold, a new one goes at the end as any row', () => {
   const view: SectionsView = { sections: [{ id: 'probe:work', title: 'Work', order: 10, owner: 'probe' }], members: { bbbbbbbb: { section: 'probe:work', by: 'probe', parent: 'aaaaaaaa' } } }
   const before = groupRows([row('aaaaaaaa', 'green', 'lead'), row('bbbbbbbb', 'green', 'sme')], { sections: [], members: {} }).map(r => ({ ...r, folded: false }))

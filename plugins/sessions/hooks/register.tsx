@@ -33,6 +33,8 @@ import {
   parseSectionsFile,
   personAssign,
   pruneMembers,
+  emptyPluginSections,
+  dropSections,
   refOf,
   drawPlan,
   foldRows,
@@ -502,6 +504,8 @@ async function beat($: any) {
 // keys, heartbeats and requests. Never that of a session created in the last 5 minutes, nor of one with a fresh
 // heartbeat: the agent view's pre-started session is running and hidden from the list
 let lastPrune = 0
+// The plugins' sections the last prune found empty
+let emptyBefore = new Set<string>()
 async function prune($: any) {
   const now = await $.clock.now()
   if (now - lastPrune < 600000) return
@@ -540,7 +544,9 @@ async function prune($: any) {
     const gone = (await $.fs.list(`${dataDir}/tell`)).map((f: any) => String(f.name)).filter((n: string) => isRef(n) && !n.startsWith('sid:') && !shorts.has(n))
     if (gone.length) await runSafe($, ['rm', '-rf', ...gone.map((n: string) => `${dataDir}/tell/${n}`)])
   } catch {}
-  // Section members of sessions no longer in the list (a regular one's stays while its heartbeat is fresh)
+  // Section members of sessions no longer in the list (a regular one's stays while its heartbeat is fresh), and the
+  // plugins' sections that this pass and the one before found empty (one just defined, waiting for its first member,
+  // stays: it was found empty once at most)
   const sections = await readSectionsFile($)
   if ('problem' in sections) return
   const refs = new Set(list.map(refOf))
@@ -550,7 +556,16 @@ async function prune($: any) {
     const h = ref.startsWith('sid:') ? sidBeats[ref.slice(4)] : undefined
     return refs.has(ref) || (!!h && now - h.at < 120000)
   }
-  if (Object.keys(sections.file.members).some(r => !keep(r))) await changeSections($, file => ({ file: pruneMembers(file, keep) }))
+  const wasEmpty = emptyBefore
+  const empty = emptyPluginSections(pruneMembers(sections.file, keep))
+  emptyBefore = new Set(empty)
+  if (!Object.keys(sections.file.members).some(r => !keep(r)) && !empty.some(id => wasEmpty.has(id))) return
+  await changeSections($, file => {
+    const pruned = pruneMembers(file, keep)
+    const drop = emptyPluginSections(pruned).filter(id => wasEmpty.has(id))
+    for (const id of drop) emptyBefore.delete(id)
+    return { file: dropSections(pruned, drop) }
+  })
 }
 
 // The version of a session whose own mod doesn't record it (no mod, or one that never started): the program its

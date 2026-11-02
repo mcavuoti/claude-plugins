@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { BAND, COMMAND, DATA, ROOT, SID, startSession, world } from './world'
+import { BAND, COMMAND, DATA, ROOT, SID, SLOW, startSession, world } from './world'
 
 // What the panel's rows show beyond each session: sections (the person's /sessions section, the headers, the freeze
 // while the panel has the keyboard, sections.json kept tidy) and what the sessions spend
@@ -84,6 +84,30 @@ test('members of sessions gone from the list are dropped with the rest of their 
   await startSession($, w)
   await w.clock.advance(3000)
   expect(Object.keys(JSON.parse(w.files.get(SECTIONS) ?? '{}').members)).toEqual(['bbbbbbbb'])
+})
+
+test("a plugin's section that two cleanups in a row find empty goes; one just defined, or with members, stays", SLOW, async ($, on) => {
+  const w = world(on, { list: list() })
+  const sections = (members: Record<string, unknown>) =>
+    JSON.stringify({
+      sectionsFormat: 1,
+      sections: [
+        { id: 'probe:old', title: 'Old', order: 200, owner: 'probe' },
+        { id: 'probe:desk', title: 'Desk', order: 10, owner: 'probe' },
+      ],
+      members,
+    })
+  w.files.set(SECTIONS, sections({ bbbbbbbb: { section: 'probe:desk', by: 'probe' } }))
+  await startSession($, w)
+  const ids = () => JSON.parse(w.files.get(SECTIONS) ?? '{}').sections.map((s: any) => s.id)
+  // The first cleanup finds probe:old empty and keeps it
+  expect(ids()).toEqual(['probe:old', 'probe:desk'])
+  // A section defined meanwhile, still waiting for its first member, is found empty only once at the next cleanup
+  const file = JSON.parse(w.files.get(SECTIONS) ?? '{}')
+  file.sections.push({ id: 'probe:new', title: 'New', order: 200, owner: 'probe' })
+  w.files.set(SECTIONS, JSON.stringify(file))
+  await w.clock.advance(600000)
+  expect(ids()).toEqual(['probe:desk', 'probe:new'])
 })
 
 test("/clear in a regular session: its section follows its new session id", async ($, on) => {
