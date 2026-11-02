@@ -168,6 +168,21 @@ test('AskUserQuestion: a pick or typed text is an answer; chat and Esc are not',
   expect(classifyDialog(qs, { deny: 'no' })).toMatchObject({ state: 'not answered' })
 })
 
+test('AskUserQuestion with multiSelect: the picks as labels, each matched against the options, joined or as a list', () => {
+  const qs = [
+    { question: 'Which checks?', options: [{ label: 'Lint' }, { label: 'Tests, fast' }, { label: 'Tests, slow' }], multiSelect: true },
+    { question: 'Which days?', options: [{ label: 'Mon' }, { label: 'Tue' }], multiSelect: true },
+    { question: 'Which pets?', options: [{ label: 'Cat' }, { label: 'Dog' }], multiSelect: true },
+  ]
+  // A label that holds ", " itself is still one pick; a piece that matches no option is what he typed
+  expect(classifyDialog(qs, { result: { answers: { 'Which checks?': 'Lint, Tests, slow', 'Which days?': ['Tue', 'Mon'], 'Which pets?': 'Cat, a parrot' } } })).toEqual({
+    answers: [{ labels: ['Lint', 'Tests, slow'] }, { labels: ['Tue', 'Mon'] }, { labels: ['Cat'], text: 'a parrot' }],
+    state: 'answered',
+  })
+  expect(classifyDialog(qs.slice(2), { result: { answers: { 'Which pets?': 'a parrot' } } })).toEqual({ answers: [{ text: 'a parrot' }], state: 'answered' })
+  expect(classifyDialog(qs.slice(2), { result: { answers: { 'Which pets?': [] } } })).toMatchObject({ answers: [null], state: 'not answered' })
+})
+
 test('formats: wire files of another format are recognised, config.json from a newer fleet is left alone', () => {
   expect(parseWire('{"format":1,"id":"D-1"}')).toEqual({ value: { format: 1, id: 'D-1' } })
   expect(parseWire('{"format":2}')).toEqual({ otherFormat: 2 })

@@ -680,7 +680,7 @@ Off by default, on in the `proposal` template (`/fleet init` says so); `"commit"
 
 ## The register
 
-Every closed decision, and every AskUserQuestion of the model that you answered in a dialog (an option or text you typed; "Chat about this" and Esc record as not answered), is one JSON file in `<project>/.claude/fleet/decisions/register/<YYYY-MM>/`: the questions, the options, who asked, your answers and notes, where you typed them, and when it was delivered; for a choice, its area and flags and what the judge proposed, with whether you agreed. A "no" of yours recorded with `mcp__fleet__taste` is one too (`T-<n>`), and so is your correction of a judge (`D-<n>.overrule.json`, beside the decision). Another plugin's dialog isn't recorded. It's out of git unless you chose `--commit-register`.
+Every closed decision, and every AskUserQuestion of the model that you answered in a dialog (an option or text you typed, or the options you picked in a multi-select, each matched against its options; "Chat about this" and Esc record as not answered), is one JSON file in `<project>/.claude/fleet/decisions/register/<YYYY-MM>/`: the questions, the options, who asked, your answers and notes, where you typed them, and when it was delivered; for a choice, its area and flags and what the judge proposed, with whether you agreed. A "no" of yours recorded with `mcp__fleet__taste` is one too (`T-<n>`), and so is your correction of a judge (`D-<n>.overrule.json`, beside the decision). Another plugin's dialog isn't recorded. It's out of git unless you chose `--commit-register`.
 
 Once a day the first session to get there closes the decisions of sessions gone from the list as `abandoned` (their answers kept), and removes stray answer files and old temporary files.
 

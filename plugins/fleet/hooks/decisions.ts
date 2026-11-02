@@ -107,8 +107,9 @@ export type DropFile = { format: number; id: string; why?: string; origin: strin
 /** What a judge's own answer rests on (origin judge): the precedents or statute lines it cites; repeat: an exact repeat */
 export type JudgeCite = { cites: string[]; repeat?: true }
 /** One question's outcome in the register: the option picked or the text typed, and any note (allowed: an outbound's
- * hosts and remotes the person allowed as he sent it) */
-export type Outcome = { label?: string; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true; allowed?: string[]; judge?: JudgeCite }
+ * hosts and remotes the person allowed as he sent it; labels: the options he picked in a dialog's multi-select, text
+ * then only what matched none) */
+export type Outcome = { label?: string; labels?: string[]; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true; allowed?: string[]; judge?: JudgeCite }
 export type RegisterState = 'delivered' | 'dropped' | 'abandoned' | 'answered' | 'not answered'
 export type RegisterRecord = {
   registerFormat: number
@@ -709,13 +710,35 @@ export function gitignoreText(commitRegister: boolean): string {
 
 // ---- AskUserQuestion, as the person answered it in the session ----
 
+/** A multi-select's picks: a list, or the labels joined with ", " (a label may hold ", " itself: the longest run of
+ * pieces that is a label wins), each matched against the options; what matches none is the text he typed */
+export function multiOutcome(q: DialogQuestion, a: unknown): Outcome | null {
+  const pieces = Array.isArray(a) ? a.filter((x): x is string => typeof x === 'string' && !!x) : typeof a === 'string' && a ? a.split(', ') : []
+  const labels: string[] = []
+  const rest: string[] = []
+  for (let i = 0; i < pieces.length; ) {
+    let j = pieces.length
+    for (; j > i; j--) if (q.options.some(o => o.label === pieces.slice(i, j).join(', '))) break
+    if (j > i) {
+      const l = pieces.slice(i, j).join(', ')
+      if (!labels.includes(l)) labels.push(l)
+      i = j
+    } else rest.push(pieces[i++] as string)
+  }
+  const text = cut(rest.join(', ').trim(), 2000)
+  if (!labels.length) return text ? { text } : null
+  return { labels, ...(text ? { text } : {}) }
+}
+
 /** The person's answers to a model's AskUserQuestion, from what the dialog returned: an object with answers (an option
- * picked, or text typed), or an error string ("Chat about this", Esc), which records as not answered */
+ * picked, the options picked in a multi-select, or text typed), or an error string ("Chat about this", Esc), which
+ * records as not answered */
 export function classifyDialog(questions: readonly DialogQuestion[], r: any): { answers: (Outcome | null)[]; state: RegisterState; why?: string } {
   const res = r?.result
   if (res && typeof res === 'object' && res.answers && typeof res.answers === 'object') {
     const answers = questions.map(q => {
       const a = res.answers[q.question]
+      if (q.multiSelect) return multiOutcome(q, a)
       if (typeof a !== 'string' || !a) return null
       return q.options.some(o => o.label === a) ? { label: a } : { text: cut(a, 2000) }
     })
