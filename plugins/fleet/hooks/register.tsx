@@ -850,6 +850,7 @@ const recent: ChangeEvent[] = []
 let otherEvents = 0
 let latestMark = -1
 let pulling: Promise<void> | null = null
+let pullAgain = false
 let eventCount = 0
 // The world as this session's scan last saw it (with the pins each file cites), and the changes nobody's event
 // explains yet (recorded as outside changes when they stay so for a scan)
@@ -1133,7 +1134,12 @@ async function refreshName($: any) {
 
 // The event files of the trailing window not seen yet (the current hour and the one before; 25 hours at the start)
 function pullEvents($: any, hours = 2): Promise<void> {
-  if (pulling) return pulling
+  // One at a time; a call that comes while one runs gets one more after it (its trigger may name a file the running
+  // one listed too early to see)
+  if (pulling) {
+    pullAgain = true
+    return pulling
+  }
   pulling = (async () => {
     const now = await $.clock.now()
     for (const folder of windowFolders(now, hours)) {
@@ -1153,10 +1159,15 @@ function pullEvents($: any, hours = 2): Promise<void> {
           if (v && v.format !== FORMAT) otherEvents++
           continue
         }
-        if (newer(latest.get(v.path), v)) latest.set(v.path, v)
+        if (newer(latest.get(v.path), v)) {
+          latest.set(v.path, v)
+          // What this session knows of the file follows the landing at once (its scan settles the rest), so the suspects
+          // reckoned next see it
+          const k = known.get(v.path)
+          if (k && v.to !== null && k.v !== v.to) known.set(v.path, { ...k, v: v.to, pins: v.pins ?? (v.id ? [] : k.pins) })
+        }
         remember(v)
-        // A record's new version, or a file's new pins: the suspects may have changed
-        if (v.id || v.pins) sweep.dirty = true
+        sweep.dirty = true
         if (v.id) forget(v.id)
       }
     }
@@ -1165,6 +1176,10 @@ function pullEvents($: any, hours = 2): Promise<void> {
     .catch(() => {})
     .finally(() => {
       pulling = null
+      if (pullAgain) {
+        pullAgain = false
+        bg(pullEvents($))
+      }
     })
   return pulling
 }

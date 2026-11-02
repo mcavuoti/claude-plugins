@@ -34,15 +34,15 @@ async function begin($: any, w: World) {
 }
 
 let n = 0
-function landByR(w: World, path: string, text: string, rev: number, kind = 'revision') {
+function landByR(w: World, path: string, text: string, rev: number, kind = 'revision', marks: { pins?: string[]; confirmed?: string[] } = {}) {
   const rel = path.slice(ROOT.length + 1)
   const id = (/^[A-Z]+-\d+/.exec(rel.slice(rel.lastIndexOf('/') + 1)) as RegExpExecArray)[0]
   const before = w.files.get(path)
   w.touch(path, text)
   const at = w.clock.now()
-  w.touch(`${STATE}/revs/${id}/${rev}.json`, JSON.stringify({ format: 1, id, path: rel, rev, hash: hashText(text), kind, changeHash: null, at, by: RB, via: 'tool', pins: [] }))
+  w.touch(`${STATE}/revs/${id}/${rev}.json`, JSON.stringify({ format: 1, id, path: rel, rev, hash: hashText(text), kind, changeHash: null, at, by: RB, via: 'tool', pins: marks.pins ?? [], ...marks }))
   const name = `${at}-bbbbbbbb-${++n}.json`
-  const event = { format: 1, at, path: rel, from: before === undefined ? null : hashText(before), to: hashText(text), via: 'tool', tool: 'Edit', blind: false, by: RB, id, rev, kind }
+  const event = { format: 1, at, path: rel, from: before === undefined ? null : hashText(before), to: hashText(text), via: 'tool', tool: 'Edit', blind: false, by: RB, id, rev, kind, ...marks }
   w.touch(`${FLEET}/events/${hourFolder(at)}/${name}`, JSON.stringify(event))
   w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: name }))
 }
@@ -108,6 +108,18 @@ test('C10: a record cited at a version that has been revised: its owner hears it
   await tick(w)
   await tick(w)
   expect(json(w, `${STATE}/suspects.json`).suspects.map((s: any) => [s.path, s.reasons.map((r: any) => r.pin)])).toEqual([['board/B-1.md', ['R-1@1', 'R-1@2']]])
+})
+
+test('another session’s landing that keeps a stale pin after reading its record clears the suspect at once, before any scan here', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['req/**', 'board/**'], files: { [R1]: 'R-1 v1\n', [B1]: WORK } })
+  await begin($, w)
+  landByR(w, R1, 'R-1 v2\n', 2)
+  await tick(w)
+  await tick(w)
+  expect(json(w, `${STATE}/suspects.json`).suspects.map((s: any) => s.path)).toEqual(['board/B-1.md'])
+  landByR(w, B1, `${WORK}note: v1 still holds\n`, 2, 'revision', { pins: ['R-1@1'], confirmed: ['R-1@1>2'] })
+  await tick(w)
+  expect(json(w, `${STATE}/suspects.json`).suspects).toEqual([])
 })
 
 test('the gate tells once: a second identical try passes; a new pin of a record never read is refused once; a current pin the file had needs no read', WITH_SESSIONS, async ($, on) => {
