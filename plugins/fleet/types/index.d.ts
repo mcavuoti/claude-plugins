@@ -5,8 +5,9 @@
  * (a hot reload loses the copy that waited on the submit) */
 export type FleetInflight = { at: number; epoch: string }
 
-/** A world file as one thread last read it (or wrote it): the version, when, and the newest version it was told of */
-export type FleetRead = { v: string; at: number; told?: string }
+/** A world file as one thread last read it (or wrote it): the version, when, and the newest version it was told of;
+ * for a record, the version number fleet gave what it read */
+export type FleetRead = { v: string; at: number; told?: string; rev?: number }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -30,8 +31,13 @@ declare module 'claude-code' {
       section: string
       /** What each thread of this session read of the world: 'main' or a helper's agentId → path → the read */
       reads: Record<string, Record<string, FleetRead>>
-      /** The version each thread's write of a path was refused at once already (the gate tells once): thread → path */
+      /** What the gate told each thread once already: thread → path → the version it was refused at; 'pins:<path>'
+       * → the pin problems it was told (one per line); 'copy:<path>' → the worktree copy's version */
       warned: Record<string, Record<string, string>>
+      /** What the band counts besides the questions: the project's suspect files and files failing a check */
+      flags: number
+      /** What this session's model was told about the files it owns (suspects, failed checks): key → when */
+      ownTold: Record<string, number>
     }
   }
 }

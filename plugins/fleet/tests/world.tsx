@@ -90,6 +90,8 @@ export type World = {
   beforeTool: { value: (tool: string) => void }
   // Writes a file as another program would (an editor, a script, another session): bumps its time
   touch: (path: string, text: string) => void
+  // Any other command fleet runs (git, a check script): its answer, or undefined for "unknown command"
+  exec: { value: (argv: string[], cwd: string) => { exitCode: number; stdout?: string; stderr?: string } | undefined }
 }
 
 export type WorldOptions = {
@@ -121,10 +123,15 @@ function parentsOf(path: string): string[] {
 export function world(on: On, options: WorldOptions = {}): World {
   const clock = mock.clock(on, { now: Date.UTC(2026, 10, 2, 12, 0, 0) })
   const files = new Map<string, string>(Object.entries(options.files ?? {}))
-  // When each file was last written (fs.list's mtimeMs)
+  // When each file was last written (fs.list's mtimeMs); a folder's time is a counter that moves when an entry in it
+  // comes or goes (fleet only compares a folder's times)
   const mtimes = new Map<string, number>()
+  const dirTimes = new Map<string, number>()
+  let dirTick = 0
+  const moved = (path: string) => dirTimes.set(path.slice(0, path.lastIndexOf('/')) || '/', ++dirTick)
   const dirs = new Set<string>(['/', '/Users', HOME, ROOT, JOB, `${HOME}/.claude`, `${HOME}/.claude/jobs`])
   const addFile = (path: string, text: string) => {
+    if (!files.has(path)) moved(path)
     files.set(path, text)
     mtimes.set(path, clock.now())
     for (const d of parentsOf(path)) dirs.add(d)
@@ -188,7 +195,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const below = (p: string) => p.startsWith(prefix) && p.length > prefix.length && !p.slice(prefix.length).includes('/')
     const entries = [
       ...[...files.keys()].filter(below).map(p => ({ name: p.slice(prefix.length), kind: 'file' as const, size: (files.get(p) as string).length, mtimeMs: mtimes.get(p) ?? 0, isLink: false })),
-      ...[...dirs].filter(below).map(p => ({ name: p.slice(prefix.length), kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })),
+      ...[...dirs].filter(below).map(p => ({ name: p.slice(prefix.length), kind: 'dir' as const, size: 0, mtimeMs: dirTimes.get(p) ?? 0, isLink: false })),
     ]
     return { value: entries }
   })
@@ -196,14 +203,17 @@ export function world(on: On, options: WorldOptions = {}): World {
     const p = real(e.path)
     if (p === undefined) throw new Error(`ENOENT: ${e.path}`)
     const file = files.get(p)
-    const stat = file !== undefined ? { kind: 'file' as const, size: file.length, mtimeMs: mtimes.get(p) ?? 0, isLink: false } : { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }
+    const stat = file !== undefined ? { kind: 'file' as const, size: file.length, mtimeMs: mtimes.get(p) ?? 0, isLink: false } : { kind: 'dir' as const, size: 0, mtimeMs: dirTimes.get(p) ?? 0, isLink: false }
     return { value: e.resolve ? { ...stat, realPath: p } : stat }
   })
+  const exec = { value: (_argv: string[], _cwd: string): { exitCode: number; stdout?: string; stderr?: string } | undefined => undefined }
   on('process.run', (_, e) => {
     const argv = [...e.argv]
     runs.push(argv)
     const ok = { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+    const other = exec.value(argv, String(e.init?.cwd ?? ''))
+    if (other) return { value: { stdout: '', stderr: '', ...other, isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.init?.cwd !== '/') return failed('fleet runs every command from /')
     const [cmd, ...args] = argv
     if (cmd === 'ln') {
@@ -220,13 +230,15 @@ export function world(on: On, options: WorldOptions = {}): World {
       const text = files.get(from)
       if (text === undefined) return failed('No such file')
       files.delete(from)
+      moved(from)
+      moved(to)
       addFile(to, text)
       return ok
     }
     if (cmd === 'rm') {
       const recursive = args.some(a => /^-\w*r/.test(a))
       for (const p of args.filter(a => !a.startsWith('-'))) {
-        files.delete(p)
+        if (files.delete(p)) moved(p)
         if (!recursive) continue
         for (const f of [...files.keys()]) if (f.startsWith(`${p}/`)) files.delete(f)
         for (const d of [...dirs]) if (d === p || d.startsWith(`${p}/`)) dirs.delete(d)
@@ -303,7 +315,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch }
+  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, exec }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

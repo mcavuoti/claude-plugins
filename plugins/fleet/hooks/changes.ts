@@ -43,6 +43,14 @@ export type ChangeEvent = {
   by: Who | null
   /** The write replaced a version the writer had not validated (another landing came in between) */
   overwrote?: boolean
+  /** A record's landing (records.ts): its id, the version fleet gave it, what kind of change it was */
+  id?: string
+  rev?: number
+  kind?: string
+  /** The pins the file cites after the landing (ID@n), records or not */
+  pins?: string[]
+  /** A blind landing citing pins its thread hadn't read as they were: "<pin>:<stale|unread|ahead>" */
+  suspect?: string[]
 }
 /** A thread: 'main' for the main loop, else the helper's agentId */
 export type Threads = Record<string, Record<string, FleetRead>>
@@ -267,10 +275,12 @@ export function whoText(e: ChangeEvent, me: Me): string {
 
 const OUTSIDE = 'outside fleet (an editor, a script, or a session without fleet)'
 
-/** "changed at 14:02 by TEST B (Edit)", "was removed at 14:05 outside fleet (…)" */
+/** "changed at 14:02 by TEST B (Edit)", "was removed at 14:05 outside fleet (…)"; a record's adds its new version,
+ * ", now R-12@5", with the kind when it's not a revision */
 export function changeLine(e: ChangeEvent, me: Me): string {
   const what = `${e.to === null ? 'was removed' : 'changed'} at ${clock(e.at, me.offsetMin)}`
-  return e.via === 'outside' || !e.by ? `${what} ${OUTSIDE}` : `${what} by ${whoText(e, me)}`
+  const rev = e.id && e.rev && e.to !== null ? `, now ${e.id}@${e.rev}${e.kind && e.kind !== 'revision' ? ` (${e.kind})` : ''}` : ''
+  return `${e.via === 'outside' || !e.by ? `${what} ${OUTSIDE}` : `${what} by ${whoText(e, me)}`}${rev}`
 }
 
 // ---- The gate ----

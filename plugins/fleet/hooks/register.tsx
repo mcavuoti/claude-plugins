@@ -93,6 +93,53 @@ import {
   type QueueRecord,
   type RegisterRecord,
 } from './decisions'
+import {
+  LEASE_MS,
+  MAX_LINES,
+  blindText,
+  changeOf,
+  checkOutcome,
+  checksKey,
+  citeText,
+  commitMessage,
+  copyOf,
+  copyReadText,
+  copyWriteText,
+  idOf,
+  isStrict,
+  landedText,
+  landingKind,
+  leaseState,
+  needsCheck,
+  ownedBy,
+  parseCheckFile,
+  parseLease,
+  parsePin,
+  parseRev,
+  parseSuspects,
+  pinKey,
+  pinProblems,
+  pinState,
+  pinsOf,
+  pinsText,
+  porcelainPaths,
+  problemKeys,
+  recordsOf,
+  scriptsOf,
+  suspectKey,
+  suspectLine,
+  suspectsOf,
+  worktreeFolders,
+  type Check,
+  type CheckFile,
+  type Facts,
+  type PinState,
+  type ReadState,
+  type Records,
+  type Rev,
+  type Suspect,
+  type SuspectsFile,
+} from './records'
 
 // fleet, per project: a background session asks the person with mcp__fleet__decide and goes on working; the person
 // answers from any session of the project with /fleet (no tokens), and the asking session's fleet hands the answer to
@@ -114,6 +161,8 @@ const listing = atom({ plugin: 'fleet', key: 'listing' } as const, [] as string[
 const section = atom({ plugin: 'fleet', key: 'section' } as const, '')
 const reads = atom({ plugin: 'fleet', key: 'reads' } as const, {} as Record<string, Record<string, FleetRead>>)
 const warned = atom({ plugin: 'fleet', key: 'warned' } as const, {} as Record<string, Record<string, string>>)
+const flags = atom({ plugin: 'fleet', key: 'flags' } as const, 0)
+const ownTold = atom({ plugin: 'fleet', key: 'ownTold' } as const, {} as Record<string, number>)
 
 // This copy of the module: a hot reload makes a new one and drops the old one's timers and the submits it waited on
 const EPOCH = Math.random().toString(36).slice(2, 10)
@@ -128,6 +177,8 @@ let version = ''
 // The project: the nearest folder upwards from the session's root with .claude/fleet/config.json (never the home folder)
 let root: string | null = null
 let configProblem = ''
+// The linked worktree this session started in, when its project is the main checkout's
+let startedInTree = ''
 // A background session's official short id, from Claude's CLAUDE_JOB_DIR (~/.claude/jobs/<short id>); null otherwise.
 // It stays across /clear and restarts, so it names the asker of a decision
 let jobRef: string | null = null
@@ -198,12 +249,14 @@ function dec(sub: string): string {
   return `${root}/.claude/fleet/decisions/${sub}`
 }
 
-// Every command runs from / (it exists; every path is absolute), and one that can't start counts as a failure
-async function run($: any, argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+// Every command runs from / (it exists; every path is absolute), except a project's check script, which runs from the
+// project's folder (it exists: fleet found its .claude/fleet/ there). One that can't start counts as a failure (127),
+// one still running at its timeout too (124)
+async function run($: any, argv: string[], opts: { cwd?: string; timeoutMs?: number } = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   try {
-    return await $.process.run(argv, { cwd: '/', timeoutMs: 10000 })
+    return await $.process.run(argv, { cwd: opts.cwd ?? '/', timeoutMs: opts.timeoutMs ?? 10000 })
   } catch (err) {
-    return { exitCode: 127, stdout: '', stderr: String(err) }
+    return { exitCode: /time/i.test(String(err)) ? 124 : 127, stdout: '', stderr: String(err) }
   }
 }
 
@@ -276,8 +329,23 @@ function omit<T>(m: Record<string, T>, ids: readonly string[]): Record<string, T
 
 // ---- Where this session stands: its project, whether it's a background session ----
 
+// A session started in a linked git worktree belongs to the project of the main checkout: one world, one set of events
+// (a worktree's own .claude/fleet/, committed with the project, would make it a project apart)
 async function findRoot($: any): Promise<string | null> {
-  let dir = String(await $.session.root()).replace(/\/+$/, '')
+  const start = String(await $.session.root()).replace(/\/+$/, '')
+  const main = await mainCheckoutOf($, start).catch(() => null)
+  if (main) {
+    const r = await rootAbove($, main)
+    if (r) {
+      startedInTree = start
+      return r
+    }
+  }
+  return rootAbove($, start)
+}
+
+async function rootAbove($: any, from: string): Promise<string | null> {
+  let dir = from
   for (let i = 0; i < 32 && dir && dir !== home; i++) {
     if (await exists($, `${dir}/.claude/fleet/config.json`)) return dir
     const up = dir.slice(0, dir.lastIndexOf('/'))
@@ -782,9 +850,10 @@ let otherEvents = 0
 let latestMark = -1
 let pulling: Promise<void> | null = null
 let eventCount = 0
-// The world as this session's scan last saw it, and the changes nobody's event explains yet (recorded as outside
-// changes when they stay so for a scan)
-const known = new Map<string, { mtimeMs: number; size: number; v: string | null }>()
+// The world as this session's scan last saw it (with the pins each file cites), and the changes nobody's event
+// explains yet (recorded as outside changes when they stay so for a scan)
+type Known = { mtimeMs: number; size: number; v: string | null; pins?: string[] }
+const known = new Map<string, Known>()
 const unexplained = new Map<string, { v: string | null; since: number }>()
 let baselined = false
 let worldStarted = false
@@ -797,9 +866,57 @@ let myRef: string | null = null
 // A world past this many files isn't scanned after each command (the scan every 10 s still runs)
 const MAX_WORLD_FILES = 5000
 const MiB4 = 4 * 1024 * 1024
+// What world.json says of records (records.ts); null with nothing to say, or when it's wrong (recordsProblem says why,
+// and the rest of the world stays on)
+let records: Records | null = null
+let recordsProblem = ''
+// Each record's versions, as read from state/revs/<id>/ (its folder's time says when to look again)
+const revCache = new Map<string, { revs: Map<number, Rev>; mtime: number; at: number }>()
+// The world's records by id, from what the scans saw (the first file of an id wins; status names the others)
+const idIndex = new Map<string, string>()
+const twins = new Map<string, string[]>()
+// The linked git worktrees of the project's repository (their real folders), and where the project sits in it
+const trees = { at: 0, linked: [] as string[], sub: '', git: true, forced: 0 }
 
 function eventsDir(sub = ''): string {
   return `${root}/.claude/fleet/events${sub ? `/${sub}` : ''}`
+}
+function stateDir(sub = ''): string {
+  return `${root}/.claude/fleet/state${sub ? `/${sub}` : ''}`
+}
+function revDir(id: string): string {
+  return stateDir(`revs/${id}`)
+}
+
+function pinsFrom(text: string | null): string[] {
+  return records && text ? pinsOf(text, records).map(pinKey) : []
+}
+
+function setKnown(rel: string, k: Known) {
+  known.set(rel, k)
+  const id = records ? idOf(rel, records) : null
+  if (!id) return
+  const at = idIndex.get(id)
+  if (at === undefined) idIndex.set(id, rel)
+  else if (at !== rel && !(twins.get(id) ?? []).includes(rel)) twins.set(id, [...(twins.get(id) ?? []), rel])
+}
+
+function dropKnown(rel: string) {
+  known.delete(rel)
+  const id = records ? idOf(rel, records) : null
+  if (id && (idIndex.get(id) === rel || twins.has(id))) indexIds()
+}
+
+function indexIds() {
+  idIndex.clear()
+  twins.clear()
+  if (!records) return
+  for (const rel of [...known.keys()].sort()) {
+    const id = idOf(rel, records)
+    if (!id) continue
+    if (!idIndex.has(id)) idIndex.set(id, rel)
+    else twins.set(id, [...(twins.get(id) ?? []), rel])
+  }
 }
 function readsPath(sessionId: string): string {
   return `${root}/.claude/fleet/reads/${sessionId}.json`
@@ -863,6 +980,11 @@ async function loadWorld($: any) {
   }
   worldProblem = ''
   world = { globs: p.world.paths, res: p.world.paths.map(g => globRegex(g, insensitive)), mtimeMs: st.mtimeMs }
+  const r = recordsOf(p.world, insensitive)
+  const idBefore = records?.id.source
+  records = 'records' in r ? r.records : null
+  if ('problem' in r && recordsProblem !== r.problem) log($, r.problem)
+  recordsProblem = 'problem' in r ? r.problem : ''
   if (before !== world.globs.join('\n')) {
     // Other globs: what's in the world now is the new baseline, not a change
     known.clear()
@@ -870,6 +992,11 @@ async function loadWorld($: any) {
     baselined = false
     tooBig = false
     log($, `world: ${world.globs.join(', ') || 'no globs'}`)
+  }
+  if (idBefore !== records?.id.source) {
+    // Other ids: the pins of the files are read again at the next scan
+    indexIds()
+    if (baselined) baselined = false
   }
 }
 
@@ -893,32 +1020,88 @@ async function place($: any, path: string): Promise<string | null> {
   return null
 }
 
-/** A world file a tool names: its path relative to the project, and where it is; null for anything else */
-async function worldFile($: any, path: unknown): Promise<{ rel: string; abs: string } | null> {
+/** A world file a tool names: its path relative to the project, and where it is; copy: the linked worktree it's a copy
+ * in (the shared one is the main checkout's, at <realRoot>/<rel>). Null for anything else */
+type Placed = { rel: string; abs: string; copy?: string }
+async function worldFile($: any, path: unknown): Promise<Placed | null> {
   if (typeof path !== 'string' || !path) return null
   await ensureWorld($)
   if (!worldOn()) return null
   const given = path.startsWith('/') ? path : `${String(await $.session.cwd()).replace(/\/+$/, '')}/${path}`
   const abs = await place($, given)
   if (!abs) return null
+  const res = (world as { res: RegExp[] }).res
+  if (abs.includes('/.claude/worktrees/')) await refreshTrees($, true)
+  const c = copyOf(abs, trees.linked, trees.sub, insensitive)
+  if (c) return c.rel && inWorld(c.rel, res) ? { rel: c.rel, abs, copy: c.tree } : null
   const rel = relOf(abs, realRoot, insensitive)
-  return rel !== null && inWorld(rel, (world as { res: RegExp[] }).res) ? { rel, abs } : null
+  return rel !== null && inWorld(rel, res) ? { rel, abs } : null
 }
 
-/** A file's version: the hash of its text, or its size and time past 4 MiB; null when it isn't there */
-async function versionOf($: any, abs: string): Promise<{ v: string | null; mtimeMs: number; size: number }> {
+/** A file's version: the hash of its text, or its size and time past 4 MiB; null when it isn't there. With the text
+ * (null past 4 MiB), which the pins are read from */
+async function versionOf($: any, abs: string): Promise<{ v: string | null; mtimeMs: number; size: number; text: string | null }> {
   let st: any
   try {
     st = await $.fs.stat(abs)
   } catch {
-    return { v: null, mtimeMs: 0, size: 0 }
+    return { v: null, mtimeMs: 0, size: 0, text: null }
   }
-  if (st.kind !== 'file') return { v: null, mtimeMs: 0, size: 0 }
+  if (st.kind !== 'file') return { v: null, mtimeMs: 0, size: 0, text: null }
   const size = Number(st.size)
   const mtimeMs = Number(st.mtimeMs)
-  if (size > MiB4) return { v: statVersion(size, mtimeMs), mtimeMs, size }
+  if (size > MiB4) return { v: statVersion(size, mtimeMs), mtimeMs, size, text: null }
   const t = await readText($, abs)
-  return { v: t === null ? statVersion(size, mtimeMs) : hashText(t), mtimeMs, size }
+  return { v: t === null ? statVersion(size, mtimeMs) : hashText(t), mtimeMs, size, text: t }
+}
+
+// ---- Git: the repository the project is in, its linked worktrees ----
+
+/** The repository a folder is in: its working tree's top, its git folder, and the folder shared by every worktree
+ * (the main checkout's .git). Null outside git */
+async function gitOf($: any, dir: string): Promise<{ top: string; gitDir: string; common: string } | null> {
+  const r = await run($, ['git', '-C', dir, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir'])
+  if (r.exitCode !== 0) return null
+  const [top, gitDir, common] = r.stdout.trim().split('\n')
+  return top && gitDir && common ? { top, gitDir, common } : null
+}
+
+/** The same folder in the main checkout, when dir is in a linked worktree of a repository; null otherwise */
+async function mainCheckoutOf($: any, dir: string): Promise<string | null> {
+  const g = await gitOf($, dir)
+  if (!g || g.gitDir === g.common || !g.common.endsWith('/.git')) return null
+  let real = dir
+  try {
+    real = String((await $.fs.stat(dir, { resolve: true })).realPath ?? dir).replace(/\/+$/, '')
+  } catch {}
+  if (real !== g.top && !real.startsWith(`${g.top}/`)) return null
+  return `${g.common.slice(0, -'/.git'.length)}${real.slice(g.top.length)}`
+}
+
+// The linked worktrees, every minute (every 10 minutes outside git), and at once when a path names one fleet doesn't
+// know yet (at most every 5 s)
+async function refreshTrees($: any, force = false) {
+  const now = await $.clock.now()
+  if (force ? now - trees.forced < 5000 : now - trees.at < (trees.git ? 60000 : 600000)) return
+  trees.at = now
+  if (force) trees.forced = now
+  const g = await gitOf($, realRoot)
+  if (!g) {
+    trees.git = false
+    trees.linked = []
+    return
+  }
+  trees.git = true
+  const main = g.common.endsWith('/.git') ? g.common.slice(0, -'/.git'.length) : g.top
+  trees.sub = realRoot.startsWith(`${main}/`) ? realRoot.slice(main.length + 1) : ''
+  const l = await run($, ['git', '-C', realRoot, 'worktree', 'list', '--porcelain'])
+  const linked: string[] = []
+  for (const f of l.exitCode === 0 ? worktreeFolders(l.stdout).slice(1) : []) {
+    try {
+      linked.push(String((await $.fs.stat(f, { resolve: true })).realPath ?? f).replace(/\/+$/, ''))
+    } catch {}
+  }
+  trees.linked = linked
 }
 
 async function meNow($: any): Promise<Me> {
@@ -971,6 +1154,9 @@ function pullEvents($: any, hours = 2): Promise<void> {
         }
         if (newer(latest.get(v.path), v)) latest.set(v.path, v)
         remember(v)
+        // A record's new version, or a file's new pins: the suspects may have changed
+        if (v.id || v.pins) sweep.dirty = true
+        if (v.id) forget(v.id)
       }
     }
     for (const [name, at] of seen) if (now - at > 3 * HOUR) seen.delete(name)
@@ -1031,23 +1217,46 @@ async function writeEvent($: any, ev: Omit<ChangeEvent, 'format' | 'at'> & { at?
 
 // ---- What each thread read ----
 
-async function setRead($: any, thread: string, rel: string, v: string | null) {
+async function setRead($: any, thread: string, rel: string, v: string | null, rev?: number) {
   const now = await $.clock.now()
   await update($, reads, m => {
     const mine = { ...(m[thread] ?? {}) }
     if (v === null) delete mine[rel]
-    else mine[rel] = { v, at: now, told: v }
+    else mine[rel] = { v, at: now, told: v, ...(rev ? { rev } : {}) }
     return { ...m, [thread]: mine }
   })
   await update($, warned, m => (m[thread]?.[rel] === undefined ? m : { ...m, [thread]: omit(m[thread] as Record<string, string>, [rel]) }))
   saveReadsSoon($)
 }
 
-async function noteRead($: any, thread: string, abs: unknown) {
-  const w = await worldFile($, abs)
-  if (!w) return
-  const { v } = await versionOf($, w.abs)
-  if (v !== null) await setRead($, thread, w.rel, v)
+// A read of a world file: this thread read that version. A record's read says which version it is, so the model can
+// cite it. A worktree's copy counts as a read of the shared file when it's the same; when it differs, the model hears
+// so once
+async function noteRead($: any, thread: string, path: unknown): Promise<string[]> {
+  const w = await worldFile($, path)
+  if (!w) return []
+  const main = `${realRoot}/${w.rel}`
+  const f = await versionOf($, main)
+  if (w.copy) {
+    const c = await versionOf($, w.abs)
+    if (c.v === null) return []
+    if (c.v !== f.v) {
+      const key = `copy-read:${w.rel}`
+      if ((await read($, warned))[thread]?.[key] === c.v) return []
+      await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [key]: c.v as string } }))
+      return [copyReadText(String(path), w.rel, main)]
+    }
+  }
+  if (f.v === null) return []
+  const id = records ? idOf(w.rel, records) : null
+  let rev: number | undefined
+  if (id) {
+    const revs = await revsFor($, id, { rel: w.rel, v: f.v, text: f.text })
+    const last = revs[revs.length - 1]
+    if (last && last.hash === f.v) rev = last.rev
+  }
+  await setRead($, thread, w.rel, f.v, rev)
+  return id && rev ? [citeText(id, rev)] : []
 }
 
 // reads/<sessionId>.json, a second after a change (for /fleet status in other sessions, and after a restart)
@@ -1084,31 +1293,48 @@ async function dropThread($: any, thread: string) {
 async function clearReads($: any, oldSessionId: string) {
   await update($, reads, () => ({}))
   await update($, warned, () => ({}))
+  // The new conversation doesn't remember what it was told about the files it wrote: it hears it again
+  await update($, ownTold, () => ({}))
   if (root && oldSessionId) await remove($, [readsPath(oldSessionId)])
 }
 
 // ---- The digest: at a thread's next step (a tool result's context, C2) or with the next prompt ----
 
-/** The digest lines for one thread, and what marks them told (called once they're on their way) */
+/** The digest lines for one thread, and what marks them told (called once they're on their way): the world files it
+ * read that changed since, and for the main thread the files this session wrote last that are flagged */
 async function digestFor($: any, thread: string): Promise<{ lines: string[]; told: () => Promise<void> }> {
   const none = { lines: [], told: async () => {} }
   if (!worldOn()) return none
   await eventsTick($)
   const mine = (await read($, reads))[thread]
-  if (!mine || !latest.size) return none
   const me = await meNow($)
-  const items = digestItems(mine, latest, me)
-  if (!items.length) return none
+  const items = mine && latest.size ? digestItems(mine, latest, me) : []
+  let own: { lines: string[]; keys: string[] } = { lines: [], keys: [] }
+  if (thread === 'main') {
+    await loadFlags($)
+    own = await ownLines($)
+  }
+  if (!items.length && !own.lines.length) return none
   return {
-    lines: [digestText(items, me)],
+    lines: [...(items.length ? [digestText(items, me)] : []), ...own.lines],
     told: async () => {
-      await update($, reads, m => {
-        const t = { ...(m[thread] ?? {}) }
-        for (const i of items) if (t[i.path] && i.event.to !== null) t[i.path] = { ...(t[i.path] as FleetRead), told: i.event.to }
-        return { ...m, [thread]: t }
-      })
-      log($, `digest to ${thread}: ${items.map(i => i.path).join(', ')}`)
-      saveReadsSoon($)
+      if (items.length) {
+        await update($, reads, m => {
+          const t = { ...(m[thread] ?? {}) }
+          for (const i of items) if (t[i.path] && i.event.to !== null) t[i.path] = { ...(t[i.path] as FleetRead), told: i.event.to }
+          return { ...m, [thread]: t }
+        })
+        log($, `digest to ${thread}: ${items.map(i => i.path).join(', ')}`)
+        saveReadsSoon($)
+      }
+      if (own.keys.length) {
+        const at = me.sessionId ? await $.clock.now() : 0
+        await update($, ownTold, m => {
+          const kept = Object.fromEntries(Object.entries(m).filter(([, t]) => at - t < 24 * HOUR))
+          return { ...kept, ...Object.fromEntries(own.keys.map(k => [k, at])) }
+        })
+        log($, `flags to ${thread}: ${own.keys.map(k => k.split('|')[1]).join(', ')}`)
+      }
     },
   }
 }
@@ -1123,25 +1349,170 @@ async function withLines($: any, r: any, thread: string, extra: string[] = []): 
   return { ...r, context: [...(r.context ?? []), ...lines] }
 }
 
-// ---- The gate: a Write, Edit or NotebookEdit of a world file this thread didn't read as it is now ----
+// ---- Records: versions, pins (records.ts) ----
+
+function sortedRevs(c: { revs: Map<number, Rev> }): Rev[] {
+  return [...c.revs.values()].sort((a, b) => a.rev - b.rev)
+}
+
+/** A record's versions, oldest first: state/revs/<id>/, listed again when the folder's time moved (looked at once a
+ * second at most) */
+async function revsOf($: any, id: string): Promise<Rev[]> {
+  if (!/^[A-Za-z0-9._-]+$/.test(id) || id.startsWith('.')) return []
+  const now = await $.clock.now()
+  let c = revCache.get(id)
+  if (c && now - c.at < 1000) return sortedRevs(c)
+  let m = -1
+  try {
+    m = Number((await $.fs.stat(revDir(id))).mtimeMs)
+  } catch {}
+  if (!c) {
+    c = { revs: new Map(), mtime: -2, at: 0 }
+    revCache.set(id, c)
+  }
+  c.at = now
+  if (m !== c.mtime) {
+    c.mtime = m
+    if (m === -1) c.revs.clear()
+    for (const n of m === -1 ? [] : await names($, revDir(id))) {
+      const k = Number(n.replace(/\.json$/, ''))
+      if (!/^\d+\.json$/.test(n) || c.revs.has(k)) continue
+      const r = parseRev((await readText($, `${revDir(id)}/${n}`)) ?? '')
+      if (r) c.revs.set(k, r)
+    }
+  }
+  return sortedRevs(c)
+}
+
+function forget(id: string) {
+  const c = revCache.get(id)
+  if (c) c.at = 0
+}
+
+/** A record fleet never saw a version of gets its first, the one there now (no landing: its owner is nobody) */
+async function ensureBase($: any, id: string, rel: string, v: string, pins: string[], changeHash: string | null) {
+  if ((await revsOf($, id)).length) return
+  const entry: Rev = { format: FORMAT, id, path: rel, rev: 1, hash: v, kind: 'addition', changeHash, at: await $.clock.now(), by: null, via: 'base', pins }
+  await publish($, `${revDir(id)}/1.json`, json(entry))
+  forget(id)
+}
+
+/** A record's versions, its first allocated when it has none (from what's there now, or what the caller read) */
+async function revsFor($: any, id: string, have?: { rel: string; v: string | null; text: string | null }): Promise<Rev[]> {
+  const revs = await revsOf($, id)
+  if (revs.length || !records) return revs
+  const rel = have?.rel ?? idIndex.get(id)
+  if (!rel) return revs
+  const f = have ?? (await versionOf($, `${realRoot}/${rel}`))
+  if (f.v === null) return revs
+  await ensureBase($, id, rel, f.v, pinsFrom(f.text), f.text === null ? null : (changeOf(f.text, records.changeKey)?.hash ?? null))
+  return revsOf($, id)
+}
+
+/** A landing of a world file: a record gets its next version (no-clobber: on a name taken, the one after), with the
+ * kind its change line names; the event carries it, and the pins the file cites now */
+async function landRecord($: any, rel: string, after: { v: string | null; text: string | null }, via: ChangeEvent['via'], by: Who | null, suspect: string[] = []): Promise<Partial<ChangeEvent>> {
+  const pins = pinsFrom(after.text)
+  const extra: Partial<ChangeEvent> = { ...(pins.length ? { pins } : {}), ...(suspect.length ? { suspect } : {}) }
+  const id = records ? idOf(rel, records) : null
+  if (!records || !id) return extra
+  const revs = await revsOf($, id)
+  const prev = revs[revs.length - 1] ?? null
+  if (prev && prev.hash === after.v) return { id, rev: prev.rev, ...extra }
+  const change = after.text === null ? null : changeOf(after.text, records.changeKey)
+  const kind = landingKind(change, prev, after.v === null)
+  const at = await $.clock.now()
+  for (let n = (prev?.rev ?? 0) + 1, tries = 0; tries < 20; tries++, n++) {
+    const entry: Rev = { format: FORMAT, id, path: rel, rev: n, hash: after.v, kind, changeHash: change?.hash ?? null, at, by, via, pins, ...(suspect.length ? { suspect } : {}) }
+    const r = await publish($, `${revDir(id)}/${n}.json`, json(entry))
+    if (r === 'ok') {
+      forget(id)
+      sweep.dirty = true
+      return { id, rev: n, kind, ...extra }
+    }
+    if (r === 'failed') break
+  }
+  log($, `${rel}: couldn't give ${id} a version (${revDir(id)})`)
+  return { id, ...extra }
+}
+
+type PinCheck = { problems: ReturnType<typeof pinProblems>; keys: string[]; states: PinState[] }
+
+/** The pins of a text a thread is about to land, against the pins the file cited before: the problems to tell
+ * (records.ts pinProblems), and every pin's state */
+async function checkPins($: any, thread: string, text: string, before: ReadonlySet<string>): Promise<PinCheck | null> {
+  if (!records) return null
+  const pins = pinsOf(text, records)
+  if (!pins.length) return null
+  const states = new Map<string, PinState>()
+  for (const p of pins) states.set(pinKey(p), pinState(p, await revsFor($, p.id)))
+  const mine = (await read($, reads))[thread] ?? {}
+  const readStates = new Map<string, ReadState>()
+  for (const p of pins) {
+    if (readStates.has(p.id)) continue
+    const rel = idIndex.get(p.id)
+    const r = rel ? mine[rel] : undefined
+    if (!rel || !r) {
+      readStates.set(p.id, 'never')
+      continue
+    }
+    // The version there now, read only for a pin that needs it
+    const st = states.get(pinKey(p)) as PinState
+    const now = st.state === 'stale' || st.state === 'ahead' ? (await versionOf($, `${realRoot}/${rel}`)).v : r.v
+    readStates.set(p.id, r.v === now ? 'current' : 'older')
+  }
+  const problems = pinProblems(pins, before, p => states.get(pinKey(p)) as PinState, id => readStates.get(id) ?? 'never', id => idIndex.get(id) ?? null)
+  return { problems, keys: problemKeys(problems), states: [...states.values()] }
+}
+
+/** What a Write or Edit leaves in the file (null: it can't be told, or the edit won't apply) */
+function resultOf(e: any, current: string | null): string | null {
+  if (e.tool === 'Write') return typeof e.content === 'string' ? e.content : null
+  if (e.tool !== 'Edit' || typeof e.old_string !== 'string' || typeof e.new_string !== 'string') return null
+  if (current === null || !e.old_string || !current.includes(e.old_string)) return null
+  return e.replace_all ? current.split(e.old_string).join(e.new_string) : current.replace(e.old_string, () => e.new_string)
+}
+
+// ---- The gate: a Write, Edit or NotebookEdit of a world file this thread didn't read as it is now, or whose pins it
+// didn't read as they are ----
 
 async function gate($: any, e: any, next: any) {
   const w = await worldFile($, e.file_path ?? e.notebook_path)
   if (!w) return next(e)
   const thread = threadOf(e)
+  if (w.copy) return copyGate($, e, next, w, thread)
   const cur = await versionOf($, w.abs)
   const mine = (await read($, reads))[thread]?.[w.rel]
-  const said = (await read($, warned))[thread]?.[w.rel]
-  const v = verdict(mine, cur.v, said)
-  if (v !== 'pass') {
-    await pullEvents($)
-    const last = latest.get(w.rel)
+  const told = (await read($, warned))[thread] ?? {}
+  // Under strict, nothing passes on a second try: only a read clears it
+  const strict = isStrict(records, w.rel)
+  const v = verdict(mine, cur.v, strict ? undefined : told[w.rel])
+  // The pins of what the write leaves: a stale one, or a new one of a record this thread never read, is told once
+  const text = resultOf(e, cur.text)
+  const pins = text === null ? null : await checkPins($, thread, text, new Set(pinsFrom(cur.text)))
+  const said = new Set((told[`pins:${w.rel}`] ?? '').split('\n').filter(Boolean))
+  const fresh = pins ? pins.keys.filter(k => strict || !said.has(k)) : []
+  if (v !== 'pass' || fresh.length) {
     const me = await meNow($)
-    await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: cur.v as string } }))
-    if (mine && cur.v) await update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } }))
-    log($, `refused once: ${e.tool} of ${w.rel} by ${thread} (${v})`)
-    return { deny: gateText(v, w.rel, last && last.to === cur.v ? last : null, cur.mtimeMs, me) }
+    const texts: string[] = []
+    if (v !== 'pass') {
+      await pullEvents($)
+      const last = latest.get(w.rel)
+      await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: cur.v as string } }))
+      if (mine && cur.v) await update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } }))
+      texts.push(gateText(v, w.rel, last && last.to === cur.v ? last : null, cur.mtimeMs, me))
+    }
+    if (fresh.length && pins) {
+      await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [`pins:${w.rel}`]: [...new Set([...said, ...pins.keys])].join('\n') } }))
+      texts.push(pinsText(pins.problems, me, offered && thread === 'main'))
+    }
+    const why = [v !== 'pass' ? v : '', fresh.length && pins ? `pins ${pins.problems.map(p => `${pinKey(p.pin)} ${p.why}`).join(', ')}` : ''].filter(Boolean).join('; ')
+    log($, `refused once: ${e.tool} of ${w.rel} by ${thread} (${why})${strict ? ', strict' : ''}`)
+    return { deny: texts.join('\n\n') }
   }
+  // A record fleet never saw a version of: the one there now is its first
+  const id = records ? idOf(w.rel, records) : null
+  if (id && cur.v !== null) await revsFor($, id, { rel: w.rel, v: cur.v, text: cur.text })
   const r = await next(e)
   if (!r || r.deny !== undefined || r.isError) return r
   const extra: string[] = []
@@ -1153,17 +1524,39 @@ async function gate($: any, e: any, next: any) {
     const raced = replaced !== null && cur.v !== null && cur.v.startsWith('h') && replaced !== cur.v
     await pullEvents($)
     const before = latest.get(w.rel)
-    await writeEvent($, { path: w.rel, from: replaced ?? cur.v, to: after.v, via: 'tool', tool: String(e.tool), blind: false, by: await whoAmI($, thread), ...(raced ? { overwrote: true } : {}) })
-    known.set(w.rel, { mtimeMs: after.mtimeMs, size: after.size, v: after.v })
+    const by = await whoAmI($, thread)
+    const fields = await landRecord($, w.rel, after, 'tool', by)
+    await writeEvent($, { path: w.rel, from: replaced ?? cur.v, to: after.v, via: 'tool', tool: String(e.tool), blind: false, by, ...(raced ? { overwrote: true } : {}), ...fields })
+    setKnown(w.rel, { mtimeMs: after.mtimeMs, size: after.size, v: after.v, pins: fields.pins ?? [] })
     unexplained.delete(w.rel)
-    await setRead($, thread, w.rel, after.v)
+    await setRead($, thread, w.rel, after.v, fields.rev)
     if (raced && before && before.to === replaced && before.by?.sessionId !== String(await $.session.id())) {
       extra.push(overwroteText(w.rel, before, await meNow($), e.tool === 'Write' ? 'write' : 'edit'))
     }
+    const states = pins?.states ?? []
+    const landed = landedText(w.rel, fields.id ?? null, fields.rev ?? null, states.filter(s => s.state === 'unknown').map(s => s.pin), states.filter(s => s.state === 'ahead'))
+    if (landed) extra.push(landed)
+    scheduleChecks($, [w.rel])
   } catch (err) {
     log($, `after ${e.tool} of ${w.rel}: ${String(err).slice(0, 200)}`)
   }
   return withLines($, r, thread, extra)
+}
+
+// A write of a worktree's copy of a shared file: told once that the shared one is the main checkout's (a session
+// isolated in its worktree can't write that one: it keeps its change in the worktree, or reports it). Nothing lands
+async function copyGate($: any, e: any, next: any, w: Placed, thread: string) {
+  const key = `copy:${w.rel}`
+  const cur = await versionOf($, w.abs)
+  const now = cur.v ?? 'new'
+  if ((await read($, warned))[thread]?.[key] !== now) {
+    await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [key]: now } }))
+    log($, `refused once: ${e.tool} of a worktree copy of ${w.rel} by ${thread} (${w.copy})`)
+    return { deny: copyWriteText(String(e.file_path ?? e.notebook_path), w.rel, `${realRoot}/${w.rel}`) }
+  }
+  const r = await next(e)
+  if (r && r.deny === undefined && !r.isError) log($, `${w.rel}: written in the worktree ${w.copy} only`)
+  return r
 }
 
 // ---- Bash: what it read, and what it wrote that the gate didn't see (found by comparing the world before and after) ----
@@ -1177,8 +1570,11 @@ async function snapshot($: any): Promise<Snapshot | undefined> {
   const deep = world.globs.some(g => globBase(g) === '' && g.includes('/'))
   const out: Snapshot = new Map()
   let count = 0
+  // Never into a linked worktree: what's there is a copy, not the world
+  const inside = trees.linked.map(t => relOf(t, realRoot, insensitive)).filter((x): x is string => x !== null)
   const descend = (p: string) => {
     if (p === '.git' || p === '.claude/fleet' || p.endsWith('/.git') || p.endsWith('/node_modules') || p === 'node_modules') return false
+    if (p === '.claude/worktrees' || inside.includes(p)) return false
     return deep || bases.some(b => b !== '' && (p === b || p.startsWith(`${b}/`) || b.startsWith(`${p}/`)))
   }
   const walk = async (rel: string, depth: number): Promise<boolean> => {
@@ -1214,7 +1610,7 @@ function knownSnapshot(): Snapshot {
 
 // After a Bash command: every world file it changed is a landing of this thread, marked blind (it didn't go through
 // the gate: decision 3c flags it, never blocks). One whose newest change was someone else's after this thread read it
-// gets a line for the model
+// gets a line for the model; so does one whose pins this thread hadn't read as they are, and it's marked suspect
 async function afterBash($: any, thread: string, before: Snapshot, startedAt: number): Promise<string[]> {
   const after = await snapshot($)
   if (!after) return []
@@ -1223,14 +1619,16 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   await pullEvents($)
   const sessionId = String(await $.session.id())
   const out: string[] = []
+  const landed: string[] = []
   for (const rel of changed) {
     const s = after.get(rel)
-    const v = s ? (await versionOf($, `${realRoot}/${rel}`)).v : null
+    const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
+    const v = f.v
     const last = latest.get(rel)
     const k = known.get(rel)
     const settle = () => {
-      if (s) known.set(rel, { ...s, v })
-      else known.delete(rel)
+      if (s) setKnown(rel, { ...s, v, pins: pinsFrom(f.text) })
+      else dropKnown(rel)
       unexplained.delete(rel)
     }
     // Someone's landing during the command, or only its time moved
@@ -1239,11 +1637,24 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
       continue
     }
     const mine = (await read($, reads))[thread]?.[rel]
-    await writeEvent($, { path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'bash', tool: 'Bash', blind: true, by: await whoAmI($, thread) })
+    // The pins of what the command left, as the gate would have checked them (it isn't held: it's marked)
+    const pc = f.text === null ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []))
+    const suspect = pc ? pc.problems.map(p => `${pinKey(p.pin)}:${p.why}`) : []
+    const id = records ? idOf(rel, records) : null
+    if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
+    const by = await whoAmI($, thread)
+    const fields = await landRecord($, rel, f, 'bash', by, suspect)
+    await writeEvent($, { path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'bash', tool: 'Bash', blind: true, by, ...fields })
     settle()
-    await setRead($, thread, rel, v)
+    await setRead($, thread, rel, v, fields.rev)
     if (last && last.by?.sessionId !== sessionId && last.to !== mine?.v) out.push(overwroteText(rel, last, await meNow($), 'command'))
+    if (pc?.problems.length) {
+      out.push(blindText(rel, pc.problems, await meNow($)))
+      log($, `${rel}: landed blind citing ${suspect.join(', ')}: suspect`)
+    }
+    if (v !== null) landed.push(rel)
   }
+  scheduleChecks($, landed)
   return out
 }
 
@@ -1269,7 +1680,7 @@ async function bashHook($: any, e: any, next: any) {
   try {
     if (before) extra.push(...(await afterBash($, thread, before, startedAt)))
     const target = bashReadTarget(String(e.command ?? ''))
-    if (target && r && !r.isError && r.deny === undefined) await noteRead($, thread, target)
+    if (target && r && !r.isError && r.deny === undefined) extra.push(...(await noteRead($, thread, target)))
   } catch (err) {
     log($, `after a Bash command: ${String(err).slice(0, 200)}`)
   }
@@ -1286,8 +1697,14 @@ async function scanWorld($: any) {
   if (!snap) return
   const now = await $.clock.now()
   if (!baselined) {
-    for (const [rel, s] of snap) known.set(rel, { ...s, v: (await versionOf($, `${realRoot}/${rel}`)).v })
+    known.clear()
+    for (const [rel, s] of snap) {
+      const f = await versionOf($, `${realRoot}/${rel}`)
+      known.set(rel, { ...s, v: f.v, pins: pinsFrom(f.text) })
+    }
+    indexIds()
     baselined = true
+    sweep.dirty = true
     return
   }
   const changed = changedPaths(knownSnapshot(), snap)
@@ -1295,12 +1712,13 @@ async function scanWorld($: any) {
   await pullEvents($)
   for (const rel of changed) {
     const s = snap.get(rel)
-    const v = s ? (await versionOf($, `${realRoot}/${rel}`)).v : null
+    const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
+    const v = f.v
     const k = known.get(rel)
     const last = latest.get(rel)
     const settle = () => {
-      if (s) known.set(rel, { ...s, v })
-      else known.delete(rel)
+      if (s) setKnown(rel, { ...s, v, pins: pinsFrom(f.text) })
+      else dropKnown(rel)
       unexplained.delete(rel)
     }
     if ((k && k.v === v) || (last && last.to === v)) {
@@ -1316,7 +1734,10 @@ async function scanWorld($: any) {
     const at = Math.floor(s?.mtimeMs ?? now)
     const claim = `${eventsDir('claims')}/${hashText(`${rel}\n${v ?? 'removed'}\n${Math.floor(s?.mtimeMs ?? k?.mtimeMs ?? 0)}`).slice(1)}`
     if ((await publish($, claim, json({ format: FORMAT, path: rel, at: now }))) === 'ok') {
-      await writeEvent($, { at: s ? at : now, path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'outside', blind: true, by: null })
+      const id = records ? idOf(rel, records) : null
+      if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
+      const fields = await landRecord($, rel, f, 'outside', null)
+      await writeEvent($, { at: s ? at : now, path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'outside', blind: true, by: null, ...fields })
     }
     settle()
   }
@@ -1340,6 +1761,15 @@ async function startWorld($: any) {
   }
   await refreshName($)
   await pullEvents($, 25)
+  // fleet's own state (versions, suspects, check results, the sweeper's lease) stays out of git whatever .gitignore says
+  await run($, ['mkdir', '-p', stateDir('revs'), stateDir('checks')])
+  if (!(await exists($, stateDir('.gitignore')))) {
+    try {
+      await $.fs.write(stateDir('.gitignore'), '# fleet’s own state: versions, suspects, check results, the sweeper\n*\n')
+    } catch {}
+  }
+  await refreshTrees($)
+  await lease($)
 }
 
 async function worldTick($: any) {
@@ -1353,6 +1783,328 @@ async function worldTick($: any) {
   await loadWorld($)
   if (world && !worldStarted) await startWorld($)
   await eventsTick($)
+  if (!worldOn()) return
+  await lease($)
+  await sweepTick($)
+  await loadFlags($)
+  await refreshTrees($)
+}
+
+// ---- The sweeper: one session of the project, elected by a lease, every 60 s (and soon after each landing) ----
+
+const sweep = { holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0, running: false, dirty: false, lastRun: {} as Record<string, number>, commitNote: '', suspectsKey: '' }
+
+// The lease, <project>/.claude/fleet/state/sweeper.json: whoever holds it rewrites it every 20 s; one older than 90 s
+// (or none) is taken by writing it, and the taker sweeps once it still finds itself there 2 s later (two that took it
+// at once: the last write wins, and the other backs off). Replaced with mv, no lock: a minute of two sweepers is harmless
+async function lease($: any) {
+  const now = await $.clock.now()
+  const due = sweep.holding ? 20000 : sweep.takenAt ? 2000 : 10000
+  if (now - sweep.leaseAt < due) return
+  sweep.leaseAt = now
+  const sessionId = String(await $.session.id())
+  const st = leaseState(parseLease(await readText($, stateDir('sweeper.json'))), sessionId, now)
+  if (st === 'held') {
+    if (sweep.holding) log($, 'sweeper: another session took it')
+    sweep.holding = false
+    sweep.takenAt = 0
+    return
+  }
+  if (st === 'mine' && !sweep.holding && (!sweep.takenAt || now - sweep.takenAt >= 2000)) {
+    sweep.holding = true
+    sweep.takenAt = 0
+    sweep.dirty = true
+    log($, 'sweeper: this session')
+  } else if (st === 'free') sweep.takenAt = now
+  if (!(await replace($, stateDir('sweeper.json'), json({ format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: now })))) {
+    await run($, ['mkdir', '-p', stateDir()])
+  }
+}
+
+async function releaseLease($: any) {
+  if (!sweep.holding || !root) return
+  sweep.holding = false
+  const l = parseLease(await readText($, stateDir('sweeper.json')))
+  if (l && l.sessionId === String(await $.session.id())) await remove($, [stateDir('sweeper.json')])
+}
+
+// Every 2 s: a full sweep every 60 s, and the suspects again soon after a landing anywhere in the project
+async function sweepTick($: any) {
+  if (!sweep.holding || sweep.running || !baselined) return
+  const now = await $.clock.now()
+  const full = now - sweep.lastSweep >= 60000
+  if (!full && !sweep.dirty) return
+  sweep.running = true
+  try {
+    await computeSuspects($)
+    if (full) {
+      sweep.lastSweep = now
+      await sweepChecks($)
+      await maybeCommit($)
+    }
+  } catch (err) {
+    log($, `sweep: ${String(err).slice(0, 200)}`)
+  } finally {
+    sweep.running = false
+  }
+}
+
+// Suspects (records.ts suspectsOf) over every world file this session's scans know, written to
+// <project>/.claude/fleet/state/suspects.json when they change. A record seen for the first time gets its first version
+async function computeSuspects($: any) {
+  sweep.dirty = false
+  if (!records) return
+  const facts: Facts[] = []
+  for (const [rel, k] of [...known].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const id = idOf(rel, records)
+    let owner: Who | null = null
+    let blind: string[] | undefined
+    if (id && idIndex.get(id) === rel) {
+      let revs = await revsOf($, id)
+      if (!revs.length && k.v !== null) {
+        await ensureBase($, id, rel, k.v, k.pins ?? [], null)
+        revs = await revsOf($, id)
+      }
+      const last = revs[revs.length - 1]
+      owner = last?.by ?? null
+      if (last && last.hash === k.v) blind = last.suspect
+    } else {
+      const e = latest.get(rel)
+      owner = e?.by ?? null
+      if (e && e.to === k.v) blind = e.suspect
+    }
+    if (k.pins?.length || blind?.length) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}) })
+  }
+  const cited = new Map<string, Rev[]>()
+  for (const id of new Set(facts.flatMap(f => f.pins.map(p => parsePin(p)?.id ?? '')))) if (id) cited.set(id, await revsFor($, id))
+  const list = suspectsOf(facts, p => pinState(p, cited.get(p.id)))
+  const key = list.map(suspectKey).join('\n')
+  if (key === sweep.suspectsKey && (await exists($, stateDir('suspects.json')))) return
+  const file: SuspectsFile = { format: FORMAT, at: await $.clock.now(), by: String(await $.session.id()), suspects: list }
+  if (await replace($, stateDir('suspects.json'), json(file))) {
+    if (key !== sweep.suspectsKey) log($, `suspects: ${list.filter(s => s.reasons.length).map(s => s.path).join(', ') || 'none'}`)
+    sweep.suspectsKey = key
+  }
+}
+
+// ---- What every session reads of the sweeper's work: the suspects, the check results; the band counts them ----
+
+const flagged = { suspectsMtime: -1, suspects: null as SuspectsFile | null, checksMtime: -1, checks: new Map<string, { mtime: number; file: CheckFile }>(), at: 0 }
+
+async function loadFlags($: any) {
+  let m = -1
+  try {
+    m = Number((await $.fs.stat(stateDir('suspects.json'))).mtimeMs)
+  } catch {}
+  if (m !== flagged.suspectsMtime) {
+    flagged.suspectsMtime = m
+    flagged.suspects = m === -1 ? null : parseSuspects((await readText($, stateDir('suspects.json'))) ?? '')
+  }
+  let c = -1
+  try {
+    c = Number((await $.fs.stat(stateDir('checks'))).mtimeMs)
+  } catch {}
+  if (c !== flagged.checksMtime) {
+    flagged.checksMtime = c
+    let entries: any[] = []
+    try {
+      entries = await $.fs.list(stateDir('checks'))
+    } catch {}
+    const present = new Set<string>()
+    for (const x of entries) {
+      const name = String(x.name)
+      if (!name.endsWith('.json')) continue
+      present.add(name)
+      const had = flagged.checks.get(name)
+      if (had && had.mtime === Number(x.mtimeMs)) continue
+      const f = parseCheckFile((await readText($, stateDir(`checks/${name}`))) ?? '')
+      if (f) flagged.checks.set(name, { mtime: Number(x.mtimeMs), file: f })
+    }
+    for (const name of [...flagged.checks.keys()]) if (!present.has(name)) flagged.checks.delete(name)
+  }
+  const n = new Set([...directSuspects().map(s => s.path), ...failing().map(f => f.path)]).size
+  if ((await read($, flags)) !== n) await update($, flags, () => n)
+}
+
+function directSuspects(): Suspect[] {
+  return (flagged.suspects?.suspects ?? []).filter(s => s.reasons.length > 0)
+}
+
+/** Files whose last check results, on the version there now, failed */
+function failing(): { path: string; owner: Who | null; check: string; message: string; hash: string | null }[] {
+  const out: { path: string; owner: Who | null; check: string; message: string; hash: string | null }[] = []
+  for (const { file } of flagged.checks.values()) {
+    const k = known.get(file.path)
+    if (!k || k.v !== file.hash) continue
+    for (const [check, r] of Object.entries(file.results)) if (!r.ok) out.push({ path: file.path, owner: file.owner, check, message: r.message ?? 'failed', hash: file.hash })
+  }
+  return out.sort((a, b) => a.path.localeCompare(b.path) || a.check.localeCompare(b.check))
+}
+
+/** The digest's part for the files this session wrote last: suspects and failed checks, each told once */
+async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
+  const me = { sessionId: String(await $.session.id()), ref: myRef ?? jobRef }
+  const told = await read($, ownTold)
+  const items: { key: string; line: string }[] = []
+  const words = await meNow($)
+  for (const s of directSuspects()) {
+    if (!ownedBy(s.owner, me)) continue
+    const key = `s|${suspectKey(s)}`
+    if (!told[key]) items.push({ key, line: `- ${suspectLine(s, words)}` })
+  }
+  for (const f of failing()) {
+    if (!ownedBy(f.owner, me)) continue
+    const key = `c|${f.path}|${f.check}|${f.hash}`
+    if (!told[key]) items.push({ key, line: `- ${f.path} failed the check ${f.check}: ${f.message}` })
+  }
+  if (!items.length) return { lines: [], keys: [] }
+  const shown = items.slice(0, MAX_LINES)
+  const text = [
+    `fleet: shared files you wrote last are flagged (nothing is held; fix them when you can: read what they cite, then update them, or say why they still hold):`,
+    ...shown.map(i => i.line),
+    ...(items.length > shown.length ? [`- and ${items.length - shown.length} more: /fleet status in any session lists them`] : []),
+  ].join('\n')
+  return { lines: [text], keys: items.map(i => i.key) }
+}
+
+// ---- Check scripts: the project's own, run on landing and by the sweeper, stamped by the person ----
+
+const checkState = { stampAt: 0, stamp: { ok: false, key: '' }, errors: new Map<string, string>() }
+
+// A check runs only while its definitions and scripts are the ones the person stamped (/fleet accept checks): fleet
+// runs them as the person, in every session of the project, with no permission prompt
+async function checksStamp($: any, fresh = false): Promise<{ ok: boolean; key: string }> {
+  const now = await $.clock.now()
+  if (!fresh && now - checkState.stampAt < 10000) return checkState.stamp
+  checkState.stampAt = now
+  if (!records?.checks.length) return (checkState.stamp = { ok: false, key: '' })
+  const scripts = new Map<string, string | null>()
+  for (const s of scriptsOf(records.checks)) scripts.set(s, (await versionOf($, `${realRoot}/${s}`)).v)
+  const key = checksKey(records.checks, scripts)
+  let stamped = ''
+  try {
+    const v = JSON.parse((await readText($, stateDir('checks-stamp.json'))) ?? '')
+    if (v && v.format === FORMAT && typeof v.key === 'string') stamped = v.key
+  } catch {}
+  return (checkState.stamp = { ok: stamped === key, key })
+}
+
+function checkPath(rel: string): string {
+  return stateDir(`checks/${hashText(rel).slice(1)}.json`)
+}
+
+async function ownerOf($: any, rel: string): Promise<Who | null> {
+  const id = records ? idOf(rel, records) : null
+  if (id) {
+    const revs = await revsOf($, id)
+    return revs[revs.length - 1]?.by ?? null
+  }
+  return latest.get(rel)?.by ?? null
+}
+
+// One run of a check on some files, from the project's folder: the files are its last arguments. Each file's result
+// is stamped with the version checked, so an unchanged file isn't checked again
+async function runCheck($: any, check: Check, rels: string[]) {
+  const versions = new Map<string, string | null>()
+  for (const rel of rels) versions.set(rel, (await versionOf($, `${realRoot}/${rel}`)).v)
+  const r = await run($, [...check.argv, ...rels], { cwd: realRoot, timeoutMs: check.timeoutMs })
+  const out = r.exitCode === 124 ? null : checkOutcome(rels, r)
+  if (!out) {
+    const why = r.exitCode === 124 ? `timed out after ${Math.round(check.timeoutMs / 1000)} s` : (r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 200) || `exit ${r.exitCode}`
+    checkState.errors.set(check.name, why)
+    log($, `check ${check.name} couldn't run: ${why}`)
+    return
+  }
+  checkState.errors.delete(check.name)
+  const now = await $.clock.now()
+  for (const [rel, message] of out) {
+    const path = checkPath(rel)
+    const had = parseCheckFile((await readText($, path)) ?? '')
+    const hash = versions.get(rel) ?? null
+    const results = had && had.hash === hash ? { ...had.results } : {}
+    results[check.name] = { key: check.key, ok: message === null, ...(message !== null ? { message } : {}), at: now }
+    const file: CheckFile = { format: FORMAT, path: rel, hash, owner: await ownerOf($, rel), results }
+    await replace($, path, json(file))
+  }
+  const bad = [...out].filter(([, m]) => m !== null).map(([p]) => p)
+  log($, `check ${check.name} on ${rels.length} file(s)${bad.length ? `: failed ${bad.join(', ')}` : ': passed'}`)
+}
+
+// After a landing in this session: the stamped checks that run on landing, on the files it landed (in the background:
+// the landing isn't held, and the owner hears a failure at its next step)
+function scheduleChecks($: any, rels: string[]) {
+  if (!rels.length || !records?.checks.some(c => c.when === 'land')) return
+  $.clock.after(0, () =>
+    bg(
+      (async () => {
+        if (!(await checksStamp($)).ok) return
+        for (const c of (records as Records).checks) {
+          if (c.when !== 'land') continue
+          const mine = rels.filter(r => c.re.test(r))
+          if (mine.length) await runCheck($, c, mine)
+        }
+        await loadFlags($)
+      })(),
+    ),
+  )
+}
+
+// The sweeper's part: every check on the files whose results are out of date (changed since, or never checked):
+// landing checks each minute (to catch what Bash or an editor wrote), sweep checks every everyMin minutes
+async function sweepChecks($: any) {
+  if (!records?.checks.length || !(await checksStamp($)).ok) return
+  await loadFlags($)
+  const byPath = new Map([...flagged.checks.values()].map(x => [x.file.path, x.file]))
+  const now = await $.clock.now()
+  for (const c of records.checks) {
+    if (c.when === 'sweep' && now - (sweep.lastRun[c.name] ?? 0) < c.everyMin * 60000) continue
+    sweep.lastRun[c.name] = now
+    const due = [...known].filter(([rel, k]) => k.v !== null && c.re.test(rel) && needsCheck(byPath.get(rel), c, k.v)).map(([rel]) => rel)
+    for (let i = 0; i < due.length; i += 50) await runCheck($, c, due.slice(i, i + 50))
+  }
+}
+
+// ---- The world commit (world.json commit.everyMin, off by default): only world paths, never in a worktree ----
+
+async function maybeCommit($: any) {
+  const every = records?.commitEveryMin
+  if (!every || !world) return
+  const now = await $.clock.now()
+  let last: any = null
+  try {
+    last = JSON.parse((await readText($, stateDir('commit.json'))) ?? '')
+  } catch {}
+  if (last && last.format === FORMAT && now - Number(last.at || 0) < every * 60000) return
+  const note = async (n: string) => {
+    if (n !== sweep.commitNote) log($, `world commit: ${n}`)
+    sweep.commitNote = n
+  }
+  const g = await gitOf($, realRoot)
+  if (!g) return note('not a git repository')
+  if (g.gitDir !== g.common) return note('the project is a linked worktree: fleet commits only in the main checkout')
+  if (await exists($, `${g.common}/index.lock`)) return note('git is busy (index.lock): next minute')
+  if ((await run($, ['git', '-C', realRoot, 'var', 'GIT_COMMITTER_IDENT'])).exitCode !== 0) return note('git has no user.name and user.email here')
+  const bases = [...new Set(world.globs.map(globBase))].map(b => (b ? `${realRoot}/${b}` : realRoot))
+  const st = await run($, ['git', '-C', realRoot, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...bases], { timeoutMs: 30000 })
+  if (st.exitCode !== 0) return note(`git status failed: ${st.stderr.trim().slice(0, 200)}`)
+  const top = g.top.replace(/\/+$/, '')
+  const prefix = realRoot === top ? '' : realRoot.startsWith(`${top}/`) ? `${realRoot.slice(top.length + 1)}/` : null
+  if (prefix === null) return note("the project's folder isn't in its repository's working tree")
+  const res = world.res
+  const files = [...new Set(porcelainPaths(st.stdout).map(x => x.path))]
+    .filter(p => p.startsWith(prefix))
+    .map(p => p.slice(prefix.length))
+    .filter(rel => inWorld(rel, res) && rel !== '.claude/worktrees' && !rel.startsWith('.claude/worktrees/'))
+    .slice(0, 1000)
+  if (!files.length) return note('nothing to commit')
+  const abs = files.map(f => `${realRoot}/${f}`)
+  const add = await run($, ['git', '-C', realRoot, 'add', '-A', '--', ...abs], { timeoutMs: 30000 })
+  const msg = commitMessage(now, -new Date(now).getTimezoneOffset())
+  // --only: the commit takes these paths as they are, and leaves whatever else the person staged staged
+  const c = add.exitCode === 0 ? await run($, ['git', '-C', realRoot, 'commit', '-q', '--only', '-m', msg, '--', ...abs], { timeoutMs: 60000 }) : add
+  const ok = c.exitCode === 0
+  await replace($, stateDir('commit.json'), json({ format: FORMAT, at: ok ? now : Number(last?.at || 0), tried: now, ok, files: files.length, ...(ok ? {} : { error: (c.stderr || c.stdout).trim().slice(0, 300) }) }))
+  return note(ok ? `${msg} (${files.length} file(s))` : `failed: ${(c.stderr || c.stdout).trim().slice(0, 200)}`)
 }
 
 // The daily prune's part: event days and outside claims older than KEEP_DAYS, reads files not written since
@@ -1414,6 +2166,7 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
   if (!worldOn()) return worldProblem || 'This project has no world (world.json): /fleet world add <glob> starts one.'
   await pullEvents($)
   const me = await meNow($)
+  if (path === 'checks') return stampChecks($, origin)
   if (!path) {
     const out: string[] = []
     for (const e of [...latest.values()].filter(x => x.via === 'outside').sort((a, b) => b.at - a.at)) {
@@ -1432,11 +2185,38 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
   if (typeof a === 'object') return `${w.rel}: its current version is from ${whoText(a.by, me)} at ${clock(a.by.at, me.offsetMin)}: nothing to stamp`
   const at = Math.max(Math.floor(cur.mtimeMs), (last?.at ?? 0) + 1)
   const from = last && last.via === 'outside' ? last.from : (last?.to ?? null)
-  const ev = await writeEvent($, { at, path: w.rel, from, to: cur.v, via: 'accept', blind: false, by: { ...(await whoAmI($, 'main')), person: true } })
+  const by: Who = { ...(await whoAmI($, 'main')), person: true }
+  // A record whose change no landing recorded yet gets its version now, as the person's
+  const id = records ? idOf(w.rel, records) : null
+  const k = known.get(w.rel)
+  if (id && k?.v && k.v !== cur.v) await ensureBase($, id, w.rel, k.v, k.pins ?? [], null)
+  const fields = await landRecord($, w.rel, cur, 'accept', by)
+  const ev = await writeEvent($, { at, path: w.rel, from, to: cur.v, via: 'accept', blind: false, by, ...fields })
   if (!ev) return `couldn't record it (${eventsDir()})`
-  known.set(w.rel, { mtimeMs: cur.mtimeMs, size: cur.size, v: cur.v })
+  setKnown(w.rel, { mtimeMs: cur.mtimeMs, size: cur.size, v: cur.v, pins: fields.pins ?? [] })
   unexplained.delete(w.rel)
-  return `${w.rel}: its current version (changed at ${clock(cur.mtimeMs, me.offsetMin)}) is recorded as yours. Sessions that read an older version hear it as your change.`
+  return `${w.rel}: its current version (changed at ${clock(cur.mtimeMs, me.offsetMin)}) is recorded as yours${fields.id && fields.rev ? ` (${fields.id}@${fields.rev})` : ''}. Sessions that read an older version hear it as your change.`
+}
+
+// The person stamps the project's checks (world.json's checks and the scripts they name, as they are now): fleet runs
+// them, in every session of the project, only while they stay as stamped
+async function stampChecks($: any, origin: string): Promise<string> {
+  if (!records?.checks.length) return recordsProblem || 'world.json lists no checks ("checks": [{ "glob": …, "argv": [...] }]): nothing to stamp'
+  const st = await checksStamp($, true)
+  const list = records.checks.map(c => `${c.name} (${c.argv.join(' ')}, on ${c.glob}, ${c.when === 'land' ? 'at each landing' : `every ${c.everyMin} min`})`)
+  if (st.ok) return `The checks are stamped as they are: ${list.join('; ')}`
+  if (origin !== 'composer') return `Only the person stamps the checks, typing /fleet accept checks at a terminal (this came from ${origin || 'somewhere else'})`
+  if (!(await replace($, stateDir('checks-stamp.json'), json({ format: FORMAT, key: st.key, at: await $.clock.now() })))) {
+    await run($, ['mkdir', '-p', stateDir()])
+    if (!(await replace($, stateDir('checks-stamp.json'), json({ format: FORMAT, key: st.key, at: await $.clock.now() })))) return `couldn't stamp them (${stateDir()})`
+  }
+  checkState.stampAt = 0
+  checkState.errors.clear()
+  log($, `checks stamped: ${records.checks.map(c => c.name).join(', ')}`)
+  return [
+    `Stamped: ${list.join('; ')}.`,
+    'fleet runs them as you, in every session of the project, until world.json\'s checks or a script they name changes (then /fleet accept checks again). A failure goes to whoever wrote the file last, at its next step, and shows in /fleet status; nothing is held.',
+  ].join('\n')
 }
 
 async function worldStatus($: any): Promise<string[]> {
@@ -1488,6 +2268,57 @@ async function worldStatus($: any): Promise<string[]> {
   for (const e of latest.values()) if (e.via === 'outside' && (await current(e.path)) === e.to) outside.push(e.path)
   if (outside.length) lines.push(`not stamped: ${outside.join(', ')} changed outside fleet: /fleet accept <path> stamps the change as yours`)
   if (other || otherEvents) lines.push(`${other + otherEvents} file(s) from a fleet with another format: restart the sessions (u)`)
+  lines.push(...(await recordsStatus($, me)))
+  return lines
+}
+
+// Records, suspects, checks, the sweeper, world commits and worktrees, for /fleet status
+async function recordsStatus($: any, me: Me): Promise<string[]> {
+  const lines: string[] = []
+  if (recordsProblem) lines.push(`records: ${recordsProblem}`)
+  if (!records) return lines
+  await loadFlags($)
+  const ids = [...idIndex.keys()].sort()
+  lines.push(
+    ids.length
+      ? `records: ${ids.length} (${ids.slice(0, 8).join(', ')}${ids.length > 8 ? ', …' : ''}), cited as ID@n; a version per landing${records.strict ? `, strict on ${records.strict === 'all' ? 'every shared file' : 'some'}` : ''}`
+      : 'records: none yet (a shared file whose name starts with an id, like R-12.md, is a record)',
+  )
+  for (const [id, more] of twins) lines.push(`  ${id} names more than one file: ${[idIndex.get(id), ...more].join(', ')} (the first counts)`)
+  const all = flagged.suspects?.suspects ?? []
+  const direct = all.filter(s => s.reasons.length)
+  const indirect = all.filter(s => !s.reasons.length)
+  const who = (s: Suspect) => (s.owner ? ` · last written by ${s.owner.person ? 'the person' : ownedBy(s.owner, { sessionId: me.sessionId, ref: myRef ?? jobRef }) ? 'this session' : s.owner.name || s.owner.ref || s.owner.sessionId?.slice(0, 8)}` : '')
+  lines.push(direct.length ? 'suspect (flags, nothing is held):' : 'suspect: none')
+  for (const s of direct.slice(0, 20)) lines.push(`  ${suspectLine(s, me)}${who(s)}`)
+  if (indirect.length) lines.push(`indirectly suspect: ${indirect.map(s => `${s.path} (cites ${(s.via ?? []).join(', ')})`).join('; ')}`)
+  if (records.checks.length) {
+    const st = await checksStamp($)
+    lines.push(`checks: ${records.checks.map(c => `${c.name} (${c.when === 'land' ? 'at landing' : `every ${c.everyMin} min`})`).join(', ')}${st.ok ? '' : ': not stamped, so not run: /fleet accept checks runs them'}`)
+    for (const [name, why] of checkState.errors) lines.push(`  ${name} couldn't run: ${why}`)
+    const bad = failing()
+    lines.push(bad.length ? 'failing a check:' : 'failing a check: nothing')
+    for (const f of bad.slice(0, 20)) lines.push(`  ${f.path}: ${f.check}: ${f.message}`)
+  }
+  const l = parseLease(await readText($, stateDir('sweeper.json')))
+  const now = await $.clock.now()
+  lines.push(
+    sweep.holding
+      ? `sweeper: this session${sweep.lastSweep ? `, last sweep at ${clock(sweep.lastSweep, me.offsetMin)}` : ''}`
+      : l && now - l.at <= LEASE_MS
+        ? `sweeper: ${l.name || l.ref || l.sessionId.slice(0, 8)}`
+        : 'sweeper: none yet (one is elected within a minute)',
+  )
+  if (records.commitEveryMin) {
+    let c: any = null
+    try {
+      c = JSON.parse((await readText($, stateDir('commit.json'))) ?? '')
+    } catch {}
+    const lastAt = c && Number(c.at) ? `last at ${clock(Number(c.at), me.offsetMin)}` : 'none yet'
+    lines.push(`world commits: every ${records.commitEveryMin} min, only the shared files; ${lastAt}${c && c.ok === false && c.error ? `; the last try failed: ${c.error}` : ''}${sweep.holding && sweep.commitNote ? ` (${sweep.commitNote})` : ''}`)
+  } else lines.push('world commits: off (world.json "commit": { "everyMin": 60 } turns them on)')
+  if (startedInTree) lines.push(`worktree: this session started in ${startedInTree}; its project is the main checkout's, ${root}`)
+  if (trees.linked.length) lines.push(`worktrees: ${trees.linked.length} linked (${trees.linked.slice(0, 4).join(', ')}): their copies of shared files are not the world`)
   return lines
 }
 
@@ -1802,10 +2633,11 @@ export const register: Register = on => {
   })
 
   // A /clear keeps this process and its $.state; the open decisions are read again from the files all the same, and the
-  // new conversation has read nothing of the world
+  // new conversation has read nothing of the world. A session that ends for good gives up the sweeper's lease
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' && timersOn && jobRef) $.clock.after(500, () => bg(rebuild($)))
     if (e.reason === 'clear') bg(clearReads($, String(e.sessionId ?? '')))
+    else await Promise.race([releaseLease($).catch(() => {}), $.clock.sleep(500)])
     return next(e)
   })
 
@@ -1834,8 +2666,7 @@ export const register: Register = on => {
     await ensureWorld($)
     if (!worldOn()) return r
     const thread = threadOf(e)
-    await noteRead($, thread, e.file_path)
-    return withLines($, r, thread)
+    return withLines($, r, thread, await noteRead($, thread, e.file_path))
   }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: ['Write', 'Edit', 'NotebookEdit'] }, async ($, e, next) => gate($, e, next)).catch(($, e, next) => next(e))
@@ -1921,8 +2752,9 @@ export const register: Register = on => {
     }
   })
 
-  // Above the prompt: how many questions wait for the person in this project, with whatever is drawn there after it.
-  // Its first draw starts fleet when session.start didn't come (a draw only draws: the start runs from a timer)
+  // Above the prompt: how many questions wait for the person in this project, and how many shared files are flagged
+  // (suspect, or failing a check), with whatever is drawn there after it. Its first draw starts fleet when
+  // session.start didn't come (a draw only draws: the start runs from a timer)
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!started && !startScheduled) {
       startScheduled = true
@@ -1931,11 +2763,13 @@ export const register: Register = on => {
     const beneath = await next(e)
     if (e.props.hasSurvey) return beneath
     const n = await read($, held)
-    if (n <= 0) return beneath
+    const f = await read($, flags)
+    if (n <= 0 && f <= 0) return beneath
+    const parts = [...(n > 0 ? [`? ${n} for you`] : []), ...(f > 0 ? [`!! ${f} flagged`] : []), n > 0 ? '/fleet' : '/fleet status']
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">
-        <Text color="warning">{`? ${n} for you · /fleet`}</Text>
+        <Text color="warning">{parts.join(' · ')}</Text>
         {beneath}
       </Box>
     )

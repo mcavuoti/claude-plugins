@@ -17,10 +17,16 @@
 //   events/latest                        wire: the last event's name, rewritten by each writer; every session watches it
 //   events/claims/<hash>                 wire: an outside change claimed no-clobber, so one session records it
 //   reads/<sessionId>.json               wire: what that session's threads read of the world, written only by it
+//   state/revs/<id>/<n>.json             wire: version n of the record <id> (records.ts), published no-clobber
+//   state/suspects.json                  wire: the suspect files, written by the sweeper
+//   state/checks/<hash>.json             wire: the last results of the checks on one file (the last run wins)
+//   state/checks-stamp.json              wire: the checks the person stamped (/fleet accept checks)
+//   state/sweeper.json                   wire: the sweeper's lease, rewritten by whoever holds or takes it
+//   state/commit.json                    wire: the last world commit, written by the sweeper
 // A reader that meets another format acts on nothing and says to restart (u): there is no code for older formats.
 
-/** The format of the wire files: queue/, answers/, last, prune/, events/, reads/. Raise it when a key or its meaning
- * changes */
+/** The format of the wire files: queue/, answers/, last, prune/, events/, reads/, state/. Raise it when a key or its
+ * meaning changes */
 export const FORMAT = 1
 /** Person data: the register. It only gains fields, and a write keeps the fields it doesn't know */
 export const REGISTER_FORMAT = 1
@@ -343,6 +349,7 @@ export const HELP = [
   '/fleet status          what fleet does in this session, the shared files, what changed and who is behind',
   '/fleet world           the shared files (world.json); /fleet world add <glob>, /fleet world remove <glob>',
   '/fleet accept [path]   stamp a change made outside fleet (your editor, a script) as yours; alone, lists them',
+  '/fleet accept checks   let fleet run the check scripts world.json lists, as they are now',
   '/fleet init            set fleet up in this project (.claude/fleet/)',
 ].join('\n')
 
@@ -407,7 +414,7 @@ export function parseConfig(textIn: string): { config: Config } | { problem: str
 }
 
 export function gitignoreText(commitRegister: boolean): string {
-  const runtime = "# What fleet's sessions write as they work: the landings on shared files, and what each session read\nevents/\nreads/\n"
+  const runtime = "# What fleet's sessions write as they work: the landings on shared files, what each session read, versions and flags\nevents/\nreads/\nstate/\n"
   return commitRegister
     ? `# Written by /fleet init from config.json ("commitRegister": true): the register is committed, the rest of decisions/ is not\ndecisions/*\n!decisions/register/\n${runtime}`
     : `# Written by /fleet init from config.json ("commitRegister": false): fleet's decisions and their register stay out of git\ndecisions/\n${runtime}`
