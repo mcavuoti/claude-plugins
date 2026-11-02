@@ -136,14 +136,80 @@ test('a Bash command that writes a world file lands blind: an event of its threa
   expect(r.context.join('\n')).toMatch(new RegExp(`fleet: your command changed notes/plan\\.md, which changed at ${WHEN} by TEST B \\(Edit\\) after you read it\\. Read notes/plan\\.md and check that change is still there\\.`))
   const ev = mine(w)
   expect(ev[0]).toMatchObject({ path: 'notes/plan.md', via: 'bash', tool: 'Bash', blind: true, from: hashText('plan v2 from B\n'), to: hashText('written by a command\n'), by: { sessionId: SID } })
-  // Its own command's result counts as read for the thread that ran it; so does a cat of one file
+  // The command's result doesn't count as read: the thread never saw TEST B's version it replaced, so its next write is
+  // refused once (R6). A cat of one file is a read
+  expect((await call($, { tool: 'Edit', file_path: PLAN, old_string: 'command', new_string: 'command, then edited' })).deny).toContain('after you read it')
   expect((await call($, { tool: 'Edit', file_path: PLAN, old_string: 'command', new_string: 'command, then edited' })).deny).toBe(undefined)
   await call($, { tool: 'Bash', command: 'cat notes/todo.md' })
   expect((await call($, { tool: 'Write', file_path: TODO, content: 'todo v2\n' })).deny).toBe(undefined)
+  // One that changes a file the thread had read as it was: its result counts as read
+  w.bash.value = command => {
+    if (command.startsWith('sed')) w.touch(TODO, 'todo v3\n')
+  }
+  await call($, { tool: 'Bash', command: "sed -i '' s/v2/v3/ notes/todo.md" })
+  expect((await call($, { tool: 'Write', file_path: TODO, content: 'todo v4\n' })).deny).toBe(undefined)
   // A command that writes nothing of the world records nothing
   w.bash.value = () => w.touch(`${ROOT}/build.log`, 'ok\n')
   await call($, { tool: 'Bash', command: 'make' })
-  expect(mine(w).map(e => e.via)).toEqual(['bash', 'tool', 'tool'])
+  expect(mine(w).map(e => e.via)).toEqual(['bash', 'tool', 'tool', 'bash', 'tool'])
+})
+
+test('R6: the scan runs during a long command; what the command writes lands as its own, what another session’s long command writes waits for it', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [TODO]: 'todo v1\n' } })
+  await begin($, w)
+  await tick(w)
+  // A long command here (npm test): it writes notes/plan.md at once, and runs a minute
+  let finish: () => void = () => {}
+  w.bash.value = () => {
+    w.touch(PLAN, 'plan from the tests\n')
+    return new Promise<void>(res => (finish = res))
+  }
+  const pending = call($, { tool: 'Bash', command: 'npm test' })
+  for (let i = 0; i < 6; i++) await tick(w, 10000)
+  expect(mine(w)).toEqual([])
+  finish()
+  await pending
+  expect(mine(w)).toEqual([expect.objectContaining({ path: 'notes/plan.md', via: 'bash', by: expect.objectContaining({ sessionId: SID }) })])
+  // Another session runs a long command (its reads file says so): a change meanwhile waits for its post-scan
+  const OTHER = `${FLEET}/reads/${B_SID}.json`
+  const reads = (running: unknown[]) => w.touch(OTHER, JSON.stringify({ format: 1, sessionId: B_SID, ref: 'bbbbbbbb', name: 'TEST B', at: w.clock.now(), threads: {}, running }))
+  reads([{ thread: 'main', at: w.clock.now() }])
+  w.touch(TODO, 'todo by its build\n')
+  for (let i = 0; i < 4; i++) await tick(w, 10000)
+  expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([])
+  // It ended without landing it (here no fleet there): then it's an outside change
+  reads([])
+  await tick(w, 10000)
+  await tick(w, 10000)
+  expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([expect.objectContaining({ via: 'outside', by: null })])
+})
+
+test('a command run in the background: what changes while it runs is probably its; what it changed lands when it completes', WITH_SESSIONS, async ($, on) => {
+  on('classic.Stop', () => ({}))
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan v1\n', [TODO]: 'todo v1\n' } })
+  await begin($, w)
+  await tick(w)
+  const r = await call($, { tool: 'Bash', command: 'npm run build', run_in_background: true })
+  expect(r.result.backgroundTaskId).toBe('bash-1')
+  await tick(w, 1100)
+  expect(json(w, `${FLEET}/reads/${SID}.json`)?.running).toEqual([{ thread: 'main', at: expect.any(Number), task: 'bash-1' }])
+  // It writes plan.md: the sweeper's scan takes it as probably this session's background command, never the person's
+  w.touch(PLAN, 'plan from the build\n')
+  await tick(w, 10000)
+  await tick(w, 10000)
+  expect(mine(w)).toEqual([expect.objectContaining({ path: 'notes/plan.md', via: 'bash', blind: true, probably: true, by: expect.objectContaining({ sessionId: SID, agentId: null }) })])
+  expect(await fleet($, 'status')).toContain('notes/plan.md: changed at')
+  expect(await fleet($, 'status')).toContain("by this session's main thread (probably its background command, landed blind)")
+  // ... which the person can stamp as his, like an outside change
+  expect(await fleet($, 'accept')).toContain('notes/plan.md: changed at')
+  // It writes todo.md and completes: at the next stop, what's left lands as its own
+  w.touch(TODO, 'todo from the build\n')
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as any)
+  await w.clock.settle()
+  expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([expect.objectContaining({ via: 'bash', blind: true, by: expect.objectContaining({ sessionId: SID }) })])
+  expect(mine(w).find(e => e.path === 'notes/todo.md')?.probably).toBe(undefined)
+  await tick(w, 1100)
+  expect(json(w, `${FLEET}/reads/${SID}.json`)?.running).toBe(undefined)
 })
 
 test('a command that writes many shared files lands them in a couple of processes, not several a file', WITH_SESSIONS, async ($, on) => {

@@ -116,8 +116,9 @@ export type World = {
   band: { value: string }
   // Every prompt that entered, with the context hooks attached on the way down
   prompts: { text: string; context: readonly string[] }[]
-  // What a Bash command does to the files (the stand-in for the shell)
-  bash: { value: (command: string) => void }
+  // What a Bash command does to the files (the stand-in for the shell); a promise keeps the command running until it
+  // settles. One run with run_in_background returns at once with a task id (bash-1, bash-2…)
+  bash: { value: (command: string) => void | Promise<void> }
   // Runs as the engine's Write or Edit starts, after fleet's gate (another session landing just then)
   beforeTool: { value: (tool: string) => void }
   // Writes a file as another program would (an editor, a script, another session): bumps its time, or sets the one
@@ -332,7 +333,8 @@ export function world(on: On, options: WorldOptions = {}): World {
     return answerSubmit.value(e.text) as any
   })
   // The engine's file tools and shell, beneath fleet's hooks
-  const bash = { value: (_command: string): void => {} }
+  const bash = { value: (_command: string): void | Promise<void> => {} }
+  let tasks = 0
   const beforeTool = { value: (_tool: string): void => {} }
   // A write's time: the clock's, a little later than the write before it (two writes in one test tick still differ)
   let bump = 0
@@ -364,8 +366,12 @@ export function world(on: On, options: WorldOptions = {}): World {
       text: `The file ${e.file_path} has been updated successfully.`,
     }
   })
-  on('tool.call', { tool: 'Bash' }, (_, e) => {
-    bash.value(e.command)
+  on('tool.call', { tool: 'Bash' }, async (_, e) => {
+    if (e.run_in_background) {
+      void bash.value(e.command)
+      return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: `bash-${++tasks}` }, text: '' }
+    }
+    await bash.value(e.command)
     return { result: { stdout: '', stderr: '', interrupted: false }, text: '' }
   })
   on('ui.log', (_, e) => {

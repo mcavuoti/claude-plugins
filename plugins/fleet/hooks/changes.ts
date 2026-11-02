@@ -64,12 +64,18 @@ export type ChangeEvent = {
   outside?: true
   /** An intake record (via intake): its kind, tags, sender, the model's summary and who it's routed to; never the body */
   intake?: IntakeMeta
+  /** Found by the scan while a session's background command ran (via bash, by that session): probably its doing, maybe
+   * the person's, so he can stamp it as his like an outside change */
+  probably?: true
 }
 /** A thread: 'main' for the main loop, else the helper's agentId */
 export type Threads = Record<string, Record<string, FleetRead>>
 /** <project>/.claude/fleet/reads/<sessionId>.json: what a session's threads read, for /fleet status and a restart; and
  * the outside content its context read, if any (it stays until /clear, through a restart) */
-export type ReadsFile = { format: number; sessionId: string; ref: string | null; name: string | null; at: number; threads: Threads; outside?: { at: number; what: string } }
+export type ReadsFile = { format: number; sessionId: string; ref: string | null; name: string | null; at: number; threads: Threads; outside?: { at: number; what: string }; running?: Running[] }
+/** A Bash command a session runs now (shown once it has run a few seconds; task: one in the background), so the sweeper
+ * doesn't take what it writes meanwhile for a change outside fleet */
+export type Running = { thread: string; at: number; task?: string }
 
 // ---- world.json ----
 
@@ -285,7 +291,7 @@ export function whoText(e: ChangeEvent, me: Me): string {
   const who = sessionWords(e.by, me)
   if (e.via === 'accept') return 'the person'
   if (e.via === 'answer') return 'the person (a change applied by fleet)'
-  if (e.via === 'bash') return `${who} (a Bash command, landed blind)`
+  if (e.via === 'bash') return e.probably ? `${who} (probably its background command, landed blind)` : `${who} (a Bash command, landed blind)`
   return e.tool ? `${who} (${e.tool})` : who
 }
 
@@ -426,7 +432,7 @@ export function changedPaths(before: Snapshot, after: Snapshot): string[] {
 /** Whether the person can stamp a world file's current version as his: only one nobody's landing explains */
 export function acceptable(last: ChangeEvent | null, current: string | null): 'ok' | 'missing' | 'already' | { by: ChangeEvent } {
   if (current === null) return 'missing'
-  if (!last || last.to !== current || last.via === 'outside') return 'ok'
+  if (!last || last.to !== current || last.via === 'outside' || last.probably) return 'ok'
   if (last.via === 'accept') return 'already'
   return { by: last }
 }

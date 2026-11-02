@@ -28,8 +28,8 @@
 //   events/YYYY-MM-DD/HH/<ms>-<sid8>-<n>.json  wire: one landing on a world file, written once by the session that saw it
 //   events/latest                        wire: the last event's name, rewritten by each writer; every session watches it
 //   events/claims/<hash>                 wire: an outside change claimed no-clobber, so one session records it
-//   reads/<sessionId>.json               wire: what that session's threads read of the world, and the outside content
-//                                        its conversation read, written only by it
+//   reads/<sessionId>.json               wire: what that session's threads read of the world, the outside content its
+//                                        conversation read and the Bash commands it runs now, written only by it
 //   state/revs/<id>/<n>.json             wire: version n of the record <id> (records.ts), published no-clobber
 //   state/suspects.json                  wire: the suspect files, written by the sweeper
 //   state/checks/<hash>.json             wire: the last results of the checks on one file (the last run wins)

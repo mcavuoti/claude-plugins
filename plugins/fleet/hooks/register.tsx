@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { FleetInflight, FleetLate, FleetMark, FleetRead } from '../types'
+import type { FleetBg, FleetInflight, FleetLate, FleetMark, FleetRead } from '../types'
 import { OUTSIDE_TOOLS, checkResource, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, markWords, preAnswer, resourceDelivery, resourceTicket, type OutsideMark, type ResourceSpec } from './authority'
 import { CHIEF_PROMPT, SHOWN as BRIEF_SHOWN, briefText, chiefLines, closedLine, type BriefFacts, type BriefNeed } from './brief'
 import {
@@ -79,6 +79,7 @@ import {
   type DigestItem,
   type Me,
   type ReadsFile,
+  type Running,
   type Snapshot,
   type Who,
   type WorldConfig,
@@ -377,6 +378,8 @@ const slotWait = atom({ plugin: 'fleet', key: 'slotWait' } as const, [] as strin
 const overruling = atom({ plugin: 'fleet', key: 'overruling' } as const, {} as Record<string, FleetInflight>)
 // The person's notes that came once this session's answers were on their way: delivered on their own (deliverLate)
 const lateNotes = atom({ plugin: 'fleet', key: 'lateNotes' } as const, {} as Record<string, FleetLate>)
+// This session's Bash commands running in the background, with the world as it was when each started
+const bgCommands = atom({ plugin: 'fleet', key: 'bgCommands' } as const, {} as Record<string, FleetBg>)
 // A fresh period's hand-off, from the /clear until a turn carrying it starts
 const handoff = atom({ plugin: 'fleet', key: 'handoff' } as const, null as { text: string; at: number } | null)
 // What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing)
@@ -1178,6 +1181,13 @@ async function beat($: any) {
   if ((await read($, overBudget)) !== o) await update($, overBudget, () => o)
   if (jobRef) await keepSection($, records, present)
   await refreshName($)
+  // The commands it runs, said again every minute while they run (a mark not renewed for 3 min is taken as gone); a
+  // background one a day old is taken as done
+  if (worldOn()) {
+    const now = await $.clock.now()
+    for (const [task, b] of Object.entries(await read($, bgCommands))) if (now - b.at > 24 * HOUR) await bgDone($, task)
+    if ((await runningHere($)).length && now - readsSavedAt > 60000) saveReadsSoon($)
+  }
   // The outside scan is the sweeper's (claims dedupe it anyway); every session walks the world once, for its baseline
   if (sweep.holding || !baselined) await scanWorld($).catch(err => log($, `world scan: ${String(err).slice(0, 200)}`))
   // What the band says besides the counts: nobody sweeps, the world too big to scan
@@ -1292,6 +1302,11 @@ let tooBigAt = 0
 // Why: 'files' (past MAX_WORLD_FILES) or 'entries' (past MAX_WALK)
 let tooBigWhy: 'files' | 'entries' = 'files'
 let bashRunning = 0
+// This session's foreground commands running now, by a number of their own; shown is set once one has run 3 s (the
+// reads file then says so)
+const fgRunning = new Map<number, { thread: string; at: number; shown: boolean }>()
+let fgCount = 0
+let readsSavedAt = 0
 let readsTimer = false
 // This session as other sessions' digests name it, from $.sessions every 10 s
 let myName: string | null = null
@@ -1810,11 +1825,20 @@ async function saveReads($: any) {
   const mark = root ? await read($, outside) : null
   if (!worldOn() && !mark) return
   const sessionId = String(await $.session.id())
-  const file: ReadsFile = { format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: await $.clock.now(), threads: await read($, reads), ...(mark ? { outside: mark } : {}) }
+  const running = await runningHere($)
+  readsSavedAt = await $.clock.now()
+  const file: ReadsFile = { format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: readsSavedAt, threads: await read($, reads), ...(mark ? { outside: mark } : {}), ...(running.length ? { running } : {}) }
   if (!(await replace($, readsPath(sessionId), json(file)))) {
     await run($, ['mkdir', '-p', `${fleetDir()}/reads`])
     await replace($, readsPath(sessionId), json(file))
   }
+}
+
+/** The commands this session runs now that the others should know of: a foreground one past 3 s, a background one */
+async function runningHere($: any): Promise<Running[]> {
+  const out: Running[] = [...fgRunning.values()].filter(c => c.shown).map(c => ({ thread: c.thread, at: c.at }))
+  for (const [task, b] of Object.entries(await read($, bgCommands))) out.push({ thread: b.thread, at: b.at, task })
+  return out
 }
 
 // A helper that finished takes its reads with it; a /clear starts a conversation that read nothing
@@ -2551,7 +2575,9 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   if (last) await trigger($, last)
   for (const x of todo) {
     const v = x.f.v
-    await setRead($, thread, x.rel, v, x.fields.rev)
+    // The command's result counts as read only for a thread that had read the version it changed (or that made the
+    // file): another's change it never saw, landed meanwhile, is refused once at its next write, as for any unread file
+    if (x.mine?.v === x.k?.v) await setRead($, thread, x.rel, v, x.fields.rev)
     if (x.last && x.last.by?.sessionId !== sessionId && x.last.to !== x.mine?.v) out.push(overwroteText(x.rel, x.last, await meNow($), 'command'))
     if (x.pc?.problems.length) {
       out.push(blindText(x.rel, x.pc.problems, await meNow($)))
@@ -2583,14 +2609,35 @@ async function bashHook($: any, e: any, next: any) {
   }
   const startedAt = await $.clock.now()
   bashRunning++
+  // Past 3 s, the other sessions hear it runs (its reads file): their sweeper leaves what changes meanwhile to it
+  const n = ++fgCount
+  fgRunning.set(n, { thread, at: startedAt, shown: false })
+  $.clock.after(3000, () => {
+    const c = fgRunning.get(n)
+    if (!c) return
+    c.shown = true
+    saveReadsSoon($)
+  })
   let r: any
   try {
     r = await next(e)
   } finally {
     bashRunning--
+    if (fgRunning.get(n)?.shown) saveReadsSoon($)
+    fgRunning.delete(n)
   }
   if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
   const extra: string[] = []
+  // Run in the background (or moved there): what it writes comes later. Its world as it was is kept under its task id,
+  // and compared with when it completes (bgDone); meanwhile the sweeper takes a change it can't explain as probably its
+  const task = typeof r?.result?.backgroundTaskId === 'string' && r.result.backgroundTaskId ? (r.result.backgroundTaskId as string) : null
+  if (task && before) {
+    const b: FleetBg = { thread, at: startedAt, before: [...before].map(([p, s]) => [p, s.mtimeMs, s.size]) }
+    await update($, bgCommands, m => ({ ...m, [task]: b }))
+    saveReadsSoon($)
+    log($, `Bash in the background (${task}) by ${thread}: its landings when it completes`)
+    before = undefined
+  }
   try {
     if (before) extra.push(...(await afterBash($, thread, before, startedAt)))
     const target = bashReadTarget(String(e.command ?? ''))
@@ -2601,12 +2648,46 @@ async function bashHook($: any, e: any, next: any) {
   return withLines($, r, thread, extra)
 }
 
+/** A background command completed (classic.Stop no longer lists it, or it's a day old): what it changed since it
+ * started, and nobody's landing explains, lands as its thread's, blind (what to tell its model goes to the log: no
+ * tool result carries it) */
+async function bgDone($: any, task: string) {
+  const b = (await read($, bgCommands))[task]
+  await update($, bgCommands, m => omit(m, [task]))
+  saveReadsSoon($)
+  if (!b || !worldOn()) return
+  const before: Snapshot = new Map(b.before.map(([p, mtimeMs, size]) => [p, { mtimeMs, size }]))
+  const lines = await afterBash($, b.thread, before, b.at).catch(err => [`after the background command ${task}: ${String(err).slice(0, 200)}`])
+  log($, `Bash in the background (${task}) completed${lines.length ? `: ${lines.join(' | ').slice(0, 400)}` : ''}`)
+}
+
+/** What runs in the project's sessions now, for the sweeper's scan: a foreground command (this session's, or another's
+ * past 3 s: what changes meanwhile is left to its own post-scan), and the newest background one's session and thread
+ * (what changes meanwhile is probably its) */
+async function runningNow($: any): Promise<{ foreground: boolean; background: Who | null }> {
+  const now = await $.clock.now()
+  const sessionId = String(await $.session.id())
+  let foreground = bashRunning > 0
+  let newest: { who: Who; at: number } | null = null
+  for (const b of Object.values(await read($, bgCommands))) if (!newest || b.at > newest.at) newest = { who: await whoAmI($, b.thread), at: b.at }
+  for (const name of await names($, `${fleetDir()}/reads`)) {
+    if (!name.endsWith('.json') || name === `${sessionId}.json`) continue
+    const p = parseReads((await readText($, `${fleetDir()}/reads/${name}`)) ?? '')
+    if (!p || 'otherFormat' in p || !p.running?.length || now - p.at > 3 * 60000) continue
+    for (const c of p.running) {
+      if (!c.task) foreground ||= now - c.at < 11 * 60000
+      else if (now - c.at < 24 * HOUR && (!newest || c.at > newest.at)) newest = { who: { sessionId: p.sessionId, agentId: c.thread === 'main' ? null : c.thread, ref: p.ref, name: p.name }, at: c.at }
+    }
+  }
+  return { foreground, background: newest?.who ?? null }
+}
+
 // ---- Outside changes: every 10 s, the world against what this session last saw ----
 
 // A change nobody's event explains, still so a scan later, is recorded as outside fleet (an editor, a script, a session
 // without fleet), claimed no-clobber so that one session of the project records it
 async function scanWorld($: any) {
-  if (!worldOn() || bashRunning > 0) return
+  if (!worldOn()) return
   // Past MAX_WORLD_FILES the walk stops: tried again every 10 minutes, or as soon as world.json changes
   if (tooBig && (await $.clock.now()) - tooBigAt < 10 * 60000) return
   const snap = await snapshot($)
@@ -2626,6 +2707,8 @@ async function scanWorld($: any) {
   const changed = removalsLast(changedPaths(knownSnapshot(), snap), snap)
   if (!changed.length) return
   await pullEvents($)
+  // Asked once a scan, when a change is to be recorded: whether a command runs that may be its author
+  let running: { foreground: boolean; background: Who | null } | null = null
   for (const rel of changed) {
     const s = snap.get(rel)
     const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
@@ -2647,14 +2730,22 @@ async function scanWorld($: any) {
       continue
     }
     if (now - u.since < 4000) continue
+    // A foreground command runs (here, or in another session past 3 s): the change may be its, and its own post-scan
+    // says so when it ends; until then it waits, unexplained
+    running ??= await runningNow($)
+    if (running.foreground) continue
     const claim = `${eventsDir('claims')}/${hashText(`${rel}\n${v ?? 'removed'}\n${Math.floor(s?.mtimeMs ?? k?.mtimeMs ?? 0)}`).slice(1)}`
     if ((await publish($, claim, json({ format: FORMAT, path: rel, at: now }))) === 'ok') {
       const id = records ? idOf(rel, records) : null
       if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
-      const fields = await landRecord($, rel, f, 'outside', null)
+      // A background command runs: probably its doing (never the person's for sure), recorded as that session's, blind
+      const by = running.background
+      const fields = await landRecord($, rel, f, by ? 'bash' : 'outside', by)
       // Recorded now: a copy that kept an older time (rsync -a, cp -p) is still news to a thread that read the file
       // since. Its own time only says when it changed
-      await writeEvent($, { ...(s ? { changedAt: Math.floor(s.mtimeMs) } : {}), path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'outside', blind: true, by: null, ...fields })
+      const from = last && last.to !== v ? last.to : (k?.v ?? null)
+      if (by) await writeEvent($, { path: rel, from, to: v, via: 'bash', tool: 'Bash', blind: true, by, probably: true, ...fields })
+      else await writeEvent($, { ...(s ? { changedAt: Math.floor(s.mtimeMs) } : {}), path: rel, from, to: v, via: 'outside', blind: true, by: null, ...fields })
     }
     settle()
   }
@@ -3945,7 +4036,7 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
   if (path === 'checks') return stampChecks($, origin)
   if (!path) {
     const out: string[] = []
-    for (const e of [...latest.values()].filter(x => x.via === 'outside').sort((a, b) => b.at - a.at)) {
+    for (const e of [...latest.values()].filter(x => x.via === 'outside' || x.probably).sort((a, b) => b.at - a.at)) {
       if ((await versionOf($, `${realRoot}/${e.path}`)).v === e.to) out.push(`  ${e.path}: ${changeLine(e, me)} · /fleet accept ${e.path}`)
     }
     for (const rel of await unstamped($)) out.push(`  ${rel}: changed outside fleet (not through a change you applied) · /fleet accept ${rel}`)
@@ -3961,7 +4052,7 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
   if (a === 'already') return `${w.rel}: its current version is yours already`
   if (typeof a === 'object') return `${w.rel}: its current version is from ${whoText(a.by, me)} at ${clock(a.by.at, me.offsetMin)}: nothing to stamp`
   const at = Math.max(Math.floor(cur.mtimeMs), (last?.at ?? 0) + 1)
-  const from = last && last.via === 'outside' ? last.from : (last?.to ?? null)
+  const from = last && (last.via === 'outside' || last.probably) ? last.from : (last?.to ?? null)
   const by: Who = { ...(await whoAmI($, 'main')), person: true }
   // A record whose change no landing recorded yet gets its version now, as the person's
   const id = records ? idOf(w.rel, records) : null
@@ -4043,7 +4134,7 @@ async function worldStatus($: any): Promise<string[]> {
   }
   lines.push(behind.length ? 'behind (read a version that has changed since):' : 'behind: nobody (every session read the current version of what it read)', ...behind)
   const outside: string[] = []
-  for (const e of latest.values()) if (e.via === 'outside' && (await current(e.path)) === e.to) outside.push(e.path)
+  for (const e of latest.values()) if ((e.via === 'outside' || e.probably) && (await current(e.path)) === e.to) outside.push(e.path)
   if (outside.length) lines.push(`not stamped: ${outside.join(', ')} changed outside fleet: /fleet accept <path> stamps the change as yours`)
   if (other || otherEvents) lines.push(`${other + otherEvents} file(s) from a fleet with another format: restart the sessions (u)`)
   lines.push(...(await recordsStatus($, me)))
@@ -7615,6 +7706,21 @@ export const register: Register = on => {
       bg(heartbeat($))
     }
     return next(e)
+  }).catch(($, e, next) => next(e))
+  // The background work still running at each stop: a Bash command of this session's that's no longer there completed,
+  // and what it wrote lands now (bgDone)
+  on('classic.Stop', async ($, e, next) => {
+    const r = await next(e)
+    const tasks = (e as any).background_tasks
+    if (Array.isArray(tasks)) {
+      const live = new Set(tasks.map((t: any) => String(t?.id ?? '')))
+      bg(
+        (async () => {
+          for (const task of Object.keys(await read($, bgCommands))) if (!live.has(task)) await bgDone($, task)
+        })(),
+      )
+    }
+    return r
   }).catch(($, e, next) => next(e))
   // ... until its tool ran or was refused
   on('classic.PostToolUse', async ($, e, next) => {

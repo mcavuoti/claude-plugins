@@ -9,6 +9,10 @@ export type FleetInflight = { at: number; epoch: string }
  * the delivery's read): delivered once, on their own; sent: their submit, while its turn hasn't started */
 export type FleetLate = { notes: { q: number; question: string; text: string }[]; at: number; sent?: FleetInflight }
 
+/** A Bash command run in the background (run_in_background, or moved there), until it completes: its thread, when it
+ * started, and the world as it was then (path, time, size), to compare with when it's done */
+export type FleetBg = { thread: string; at: number; before: [string, number, number][] }
+
 /** A world file as one thread last read it (or wrote it): the version, when, and the newest version it was told of;
  * for a record, the version number fleet gave what it read */
 export type FleetRead = { v: string; at: number; told?: string; rev?: number }
@@ -89,6 +93,8 @@ declare module 'claude-code' {
       overruling: Record<string, FleetInflight>
       /** The person's notes that came after this session's answers were on their way: decision id → them */
       lateNotes: Record<string, FleetLate>
+      /** This session's Bash commands running in the background: task id → them */
+      bgCommands: Record<string, FleetBg>
     }
   }
 }
