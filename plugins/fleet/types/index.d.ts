@@ -70,6 +70,8 @@ declare module 'claude-code' {
       slotTold: Record<string, number>
       /** The slots this session waits in line for */
       slotWait: string[]
+      /** The person's overrules of a judge's answer to this session, submitted and whose turn hasn't started */
+      overruling: Record<string, FleetInflight>
     }
   }
 }

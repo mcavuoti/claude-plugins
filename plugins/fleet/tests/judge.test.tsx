@@ -41,14 +41,16 @@ function model(on: any, reply: (prompt: string) => string) {
   return asked
 }
 
-function project(on: any) {
+function project(on: any, extra: { env?: Record<string, string>; files?: Record<string, string> } = {}) {
   return world(on, {
+    ...(extra.env ? { env: extra.env } : {}),
     files: {
       [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], tags: ['storage', 'ui'] }),
       [`${FLEET}/charter.md`]: '# Charter\n\nA small tool for one machine.\n',
       [`${FLEET}/principles.md`]: '# Principles\n\nWarnings are amber; red is only for errors.\n',
       [`${ROOT}/CLAUDE.md`]: '# Project\n\nTests first.\n',
       [`${DEC}/register/2026-11/D-1.json`]: JSON.stringify(D1),
+      ...extra.files,
     },
   })
 }
@@ -106,7 +108,7 @@ test('shadow: gates and exact repeats with no model, one call for the rest, the 
   const ui = await fleet($, 'stats ui')
   expect(ui).toContain('   D-3 · ')
   expect(ui).toContain('1) a) Amber citing principles.md:3: you answered b) Red')
-  expect(await fleet($, 'status')).toContain('judges: on, in shadow (haiku): today 1 call, $0.')
+  expect(await fleet($, 'status')).toContain('judges: on (haiku), in shadow: today 1 call, $0.')
 })
 
 test('a citation code can’t check makes the proposal a hold; outside content and world.json’s judges gate it', WITH_SESSIONS, async ($, on) => {
@@ -165,4 +167,126 @@ test('taste: the person’s "no", recorded in the register with its provenance; 
   const law = String(asked[0].promptBlocks[1].text)
   expect(law).toContain('T-2 (2026-11-02, area ui), the person said no: "the band is too loud" about a red warning band; the principle it suggests: warning colors stay calm')
   expect(law).not.toContain('T-1')
+})
+
+// ---- Live areas (0.7.0) ----
+
+const FLAGS = { reversible: true, touchesMoney: false, outsideWorld: false }
+
+test('live: an area turned on by the person (forced); an exact repeat answered by the judge, a malformed one sent back, a money one held', WITH_SESSIONS, async ($, on) => {
+  const asked = model(on, text => (text.includes('Which cache, the fast one or the quick one?') ? '{"answers": [{"q": 1, "outcome": "send-back", "why": "the two options are the same thing"}]}' : '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}'))
+  const w = project(on)
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
+  await startSession($, w)
+  // Not earned: refused, unless forced (recorded); only the person turns an area live
+  expect(await fleet($, 'judges live storage', { kind: 'plugin', name: 'other' })).toContain('Only the person turns an area live')
+  expect(await fleet($, 'judges live storage')).toBe('Not turned live: storage it has 0 proposals (it needs 30 proposals and 90% agreement on what the judge decided). /fleet stats storage shows it; /fleet judges live storage --force "why" turns it on anyway, recorded as forced.')
+  expect(await fleet($, 'judges live hosting')).toContain("hosting isn't one of the project's tags (storage, ui)")
+  const on1 = await fleet($, 'judges live storage --force "trying it"')
+  expect(on1).toContain('Area storage is live (forced: it has 0 proposals')
+  expect(json(w, `${FLEET}/state/judges.json`)).toMatchObject({ format: 1, live: { storage: { forced: true, why: 'trying it', by: 'TEST A' } } })
+  // An exact repeat of D-1, with the asker's word that it's reversible, touches no money and stays inside: answered at once
+  await decide($, { questions: [DB], area: 'storage', ...FLAGS })
+  await tick(w)
+  expect(asked.length).toBe(0)
+  expect(json(w, `${DEC}/answers/D-2.1.json`)).toMatchObject({ format: 1, id: 'D-2', q: 1, label: 'SQLite', origin: 'judge', judge: { cites: ['D-1'], repeat: true } })
+  for (let i = 0; i < 2; i++) await tick(w)
+  expect(w.submits[0]).toBe(
+    "[D-2] The judge answered for the person, from what they decided before (they can overrule it):\n1) Which database for the cache? → a) SQLite (the judge's answer, citing D-1: the same question, answered so before)\n\nGo on with what depended on it. If the person overrules the judge, you'll hear it as a message from the fleet plugin that starts with the same id: then undo what you built on its answer.",
+  )
+  expect(json(w, `${DEC}/register/2026-11/D-2.json`)).toMatchObject({ state: 'delivered', judge: { live: true, answered: [1], agreed: [null] } })
+  // A malformed one: back to its asker, with why
+  await decide($, { questions: [{ question: 'Which cache, the fast one or the quick one?', options: [{ label: 'Fast' }, { label: 'Quick' }], recommended: 'Fast', why: 'speed' }], area: 'storage', ...FLAGS })
+  for (let i = 0; i < 3; i++) await tick(w)
+  expect(w.submits[1]).toContain('[D-3] The judge sent this question back without asking the person: the two options are the same thing\nYou asked: 1) Which cache, the fast one or the quick one?')
+  expect(json(w, `${DEC}/register/2026-11/D-3.json`)).toMatchObject({ state: 'dropped', why: 'the two options are the same thing', judge: { sentBack: true } })
+  // Money: held by a gate, waits for the person; no flags given: the judge proposes, and waits too
+  await decide($, { questions: [PAY], area: 'storage', touchesMoney: true })
+  await decide($, { questions: [{ ...DB, question: 'Which database for the logs?' }], area: 'storage' })
+  for (let i = 0; i < 3; i++) await tick(w)
+  expect(w.submits.length).toBe(2)
+  expect(json(w, `${DEC}/judge/D-4.json`).gated).toBe('it touches money')
+  expect(json(w, `${DEC}/judge/D-5.json`)).toMatchObject({ live: true, liveWhy: "its asker didn't say it's reversible" })
+  const list = await fleet($, '')
+  expect(list).toContain('2 questions for you')
+  expect(list).toContain('judge: held by a gate (it touches money)')
+  expect((await fleet($, 'stats')).split('\n')[0]).toContain('Judges: on, live in storage, in shadow elsewhere · model haiku · today 2 calls')
+  expect(await fleet($, 'status')).toContain('judges: on (haiku), live in storage, in shadow elsewhere: today 2 calls')
+  expect(json(w, `${FLEET}/state/judges/2026-11-02/aaaaaaaa.json`)).toMatchObject({ format: 1, calls: 2, live: 2 })
+  // The cap: past perDay a live area only proposes
+  w.touch(`${FLEET}/world.json`, JSON.stringify({ worldFormat: 1, paths: ['notes/**'], tags: ['storage', 'ui'], judges: { perDay: 2 } }))
+  await tick(w)
+  await decide($, { questions: [DB], area: 'storage', ...FLAGS })
+  await tick(w)
+  expect(json(w, `${DEC}/judge/D-6.json`)).toMatchObject({ live: true, liveWhy: "today's 2 live answers in the project are used up", verdicts: [{ outcome: 'decided', repeat: true }] })
+  expect(w.files.has(`${DEC}/answers/D-6.1.json`)).toBe(false)
+})
+
+test('overrule: the asker hears it once, the correction is case law ahead of the judge, and the area goes back to shadow', WITH_SESSIONS, async ($, on) => {
+  model(on, () => '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}')
+  const w = project(on)
+  w.touch(`${FLEET}/world.json`, JSON.stringify({ worldFormat: 1, paths: ['notes/**'], tags: ['storage', 'ui'], judges: { reviewer: 'TEST A' } }))
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
+  await startSession($, w)
+  await fleet($, 'judges live storage --force')
+  await decide($, { questions: [DB], area: 'storage', ...FLAGS })
+  for (let i = 0; i < 3; i++) await tick(w)
+  expect(w.submits.length).toBe(1)
+  expect(await fleet($, 'overrule D-1 b')).toBe("D-1 wasn't answered by a judge: there's nothing to overrule (what you answered stands).")
+  expect(await fleet($, 'overrule D-2 a')).toBe('1: the judge answered a) SQLite already: nothing to overrule')
+  expect(await fleet($, 'overrule D-2 b "the queue runs it"', { kind: 'plugin', name: 'other' })).toContain('Only the person overrules a judge')
+  const said = await fleet($, 'overrule D-2 b "the queue runs it"')
+  expect(said).toContain('Overruled D-2:\n  1) Which database for the cache? → b) Redis (the judge had a) SQLite)')
+  expect(said).toContain('TEST A hears it as a message from fleet when it\'s idle. The correction is in the register: the judges read it from now on, ahead of their own answers. TEST A is told, to propose a principle.')
+  expect(said).toContain('Area storage: agreement on what the judge decided 0% (0 of 1), below 90%: back to shadow')
+  expect(await fleet($, 'overrule D-2 b')).toBe('D-2 was overruled already: the judges read that correction')
+  expect(json(w, `${DEC}/register/2026-11/D-2.overrule.json`)).toMatchObject({ registerFormat: 1, id: 'D-2', overrules: 'D-2', answers: [{ label: 'Redis', origin: 'composer', session: 'TEST A' }], judged: ['SQLite'], why: 'the queue runs it', area: 'storage' })
+  expect(json(w, `${FLEET}/state/judges.json`)).toMatchObject({ live: {}, back: { storage: { why: 'its agreement on what the judge decided 0% (0 of 1) fell below 90% when you overruled D-2' } } })
+  expect(await fleet($, '')).toContain("   D-2 · TEST A · you overruled the judge, told when it's idle")
+  // Delivered once, at idle; the notice goes
+  for (let i = 0; i < 3; i++) await tick(w)
+  const told = w.submits.find(s => s.includes('overruled')) ?? ''
+  expect(told).toBe('[D-2] The person overruled the judge on D-2:\n1) Which database for the cache? → b) Redis, not a) SQLite\nWhy: "the queue runs it"\n\nUndo what you built on the judge\'s answer, and go on with theirs.')
+  expect(w.files.has(`${DEC}/overrules/D-2.json`)).toBe(false)
+  for (let i = 0; i < 3; i++) await tick(w)
+  expect(w.submits.filter(s => s.includes('overruled')).length).toBe(1)
+  // The stats count it against the area; the brief says what happened
+  expect(await fleet($, 'stats storage')).toContain('1) a) SQLite citing D-1 (an exact repeat): answered live, you overruled it')
+  const brief = await fleet($, 'brief')
+  expect(brief).toContain('2. What changed: the judges')
+  expect(brief).toContain('   - the judge answered D-2 (area storage) for you, citing D-1: /fleet overrule D-2 <answer> corrects it')
+  expect(brief).toContain('   - you overruled the judge on D-2 (area storage): "the queue runs it"')
+  expect(brief).toContain('   - area storage went back to shadow at ')
+  const judges = await fleet($, 'judges')
+  expect(judges).toContain('Live: no area; the judges only propose (shadow).')
+  expect(judges).toContain('Back to shadow: storage at ')
+  // The next time, the correction is the case law: the same question is now an exact repeat of D-2, with Redis
+  await decide($, { questions: [DB], area: 'storage', ...FLAGS })
+  await tick(w)
+  expect(json(w, `${DEC}/judge/D-3.json`).verdicts[0]).toMatchObject({ outcome: 'decided', option: 'Redis', cites: ['D-2'], repeat: true })
+  expect(w.files.has(`${DEC}/answers/D-3.1.json`)).toBe(false)
+})
+
+test('the reviewer of the judges hears each overrule once, to propose a principle', WITH_SESSIONS, async ($, on) => {
+  const notice = { format: 1, id: 'D-9', at: PAST, asker: { ref: 'bbbbbbbb', sessionId: 'x', name: 'TEST B', root: ROOT }, questions: [DB], judged: ['SQLite'], answers: [{ label: 'Redis' }], why: 'the queue runs it', area: 'storage' }
+  const w = project(on, {
+    env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Chief', FLEET_ROLE: 'chief' },
+    files: {
+      [`${DEC}/overrules/D-9.review.json`]: JSON.stringify(notice),
+      [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], tags: ['storage'], judges: { reviewer: 'chief' } }),
+      [`${FLEET}/roster.json`]: JSON.stringify({ rosterFormat: 1, roles: { chief: { agent: 'chief', model: 'haiku' } }, instances: [{ name: 'Chief', role: 'chief' }] }),
+      [`${ROOT}/.claude/agents/chief.md`]: '---\nname: chief\ntools: Read, mcp__fleet__*\n---\nYou are the chief.\n',
+      [`${FLEET}/instances/chief.json`]: '{}\n',
+    },
+  })
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.01 } } }))
+  on('classic.SessionStart', () => ({}))
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Chief', root: ROOT, background: true, agent: 'chief' }, rows: { [REF]: row(REF, 'Chief', 'idle') } })
+  await startSession($, w)
+  await $.classic.SessionStart({ source: 'startup', agent_type: 'chief' } as any)
+  for (let i = 0; i < 20; i++) await tick(w)
+  const told = w.submits.find(s => s.includes('overruled')) ?? ''
+  expect(told).toContain('fleet: the person overruled the project\'s judge once (you review the judges\' disagreements):\n- D-9 (area storage): "Which database for the cache?" → b) Redis, not a) SQLite (why: "the queue runs it")')
+  expect(told).toContain('a change to .claude/fleet/principles.md with mcp__fleet__decide kind "change"')
+  expect(w.files.has(`${DEC}/overrules/D-9.review.json`)).toBe(false)
 })

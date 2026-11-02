@@ -46,6 +46,9 @@ export type BriefFacts = {
   derived?: { path: string; kind: string; owner: string; pins: string[] }[]
   slots?: { slot: string; waiting: { name: string; at: number }[] }[]
   intakeSpend?: { usd: number; records: number } | null
+  /** What the judges did in the window in live areas (answered, sent back), the person's overrules, and an area that
+   * went back to shadow by itself: one line each */
+  judges?: string[]
 }
 
 const SHOWN = 15
@@ -100,9 +103,15 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   // 2. What changed, and who changed it
   const shared = newestPerFile(f.events, f).filter(e => !['information', 'proposal'].includes(f.levelOf(e.path)))
   const closed = [...f.closed].filter(c => c.at >= f.since).sort((a, b) => b.at - a.at)
-  const counts = [shared.length ? `${shared.length} shared file${shared.length === 1 ? '' : 's'}` : '', closed.length ? `${closed.length} decision${closed.length === 1 ? '' : 's'} carried out` : ''].filter(Boolean)
+  const judged = f.judges ?? []
+  const counts = [
+    shared.length ? `${shared.length} shared file${shared.length === 1 ? '' : 's'}` : '',
+    closed.length ? `${closed.length} decision${closed.length === 1 ? '' : 's'} carried out` : '',
+    judged.length ? 'the judges' : '',
+  ].filter(Boolean)
   out.push('', counts.length ? `2. What changed: ${counts.join(', ')}` : '2. No shared file changed.')
   for (const c of closed.slice(0, SHOWN)) out.push(`   - ${c.line}`)
+  for (const j of judged.slice(0, SHOWN)) out.push(`   - ${j}`)
   for (const e of shared.slice(0, SHOWN)) out.push(eventLine(e, f))
   if (shared.length > SHOWN) out.push(`   - and ${shared.length - SHOWN} more: /fleet status lists the last changes`)
   // 3. Blocked, stale, suspect, quiet, without fleet
