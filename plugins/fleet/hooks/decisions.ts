@@ -8,6 +8,7 @@
 //   outbound.json                        person data (outboundFormat): what may leave without asking (outbound.ts)
 //   slots.json                           person data (slotsFormat): the project's scarce resources (slots.ts)
 //   charter.md, interview.md, seeds/     the project's charter, the chief's interview, each role's first prompt (templates)
+//   principles.md                        the person's principles, the judges' statute with the charter (command-level)
 //   .gitignore                           written by /fleet init from config.json
 //   decisions/queue/D-<n>.json           wire (format): an open decision, written once by the session that asked
 //   decisions/answers/D-<n>.<q>.json     wire: the answer to question q, published no-clobber (the first answer wins)
@@ -17,7 +18,10 @@
 //   decisions/drafts/D-<n>.json          an outbound's exact call (a command, or an MCP tool and its input), the same
 //   decisions/applied/D-<n>.json         wire: a change claimed for applying, or an outbound for sending, published
 //                                        no-clobber (it's applied or sent once)
-//   decisions/register/YYYY-MM/<id>.json person data (registerFormat): every closed decision and recorded dialog
+//   decisions/register/YYYY-MM/<id>.json person data (registerFormat): every closed decision and recorded dialog, and
+//                                        each piece of the person's taste (T-<n>, mcp__fleet__taste)
+//   decisions/judge/D-<n>.json           wire: what the judge proposed on a choice (judges.ts), written once by the session
+//                                        that asked; it goes into the register with the decision
 //   decisions/last                       wire: the highest D-<n> handed out (a hint for the next one)
 //   decisions/prune/YYYY-MM-DD           wire: the session that publishes it runs that day's prune
 //   decisions/tmp/                       files about to be published or moved into place (events' too)
@@ -39,6 +43,7 @@
 //   state/alerts.json, channel-stamp.json  wire: the alerts sent to the person today; the command channel he stamped
 //   state/slots/<slot>/<n>.json          wire: lease n of a slot, published no-clobber by its taker (slots.ts)
 //   state/slots/<slot>/waiting/<who>.json  wire: one in line for a slot, written by the session that waits
+//   state/judges/<day>/<sid8>.json       wire: a session's judge calls and their cost today, written only by it
 //   inbox/<source>/<name>.json, latest   a poller's items (itemFormat, intake.ts), and the trigger it rewrites
 //   intake/seen/<key>.json               wire: an item read (dedup), published no-clobber by the sweeper
 //   intake/raw/, dup/, failed/           items as they arrived, kept aside once read, duplicates, unreadable ones
@@ -49,6 +54,7 @@
 
 import type { OutsideMark, ResourceSpec } from './authority'
 import type { ChangeSpec } from './drafts'
+import type { JudgeEntry, TasteSpec } from './judges'
 import type { OutboundSpec } from './outbound'
 
 /** The format of the wire files: queue/, answers/, applied/, last, prune/, events/, reads/, state/, instances/. Raise it
@@ -83,6 +89,11 @@ export type QueueRecord = {
   outbound?: OutboundSpec
   /** The asker's context had read outside content when it filed this (decision 2b): what, and when */
   outside?: OutsideMark
+  /** A choice's area (one of the project's tags) and the asker's own word on it, which the judges' gates read */
+  area?: string
+  reversible?: boolean
+  touchesMoney?: boolean
+  outsideWorld?: boolean
 }
 /** origin: how the person typed it (composer: a terminal); session: the session it was typed in. pre: a change applied
  * as it was filed, because the person typed the turn that filed it (quoted: the start of what he typed); hash: the
@@ -96,8 +107,9 @@ export type RegisterState = 'delivered' | 'dropped' | 'abandoned' | 'answered' |
 export type RegisterRecord = {
   registerFormat: number
   id: string
-  /** decide: asked through mcp__fleet__decide; dialog: an AskUserQuestion the person answered in the session */
-  source: 'decide' | 'dialog'
+  /** decide: asked through mcp__fleet__decide; dialog: an AskUserQuestion the person answered in the session; taste:
+   * the person said no to something, recorded with mcp__fleet__taste (T-<n>) */
+  source: 'decide' | 'dialog' | 'taste'
   fleet: string
   at: number
   asker: Asker
@@ -116,6 +128,14 @@ export type RegisterRecord = {
   outside?: OutsideMark
   /** An outbound's call as its draft held it when it closed (what was sent, or would have been) */
   call?: string
+  area?: string
+  reversible?: boolean
+  touchesMoney?: boolean
+  outsideWorld?: boolean
+  /** What the judge proposed on it, and whether the person agreed (judges.ts) */
+  judge?: JudgeEntry
+  /** A taste record's what, about, principle and provenance */
+  taste?: TasteSpec
 }
 export type DialogQuestion = { question: string; header?: string; options: Option[]; multiSelect?: boolean }
 export type Config = { configFormat: number; template: string; commitRegister: boolean; [key: string]: unknown }
@@ -247,6 +267,10 @@ export const DECIDE_SCHEMA = {
       },
     },
     blocks: { type: 'string', maxLength: 200, description: 'Optional: what waits on the answer' },
+    area: { type: 'string', maxLength: 40, description: "kind choice, optional: the area the decision belongs to, one of the project's tags (world.json tags)" },
+    reversible: { type: 'boolean', description: "kind choice: true if a wrong choice is cheap to undo, false if it can't be undone" },
+    touchesMoney: { type: 'boolean', description: 'kind choice: true if any option spends, moves, promises or prices money' },
+    outsideWorld: { type: 'boolean', description: 'kind choice: true if any option sends, publishes, buys, deletes or reaches people or services outside this project' },
     path: { type: 'string', description: 'kind change: the file, relative to the project folder' },
     summary: { type: 'string', maxLength: 200, description: 'kind change: one line on what the change does and why' },
     edits: {
@@ -268,10 +292,13 @@ export const DECIDE_SCHEMA = {
 } as const
 
 export const DECIDE_DESCRIPTION =
-  "Ask the person to decide something without stopping your work. This is a background session: nobody may be watching it, so AskUserQuestion or a question in your reply would leave the work waiting until the person comes by. Use this tool instead whenever you need the person's choice. It answers at once with a ticket (D-<n>); the person answers from any session of this project, and the answer reaches you later as a message from the fleet plugin that starts with [D-<n>]. Meanwhile keep working on whatever doesn't depend on the answer, or end your turn. 1-4 questions, each with 2-4 options, the option you recommend and one line on why. With kind change, it files a change to a command-level file instead (path, summary, and edits or content): the person reads its diff and applies it, and fleet writes your draft if the file is still as it was. With kind resource, it asks the person for something only they can get (a license, an access, hardware, budget: what, why, and optionally cost, byWhen, alternatives), apart from the questions of taste."
+  "Ask the person to decide something without stopping your work. This is a background session: nobody may be watching it, so AskUserQuestion or a question in your reply would leave the work waiting until the person comes by. Use this tool instead whenever you need the person's choice. It answers at once with a ticket (D-<n>); the person answers from any session of this project, and the answer reaches you later as a message from the fleet plugin that starts with [D-<n>]. Meanwhile keep working on whatever doesn't depend on the answer, or end your turn. 1-4 questions, each with 2-4 options, the option you recommend and one line on why; give its area (one of the project's tags) and say honestly whether it's reversible and whether it touchesMoney or reaches the outsideWorld: a judge may propose an answer from what the person decided before, and never touches one that spends money, reaches outside or can't be undone. With kind change, it files a change to a command-level file instead (path, summary, and edits or content): the person reads its diff and applies it, and fleet writes your draft if the file is still as it was. With kind resource, it asks the person for something only they can get (a license, an access, hardware, budget: what, why, and optionally cost, byWhen, alternatives), apart from the questions of taste."
 
 /** Checks and tidies decide's input. The engine may not enforce the schema, so this is what holds */
-export function checkDecide(input: any): { ok: true; questions: Question[]; blocks?: string } | { ok: false; reason: string } {
+/** The asker's own word on a choice, which only the judges' gates read (a flag that isn't a boolean says nothing) */
+export type DecideFlags = { area?: unknown; reversible?: boolean; touchesMoney?: boolean; outsideWorld?: boolean }
+
+export function checkDecide(input: any): ({ ok: true; questions: Question[]; blocks?: string } & DecideFlags) | { ok: false; reason: string } {
   const list = input?.questions
   if (!Array.isArray(list) || list.length < 1 || list.length > 4) return { ok: false, reason: 'questions: give 1 to 4 questions' }
   const questions: Question[] = []
@@ -301,7 +328,10 @@ export function checkDecide(input: any): { ok: true; questions: Question[]; bloc
     questions.push({ question, ...(header ? { header } : {}), options, recommended: options[pick]!.label, why })
   }
   const blocks = text(input?.blocks, 200)
-  return blocks ? { ok: true, questions, blocks } : { ok: true, questions }
+  const flags: DecideFlags = {}
+  for (const k of ['reversible', 'touchesMoney', 'outsideWorld'] as const) if (typeof input?.[k] === 'boolean') flags[k] = input[k]
+  if (input?.area !== undefined) flags.area = input.area
+  return { ok: true, questions, ...(blocks ? { blocks } : {}), ...flags }
 }
 
 export function ticketText(id: string): string {
@@ -371,6 +401,7 @@ export type Command =
   | { kind: 'worktrees'; prune: boolean; yes: boolean }
   | { kind: 'budget'; target: string; amount: string }
   | { kind: 'brief'; chief: boolean }
+  | { kind: 'stats'; area: string }
   | { kind: 'help' }
   | { kind: 'bad'; reason: string }
 
@@ -416,6 +447,10 @@ export function parseCommand(args: string): Command {
     case 'brief': {
       if (more.some(w => w !== '--chief')) return { kind: 'bad', reason: 'write /fleet brief, or /fleet brief --chief for the chief’s lines too' }
       return { kind: 'brief', chief: more.includes('--chief') }
+    }
+    case 'stats': {
+      if (more.length > 1) return { kind: 'bad', reason: 'write /fleet stats, or /fleet stats <area> for one area' }
+      return { kind: 'stats', area: (more[0] ?? '').toLowerCase() }
     }
     case 'init': {
       const flags = more.filter(w => w.startsWith('--'))
@@ -497,6 +532,7 @@ export const HELP = [
   '/fleet 5 done "note"   you got what item 5 asks for (a license, an access…); 5 no "why" if not',
   '/fleet 6 send          send the outbound of item 6 exactly as shown (also 6 reject, 6 edit, and 6 done if you sent it yourself)',
   '/fleet brief [--chief] what needs you, what changed and who changed it, what’s blocked, the spend, the inputs and ideas',
+  '/fleet stats [area]    what the judges proposed per area, how often you agreed, what they cost',
   '/fleet init [template] set fleet up in this project (.claude/fleet/): blank, solo, software or proposal',
   '/fleet up [--dry-run] [--wave n] [name…]  start the roster\'s instances that aren\'t running (--dry-run: the plan, the lints, the cost)',
   '/fleet down [name…]    take instances down: no wakes or nudges, /fleet up skips them (s in the panel stops one)',
@@ -517,13 +553,14 @@ export function ago(ms: number): string {
 /** What the listing says about an asker, from $.sessions' status (null: not known) */
 export type AskerView = { name: string; state: string | null }
 
-/** One numbered question, as /fleet shows it */
-export function heldText(n: number, record: QueueRecord, q: number, asker: AskerView, now: number): string {
+/** One numbered question, as /fleet shows it; judge: what the judge proposed on it (judges.ts proposalLine) */
+export function heldText(n: number, record: QueueRecord, q: number, asker: AskerView, now: number, judge: string | null = null): string {
   const question = record.questions[q - 1] as Question
   const lines = [`${n}. ${question.question}`]
   for (const [i, o] of question.options.entries()) lines.push(`   ${letter(i)}) ${o.label}${o.description ? `: ${o.description}` : ''}`)
   const k = question.options.findIndex(o => o.label === question.recommended)
   lines.push(`   Recommended: ${letter(k)}, ${question.why}`)
+  if (judge) lines.push(`   ${judge}`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
   const of = record.questions.length > 1 ? ` (${q} of ${record.questions.length})` : ''
   lines.push(`   ${who} · ${record.id}${of} · ${ago(now - record.at)} ago${record.blocks ? ` · blocks: ${record.blocks}` : ''}`)
