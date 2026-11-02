@@ -494,6 +494,15 @@ async function exists($: any, path: string): Promise<boolean> {
   }
 }
 
+/** Whether a file is surely not there: false when it is, and when the look failed (an error is no answer) */
+async function gone($: any, path: string): Promise<boolean> {
+  try {
+    return !(await $.fs.exists(path))
+  } catch {
+    return false
+  }
+}
+
 async function readText($: any, path: string): Promise<string | null> {
   try {
     return await $.fs.read(path)
@@ -725,7 +734,11 @@ async function queueRecords($: any): Promise<{ records: QueueRecord[]; other: nu
   const records: QueueRecord[] = []
   let other = 0
   for (const n of list) {
-    if (!queueCache.has(n)) queueCache.set(n, await readQueue($, n.slice(0, -5)))
+    // A read that failed (a hiccup, too many open files) isn't kept: the next look reads it again
+    if (!queueCache.has(n)) {
+      const read = await readQueue($, n.slice(0, -5))
+      if (read) queueCache.set(n, read)
+    }
     const r = queueCache.get(n)
     if (r && 'otherFormat' in r) other++
     else if (r) records.push(r)
@@ -972,8 +985,9 @@ async function deliver($: any) {
       if (inFlight[id] || !progress(id, mine[id] as number, present).complete) continue
       const rec = await readQueue($, id)
       if (!rec || 'otherFormat' in rec) {
-        // Closed elsewhere (dropped or pruned while its asker looked gone), or not ours to read
-        if (!rec) await update($, open, m => omit(m, [id]))
+        // Closed elsewhere (dropped or pruned while its asker looked gone): only once its queue file is surely gone, or
+        // the register has it. A read that failed is tried again in 2 s. Or not ours to read
+        if (!rec && ((await gone($, dec(`queue/${queueName(id)}`))) || (await inRegister($, id, now)))) await update($, open, m => omit(m, [id]))
         continue
       }
       if (await inRegister($, id, rec.at)) {

@@ -123,6 +123,8 @@ export type World = {
   // Writes a file as another program would (an editor, a script, another session): bumps its time, or sets the one
   // given (a copy that keeps its source's time: rsync -a, cp -p)
   touch: (path: string, text: string, mtimeMs?: number) => void
+  // Files whose reads fail for now (too many open files, a hiccup), though they're there
+  unreadable: Set<string>
   // Any other command fleet runs (git, a check script, the person's channel): its answer, or undefined for "unknown
   // command"; stdin: what fleet wrote to it
   exec: { value: (argv: string[], cwd: string, stdin?: string) => { exitCode: number; stdout?: string; stderr?: string } | undefined }
@@ -217,8 +219,10 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
+  const unreadable = new Set<string>()
   on('fs.read', (_, e) => {
     if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: '{"version": "0.1.0"}' }
+    if (unreadable.has(e.path)) throw new Error(`EMFILE: too many open files, open '${e.path}'`)
     const text = files.get(e.path)
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
     return { value: text }
@@ -354,7 +358,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, exec }
+  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

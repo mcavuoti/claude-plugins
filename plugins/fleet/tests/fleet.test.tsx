@@ -407,4 +407,28 @@ test('/fleet init says when the template turns world commits on', WITH_SESSIONS,
   await startSession($, w)
   expect(await fleet($, 'init hourly')).toContain('World commits are on: every 60 min the sweeper commits the shared files that changed, only them, and never pushes')
   expect(await fleet($, 'init')).toContain('World commits are on')
+test('a read of the queue that fails for a while (too many open files) drops nothing: the decision stays and is delivered once it reads', WITH_SESSIONS, async ($, on) => {
+  const w = world(on)
+  const QUEUE = `${DEC}/queue/D-6.json`
+  // Another session's decision, first looked at while its file can't be read: not listed then, and not forgotten
+  const OTHER = `${DEC}/queue/D-5.json`
+  w.files.set(OTHER, JSON.stringify({ format: 1, fleet: '0.1.0', id: 'D-5', at: Date.UTC(2026, 10, 2, 11, 0, 0), asker: { ref: 'dddddddd', sessionId: 'dddddddd-0000-0000-0000-000000000000', name: 'TEST D', root: ROOT }, questions: [{ question: 'Go?', options: [{ label: 'Yes' }, { label: 'No' }], recommended: 'Yes', why: 'it works' }] }))
+  w.unreadable.add(OTHER)
+  await startSession($, w)
+  expect(await fleet($, '')).not.toContain('Go?')
+  w.unreadable.delete(OTHER)
+  expect(await fleet($, '')).toContain('1. Go?')
+  await decide($, { questions: [TWO_QUESTIONS.questions[0]] })
+  await fleet($, '')
+  expect(await fleet($, '2a')).toContain('2: Which database for the cache? → a) SQLite')
+  w.unreadable.add(QUEUE)
+  for (let i = 0; i < 5; i++) await tick(w)
+  expect(w.submits).toEqual([])
+  w.unreadable.delete(QUEUE)
+  // Not cached as gone, and still open here: delivered once it reads
+  await tick(w)
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]).toContain('[D-6] The person answered:\n1) Which database for the cache? → a) SQLite')
+  await tick(w, 1100)
+  expect(json(w, `${DEC}/register/2026-11/D-6.json`)).toMatchObject({ state: 'delivered' })
 })
