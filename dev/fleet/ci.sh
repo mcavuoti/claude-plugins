@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# The fleet plugin's own checks. The GitHub check (.github/workflows/test.yml) runs dev/<plugin>/ci.sh for every
+# plugin that has one, on macOS and Linux, after the shared checks (validation, tests, script syntax).
+# They check how fleet is built, not what it says: see .claude/rules/fleet-wire-format.md.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+hooks="$here/../../plugins/fleet/hooks"
+status=0
+
+# Calls only: fleet never hooks a sessions.* event (if sessions failed to load, Claude would unload fleet whole)
+if grep -nE "on\(['\"]sessions\." "$hooks"/*; then
+  echo "fleet hooks a sessions.* event: call \$.sessions instead" >&2
+  status=1
+fi
+
+# ... and never reads sessions' files
+if grep -n "sessions-data" "$hooks"/*; then
+  echo "fleet names sessions' data folder: ask \$.sessions instead" >&2
+  status=1
+fi
+
+# Every command goes through run(), which gives it a folder that exists and a timeout
+count=$(cat "$hooks"/* | grep -c '\$\.process\.run' || true)
+if [ "$count" -ne 1 ]; then
+  echo "\$.process.run appears $count times in plugins/fleet/hooks: call run() instead" >&2
+  status=1
+fi
+
+[ "$status" -eq 0 ] && echo "fleet: calls only, no sessions files, one way to run commands"
+exit "$status"
