@@ -43,7 +43,7 @@ export type BriefFacts = {
   }
   /** The intake records of the window: what each is, who sent it, who it reached (none: nobody subscribes, and there's
    * no front door); a request for a change and its drafter */
-  intake?: { id: string; path: string; at: number; kind: string; from: string; standing: string; to: string[]; front: boolean; drafter: string | null; targets: string[] }[]
+  intake?: { id: string; path: string; at: number; kind: string; from: string; standing: string; auth?: string; to: string[]; front: boolean; drafter: string | null; targets: string[] }[]
   /** Derived documents a revised record made stale, and the slots someone waits for */
   derived?: { path: string; kind: string; owner: string; pins: string[] }[]
   slots?: { slot: string; waiting: { name: string; at: number }[] }[]
@@ -101,9 +101,13 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   const intake = (f.intake ?? []).filter(i => i.at >= f.since)
   const orphans = intake.filter(i => !i.to.length)
   const undrafted = intake.filter(i => i.kind === 'command-claim' && !i.drafter)
-  if (orphans.length || undrafted.length) {
-    if (!f.needs.length) out[needsAt] = '1. Needs you: items from outside nobody takes up'
+  // A request for a change claiming his address or a principal's that its platform didn't verify: no alert (it may be
+  // forged), so it's said here
+  const claims = intake.filter(i => i.kind === 'command-claim' && i.drafter && i.auth !== undefined && i.auth !== 'verified')
+  if (orphans.length || undrafted.length || claims.length) {
+    if (!f.needs.length) out[needsAt] = '1. Needs you: items from outside nobody takes up, or that claim your word'
     for (const i of undrafted) out.push(`   - ${i.id}: a request for a change to ${i.targets.join(', ') || 'something it names'} from ${i.from || 'an unknown sender'} (${i.standing}), and nobody subscribes to draft it: read ${i.path}`)
+    for (const i of claims) out.push(`   - ${i.id}: a request for a change to ${i.targets.join(', ') || 'something it names'} that claims ${i.standing === 'person' ? 'your address' : "a principal's"} (${i.from}), not verified (it may be forged, so no alert): ${i.drafter} drafts it, and its change waits for you; read ${i.path}`)
     for (const i of orphans.filter(x => !undrafted.includes(x))) out.push(`   - ${i.id}: ${i.kind} from ${i.from || 'an unknown sender'} reached nobody (no subscriber, no front door): ${i.path}`)
   }
   // 2. What changed, and who changed it

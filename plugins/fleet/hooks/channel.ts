@@ -127,13 +127,15 @@ export function channelWords(c: Channel): string {
 export type AlertKind = 'waiting' | 'budget' | 'nofleet' | 'check' | 'intake' | 'outside'
 export type Alert = { key: string; kind: AlertKind; text: string }
 
-/** <project>/.claude/fleet/state/alerts.json, the sweeper's: today's count, each key's last send, the last message;
- * after a send that failed, how many failed in a row and when to try again; the keys of a send nobody can tell went
- * (a timeout: not sent again for an hour); and why alerts aren't reaching the person, while they aren't */
+/** <project>/.claude/fleet/state/alerts.json, the sweeper's: today's count (and the messages sent in the room kept for
+ * budgets and instances with no fleet, past perDay), each key's last send, the last message; after a send that failed,
+ * how many failed in a row and when to try again; the keys of a send nobody can tell went (a timeout: not sent again
+ * for an hour); and why alerts aren't reaching the person, while they aren't */
 export type AlertsFile = {
   format: number
   day: string
   count: number
+  reserved?: number
   sent: Record<string, number>
   held?: number
   last?: { at: number; text: string; answer: string }
@@ -148,24 +150,33 @@ export type AlertsFile = {
 export type SendOutcome = 'sent' | 'failed' | 'unknown'
 
 const ALERT_HOUR = 3600000
+/** Room of their own, past perDay, for a budget used up and an instance with no fleet: so many more messages a day, which
+ * the day's routine alerts can't use up */
+export const RESERVED_PER_DAY = 2
+const RESERVED_KINDS: ReadonlySet<AlertKind> = new Set(['budget', 'nofleet'])
 
 /** Which alerts go now: those not sent in the last day (nor tried in the last hour with no answer), outside quiet
  * hours (a budget's goes anyway), while today's count is under perDay (one message carries every alert due at once,
- * and counts once, whether it went or not) and no back-off after a failure holds them. The rest wait */
+ * and counts once, whether it went or not) and no back-off after a failure holds them. Past perDay, a budget's and a
+ * no-fleet's still go, in RESERVED_PER_DAY more messages (none when perDay is 0: the person wants none). The rest wait */
 export function alertsDue(due: readonly Alert[], file: AlertsFile | null, p: { format: number; now: number; day: string; perDay: number; quiet: boolean }): { send: Alert[]; waiting: Alert[]; file: AlertsFile } {
   const sent = Object.fromEntries(Object.entries(file?.sent ?? {}).filter(([, at]) => p.now - at < 24 * ALERT_HOUR))
   const unknown = Object.fromEntries(Object.entries(file?.unknown ?? {}).filter(([, at]) => p.now - at < ALERT_HOUR))
   const count = file && file.day === p.day ? file.count : 0
+  const reserved = file && file.day === p.day ? (file.reserved ?? 0) : 0
   const fresh = due.filter(a => sent[a.key] === undefined && unknown[a.key] === undefined)
   const allowed = fresh.filter(a => !p.quiet || a.kind === 'budget')
   const backoff = !!file?.retryAt && p.now < file.retryAt
-  const send = count < p.perDay && !backoff ? allowed : []
+  const room = !backoff && count >= p.perDay && p.perDay > 0 && reserved < RESERVED_PER_DAY
+  const send = backoff ? [] : count < p.perDay ? allowed : room ? allowed.filter(a => RESERVED_KINDS.has(a.kind)) : []
+  const extra = count >= p.perDay && send.length > 0
   const waiting = fresh.filter(a => !send.includes(a))
   for (const a of send) sent[a.key] = p.now
   const next: AlertsFile = {
     format: p.format,
     day: p.day,
-    count: count + (send.length ? 1 : 0),
+    count: count + (send.length && !extra ? 1 : 0),
+    ...(reserved || extra ? { reserved: reserved + (extra ? 1 : 0) } : {}),
     sent,
     ...(waiting.length ? { held: waiting.length } : {}),
     ...(file?.last ? { last: file.last } : {}),

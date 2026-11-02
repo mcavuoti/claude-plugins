@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { DEC, FLEET, HOME, ROOT, fleet, json, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
+import { hashText } from '../hooks/changes'
+import { DEC, FLEET, HOME, ROOT, fleet, json, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // The person channel from the mod's side: the sweeper sends what waits for him and the closed list of alerts through
 // his channel, within its caps (a command he stamped gets the text on its standard input; a push goes through
@@ -154,4 +155,51 @@ test('an MCP channel sends to the person’s own address only; one naming anyone
   expect(calls.length).toBe(1)
   expect(await fleet($, 'status')).toContain("channel terminal (the band, /fleet and /fleet brief only) (roster.json: person.channel.to (team@example.invalid) isn't one of person.addresses: fleet sends only to the person)")
   expect(await fleet($, 'up --dry-run')).toContain("roster.json: person.channel.to (team@example.invalid) isn't one of person.addresses: fleet sends only to the person: alerts wait in the brief")
+})
+
+test('a command-level file changed outside fleet alerts only once it stayed unstamped 30 minutes, once a day; each alert claimed before it goes', WITH_SESSIONS, async ($, on) => {
+  const w = project(on, { addresses: ['me@example.invalid'], channel: { kind: 'command', argv: ['bash', '.claude/fleet/alert.sh'] } }, { [`${FLEET}/alert.sh`]: '#!/bin/bash\ncat >> /tmp/x/alerts.txt\n', [`${FLEET}/charter.md`]: '# Charter\n' })
+  const ran: string[] = []
+  w.exec.value = (argv, _cwd, stdin) => {
+    if (argv[1] !== '.claude/fleet/alert.sh') return undefined
+    ran.push(stdin ?? '')
+    return { exitCode: 0 }
+  }
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  expect(await fleet($, 'accept channel')).toContain('Stamped')
+  // D-1's digest goes; it was claimed (two sweepers for a minute send it once)
+  for (let i = 0; i < 31; i++) await tick(w)
+  expect(ran.length).toBe(1)
+  expect(under(w, `${FLEET}/state/alerts`).length).toBe(1)
+  // The person edits the charter: no alert while he may still accept it himself
+  w.touch(`${FLEET}/charter.md`, '# Charter\n\nMine.\n')
+  for (let i = 0; i < 20 * 30; i++) await tick(w)
+  expect(ran.length).toBe(1)
+  for (let i = 0; i < 12 * 30; i++) await tick(w)
+  expect(ran.length).toBe(2)
+  expect(ran[1]).toMatch(/\.claude\/fleet\/charter\.md changed outside fleet 3\dm ago \(\/fleet accept\)/)
+  const day = json(w, `${FLEET}/state/alerts.json`).day
+  expect(w.files.has(`${FLEET}/state/alerts/${day}/${hashText(`outside:.claude/fleet/charter.md:${day}`).slice(1, 17)}`)).toBe(true)
+  // Saved again: the same file, the same day: nothing more
+  w.touch(`${FLEET}/charter.md`, '# Charter\n\nMine, again.\n')
+  for (let i = 0; i < 40 * 30; i++) await tick(w)
+  expect(ran.length).toBe(2)
+})
+
+test('an alert another sweeper claimed first isn’t sent again', WITH_SESSIONS, async ($, on) => {
+  const day = new Date(NOW - new Date(NOW).getTimezoneOffset() * 60000).toISOString().slice(0, 10)
+  const minute = Math.floor(((NOW / 60000 - new Date(NOW).getTimezoneOffset()) % 1440) + 1440) % 1440
+  const part = ['night', 'morning', 'afternoon', 'evening'][Math.floor(minute / 360)]
+  const claim = `${FLEET}/state/alerts/${day}/${hashText(`waiting:${day}:${part}`).slice(1, 17)}`
+  const pushed: string[] = []
+  on('tool.call', { tool: 'PushNotification' }, (_: any, e: any) => {
+    pushed.push(e.message)
+    return { result: { pushSent: true } } as any
+  })
+  const w = project(on, { channel: { kind: 'push' } }, { [claim]: JSON.stringify({ format: 1, key: `waiting:${day}:${part}`, at: NOW }) })
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  for (let i = 0; i < 40; i++) await tick(w)
+  expect(pushed).toEqual([])
 })

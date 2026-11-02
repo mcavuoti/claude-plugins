@@ -42,6 +42,7 @@
 //   state/wakes.json                     wire: the sweeper's wakes of retired instances today
 //   state/intake.json                    wire: intake's counts and spend today, its sources' last polls (the sweeper's)
 //   state/alerts.json, channel-stamp.json  wire: the alerts sent to the person today; the command channel he stamped
+//   state/alerts/<day>/<key hash>        wire: an alert claimed no-clobber by the sweeper about to send it
 //   state/slots/<slot>/<n>.json          wire: lease n of a slot, published no-clobber by its taker (slots.ts)
 //   state/slots/<slot>/waiting/<who>.json  wire: one in line for a slot, written by the session that waits
 //   state/judges/<day>/<sid8>.json       wire: a session's judge calls and their cost today, written only by it

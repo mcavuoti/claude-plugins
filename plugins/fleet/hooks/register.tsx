@@ -136,7 +136,7 @@ import {
   type RegisterRecord,
 } from './decisions'
 import { applyEdits, applyVerdict, changeDelivery, changeTicket, checkChange, diffHead, draftName, lineDiff, sameHash, shortHash, type ChangeSpec } from './drafts'
-import { afterSend, alertMessage, alertsDue, channelKey, channelScript, channelWords, inQuiet, mcpSendArgs, personOf, type Alert, type AlertsFile, type Channel, type SendOutcome } from './channel'
+import { afterSend, alertMessage, alertsDue, channelKey, channelScript, channelWords, inQuiet, mcpSendArgs, personOf, RESERVED_PER_DAY, type Alert, type AlertsFile, type Channel, type SendOutcome } from './channel'
 import { circularOf, circularWords, derivedKindOf, derivedOf, derivedText, ownsKind, quietEnough, staleDerived, type DerivedKind } from './derived'
 import {
   CHARTER,
@@ -1172,9 +1172,12 @@ async function maybePrune($: any, records: QueueRecord[]) {
   await old(dec('judge'), HOUR, n => queued.has(n.replace(/\.json$/, '')))
   await old(dec('tmp'), 24 * HOUR, () => false)
   await old(dec('prune'), 7 * 24 * HOUR, () => false)
-  // The judges' ledgers of days long gone
+  // The judges' ledgers of days long gone, and the alerts' claims of days gone by
   for (const d of await names($, stateDir('judges'))) {
     if (/^\d{4}-\d{2}-\d{2}$/.test(d) && now - Date.parse(`${d}T00:00:00Z`) > 30 * 24 * HOUR) await run($, ['rm', '-rf', stateDir(`judges/${d}`)])
+  }
+  for (const d of await names($, stateDir('alerts'))) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(d) && now - Date.parse(`${d}T00:00:00Z`) > 2 * 24 * HOUR) await run($, ['rm', '-rf', stateDir(`alerts/${d}`)])
   }
   await pruneWorld($, now)
 }
@@ -3314,6 +3317,12 @@ async function slotLines($: any): Promise<{ lines: string[]; told: () => Promise
 const alertState = { problem: '', last: '' }
 // Since when the sweeper sees an instance running without fleet (by name), for the alert
 const noFleetNames = new Map<string, { since: number; ref: string }>()
+// Since when the sweeper sees each command-level file changed outside fleet and not stamped: the alert waits OUTSIDE_MS
+// (the person's own edit, then /fleet accept, never alerts)
+const outsideSince = new Map<string, number>()
+const OUTSIDE_MS = 30 * 60000
+// The parts of the day the waiting digest goes once in, at most: night, morning, afternoon, evening (local)
+const DAY_PARTS = ['night', 'morning', 'afternoon', 'evening']
 
 /** The command channel runs only while its command and script are as the person stamped them (/fleet accept channel):
  * fleet runs it as him, with no prompt */
@@ -3376,15 +3385,16 @@ async function alertsTick($: any) {
   }
   const now = await $.clock.now()
   const day = today(now)
+  const minute = Math.floor(((now / 60000 - new Date(now).getTimezoneOffset()) % 1440) + 1440) % 1440
   const due: Alert[] = []
-  // Decisions waiting long: one digest every six hours at most (sessions already pushes each asker the person keeps
+  // Decisions waiting long: one digest per part of the day at most (sessions already pushes each asker the person keeps
   // waiting, from the ?n mark that needs him)
   const { records } = await queueRecords($)
   const present = await answerNames($)
   const view = await askerViews($, records)
   const long = records.filter(r => knownKind(r) && !progress(r.id, slots(r), present).complete && now - r.at >= person.waitingMin * 60000).sort((a, b) => a.at - b.at)
   const oldest = long[0]
-  if (oldest) due.push({ key: `waiting:${Math.floor(now / (6 * HOUR))}`, kind: 'waiting', text: `${long.length} decision(s) have waited over ${ago(person.waitingMin * 60000)} (the oldest, ${oldest.id} from ${view(oldest).name}, ${ago(now - oldest.at)})` })
+  if (oldest) due.push({ key: `waiting:${day}:${DAY_PARTS[Math.floor(minute / 360)]}`, kind: 'waiting', text: `${long.length} decision(s) have waited over ${ago(person.waitingMin * 60000)} (the oldest, ${oldest.id} from ${view(oldest).name}, ${ago(now - oldest.at)})` })
   // A budget used up (an instance's own, the project's, intake's)
   budgetCache.at = 0
   for (const b of await budgets($)) if (b.own === 'over') due.push({ key: `budget:${b.inst.slug}:${day}`, kind: 'budget', text: `${b.inst.name} used up its budget (${usd(b.usd)} today)` })
@@ -3398,32 +3408,46 @@ async function alertsTick($: any) {
     await loadFlags($)
     for (const f of failing()) if (f.at && now - f.at >= person.checkMin * 60000) due.push({ key: `check:${f.path}:${f.check}:${f.hash}`, kind: 'check', text: `${f.path} has failed ${f.check} for ${ago(now - f.at)}` })
   }
-  // A request for a change from the person's or a principal's address, and an urgent item nobody subscribes to
+  // A request for a change from the person's or a principal's address, and an urgent item from one nobody subscribes
+  // to: only when its platform verified the sender (an unverified claim of his address still reaches its drafter,
+  // labelled, and the brief: never an alert)
   for (const e of intakeEvents.values()) {
     const m = e.intake
-    if (!m || !e.id || now - e.at > 24 * HOUR) continue
+    if (!m || !e.id || now - e.at > 24 * HOUR || m.auth !== 'verified' || m.standing === 'other') continue
     if (m.kind === 'command-claim') due.push({ key: `intake:${e.id}`, kind: 'intake', text: `${e.id}: a request for a change from ${m.standing === 'person' ? 'your address' : "a principal's"} (${m.auth}); ${m.drafter ? `${m.drafter} drafts it` : 'nobody drafts it: /fleet brief'}` })
-    else if (m.urgent && (!m.to.length || m.front)) due.push({ key: `intake:${e.id}`, kind: 'intake', text: `${e.id}: an urgent item from outside nobody subscribes to` })
+    else if (m.urgent && (!m.to.length || m.front)) due.push({ key: `intake:${e.id}`, kind: 'intake', text: `${e.id}: an urgent item from ${m.standing === 'person' ? 'your address' : 'a principal'} nobody subscribes to` })
   }
-  // A command-level file changed outside fleet
-  for (const rel of await unstamped($)) {
-    const t = await readText($, `${root}/${rel}`)
-    due.push({ key: `outside:${rel}:${t === null ? 'gone' : hashText(t)}`, kind: 'outside', text: `${rel} changed outside fleet (/fleet accept)` })
+  // A command-level file changed outside fleet and not stamped for OUTSIDE_MS (his own edit is accepted before then),
+  // once a day per file
+  const outside = await unstamped($)
+  for (const rel of [...outsideSince.keys()]) if (!outside.includes(rel)) outsideSince.delete(rel)
+  for (const rel of outside) {
+    const since = outsideSince.get(rel) ?? now
+    outsideSince.set(rel, since)
+    if (now - since >= OUTSIDE_MS) due.push({ key: `outside:${rel}:${day}`, kind: 'outside', text: `${rel} changed outside fleet ${ago(now - since)} ago (/fleet accept)` })
   }
   const file = await readWire<AlertsFile>($, stateDir('alerts.json'))
-  const minute = Math.floor(((now / 60000 - new Date(now).getTimezoneOffset()) % 1440) + 1440) % 1440
   const v = alertsDue(due, file, { format: FORMAT, now, day, perDay: person.perDay, quiet: inQuiet(person.quiet, minute) })
-  if (!v.send.length) {
+  // Each alert claimed no-clobber before it goes: two sweepers for a minute send it once
+  const claimed: { alert: Alert; path: string }[] = []
+  for (const a of v.send) {
+    const path = stateDir(`alerts/${day}/${hashText(a.key).slice(1, 17)}`)
+    if ((await publish($, path, json({ format: FORMAT, key: a.key, at: now }))) !== 'exists') claimed.push({ alert: a, path })
+  }
+  const send = claimed.map(x => x.alert)
+  if (!send.length) {
     if ((file?.held ?? 0) !== (v.file.held ?? 0)) await replace($, stateDir('alerts.json'), json(v.file))
     return
   }
-  const text = alertMessage((root ?? '').split('/').pop() || 'the project', v.send)
+  const text = alertMessage((root ?? '').split('/').pop() || 'the project', send)
   const sent = await sendToPerson($, c, text)
   alertState.last = sent.answer
-  log($, `alerts (${v.send.map(a => a.key).join(', ')}): ${sent.answer}`)
+  log($, `alerts (${send.map(a => a.key).join(', ')}): ${sent.answer}`)
+  // One that didn't go, or may not have, gives its claims back: its retry claims them again
+  if (sent.outcome !== 'sent') await remove($, claimed.map(x => x.path))
   // Every attempt counts toward perDay; a failure backs off (15 min, then an hour), a send with no answer isn't
   // repeated for an hour
-  const next = afterSend(v.file, file, v.send, sent.outcome, { at: now, text, answer: sent.answer }, sent.problem ?? null)
+  const next = afterSend(v.file, file, send, sent.outcome, { at: now, text, answer: sent.answer }, sent.problem ?? null)
   if (!(await replace($, stateDir('alerts.json'), json(next)))) {
     await run($, ['mkdir', '-p', stateDir()])
     await replace($, stateDir('alerts.json'), json(next))
@@ -5118,7 +5142,9 @@ async function rosterTick($: any) {
     const quiet = !!cad?.due && had?.cadenceFor !== cad.anchor
     const slot = granted.find(l => l.holder.ref === retired.ref && leaseKey(l) !== had?.slotFor)
     const stale = derived.find(d => ownsKind(d, inst) && quietEnough(d, now) && d.key !== had?.derivedFor)
-    const pointed = [...intakeEvents.values()].some(e => e.intake?.to.includes(inst.name) && e.at > Number((hb as Record<string, unknown>).intakeSeen ?? 0))
+    // Items from outside wake it only from a sender its platform verified as the person or a principal, or marked urgent
+    // by a verified one: the rest wait for its next wake, whatever brings it (outside mail can't spend its wakes)
+    const pointed = [...intakeEvents.values()].some(e => e.intake?.to.includes(inst.name) && e.at > Number((hb as Record<string, unknown>).intakeSeen ?? 0) && e.intake.auth === 'verified' && (e.intake.standing !== 'other' || !!e.intake.urgent))
     // The reviewer of the judges, with overrules to review it hasn't been woken for (within the wakes' caps)
     const review = reviews.length && (inst.name.toLowerCase() === reviewer || inst.role.toLowerCase() === reviewer) && reviews[reviews.length - 1] !== had?.reviewFor ? (reviews[reviews.length - 1] as string) : null
     if (!answered && !quiet && !slot && !stale && !pointed && !review && !(worldOn() && baselined && (await isBehind($, hb.sessionId)))) continue
@@ -6775,7 +6801,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
       .filter(e => e.via === 'intake' && e.id && e.intake)
       .map(e => {
         const m = e.intake as IntakeMeta
-        return { id: e.id as string, path: e.path, at: e.at, kind: m.kind, from: m.from, standing: m.standing, to: m.to, front: m.front, drafter: m.drafter, targets: m.targets }
+        return { id: e.id as string, path: e.path, at: e.at, kind: m.kind, from: m.from, standing: m.standing, auth: m.auth, to: m.to, front: m.front, drafter: m.drafter, targets: m.targets }
       }),
     derived: worldOn() ? (flagged.suspects?.derived ?? []).map(d => ({ path: d.path, kind: d.kind, owner: d.owner, pins: d.pins.map(x => `${x.pin} (now v${x.now})`) })) : [],
     slots: await slotsWaiting($),
@@ -6824,7 +6850,8 @@ async function outsideStatus($: any): Promise<string[]> {
   )
   if (person.channel.kind !== 'terminal') {
     const today0 = a && a.day === today(now) ? a.count : 0
-    lines.push(`alerts: ${today0} of ${person.perDay} sent today${person.quiet ? `, quiet ${Math.floor(person.quiet.from / 60)}:${String(person.quiet.from % 60).padStart(2, '0')}-${Math.floor(person.quiet.to / 60)}:${String(person.quiet.to % 60).padStart(2, '0')}` : ''}${a?.held ? `, ${a.held} waiting (the cap, quiet hours or a failed send)` : ''}${a?.last ? `; the last at ${clock(a.last.at, me.offsetMin)}: ${a.last.answer}` : ''}${a?.retryAt && a.retryAt > now ? `; trying again at ${clock(a.retryAt, me.offsetMin)}` : ''}${alertState.problem && alertState.problem !== problem ? ` (${alertState.problem})` : ''}`)
+    const extra = a && a.day === today(now) ? (a.reserved ?? 0) : 0
+    lines.push(`alerts: ${today0} of ${person.perDay} sent today${extra ? ` (and ${extra} of ${RESERVED_PER_DAY} more for budgets and instances with no fleet)` : ''}${person.quiet ? `, quiet ${Math.floor(person.quiet.from / 60)}:${String(person.quiet.from % 60).padStart(2, '0')}-${Math.floor(person.quiet.to / 60)}:${String(person.quiet.to % 60).padStart(2, '0')}` : ''}${a?.held ? `, ${a.held} waiting (the cap, quiet hours or a failed send)` : ''}${a?.last ? `; the last at ${clock(a.last.at, me.offsetMin)}: ${a.last.answer}` : ''}${a?.retryAt && a.retryAt > now ? `; trying again at ${clock(a.retryAt, me.offsetMin)}` : ''}${alertState.problem && alertState.problem !== problem ? ` (${alertState.problem})` : ''}`)
     if (a?.problem) lines.push(`  ${a.problem}`)
   }
   const off = intakeOff()

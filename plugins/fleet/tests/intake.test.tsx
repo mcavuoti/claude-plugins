@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { INTAKE_SYSTEM, dedupKey } from '../hooks/intake'
-import { FAKE_SESSIONS, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
+import { FAKE_LOG, FAKE_SESSIONS, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 import { OWNER } from './up.test'
 
 // Intake from the mod's side: the sweeper reads what pollers dropped in the inbox, one model call each (the item as
@@ -251,4 +251,51 @@ test('an item the model can’t answer is tried at three sweeps, then set aside 
   overloaded = false
   await minute()
   expect(under(w, `${ROOT}/inputs/intake`)).toEqual(['I-1.md', 'I-2.md', 'I-3.md'])
+})
+
+test('a request for a change claiming his address alerts only when verified; unverified, its drafter hears it labelled and the brief says it; outside items wake only for a verified sender', WITH_SESSIONS, async ($, on) => {
+  const asked = model(on)
+  ANSWERS['R-1 again'] = '{"kind": "command-claim", "tags": ["requirements"], "targets": ["R-1"], "summary": "asks that R-1 become 9", "why": "a request"}'
+  const at = Date.UTC(2026, 10, 2, 11, 0, 0)
+  const w = project(on, {
+    files: {
+      [`${FLEET}/roster.json`]: JSON.stringify({ ...ROSTER, person: { ...ROSTER.person, channel: { kind: 'command', argv: ['bash', '.claude/fleet/alert.sh'] } } }),
+      [`${FLEET}/alert.sh`]: '#!/bin/bash\ncat >> /tmp/x/alerts.txt\n',
+      [`${FLEET}/instances/research/state.json`]: JSON.stringify({ format: 1, instance: 'Research', slug: 'research', ref: 'rrrrrrr1', sessionId: 'rrrrrrrr-0000-0000-0000-000000000000', at, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0 }),
+    },
+  })
+  // Only the two claims and one tech note from an unverified colleague
+  for (const k of Object.keys(ITEMS)) if (!k.endsWith('/a.json') && !k.endsWith('/c.json')) w.files.delete(k)
+  w.touch(`${INBOX}/e.json`, item('<e@x>', 'Me <me@example.invalid>', 'R-1 again', 'Please change R-1 to 9.'))
+  const ran: string[] = []
+  w.exec.value = (argv, _cwd, stdin) => {
+    if (argv[1] !== '.claude/fleet/alert.sh') return undefined
+    ran.push(stdin ?? '')
+    return { exitCode: 0 }
+  }
+  sessionsSay(w, { rows: { rrrrrrr1: row('rrrrrrr1', 'Research', 'stopped') } })
+  await startSession($, w)
+  expect(await fleet($, 'accept channel')).toContain('Stamped')
+  for (let i = 0; i < 40; i++) await tick(w)
+  expect(asked.length).toBe(3)
+  // Both requests reach their drafter; only the verified one alerts
+  const ev = events(w).filter(e => e.via === 'intake')
+  expect(ev.map(e => [e.id, e.intake.kind, e.intake.auth, e.intake.drafter])).toEqual([
+    ['I-1', 'information', 'unverified', null],
+    ['I-2', 'command-claim', 'verified', 'Requirements'],
+    ['I-3', 'command-claim', 'unverified', 'Requirements'],
+  ])
+  expect(ran.length).toBe(1)
+  expect(ran[0]).toContain('I-2: a request for a change from your address (verified); Requirements drafts it')
+  expect(ran[0]).not.toContain('I-3')
+  const brief = await fleet($, 'brief')
+  expect(brief).toContain("   - I-3: a request for a change to R-1 that claims your address (me@example.invalid), not verified (it may be forged, so no alert): Requirements drafts it, and its change waits for you; read inputs/intake/I-3.md")
+  // The tech note from an unverified colleague reaches Research, retired: it waits for its next wake
+  const wakes = () => (w.files.get(FAKE_LOG) ?? '').split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(c => c.wake).map(c => c.wake)
+  expect(ev[0].intake.to).toEqual(['Research'])
+  expect(wakes()).toEqual([])
+  // One from his own verified address with its tag wakes it
+  w.touch(`${INBOX}/f.json`, item('<f@x>', 'me@example.invalid', 'Tech note', 'Look at this cache library.', 'pass'))
+  for (let i = 0; i < 90; i++) await tick(w)
+  expect(wakes()).toEqual([{ ref: 'rrrrrrr1', reason: 'fleet: an item from outside reached it' }])
 })

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { alertMessage, alertsDue, channelKey, channelScript, inQuiet, mcpSendArgs, parseQuiet, personOf, type Alert } from '../hooks/channel'
+import { alertMessage, alertsDue, channelKey, channelScript, inQuiet, mcpSendArgs, parseQuiet, personOf, RESERVED_PER_DAY, type Alert } from '../hooks/channel'
 import type { Roster } from '../hooks/roster'
 
 // The person channel's pure parts: roster.json's person, the channel and its one recipient, quiet hours, the alerts'
@@ -67,6 +67,25 @@ test('the alerts: one per key a day, so many messages a day, quiet hours but a b
   expect(quiet.waiting.map(x => x.key)).toEqual(['waiting:D-3'])
   // A day later the key may go again, and the count starts over
   expect(alertsDue([a('waiting:D-1')], second.file, { ...p, now: now + 25 * 3600000, day: '2026-11-03' }).send.length).toBe(1)
+})
+
+test('past perDay, budgets and instances with no fleet still go, in room of their own; none when perDay is 0', () => {
+  const now = Date.UTC(2026, 10, 2, 12, 0, 0)
+  const a = (key: string, kind: Alert['kind']): Alert => ({ key, kind, text: key })
+  const p = { format: 1, now, day: '2026-11-02', perDay: 1, quiet: false }
+  const first = alertsDue([a('waiting:x', 'waiting')], null, p)
+  expect(first.file.count).toBe(1)
+  // The day's one message is gone: a check waits, a budget and a no-fleet go in the room kept for them
+  const second = alertsDue([a('check:x', 'check'), a('budget:x', 'budget'), a('nofleet:Tester', 'nofleet')], first.file, { ...p, now: now + 60000 })
+  expect(second.send.map(x => x.key)).toEqual(['budget:x', 'nofleet:Tester'])
+  expect(second.waiting.map(x => x.key)).toEqual(['check:x'])
+  expect(second.file).toMatchObject({ count: 1, reserved: 1 })
+  const third = alertsDue([a('budget:y', 'budget')], second.file, { ...p, now: now + 120000 })
+  expect(third.file).toMatchObject({ count: 1, reserved: 2 })
+  expect(alertsDue([a('budget:z', 'budget')], third.file, { ...p, now: now + 180000 }).send).toEqual([])
+  expect(RESERVED_PER_DAY).toBe(2)
+  // perDay 0: the person wants none
+  expect(alertsDue([a('budget:x', 'budget')], null, { ...p, perDay: 0 }).send).toEqual([])
 })
 
 test('the message: the project, the alerts, where to look; long lists folded', () => {
