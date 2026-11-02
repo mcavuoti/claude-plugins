@@ -10,7 +10,7 @@ test('session.start starts the mod once: heartbeat, panel and /sessions; a draw 
   expect(w.registered).toEqual(['sessions'])
   expect(w.opens.filter(o => o.id === 'sessions').length).toBe(1)
   const beat = w.files.get(`${DATA}/alive/${SID}`) ?? ''
-  expect(beat).toContain('format=1\n')
+  expect(beat).toContain('format=2\n')
   expect(beat).toContain('via=session.start\n')
   expect(beat).toContain('version=0.10.0\n')
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
@@ -71,12 +71,12 @@ test('a fresh focus request from ccc gives the panel the keyboard and is consume
   const w = world(on)
   await startSession($, w)
   const inbox = `${DATA}/inbox/${SID}`
-  w.files.set(inbox, `format=1\naction=focus\nat=${w.clock.now()}\n`)
+  w.files.set(inbox, `format=2\naction=focus\nat=${w.clock.now()}\n`)
   await w.clock.advance(600)
   expect(w.files.has(inbox)).toBe(false)
   expect(w.opens.some(o => o.id === 'sessions' && o.focus === true)).toBe(true)
   const before = w.opens.length
-  w.files.set(inbox, `format=1\naction=focus\nat=${w.clock.now() - 60000}\n`)
+  w.files.set(inbox, `format=2\naction=focus\nat=${w.clock.now() - 60000}\n`)
   await w.clock.advance(600)
   expect(w.files.has(inbox)).toBe(false)
   expect(w.opens.slice(before).some(o => o.focus === true)).toBe(false)
@@ -86,7 +86,7 @@ test('a request in another format is consumed and not acted on', async ($, on) =
   const w = world(on)
   await startSession($, w)
   const inbox = `${DATA}/inbox/${SID}`
-  w.files.set(inbox, `format=2\naction=focus\nat=${w.clock.now()}\n`)
+  w.files.set(inbox, `format=1\naction=focus\nat=${w.clock.now()}\n`)
   await w.clock.advance(600)
   expect(w.files.has(inbox)).toBe(false)
   expect(w.opens.some(o => o.focus === true)).toBe(false)
@@ -120,7 +120,7 @@ test('closed by you: no panel at start, no panel on arrival, the band says how t
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(JSON.stringify(await ui.drawn())).toContain('panel closed · /sessions to open')
   // Arriving with ccc (a focus request) lands on the prompt
-  w.files.set(`${DATA}/inbox/${SID}`, `format=1\naction=focus\nat=${w.clock.now()}\n`)
+  w.files.set(`${DATA}/inbox/${SID}`, `format=2\naction=focus\nat=${w.clock.now()}\n`)
   await w.clock.advance(600)
   expect(w.opens.filter(o => o.id === 'sessions')).toEqual([])
   await ui.press({ key: 'show-panel' })
@@ -197,7 +197,7 @@ for (const reason of ['clear', 'resume'] as const) {
     list[0]!.sessionId = NEW
     await w.clock.advance(1000)
     expect(w.files.has(`${DATA}/alive/${SID}`)).toBe(false)
-    expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=1\n')
+    expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=2\n')
     expect(w.store.get(`state:${SID}`)).toBe(undefined)
     expect((w.store.get(`state:${NEW}`) as any)?.created).toBeDefined()
     // The old conversation's title isn't the new one's; having seen the session carries over
@@ -210,7 +210,7 @@ for (const reason of ['clear', 'resume'] as const) {
     expect(band).not.toContain('"dddddddd"')
     await ui.unmount()
     // A request for the new id is heard
-    w.files.set(`${DATA}/inbox/${NEW}`, `format=1\naction=focus\nat=${w.clock.now()}\n`)
+    w.files.set(`${DATA}/inbox/${NEW}`, `format=2\naction=focus\nat=${w.clock.now()}\n`)
     await w.clock.advance(600)
     expect(w.files.has(`${DATA}/inbox/${NEW}`)).toBe(false)
   })
@@ -222,20 +222,20 @@ test('an id change nobody announced (no session.end) is caught by the 15 s beat'
   const NEW = 'eeeeeeee-0000-0000-0000-000000000000'
   w.id.value = NEW
   await w.clock.advance(15500)
-  expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=1\n')
+  expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=2\n')
   expect(w.files.has(`${DATA}/alive/${SID}`)).toBe(false)
 })
 
 test('debug logs off (the default): no --debug-file, and the launcher is told so', async ($, on) => {
   const w = world(on)
   await startSession($, w)
-  expect(w.files.get(`${DATA}/config`)).toBe('format=1\ndebug=0\n')
+  expect(w.files.get(`${DATA}/config`)).toBe('format=2\ndebug=0\n')
 })
 
 test('debug logs on: the launcher is told, and a session the panel creates writes its debug log', { options: { debugLogs: true } }, async ($, on) => {
   const w = world(on)
   await startSession($, w)
-  expect(w.files.get(`${DATA}/config`)).toBe('format=1\ndebug=1\n')
+  expect(w.files.get(`${DATA}/config`)).toBe('format=2\ndebug=1\n')
   await $.ui.mount({ plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } })
   await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface: 'terminal' })
   await $.ui.input({ plugin: 'sessions', key: 'name', text: 'TEST one', requestId: 'sessions', surface: 'terminal' })

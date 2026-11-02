@@ -5,7 +5,7 @@ import type { Color, Period, RateLimit, SessionsMark, SessionsMember, SessionsRe
 // carries `format=<n>`. A reader that finds another format leaves it alone and says the sessions need a restart (u, or
 // claude respawn): sessions running another version of the mod never act on each other's data by mistake.
 // The launcher (hooks/launcher.py, hooks/visor.sh) reads and writes the same formats: change them together.
-export const FORMAT = 1
+export const FORMAT = 2
 
 // The first version of the mod that writes heartbeats: sessions started after this version was installed are
 // expected to have one
@@ -543,12 +543,43 @@ export function parseOrderFile(text: string): { format: number; at: number; root
 
 // A request for a session's mod: <data>/inbox/<sessionId>, written by the launcher. focus: you're arriving with ccc,
 // the panel takes the keyboard; bring: bring the window `tty` forward (ccc found the project already open there) and
-// answer in `reply`. Old requests (more than 30 s) are dropped
-export type InboxRequest = { format: number; action: string; at: number; tty: string; title: string; reply: string }
+// answer in `reply`; wake: wake the stopped session `ref` for ccc tell, under the rules of $.sessions.wake, and answer
+// in `reply` with result, state (running, queued, refused) and reason. Old requests (more than 30 s) are dropped
+export type InboxRequest = { format: number; action: string; at: number; tty: string; title: string; reply: string; ref: string }
 export function parseInbox(text: string): InboxRequest | null {
   const k = parseKeyLines(text)
   if (!k.format || !k.action) return null
-  return { format: Number(k.format) || 0, action: k.action, at: Number(k.at) || 0, tty: k.tty ?? '', title: k.title ?? '', reply: k.reply ?? '' }
+  return { format: Number(k.format) || 0, action: k.action, at: Number(k.at) || 0, tty: k.tty ?? '', title: k.title ?? '', reply: k.reply ?? '', ref: k.ref ?? '' }
+}
+
+// ccc tell: a script hands a background session some text, which that session's mod submits as a turn of its own once
+// the session is idle (the model reads it as sent by the sessions plugin, never as the person's). Its files, in
+// <data>/tell/<ref>/:
+//   allow           the person's /sessions tell on in that session (format, at); without it every request is refused
+//   <id>.txt        the text, up to 4 KB (TELL_MAX_BYTES); <id> is <at>-<pid>, when and which ccc wrote it
+//   <id>.req        format, from (who ran ccc tell), at: written last, so a request is whole once it's there
+//   <id>.status     format, state, reason, at: what ccc tell prints, and what a script reads later
+// state: queued (waiting for its turn), delivered (its turn started), held (refused because the person stopped the
+// session with Esc: it goes once they type in it again), refused (never delivered, with why). The mod takes a request
+// by renaming <id>.req to <id>.taken (<id>.held while it's held)
+export const TELL_MAX_BYTES = 4096
+export type TellState = 'queued' | 'delivered' | 'held' | 'refused'
+export function tellStatusText(state: TellState, reason: string, at: number): string {
+  return keyLines({ format: FORMAT, state, reason, at })
+}
+
+export function parseTellRequest(text: string): { format: number; from: string; at: number } | null {
+  const k = parseKeyLines(text)
+  if (!k.format) return null
+  return { format: Number(k.format) || 0, from: (k.from ?? '').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 40) || 'a script', at: Number(k.at) || 0 }
+}
+
+// The turn a request becomes, and the request it came from, as turn.start sees it
+export function tellPrompt(id: string, from: string, text: string): string {
+  return `[ccc tell ${id} from ${from}: sent by a script, not typed by the person]\n${text}`
+}
+export function tellIdIn(text: string): string | null {
+  return text.match(/\[ccc tell (\d+-\d+) from /)?.[1] ?? null
 }
 
 // What the launcher opens next in a window: <data>/windows/<tty as a file name>. attach a session by its id, or the

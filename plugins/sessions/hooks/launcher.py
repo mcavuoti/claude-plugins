@@ -3,6 +3,7 @@
 
     launcher.py start --tty TTY --file FILE [--new | --agents] [--exclude ID] [NAME...]
     launcher.py pick [--tty TTY] [--new] [NAME...]      the decision only, as JSON (tests and debugging)
+    launcher.py tell [--in DIR] NAME|ID [TEXT... | -]   ccc tell: hand a background session text (see tell() below)
 
 start decides and, when something should open in this window, writes it to FILE (the window's file, which visor.sh
 reads): the project's top session, the session NAME (created if there's none), the agent view (--agents). In order:
@@ -20,7 +21,8 @@ asks whether to restart it first. On arrival the panel takes the keyboard: a req
 
 The files it reads and writes are the mod's (hooks/state.ts has the formats): <data>/alive/<sessionId> (heartbeats),
 <data>/order/<root> (the panel's order), <data>/inbox/<sessionId> (requests), <data>/windows/<tty> (what a window opens
-next), <data>/config (settings the mod mirrors), with <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
+next), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), with <data> =
+~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
 Other environment: SESSIONS_CLAUDE (the claude command), SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the
 installed plugin, from the ccc command), SESSIONS_START_WAIT (seconds to wait for a new session's mod).
 """
@@ -31,7 +33,8 @@ import subprocess
 import sys
 import time
 
-FORMAT = 1
+FORMAT = 2
+TELL_MAX_BYTES = 4096
 HEARTBEAT_VERSION = (0, 10, 0)
 HEARTBEAT_FRESH_MS = 45000
 ORDER_FRESH_MS = 60000
@@ -348,13 +351,13 @@ def request(session, action, **fields):
     write_key_lines(os.path.join(DATA, 'inbox', session['sessionId']), entries)
 
 
-# Asks a session's mod to bring a window forward; waits for its answer. (ok, reason)
-def bring(d):
-    title = title_of(d['session']) if d.get('session') else ''
-    for helper in d.get('helpers') or []:
+# Asks the first of the helpers (sessions whose mod answers) that answers to do something, through its inbox, and
+# waits up to 3 s for each one's answer: its reply's keys, or None when none answered
+def ask_helpers(helpers, action, **fields):
+    for helper in helpers:
         reply = os.path.join(DATA, 'replies', '%d-%d' % (os.getpid(), now_ms()))
         os.makedirs(os.path.dirname(reply), exist_ok=True)
-        request(helper, 'bring', tty=d['window'], title=title, reply=reply)
+        request(helper, action, reply=reply, **fields)
         deadline = time.time() + 3
         answer = {}
         while time.time() < deadline:
@@ -366,11 +369,20 @@ def bring(d):
             os.remove(reply)
         except OSError:
             pass
-        if answer.get('result') == 'ok':
-            return True, ''
         if answer.get('result'):
-            return False, answer.get('reason') or 'it said no'
-    return False, 'no session of this project answered (their panels may not be running)'
+            return answer
+    return None
+
+
+# Asks a session's mod to bring a window forward; waits for its answer. (ok, reason)
+def bring(d):
+    title = title_of(d['session']) if d.get('session') else ''
+    answer = ask_helpers(d.get('helpers') or [], 'bring', tty=d['window'], title=title)
+    if answer is None:
+        return False, 'no session of this project answered (their panels may not be running)'
+    if answer.get('result') == 'ok':
+        return True, ''
+    return False, answer.get('reason') or 'it said no'
 
 
 def write_target(path, session):
@@ -567,7 +579,125 @@ def start(args, tty, path):
     return 1
 
 
+# --- ccc tell ------------------------------------------------------------------------------------------------------
+#
+# ccc tell [--in DIR] NAME|ID [TEXT... | -] hands a background session text from any script (cron, launchd, a git
+# hook): that session's mod submits it as a turn of its own once the session is idle. It needs no terminal and no
+# project folder: the session is found by its id, by its name in the project of DIR (or of the current folder), or by a
+# name only one background session has. The session must have opted in (/sessions tell on in it), and the text is 4 KB
+# at most: send a pointer ("new mail, id ...") rather than outside text. A session the background service retired for
+# being idle is woken first, by a running session's mod and under the rules of $.sessions.wake. The request and its
+# status file live in <data>/tell/<id>/ (TELL in state.ts); it prints the state and the status file's path, and exits
+# 1 when it was refused.
+
+def caller_name():
+    # Who ran ccc tell: the parent of the launcher's shell, by its command's name
+    code, out, _ = run(['ps', '-o', 'ppid=', '-p', str(os.getppid())])
+    parent = out.strip().split('\n')[0].strip() if code == 0 else ''
+    if not parent.isdigit():
+        return 'ccc'
+    code, out, _ = run(['ps', '-o', 'comm=', '-p', parent])
+    name = re.sub(r'[^A-Za-z0-9._-]', '', os.path.basename(out.strip().split('\n')[0].strip()).lstrip('-'))[:40]
+    return name or 'ccc'
+
+
+def find_tell_target(sessions, target, folder):
+    background = [s for s in sessions if s.get('kind') == 'background' and s.get('id')]
+    if re.match(r'^[0-9a-f]{8}$', target):
+        for s in background:
+            if s['id'] == target:
+                return s, None
+    root = project_root(os.path.realpath(folder))
+
+    def named(rows):
+        exact = [s for s in rows if s.get('name') == target]
+        return exact or [s for s in rows if str(s.get('name') or '').casefold() == target.casefold()]
+    found = named([s for s in background if in_project(s['cwd'], root, HOME)]) or named(background)
+    if len(found) == 1:
+        return found[0], None
+    if found:
+        return None, 'several background sessions are named “%s”: %s. Name it by its id, or with --in <its folder>' % (
+            target, ', '.join('%s (%s)' % (s['id'], s['cwd']) for s in found))
+    if any(s.get('name') == target for s in sessions):
+        return None, '“%s” is a regular session: ccc tell reaches background sessions only' % target
+    return None, 'no background session is named “%s”' % target
+
+
+def tell_status(folder, rid, state, reason=''):
+    write_key_lines(os.path.join(folder, rid + '.status'), [('format', FORMAT), ('state', state), ('reason', reason), ('at', now_ms())])
+
+
+def tell(argv):
+    folder, words = os.getcwd(), list(argv)
+    if len(words) >= 2 and words[0] == '--in':
+        folder, words = words[1], words[2:]
+    if not words:
+        say('usage: ccc tell [--in <folder>] <name|id> "text"   (or - to read the text from stdin)')
+        return 2
+    target, text = words[0], ' '.join(words[1:])
+    if text == '-' or (not text and not sys.stdin.isatty()):
+        text = sys.stdin.read()
+    if not text.strip():
+        say('refused: no text (ccc tell <name|id> "text")')
+        return 2
+    if len(text.encode('utf-8')) > TELL_MAX_BYTES:
+        say('refused: longer than 4 KB. Send a pointer instead (a file path, an id) and let the session read it')
+        return 1
+    sessions = list_sessions()
+    if sessions is None:
+        say("refused: couldn't read the session list (claude agents --json)")
+        return 1
+    s, why = find_tell_target(sessions, target, folder)
+    if not s:
+        say('refused: %s' % why)
+        return 1
+    name, ref = title_of(s), s['id']
+    here = os.path.join(DATA, 'tell', ref)
+    if not os.path.isfile(os.path.join(here, 'allow')):
+        say('refused: “%s” doesn\'t take text from ccc tell: run /sessions tell on in it first' % name)
+        return 1
+    now = now_ms()
+    if is_live(s) and heartbeat_status(read_heartbeat(s['sessionId']), s.get('pid'), now) != 'ok':
+        say("refused: “%s”'s panel isn't running, or runs another version of the sessions mod: restart it (u)" % name)
+        return 1
+    rid = '%d-%d' % (now, os.getpid())
+    os.makedirs(here, exist_ok=True)
+    temporary = os.path.join(here, '.%s.txt' % rid)
+    with open(temporary, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.replace(temporary, os.path.join(here, rid + '.txt'))
+    tell_status(here, rid, 'queued', 'it goes as a turn of its own when “%s” is idle' % name)
+    write_key_lines(os.path.join(here, rid + '.req'), [('format', FORMAT), ('from', caller_name()), ('at', now)])
+    status = os.path.join(here, rid + '.status')
+    if not is_live(s):
+        # Stopped: a running session's mod wakes it, if the rules allow (retired for being idle)
+        others = [x for x in sessions if x['sessionId'] != s['sessionId'] and is_live(x)
+                  and heartbeat_status(read_heartbeat(x['sessionId']), x.get('pid'), now) == 'ok']
+        answer = ask_helpers(sorted(others, key=lambda x: not in_project(x['cwd'], s['cwd'], HOME)), 'wake', ref=ref)
+        if not answer or answer.get('state') not in ('running', 'queued'):
+            reason = answer.get('reason') if answer else 'it is stopped, and no session with a running panel answered to wake it'
+            for ending in ('.req', '.txt'):
+                try:
+                    os.remove(os.path.join(here, rid + ending))
+                except OSError:
+                    pass
+            tell_status(here, rid, 'refused', reason)
+        elif parse_key_lines(read_text(status)).get('state') == 'queued':
+            tell_status(here, rid, 'queued', '%s; it goes once its panel is up and it is idle' % (answer.get('reason') or 'it was woken'))
+    else:
+        # Running: what its mod says within 2 s (delivered, held), else still queued
+        deadline = time.time() + 2
+        while time.time() < deadline and parse_key_lines(read_text(status)).get('state') == 'queued':
+            time.sleep(0.1)
+    k = parse_key_lines(read_text(status))
+    say('%s%s' % (k.get('state') or 'queued', ': %s' % k['reason'] if k.get('reason') else ''))
+    say('status file: %s' % status)
+    return 1 if k.get('state') == 'refused' else 0
+
+
 def main(argv):
+    if argv[:1] == ['tell']:
+        return tell(argv[1:])
     import argparse
     parser = argparse.ArgumentParser(prog='launcher.py')
     parser.add_argument('mode', choices=['start', 'pick'])

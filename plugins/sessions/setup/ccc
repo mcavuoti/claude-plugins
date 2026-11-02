@@ -5,6 +5,7 @@
 #        ccc <name>       the session with that name, created if there's none
 #        ccc --new        this window, even if the project is already open in another one
 #        ccc --agents     Claude's agent view for this folder
+#        ccc tell <name|id> "text"   hand a background session text, as a turn of its own (from any script)
 #
 # The plugin's setup installs this file in ~/.claude/mods/sessions-data/bin/ (SESSIONS_DATA_DIR) and nothing rewrites
 # it while sessions run. It runs the launcher (hooks/visor.sh) of the copy of the plugin that Claude Code has enabled,

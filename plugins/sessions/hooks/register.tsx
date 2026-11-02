@@ -107,6 +107,12 @@ import {
   type StartRequest,
   debugLogName,
   reloadDecision,
+  TELL_MAX_BYTES,
+  tellStatusText,
+  parseTellRequest,
+  tellPrompt,
+  tellIdIn,
+  type TellState,
   FORMAT,
   NOTICE_MARKER,
 } from './state'
@@ -468,6 +474,12 @@ async function prune($: any) {
     for (const k of keys.filter(k => k.endsWith(`:${id}`))) await storeDelete($, k)
     await runSafe($, ['rm', '-f', `${dataDir}/alive/${id}`, `${dataDir}/inbox/${id}`])
   }
+  // ccc tell folders of background sessions no longer in the list
+  try {
+    const shorts = new Set(list.map(s => String(s.id ?? '')))
+    const gone = (await $.fs.list(`${dataDir}/tell`)).map((f: any) => String(f.name)).filter((n: string) => isRef(n) && !n.startsWith('sid:') && !shorts.has(n))
+    if (gone.length) await runSafe($, ['rm', '-rf', ...gone.map((n: string) => `${dataDir}/tell/${n}`)])
+  } catch {}
   // Section members of sessions no longer in the list (a regular one's stays while its heartbeat is fresh)
   const sections = await readSectionsFile($)
   if ('problem' in sections) return
@@ -1850,10 +1862,10 @@ async function checkInbox($: any) {
     await runSafe($, ['rm', '-f', path])
     const r = parseInbox(text)
     if (!r) return
-    const answer = async (result: 'ok' | 'failed', reason = '') => {
+    const answer = async (result: 'ok' | 'failed', reason = '', state?: string) => {
       if (!r.reply.startsWith(`${dataDir}/replies/`)) return
       try {
-        await $.fs.write(r.reply, keyLines({ format: FORMAT, result, reason }))
+        await $.fs.write(r.reply, keyLines({ format: FORMAT, result, state, reason }))
       } catch {}
     }
     if (r.format !== FORMAT) {
@@ -1868,10 +1880,142 @@ async function checkInbox($: any) {
     } else if (r.action === 'bring') {
       const ok = !!r.tty && (await platform.bringWindow(sys($), r.tty, r.title))
       await answer(ok ? 'ok' : 'failed', ok ? '' : platform.text.cantBring)
+    } else if (r.action === 'wake') {
+      // ccc tell for a stopped session: woken here, by the rules of $.sessions.wake, since its own mod isn't running
+      const v: WakeVerdict = ready() && isRef(r.ref) ? await wakeVerdict($, r.ref) : { state: 'refused', detail: "this session's panel hasn't read the session list yet" }
+      if (v.state === 'running') await answer('ok', '', 'running')
+      else if (v.state === 'refused') await answer('failed', v.detail, 'refused')
+      else {
+        const done = await run($, [claude, 'respawn', v.id])
+        debugLine($, `wake “${v.name}” for ccc tell: ${done.exitCode === 0 ? 'restarted' : 'failed'}`)
+        await storeSet($, 'list', {})
+        await answer(done.exitCode === 0 ? 'ok' : 'failed', done.exitCode === 0 ? `woke “${v.name}”` : `couldn't wake “${v.name}”`, done.exitCode === 0 ? 'queued' : 'refused')
+      }
     }
   } finally {
     checkingInbox = false
   }
+}
+
+// ccc tell (see TELL_MAX_BYTES in state.ts): the requests in this session's <data>/tell/<ref>/, one turn at a time, from
+// the 0.5 s timer. Only a background session the person opted in (/sessions tell on) takes them. Each one is submitted
+// with $.prompt.submit, which waits for the session to be idle and resolves when its turn starts (delivered; turn.start
+// says so too, after a reload). Refused by the engine (the person stopped the session with Esc, and plugin prompts wait
+// for them), it's held until the person types in the session again
+let telling = false
+let lastTellPrune = 0
+function tellDir(): string {
+  const own = lastList.find(s => s.sessionId === myId)
+  return dataDir && own?.kind === 'background' && typeof own.id === 'string' && isRef(own.id) ? `${dataDir}/tell/${own.id}` : ''
+}
+
+async function tellStatus($: any, dir: string, id: string, state: TellState, reason = '') {
+  try {
+    await $.fs.write(`${dir}/${id}.status`, tellStatusText(state, reason, await $.clock.now()))
+  } catch {}
+}
+
+async function checkTells($: any) {
+  const dir = tellDir()
+  if (telling || !dir || !active) return
+  let entries: any[] = []
+  try {
+    entries = await $.fs.list(dir)
+  } catch {
+    return
+  }
+  const names = entries.map(f => String(f.name))
+  const next = names.filter(n => /^\d+-\d+\.req$/.test(n)).sort()[0]
+  const now = await $.clock.now()
+  if (!next) {
+    // What scripts didn't read within a day goes
+    if (now - lastTellPrune < 600000) return
+    lastTellPrune = now
+    const old = entries.filter(f => /\.status$/.test(String(f.name)) && now - Number(f.mtimeMs) > 86400000).map(f => `${dir}/${f.name}`)
+    if (old.length) await runSafe($, ['rm', '-f', ...old])
+    return
+  }
+  telling = true
+  const id = next.slice(0, -4)
+  const refuse = async (reason: string) => {
+    await tellStatus($, dir, id, 'refused', reason)
+    await runSafe($, ['rm', '-f', `${dir}/${next}`, `${dir}/${id}.txt`])
+    debugLine($, `ccc tell ${id}: refused (${reason})`)
+  }
+  try {
+    let req: ReturnType<typeof parseTellRequest> = null
+    let text = ''
+    try {
+      req = parseTellRequest(await $.fs.read(`${dir}/${next}`))
+      text = await $.fs.read(`${dir}/${id}.txt`)
+    } catch {}
+    if (!req || req.format !== FORMAT) return await refuse('written by another version of the sessions mod: restart the sessions (u)')
+    if (!names.includes('allow')) return await refuse("this session doesn't take text from ccc tell: /sessions tell on in it")
+    if (!text.trim()) return await refuse('no text')
+    if (new TextEncoder().encode(text).length > TELL_MAX_BYTES) return await refuse('longer than 4 KB')
+    if ((await runSafe($, ['mv', '-f', `${dir}/${next}`, `${dir}/${id}.taken`])).exitCode !== 0) return
+    debugLine($, `ccc tell ${id} from ${req.from}: submitted`)
+    const r: any = await $.prompt.submit({ text: tellPrompt(id, req.from, text) })
+    if (r?.drop) {
+      await runSafe($, ['mv', '-f', `${dir}/${id}.taken`, `${dir}/${id}.held`])
+      await tellStatus($, dir, id, 'held', `${r.drop}: it goes once the person types in the session`)
+      debugLine($, `ccc tell ${id}: held (${r.drop})`)
+      return
+    }
+    await tellDelivered($, id)
+  } catch {
+    // A failure (or the mod reloading) leaves the request taken: turn.start still says when its turn starts
+  } finally {
+    telling = false
+  }
+}
+
+// A request's turn started (its $.prompt.submit resolved, or turn.start carried it): delivered, once
+async function tellDelivered($: any, id: string) {
+  const dir = tellDir()
+  if (!dir || !(await exists($, `${dir}/${id}.taken`))) return
+  await runSafe($, ['rm', '-f', `${dir}/${id}.taken`, `${dir}/${id}.txt`])
+  await tellStatus($, dir, id, 'delivered')
+  debugLine($, `ccc tell ${id}: delivered`)
+}
+
+// The person typed in the session: the requests held since an Esc go again (behind what they typed)
+async function rearmTells($: any) {
+  const dir = tellDir()
+  if (!dir) return
+  let names: string[] = []
+  try {
+    names = (await $.fs.list(dir)).map((f: any) => String(f.name)).filter((n: string) => /^\d+-\d+\.held$/.test(n))
+  } catch {
+    return
+  }
+  for (const n of names) {
+    const id = n.slice(0, -5)
+    if ((await runSafe($, ['mv', '-f', `${dir}/${n}`, `${dir}/${id}.req`])).exitCode === 0) await tellStatus($, dir, id, 'queued', 'held after an Esc; the person typed, so it goes when the session is idle')
+  }
+}
+
+// /sessions tell on|off: whether ccc tell may hand this session text (the person's switch, per session; it stays across
+// restarts and /clear)
+async function tellCommand($: any, word: string): Promise<string> {
+  const own = lastList.find(s => s.sessionId === myId)
+  if (!active || !own) return "The panel hasn't read the session list yet: try again in a few seconds"
+  const dir = tellDir()
+  if (!dir) return "Only a background session takes text from ccc tell: this one is a regular session (you're at it)"
+  const allow = `${dir}/allow`
+  const name = projectRows.find(f => f.current)?.title ?? String(own.name ?? own.id)
+  const how = `ccc tell ${JSON.stringify(name)} "<text>" (or its id, ${own.id}) hands this session text from any script, as a turn of its own when it's idle (4 KB at most; the model reads it as sent by the sessions plugin, not by you). Have scripts send pointers ("new mail, id …"), not outside text`
+  if (word === 'on') {
+    await runSafe($, ['mkdir', '-p', dir])
+    await $.fs.write(allow, keyLines({ format: FORMAT, at: await $.clock.now() }))
+    return `On. ${how}. /sessions tell off turns it off`
+  }
+  if (word === 'off') {
+    await runSafe($, ['rm', '-f', allow])
+    return 'Off: ccc tell no longer reaches this session (requests already waiting are refused)'
+  }
+  const on = await exists($, allow)
+  return on ? `On. ${how}. /sessions tell off turns it off` : `Off. /sessions tell on turns it on: then ${how}`
 }
 
 // /clear starts a new conversation in the same session: its id changes (the short id that claude attach takes doesn't)
@@ -2214,7 +2358,7 @@ async function start($: any) {
     daemonLog = (await $.env.get('SESSIONS_DAEMON_LOG')) || (home ? `${home}/.claude/daemon.log` : '')
     if (home && (await exists($, home))) workDir = home
     if (dataDir) {
-      const sub = ['alive', 'order', 'inbox', 'windows', 'replies', 'debug', 'usage'].map(d => `${dataDir}/${d}`)
+      const sub = ['alive', 'order', 'inbox', 'windows', 'replies', 'debug', 'usage', 'tell'].map(d => `${dataDir}/${d}`)
       await runSafe($, ['mkdir', '-p', ...sub])
     }
     await followFolder($)
@@ -2262,6 +2406,7 @@ async function start($: any) {
       bg(checkInbox($))
       bg(runLaunches($))
       bg(runWakes($))
+      bg(checkTells($))
     })
     $.clock.every(3000, () => {
       bg(refresh($))
@@ -2302,8 +2447,8 @@ async function start($: any) {
     $.command.register({
       name: 'sessions',
       description:
-        'Sessions panel: open, focus or close. /sessions section <title>: put this session in a section (- takes it out); /sessions sections: list them. /sessions status: is the mod running here. /sessions setup: status line, shortcuts and the ccc command',
-      argumentHint: '[section <title> | section - | sections | status | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
+        'Sessions panel: open, focus or close. /sessions section <title>: put this session in a section (- takes it out); /sessions sections: list them. /sessions tell on|off: let scripts hand this session text with ccc tell. /sessions status: is the mod running here. /sessions setup: status line, shortcuts and the ccc command',
+      argumentHint: '[section <title> | section - | sections | tell on|off | status | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
       immediate: true,
     }),
   )
@@ -2360,7 +2505,12 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    if (active) await markTurnStart($)
+    if (active) {
+      await markTurnStart($)
+      // A ccc tell request's turn: delivered (also when the call that submitted it was lost to a reload)
+      const id = e.agentId === undefined ? tellIdIn(String(e.text ?? '')) : null
+      if (id) bg(tellDelivered($, id))
+    }
     return next(e)
   })
 
@@ -2428,7 +2578,10 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     if (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') {
       bg(ensureStarted($, 'prompt'))
-      if (active) await storeSet($, `seen:${myId}`, await $.clock.now())
+      if (active) {
+        await storeSet($, `seen:${myId}`, await $.clock.now())
+        bg(rearmTells($))
+      }
     }
     return next(e)
   })
@@ -2443,6 +2596,7 @@ export const register: Register = (on, options) => {
     if (words[0] === 'status') return { text: await statusText($) }
     if (words[0] === 'section') return { text: await sectionCommand($, words.slice(1).join(' ')) }
     if (words[0] === 'sections') return { text: await sectionsList($) }
+    if (words[0] === 'tell') return { text: await tellCommand($, words[1] ?? '') }
     if (words[0] === 'setup') {
       const allowed = /^--(dry-run|force-statusline|macos-launcher|statusline|keys|alias|all|help|shell=(bash|zsh|fish))$/
       const bad = words.slice(1).filter(w => !allowed.test(w))

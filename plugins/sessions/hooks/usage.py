@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 
 DAYS = 35
 HOURS = 48
-FORMAT = 1
+FORMAT = 2
 
 
 def day_key(t):

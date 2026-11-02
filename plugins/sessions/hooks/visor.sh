@@ -5,6 +5,7 @@
 # exited, the session ended), the launcher ends and the usual terminal is left.
 #
 # Usage: visor.sh start [--new | --agents | <name>]   what ccc runs: launcher.py decides what opens first
+#        visor.sh start tell [--in <folder>] <name|id> [text | -]   ccc tell: hand a session text (no terminal needed)
 #        visor.sh attach <id> | agents                  windows the panel opens
 #
 # The window's file is <data>/windows/<tty with / as _> (<data>: ~/.claude/mods/sessions-data, or SESSIONS_DATA_DIR):
@@ -15,7 +16,7 @@
 # Everything lives inside a function and the last line calls it and exits: bash reads the function whole before
 # running it, so a new version of this file (when the plugin is updated) doesn't break a launcher that's already running.
 
-FORMAT=1
+FORMAT=2
 
 # python3, unless on a Mac it's the stand-in that asks to install the developer tools
 usable_python() {
@@ -36,6 +37,13 @@ main() {
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   data="${SESSIONS_DATA_DIR:-$HOME/.claude/mods/sessions-data}"
   claude="${SESSIONS_CLAUDE:-claude}"
+  # ccc tell runs from scripts, cron or launchd, with no terminal: the launcher hands the text to the session's mod
+  if [ "${1:-}" = start ] && [ "${2:-}" = tell ]; then
+    shift 2
+    py=$(usable_python) || { echo "ccc tell needs python3 (on a Mac: xcode-select --install)"; return 1; }
+    "$py" "$here/launcher.py" tell "$@"
+    return
+  fi
   window="${SESSIONS_TTY:-}"
   if [ -z "$window" ]; then window=$(tty) || { echo "ccc needs a terminal"; return 1; }; fi
   file="$data/windows/${window//\//_}"
@@ -56,7 +64,7 @@ main() {
         rm -f "$file"
         "$py" "$here/launcher.py" start --tty "$window" --file "$file" "$@" || return 0
       fi ;;
-    *) echo "usage: visor.sh start [--new | --agents | <name>] | attach <id> | agents"; return 2 ;;
+    *) echo "usage: visor.sh start [--new | --agents | <name> | tell <name|id> <text>] | attach <id> | agents"; return 2 ;;
   esac
 
   local cmd id title folder format k v first=1 began code

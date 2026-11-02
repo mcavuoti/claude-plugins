@@ -229,7 +229,7 @@ test('Stop: Stop & Remove is the second option, and only the dialog options do a
 
 test("notices between sessions: round trip with format and kind, and nothing if the text isn't a notice", () => {
   const m = buildNotice('ask', { from: 'abc', topic: 'stop' })
-  expect(parseNotice(m)).toEqual({ format: 1, kind: 'ask', data: { format: 1, kind: 'ask', from: 'abc', topic: 'stop' } })
+  expect(parseNotice(m)).toEqual({ format: 2, kind: 'ask', data: { format: 2, kind: 'ask', from: 'abc', topic: 'stop' } })
   // Even if Claude wraps something around it when delivering it
   expect(parseNotice(`<from peer>${m}</from peer>`)?.kind).toBe('ask')
   expect(parseNotice('sessions-notice:7f3a no data')).toBe(null)
@@ -448,7 +448,7 @@ test('order: the panel order (waiting, done, working, idle, stopped, then title)
   expect(sorted.map(r => r.sessionId)).toEqual(['s2', 's5', 's4', 's1', 's3'])
   const text = orderFileText('/Users/x/myapp', sorted, 1234)
   const back = parseOrderFile(text)
-  expect(back?.format).toBe(1)
+  expect(back?.format).toBe(2)
   expect(back?.at).toBe(1234)
   expect(back?.root).toBe('/Users/x/myapp')
   expect(back?.rows.map(r => r.sessionId)).toEqual(['s2', 's5', 's4', 's1', 's3'])
@@ -461,22 +461,22 @@ test('order: the panel order (waiting, done, working, idle, stopped, then title)
 test('shared files: key=value lines, one value per key, line breaks flattened', () => {
   expect(keyLines({ format: 1, title: 'a\nb', none: undefined })).toBe('format=1\ntitle=a b\n')
   expect(parseKeyLines('format=1\ntitle=x=y\nformat=2\njunk\n')).toEqual({ format: '1', title: 'x=y' })
-  expect(windowTargetText({ command: 'attach', id: 'aaaaaaaa', title: 'One' })).toBe('format=1\ncommand=attach\nid=aaaaaaaa\ntitle=One\n')
-  expect(windowTargetText({ command: 'agents', title: 'Agents', folder: '/Users/x/myapp' })).toBe('format=1\ncommand=agents\ntitle=Agents\nfolder=/Users/x/myapp\n')
-  expect(parseInbox('format=1\naction=bring\nat=5\ntty=/dev/ttys001\nreply=/r\n')).toEqual({ format: 1, action: 'bring', at: 5, tty: '/dev/ttys001', title: '', reply: '/r' })
+  expect(windowTargetText({ command: 'attach', id: 'aaaaaaaa', title: 'One' })).toBe('format=2\ncommand=attach\nid=aaaaaaaa\ntitle=One\n')
+  expect(windowTargetText({ command: 'agents', title: 'Agents', folder: '/Users/x/myapp' })).toBe('format=2\ncommand=agents\ntitle=Agents\nfolder=/Users/x/myapp\n')
+  expect(parseInbox('format=1\naction=bring\nat=5\ntty=/dev/ttys001\nreply=/r\n')).toEqual({ format: 1, action: 'bring', at: 5, tty: '/dev/ttys001', title: '', reply: '/r', ref: '' })
   expect(parseInbox('action=focus\n')).toBe(null)
 })
 
 test('heartbeat: fresh, same format and same process is ok; old, missing or another process is missing', () => {
   const now = 1_000_000
   const h = parseHeartbeat(heartbeatText({ pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' }))
-  expect(h).toEqual({ format: 1, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' })
+  expect(h).toEqual({ format: 2, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' })
   expect(heartbeatStatus(h, 42, now)).toBe('ok')
   expect(heartbeatStatus(h, 43, now)).toBe('missing')
   expect(heartbeatStatus(h, undefined, now)).toBe('ok')
   expect(heartbeatStatus(h, 42, now + 40000)).toBe('missing')
   expect(heartbeatStatus(null, 42, now)).toBe('missing')
-  expect(heartbeatStatus({ ...(h as Heartbeat), format: 2 }, 42, now)).toBe('other-format')
+  expect(heartbeatStatus({ ...(h as Heartbeat), format: 1 }, 42, now)).toBe('other-format')
   // Written before the mod knew its pid: no pid to compare
   expect(heartbeatStatus({ ...(h as Heartbeat), pid: 0 }, 42, now)).toBe('ok')
   expect(parseHeartbeat('pid=1\n')).toBe(null)

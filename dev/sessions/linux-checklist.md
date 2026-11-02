@@ -31,5 +31,11 @@ the desktop (X11 or Wayland) and the terminal app.
 11. **Rename (`r`) and the field lock:** arrows don't leave the field, Esc cancels, Enter renames.
 12. **Version and folders from `/proc`:** a session on an older Claude shows ↑ after an update; `a` brings an existing
     agent view for the same folder forward (or opens one in place).
+13. **Sections that fold, children, marks and ⚙n:** `/sessions section A` in one session, `c` on its row: one line
+    `▸ A · 1` that Enter unfolds, the focus on it and then on the row. A child (another plugin's `parent`) is two columns
+    in; a badge and a status line line up with the other rows; `⚙1` while a session runs a background shell.
+14. **ccc tell from cron or a systemd timer:** `/sessions tell on` in a background session, then from a job with no
+    terminal, `ccc tell <its id> "ping"`: it prints `queued` and a status file, and the session takes it as a turn of its
+    own (the status file then says `delivered`).
 
 Anything off: note what you pressed, what the window showed, and the output of `ps -A -o pid=,tty=,command= | grep -E 'claude|visor'`.

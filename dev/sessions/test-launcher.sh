@@ -70,11 +70,11 @@ for i, spec in enumerate(sys.argv[1:]):
 print(json.dumps(rows))
 PY
 }
-beat() { mkdir -p "$data/alive"; printf 'format=%s\npid=%s\nat=%s\nversion=0.10.0\nvia=session.start\n' "${3:-1}" "$2" "$(now_ms)" > "$data/alive/$1-0000-0000-0000-000000000000"; }
+beat() { mkdir -p "$data/alive"; printf 'format=%s\npid=%s\nat=%s\nversion=0.10.0\nvia=session.start\n' "${3:-2}" "$2" "$(now_ms)" > "$data/alive/$1-0000-0000-0000-000000000000"; }
 order() {
   mkdir -p "$data/order"
   local file="$data/order/${proj//\//_}"
-  printf 'format=1\nat=%s\nroot=%s\n' "${ORDER_AT:-$(now_ms)}" "$proj" > "$file"
+  printf 'format=2\nat=%s\nroot=%s\n' "${ORDER_AT:-$(now_ms)}" "$proj" > "$file"
   for id in "$@"; do printf 'row=%s-0000-0000-0000-000000000000\tgreen\t%s\tx\n' "$id" "$id" >> "$file"; done
 }
 reset() { rm -rf "$data" "${fix:?}"/*; mkdir -p "$fix"; : > "$fix/calls.log"; : > "$fix/ps.txt"; }
@@ -136,7 +136,7 @@ beat aaaaaaaa 1000
 expect "$(field "$(pick)" restart)" False "a fresh heartbeat"
 beat aaaaaaaa 1999
 expect "$(field "$(pick)" restart)" True "a heartbeat from another process"
-beat aaaaaaaa 1000 2
+beat aaaaaaaa 1000 1
 expect "$(field "$(pick)" restart)" False "another format isn't a missing mod"
 SESSIONS_PLUGIN_SINCE="$(now_ms)" expect "$(field "$(SESSIONS_PLUGIN_SINCE="$(now_ms)" pick)" restart)" False "started before the install"
 SESSIONS_PLUGIN_VERSION=0.9.2 expect "$(field "$(SESSIONS_PLUGIN_VERSION=0.9.2 pick)" restart)" False "installed version has no heartbeats"
@@ -159,7 +159,7 @@ pass "empty folder: name, create, one restart, open, focus request"
 # 5b. With the debug-logs option on (the mod mirrors it to <data>/config), a session ccc creates writes its debug log
 reset
 sessions
-mkdir -p "$data"; printf 'format=1\ndebug=1\n' > "$data/config"
+mkdir -p "$data"; printf 'format=2\ndebug=1\n' > "$data/config"
 printf 'TEST one\n' | (cd "$proj" && /bin/bash "$hooks/visor.sh" start) > /dev/null 2>&1 || true
 grep -q "^--bg -n TEST one --debug-file $data/debug/TEST_one.log" "$fix/calls.log" || fail "debug" "no --debug-file: $(cat "$fix/calls.log")"
 pass "debug logs option: --debug-file for new sessions"
@@ -215,7 +215,7 @@ printf '  501 ttys901  bash /x/hooks/visor.sh start\n  %s ttys901  claude attach
 beat aaaaaaaa 1000
 inbox="$data/inbox/aaaaaaaa-0000-0000-0000-000000000000"
 ( for _ in $(seq 1 50); do
-    if [ -f "$inbox" ]; then reply=$(sed -n 's/^reply=//p' "$inbox"); rm -f "$inbox"; printf 'format=1\nresult=ok\n' > "$reply"; break; fi
+    if [ -f "$inbox" ]; then reply=$(sed -n 's/^reply=//p' "$inbox"); rm -f "$inbox"; printf 'format=2\nresult=ok\n' > "$reply"; break; fi
     sleep 0.1
   done ) &
 (cd "$proj" && /bin/bash "$hooks/visor.sh" start beta) > "$work/out.txt" 2>&1 || true
@@ -248,5 +248,67 @@ echo '[]' > "$fix/plugins.json"
 (cd "$proj" && /bin/bash "$work/ccc") > "$work/out.txt" 2>&1 || true
 grep -q "can't find the sessions plugin" "$work/out.txt" || fail "ccc" "no message without a plugin"
 pass "ccc: finds the enabled plugin"
+
+# 11. ccc tell: needs no terminal and no project folder; refused without the session's opt-in, over 4 KB, for a regular
+#     session, for an ambiguous name and for a session whose panel isn't running; otherwise a request and its status
+tell() { (cd / && env -u SESSIONS_TTY /bin/bash "$hooks/visor.sh" start tell "$@" < /dev/null); }
+allow() { mkdir -p "$data/tell/$1"; printf 'format=2\nat=1\n' > "$data/tell/$1/allow"; }
+reset
+sessions aaaaaaaa:alpha:idle:600
+beat aaaaaaaa 1000
+out="$(tell alpha "hi" || true)"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+grep -q "refused: “alpha” doesn't take text from ccc tell" <<<"$out" || fail "tell" "no opt-in refusal: $out"
+allow aaaaaaaa
+tell alpha "New mail, id 42" > "$work/out.txt" || fail "tell" "refused: $(cat "$work/out.txt")"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+grep -q "^queued: it goes as a turn of its own when “alpha” is idle" "$work/out.txt" || fail "tell" "not queued: $(cat "$work/out.txt")"
+req=$(ls "$data/tell/aaaaaaaa/"*.req)
+grep -q '^format=2$' "$req" || fail "tell" "the request has no format"
+expect "$(cat "${req%.req}.txt")" "New mail, id 42" "the text is in its own file"
+grep -q "^status file: ${req%.req}.status$" "$work/out.txt" || fail "tell" "no status file named: $(cat "$work/out.txt")"
+rm -f "$data/tell/aaaaaaaa/"*.req
+printf 'from stdin\nsecond line\n' | (cd / && env -u SESSIONS_TTY /bin/bash "$hooks/visor.sh" start tell aaaaaaaa -) > /dev/null || fail "tell" "by id, from stdin"
+expect "$(cat "$(find "$data/tell/aaaaaaaa" -name '*.req' | head -n 1 | sed 's/\.req$/.txt/')")" "$(printf 'from stdin\nsecond line')" "the text from stdin, with its lines"
+rm -f "$data/tell/aaaaaaaa/"*.req
+grep -q "longer than 4 KB" <<<"$(tell alpha "$(head -c 4097 /dev/zero | tr '\0' x)" || true)" || fail "tell" "no 4 KB cap"
+[ -z "$(ls "$data/tell/aaaaaaaa/"*.req 2>/dev/null)" ] || fail "tell" "a request was written over 4 KB"
+rm -f "$data/alive/aaaaaaaa-0000-0000-0000-000000000000"
+grep -q "panel isn't running" <<<"$(tell alpha "hi" || true)" || fail "tell" "a session without its panel"
+sessions aaaaaaaa:dup:idle:600 bbbbbbbb:dup:idle:600:/elsewhere
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+grep -q "several background sessions are named “dup”: aaaaaaaa ($proj), bbbbbbbb (/elsewhere)" <<<"$(tell dup "hi" || true)" || fail "tell" "an ambiguous name"
+beat aaaaaaaa 1000
+(cd "$proj" && env -u SESSIONS_TTY /bin/bash "$hooks/visor.sh" start tell dup "hi" < /dev/null) > "$work/out.txt" || fail "tell" "the project's own dup: $(cat "$work/out.txt")"
+rm -f "$data/tell/aaaaaaaa/"*.req
+python3 -c 'import json,sys; print(json.dumps([{"sessionId": "cccccccc-0000-0000-0000-000000000000", "name": "reg", "cwd": sys.argv[1], "kind": "interactive", "pid": 7, "status": "idle"}]))' "$proj" > "$fix/agents.json"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+grep -q "“reg” is a regular session" <<<"$(tell reg "hi" || true)" || fail "tell" "a regular session"
+pass "tell: opt-in, request and status, stdin, 4 KB, no panel, ambiguous, regular"
+
+# 12. ccc tell to a stopped session: a running session's mod is asked to wake it (here a stand-in that answers), and
+#     with nobody to ask it's refused and its request removed
+reset
+sessions aaaaaaaa:alpha:-:600 bbbbbbbb:beta:idle:600
+allow aaaaaaaa
+beat bbbbbbbb 1001
+inbox="$data/inbox/bbbbbbbb-0000-0000-0000-000000000000"
+( for _ in $(seq 1 50); do
+    if [ -f "$inbox" ]; then
+      if ! grep -q '^ref=aaaaaaaa$' "$inbox" || ! grep -q '^action=wake$' "$inbox"; then break; fi
+      reply=$(sed -n 's/^reply=//p' "$inbox"); rm -f "$inbox"; printf 'format=2\nresult=ok\nstate=queued\nreason=woke “alpha”\n' > "$reply"; break
+    fi
+    sleep 0.1
+  done ) &
+tell alpha "ping" > "$work/out.txt" || fail "tell wake" "refused: $(cat "$work/out.txt")"
+wait "$!" 2>/dev/null || true
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+grep -q "^queued: woke “alpha”" "$work/out.txt" || fail "tell wake" "not woken: $(cat "$work/out.txt")"
+[ -n "$(ls "$data/tell/aaaaaaaa/"*.req 2>/dev/null)" ] || fail "tell wake" "the request isn't waiting for the session"
+rm -f "$data/alive/"*
+out="$(tell alpha "ping" || true)"
+grep -q "^refused: it is stopped, and no session with a running panel answered to wake it" <<<"$out" || fail "tell wake" "no refusal: $out"
+expect "$(find "$data/tell/aaaaaaaa" -name '*.req' | wc -l | tr -d ' ')" 1 "the refused request is removed (the first one waits)"
+pass "tell: wakes a stopped session through a running one, refused when none answers"
 
 echo "launcher: ok"

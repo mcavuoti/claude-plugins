@@ -17,7 +17,7 @@ In `plugins/sessions`:
 | `hooks/platform/macos.ts` | macOS: Terminal.app through AppleScript, `ioreg`, `lsof`, `sysctl` | a Mac |
 | `hooks/platform/linux.ts` | Linux: windows found by process and switched through the launcher, `wmctrl`/`xdotool`, terminal emulators, `/proc` | Linux |
 | `extras/macos/` | macOS only extras | a Mac |
-| `tests/panel.test.tsx`, `tests/rows.test.tsx`, `tests/start.test.tsx` (with `tests/world.tsx`) | shared logic and drawing, what the rows show, how the mod starts | either |
+| `tests/panel.test.tsx`, `tests/rows.test.tsx`, `tests/start.test.tsx`, `tests/tell.test.tsx` (with `tests/world.tsx`) | shared logic and drawing, what the rows show, how the mod starts, `ccc tell`'s side in the session | either |
 | `tests/macos.test.tsx`, `tests/linux.test.tsx` | each platform's pure parts (they run on both systems) | its system |
 
 `plugins/fleet` has no platform code: every file of it is shared and edited from either system.

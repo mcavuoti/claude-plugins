@@ -60,12 +60,23 @@ Sessions that were already open pick the plugin up when they restart (`u` in the
 | `ccc <name>` | The session with that name. If a window already shows it, that window comes to the front; if another window shows another session of the project, that window switches to it. A name that doesn't exist yet starts a new session with it. |
 | `ccc --new` | This window, even if the project is open in another one: the top session not shown anywhere else (or the Name prompt if they all are). |
 | `ccc --agents` | Claude's agent view for this folder. |
+| `ccc tell <name\|id> "text"` | Hands that background session the text, as a turn of its own when it's idle (see [Telling a session from a script](#telling-a-session-from-a-script)). No window opens. |
 
 - **On arrival** the panel has the keyboard, on the row after the session you're in, as when you switch with Enter: Enter again hops on. A session waiting on a question or a permission keeps it: you land on the question.
 - **The Name prompt** (an empty folder, or only stopped sessions) lists the stopped sessions with numbers: a number or a name reopens one, a new name starts a background session in the project folder and opens it once its panel is up (`Starting “name”…`). Enter on an empty line, or Ctrl+C, goes back to the shell; nothing is created until you type a name.
 - **A session whose panel isn't running** (see [Old pre-started sessions](#old-pre-started-sessions)): `ccc` asks `Restart it first? [Y/n]` before opening it, Yes by default only when it's idle, since a restart cuts what it's doing. A session `ccc` itself just created and whose panel doesn't come up is restarted once without asking: it has no conversation to lose.
 - **The project's window is brought forward** by a running session's panel (the platform code lives in the mod). Where that can't be done (Linux without `wmctrl` or `xdotool`, Wayland, a window Terminal.app doesn't have, or no session's panel answering), `ccc` says so and opens here, as `ccc --new` would.
 - **Not trusted yet:** in a folder Claude never trusted, `claude --bg` refuses to start a session; `ccc` says so and how to trust it. In your home folder Claude doesn't start background sessions at all.
+
+## Telling a session from a script
+
+`ccc tell <name|id> "text"` (or `-` to read the text from stdin) lets any script hand a background session some text: a cron job, a launchd or systemd timer, a git hook, a mail watcher. That session's mod submits it as a turn of its own once the session is idle; the model reads it as a message from the sessions plugin, marked as sent by a script, never as yours. It needs no terminal and no project folder: the session is found by its id, by its name in the current folder's project (`--in <folder>` names another), or by a name only one background session has (an ambiguous name is refused with the matches).
+
+- **Opt-in, per session:** `/sessions tell on` in that session (`/sessions tell off` turns it off; `/sessions tell` says which). Without it every request is refused. A regular session (plain `claude`, with you at it) can't opt in.
+- **4 KB at most.** Send pointers, not outside text: "new mail, id 4412: read it with the mail tool" rather than the mail itself. What a script passes on is untrusted (anyone can mail you), and the session should fetch it with its own tools, where its usual checks apply.
+- **A status file** for every request, `~/.claude/mods/sessions-data/tell/<id>/<request>.status`, with `state=`: `queued` (waiting for the session to be idle), `delivered` (its turn started), `held` (you stopped the session with Esc, and Claude refuses plugin prompts until you type in it: it goes once you do), or `refused` with `reason=`. `ccc tell` prints the state it sees within 2 s and the file's path, and exits 1 when refused.
+- **A stopped session** that Claude's background service retired for being idle is woken first (`claude respawn`, asked of a session whose panel runs, under the same rules as `$.sessions.wake`); one you stopped, or closed for lack of memory while memory is still short, is refused. A session whose panel isn't running is refused too (`u` restarts it).
+- `ccc tell` itself runs the enabled plugin's launcher like `ccc` does, so the job's `PATH` needs `claude` and `python3` (cron and launchd give a short one: set `PATH`, or `SESSIONS_CLAUDE` to claude's full path). A session named `tell` can't be opened with `ccc tell`: use `ccc` and its Name prompt, or its id.
 
 ## What it does
 
@@ -118,7 +129,7 @@ With the panel focused (`shift+→` after the setup, `ctrl+x Tab`, or `/sessions
 | `p` | tokens for all of Claude or just this project |
 | ← or Esc | back to the prompt |
 
-`/sessions` opens the panel with the keyboard (or closes it, if it has it). `/sessions section <title>`, `/sessions section -` and `/sessions sections` put this session in a section, take it out, and list them (see Sections above). `/sessions status` says whether the mod runs in this session and what started it (`session.start`, or the first draw, prompt or notice when that never came), the session's id and project folder, the mod's version and whether it's the installed copy or a folder copy, when it last wrote its heartbeat, which sessions of the project have no running panel, the API it serves other plugins, and its sections.
+`/sessions` opens the panel with the keyboard (or closes it, if it has it). `/sessions section <title>`, `/sessions section -` and `/sessions sections` put this session in a section, take it out, and list them (see Sections above). `/sessions tell on` (`off`) lets scripts hand this session text with `ccc tell`. `/sessions status` says whether the mod runs in this session and what started it (`session.start`, or the first draw, prompt or notice when that never came), the session's id and project folder, the mod's version and whether it's the installed copy or a folder copy, when it last wrote its heartbeat, which sessions of the project have no running panel, the API it serves other plugins, and its sections.
 
 A plain `→` can't go to the panel only when the prompt is empty, the way `←` goes to the agent view: that `←` is built into the prompt box, and Claude's key bindings can't be conditioned on an empty prompt. Hence `shift+→`.
 
@@ -211,7 +222,7 @@ plugins/sessions/
 │   │   ├── linux.ts              processes + launcher, wmctrl/xdotool, terminal emulators, /proc
 │   │   └── index.ts              picks one when a session starts
 │   ├── visor.sh                  the launcher that runs in each window
-│   ├── launcher.py               what ccc opens: the top session, one window per project, the Name prompt
+│   ├── launcher.py               what ccc opens: the top session, one window per project, the Name prompt; ccc tell
 │   └── usage.py                  the token usage reader
 ├── statusline/statusline.sh      the status line
 ├── setup/setup.sh                the one-time setup (/sessions setup)
@@ -219,11 +230,11 @@ plugins/sessions/
 ├── extras/macos/claude-bg-launcher   optional macOS launcher for background sessions
 ├── types/index.d.ts              $.sessions, the API for other plugins, and the mod's state types (the validator wants them here)
 ├── docs/plugin-contract.md       how other plugins call $.sessions, and how it changes
-├── tests/                        automated tests: shared logic and drawing (panel.test), what the rows show (rows.test), how the mod starts (start.test), $.sessions (contract.test), each platform's pure parts; world.tsx is the world they run in
+├── tests/                        automated tests: shared logic and drawing (panel.test), what the rows show (rows.test), how the mod starts (start.test), ccc tell in the session (tell.test), $.sessions (contract.test), each platform's pure parts; world.tsx is the world they run in
 └── tsconfig.json
 ```
 
-What the plugin creates at runtime, all in `~/.claude/mods/sessions-data/` (`SESSIONS_DATA_DIR` points it elsewhere): `bin/` (the `ccc` command and the status line, from the setup), `config` (the options `ccc` reads), `debug/` (debug logs, when on), `alive/` (heartbeats), `order/` (each project's panel order), `inbox/` and `replies/` (requests from `ccc` to a session's mod), `windows/` (one file per window with a launcher: which session comes next), `usage/` (token usage cache), `sections.json` (the sections and who's in them, with its own version, `sectionsFormat`).
+What the plugin creates at runtime, all in `~/.claude/mods/sessions-data/` (`SESSIONS_DATA_DIR` points it elsewhere): `bin/` (the `ccc` command and the status line, from the setup), `config` (the options `ccc` reads), `debug/` (debug logs, when on), `alive/` (heartbeats), `order/` (each project's panel order), `inbox/` and `replies/` (requests from `ccc` to a session's mod), `windows/` (one file per window with a launcher: which session comes next), `usage/` (token usage cache), `tell/` (`ccc tell`'s requests, their status files and each session's opt-in), `sections.json` (the sections and who's in them, with its own version, `sectionsFormat`).
 
 ## Develop
 

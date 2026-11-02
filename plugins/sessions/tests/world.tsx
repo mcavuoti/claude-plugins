@@ -96,19 +96,23 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('session.messages', () => ({ value: [] as any }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('fs.read', (_, e) => {
     if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: '{"version": "0.10.0"}' }
     const text = files.get(e.path)
     if (text === undefined) throw new Error(`no such file: ${e.path}`)
     return { value: text }
   })
+  // When each file was written (fs.list's mtimeMs); one a test set directly counts as just written
+  const written = new Map<string, number>()
   on('fs.write', (_, e) => {
     files.set(e.path, e.text)
+    written.set(e.path, clock.now())
     return { value: undefined }
   })
   on('fs.exists', (_, e) => ({ value: files.has(e.path) || dirs.has(e.path) }))
   on('fs.list', (_, e) => ({
-    value: [...files.keys()].filter(p => p.startsWith(`${e.path}/`)).map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+    value: [...files.keys()].filter(p => p.startsWith(`${e.path}/`)).map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: written.get(p) ?? clock.now(), isLink: false })),
   }))
   on('fs.stat', (_, e) => {
     if (dirs.has(e.path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: made.get(e.path) ?? 0, isLink: false } }
