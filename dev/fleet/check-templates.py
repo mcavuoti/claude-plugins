@@ -81,6 +81,34 @@ for t in templates:
             say(where, 'context is long or fresh')
         if 'parent' in i and i['parent'].lower() not in names:
             say(where, f"its parent {i['parent']} isn't an instance")
+    slots = t / 'fleet/slots.json'
+    if slots.exists():
+        try:
+            s = json.loads(slots.read_text())
+            if not isinstance(s.get('slotsFormat'), int) or not isinstance(s.get('slots', {}), dict):
+                say(slots, 'needs slotsFormat, and slots as an object')
+        except ValueError as e:
+            say(slots, e)
+    # What reaches whom: subscriptions name the world's tags and intake's kinds; derived kinds have an owner
+    tags = set(world.get('tags', [])) if isinstance(world, dict) else set()
+    kinds = {'information', 'proposal', 'command-claim', 'resource', 'noise'}
+    for who, spec in [*roles.items(), *[(i.get('name'), i) for i in instances]]:
+        sub = spec.get('subscribe') or {}
+        if sub and 'intake' not in world:
+            say(t / 'fleet/roster.json', f'{who} subscribes, and world.json has no intake')
+        for tag in sub.get('tags', []):
+            if tag not in tags:
+                say(t / 'fleet/roster.json', f"{who} subscribes to the tag {tag}, which world.json's tags don't list")
+        for kind in sub.get('kinds', []):
+            if kind not in kinds:
+                say(t / 'fleet/roster.json', f'{who} subscribes to the kind {kind}, which intake has not')
+    for kind, spec in (world.get('derived') or {}).items():
+        owner = spec.get('owner', '')
+        if owner not in roles and owner.lower() not in names:
+            say(t / 'fleet/world.json', f'derived {kind}: its owner {owner} is no role or instance')
+    channel = (roster.get('person') or {}).get('channel') or {}
+    if channel.get('kind', 'terminal') not in ('terminal', 'push', 'mcp', 'command'):
+        say(t / 'fleet/roster.json', f"person.channel.kind {channel.get('kind')} isn't terminal, push, mcp or command")
     for role, spec in roles.items():
         agent = spec.get('agent', role)
         path = t / 'agents' / f'{agent}.md'

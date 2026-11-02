@@ -4,5 +4,12 @@
   "command": ["req/**"],
   "proposal": ["ideas/**"],
   "information": ["inputs/**"],
+  "tags": ["requirements", "technology", "market", "internal", "area-a", "area-b", "test", "plan"],
+  "intake": { "folder": "inputs/intake", "model": "haiku", "perSourceHour": 30, "usdDay": 1, "sources": [] },
+  "derived": {
+    "businessplan": { "paths": ["plan/business-plan.md"], "owner": "planner", "debounceMin": 30 },
+    "proposal": { "paths": ["proposal/**"], "owner": "integrator", "debounceMin": 30 },
+    "gaps": { "paths": ["notes/gaps.md"], "owner": "requirements", "debounceMin": 30 }
+  },
   "commit": { "everyMin": 60 }
 }

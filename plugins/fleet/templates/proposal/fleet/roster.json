@@ -10,27 +10,27 @@
     { "id": "checks", "title": "Checks" }
   ],
   "roles": {
-    "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24 },
-    "requirements": { "agent": "requirements", "model": "opus", "budget": { "usdDay": 12 }, "cadenceH": 12 },
+    "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24, "subscribe": { "kinds": ["resource"] } },
+    "requirements": { "agent": "requirements", "model": "opus", "budget": { "usdDay": 12 }, "cadenceH": 12, "subscribe": { "tags": ["requirements"], "kinds": ["command-claim"], "paths": ["req/**"] } },
     "integrator": { "agent": "integrator", "context": "long", "model": "opus", "budget": { "usdDay": 15 }, "cadenceH": 12 },
-    "poc": { "agent": "poc", "model": "sonnet", "budget": { "usdDay": 12 }, "cadenceH": 6 },
+    "poc": { "agent": "poc", "model": "sonnet", "budget": { "usdDay": 12 }, "cadenceH": 6, "subscribe": { "tags": ["test"] } },
     "researcher": { "agent": "researcher", "model": "sonnet", "budget": { "usdDay": 8 }, "cadenceH": 8 },
-    "researcher-internal": { "agent": "researcher-internal", "model": "sonnet", "budget": { "usdDay": 8 }, "cadenceH": 8 },
+    "researcher-internal": { "agent": "researcher-internal", "model": "sonnet", "budget": { "usdDay": 8 }, "cadenceH": 8, "subscribe": { "tags": ["internal"] } },
     "tester": { "agent": "tester", "model": "haiku", "budget": { "usdDay": 3 }, "cadenceH": 6 },
     "verifier": { "agent": "verifier", "model": "sonnet", "budget": { "usdDay": 6 }, "cadenceH": 12 },
     "janitor": { "agent": "janitor", "model": "haiku", "budget": { "usdDay": 2 }, "cadenceH": 12 },
-    "planner": { "agent": "planner", "model": "sonnet", "budget": { "usdDay": 6 }, "cadenceH": 24 }
+    "planner": { "agent": "planner", "model": "sonnet", "budget": { "usdDay": 6 }, "cadenceH": 24, "subscribe": { "tags": ["plan"] } }
   },
   "instances": [
     { "name": "Chief", "role": "chief", "section": "front", "wave": 1 },
     { "name": "Requirements", "role": "requirements", "section": "spec", "wave": 1 },
     { "name": "Integrator", "role": "integrator", "section": "integration", "wave": 1 },
     { "name": "Lead PoC", "role": "poc", "context": "long", "model": "opus", "section": "work", "wave": 1, "brief": "You lead the proofs of concept: you hold their overall picture and split the work among the specialists." },
-    { "name": "PoC A", "role": "poc", "section": "work", "parent": "Lead PoC", "wave": 2, "brief": "You are the specialist for area A of the proof of concept, as the lead's plan draws it." },
-    { "name": "PoC B", "role": "poc", "section": "work", "parent": "Lead PoC", "wave": 2, "brief": "You are the specialist for area B of the proof of concept, as the lead's plan draws it." },
-    { "name": "Research Ext", "role": "researcher", "section": "research", "wave": 2, "brief": "You research outside work: published approaches and technologies that bear on the requirements." },
+    { "name": "PoC A", "role": "poc", "section": "work", "parent": "Lead PoC", "wave": 2, "subscribe": { "tags": ["area-a"] }, "brief": "You are the specialist for area A of the proof of concept, as the lead's plan draws it." },
+    { "name": "PoC B", "role": "poc", "section": "work", "parent": "Lead PoC", "wave": 2, "subscribe": { "tags": ["area-b"] }, "brief": "You are the specialist for area B of the proof of concept, as the lead's plan draws it." },
+    { "name": "Research Ext", "role": "researcher", "section": "research", "wave": 2, "subscribe": { "tags": ["technology"] }, "brief": "You research outside work: published approaches and technologies that bear on the requirements." },
     { "name": "Research Int", "role": "researcher-internal", "section": "research", "wave": 2, "brief": "You research the project's own material: what exists already in its sources, and what can be reused." },
-    { "name": "Market", "role": "researcher", "section": "research", "wave": 2, "brief": "You research who would use the result and what they need, and what else they can choose." },
+    { "name": "Market", "role": "researcher", "section": "research", "wave": 2, "subscribe": { "tags": ["market"] }, "brief": "You research who would use the result and what they need, and what else they can choose." },
     { "name": "Tester 1", "role": "tester", "section": "test", "wave": 2 },
     { "name": "Tester 2", "role": "tester", "section": "test", "wave": 3 },
     { "name": "Verifier", "role": "verifier", "section": "checks", "wave": 3 },
@@ -38,5 +38,6 @@
     { "name": "Business Plan", "role": "planner", "section": "integration", "wave": 3 }
   ],
   "budget": { "usdDay": 150 },
-  "wakes": { "everyMin": 60, "perDay": 8 }
+  "wakes": { "everyMin": 60, "perDay": 8 },
+  "person": { "addresses": [], "principals": [], "front": "Chief", "channel": { "kind": "terminal" }, "perDay": 3, "waitingMin": 120 }
 }
