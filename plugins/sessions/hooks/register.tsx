@@ -551,7 +551,8 @@ async function prune($: any) {
   lastPrune = now
   const r = await run($, [claude, 'agents', '--json', '--all'])
   const list = r.exitCode === 0 ? validateList(r.stdout) : 'failed'
-  if (typeof list === 'string') return
+  // A listing that lacks this very session (short, or empty) isn't trusted with deleting anything
+  if (typeof list === 'string' || !list.some(s => s.sessionId === myId)) return
   const alive = new Set(list.map(s => String(s.sessionId)))
   const ids = new Set<string>()
   const keys = await storeKeys($)
@@ -588,9 +589,14 @@ async function prune($: any) {
   const refs = new Set(list.map(refOf))
   const sids = Object.keys(sections.file.members).filter(r => r.startsWith('sid:') && !refs.has(r))
   const sidBeats = await readHeartbeats($, sids.map(r => r.slice(4)))
+  // A background session missing from the listing whose heartbeat is fresh keeps its member too (its short id is the
+  // start of its first session id, which names its heartbeat until a /clear)
+  const shorts = Object.keys(sections.file.members).filter(r => !r.startsWith('sid:') && !refs.has(r))
+  const shortBeats = await readHeartbeats($, files.filter(f => shorts.some(s => f.startsWith(s))))
   const keep = (ref: string) => {
     const h = ref.startsWith('sid:') ? sidBeats[ref.slice(4)] : undefined
-    return refs.has(ref) || (!!h && now - h.at < 120000)
+    const fresh = Object.entries(shortBeats).some(([id, b]) => !ref.startsWith('sid:') && id.startsWith(ref) && now - b.at < 120000)
+    return refs.has(ref) || (!!h && now - h.at < 120000) || fresh
   }
   const wasEmpty = emptyBefore
   const empty = emptyPluginSections(pruneMembers(sections.file, keep))
@@ -812,7 +818,8 @@ async function pinRemoteSessions($: any) {
   pinning = true
   try {
     const list = await officialList($)
-    if (typeof list === 'string') return
+    // A listing that lacks this very session (short, or empty) isn't trusted with unpinning anything
+    if (typeof list === 'string' || !list.some(s => s.sessionId === myId)) return
     const remote: Record<string, boolean | null> = {}
     for (const s of list) {
       if (s.kind !== 'background' || typeof s.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(s.id)) continue
@@ -851,45 +858,53 @@ async function pinRemoteSessions($: any) {
 // straight, with the same conversation and the same Remote Control address. One per pass, and each one at most 3 times
 // in 2 h (if memory fills up again right away, it doesn't insist). The reason for the closure comes from the service's
 // log: one you stopped, unpinned (Ctrl+T) or that closed for another reason isn't reopened. Only one session does it
-// every 20 s, the first one that finds the previous pass stale
+// every 20 s, the first one that finds the previous pass stale, under a lock (<data>/reopen.lock): two sessions whose
+// timers fired together would both respawn the same session, the second cutting the first restart short
 const NORMAL_BEFORE_REOPEN = 180000
 let reopening = false
 async function reopenRetiredSessions($: any) {
-  if (reopening || !daemonLog) return
+  if (reopening || !daemonLog || !dataDir) return
+  const first = await storeGet($, 'reopenPass')
+  if (first && (await $.clock.now()) - first.at < 15000) return
+  reopening = true
+  try {
+    await withLock($, `${dataDir}/reopen`, () => reopenPass($), 10)
+  } finally {
+    reopening = false
+  }
+}
+
+async function reopenPass($: any) {
+  // Read again under the lock: the session that held it may have just made the pass
   const now = await $.clock.now()
   const c = await storeGet($, 'reopenPass')
   if (c && now - c.at < 15000) return
-  reopening = true
-  try {
-    const normal = await platform.memoryNormal(sys($))
-    const normalSince = normal ? (typeof c?.normalSince === 'number' ? c.normalSince : now) : undefined
-    await storeSet($, 'reopenPass', { at: now, normalSince })
-    if (normalSince === undefined || now - normalSince < NORMAL_BEFORE_REOPEN) return
-    const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
-    if (r.exitCode !== 0) return
-    const closed = stopReasons(r.stdout)
-    if (!Object.values(closed).some(c => c.why === 'low-memory')) return
-    const pinned = new Set((await pinsFromFile($)) ?? [])
-    const list = await officialList($)
-    if (typeof list === 'string') return
-    for (const s of list) {
-      const c = typeof s.id === 'string' ? closed[s.id] : undefined
-      const when = c?.why === 'low-memory' ? c.at : undefined
-      if (!when || s.pid || s.kind !== 'background' || !pinned.has(s.id)) continue
-      // Memory has to have been normal since after the closure (if no pass saw it, since the closure)
-      if (now - Math.max(when, normalSince) < NORMAL_BEFORE_REOPEN) continue
-      if (!(await hasRemoteControl($, s.id))) continue
-      const previous = recentReopens(await storeGet($, `reopened:${s.sessionId}`), now)
-      if (previous.length >= 3) continue
-      await storeSet($, `reopened:${s.sessionId}`, [...previous, now])
-      const name = s.name && s.name !== s.id ? s.name : s.id
-      const done = await run($, [claude, 'respawn', s.id])
-      $.ui.toast(done.exitCode === 0 ? `Reopened “${name}”: Claude had closed it for lack of memory` : `Couldn't reopen “${name}”`)
-      await storeSet($, 'list', {})
-      return
-    }
-  } finally {
-    reopening = false
+  const normal = await platform.memoryNormal(sys($))
+  const normalSince = normal ? (typeof c?.normalSince === 'number' ? c.normalSince : now) : undefined
+  await storeSet($, 'reopenPass', { at: now, normalSince })
+  if (normalSince === undefined || now - normalSince < NORMAL_BEFORE_REOPEN) return
+  const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
+  if (r.exitCode !== 0) return
+  const closed = stopReasons(r.stdout)
+  if (!Object.values(closed).some(c => c.why === 'low-memory')) return
+  const pinned = new Set((await pinsFromFile($)) ?? [])
+  const list = await officialList($)
+  if (typeof list === 'string') return
+  for (const s of list) {
+    const c = typeof s.id === 'string' ? closed[s.id] : undefined
+    const when = c?.why === 'low-memory' ? c.at : undefined
+    if (!when || s.pid || s.kind !== 'background' || !pinned.has(s.id)) continue
+    // Memory has to have been normal since after the closure (if no pass saw it, since the closure)
+    if (now - Math.max(when, normalSince) < NORMAL_BEFORE_REOPEN) continue
+    if (!(await hasRemoteControl($, s.id))) continue
+    const previous = recentReopens(await storeGet($, `reopened:${s.sessionId}`), now)
+    if (previous.length >= 3) continue
+    await storeSet($, `reopened:${s.sessionId}`, [...previous, now])
+    const name = s.name && s.name !== s.id ? s.name : s.id
+    const done = await run($, [claude, 'respawn', s.id])
+    $.ui.toast(done.exitCode === 0 ? `Reopened “${name}”: Claude had closed it for lack of memory` : `Couldn't reopen “${name}”`)
+    await storeSet($, 'list', {})
+    return
   }
 }
 
@@ -1501,14 +1516,18 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
   if (!f.id) return
   if (action === 'restart') {
     const v = await windows($)
+    const written: string[] = []
     for (const tty of v.byId[f.id] ?? []) {
       if (!v.launchers[tty] || !dataDir) continue
       try {
         await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id: f.id, title: f.title }))
+        written.push(windowFile(tty))
       } catch {}
     }
     const r = await run($, [claude, 'respawn', f.id])
     if (r.exitCode !== 0) {
+      // Its viewers weren't closed: the window files go, or leaving one later would reattach instead of the shell
+      if (written.length) await runSafe($, ['rm', '-f', ...written])
       $.ui.toast(`Couldn't restart “${f.title}”`)
     } else {
       // The ↑ mark goes away right away, without waiting for the new session to record its version
@@ -1784,17 +1803,25 @@ async function runLaunches($: any) {
 }
 
 async function createSession($: any, name: string) {
-  await update($, askingName, () => false)
   // The new session starts in the project root: the current one, and only if it's still there
   await followFolder($)
+  const taken = lastList.filter(x => typeof x.cwd === 'string' && inProject(x.cwd, myCwd, home)).flatMap(x => [x.name, x.id].filter(Boolean))
+  // A name the project already has would make a second session with it (ccc <name> then opens either): the field
+  // stays open for another one
+  const typed = name.trim()
+  if (typed && taken.includes(typed)) {
+    $.ui.toast(`“${typed}” is already a session of this project: type another name (Esc cancels)`)
+    bg(focusElement($, 'name'))
+    return
+  }
+  await update($, askingName, () => false)
   if (!myCwd || !(await exists($, myCwd))) {
     $.ui.toast(`Can't create a session: this session's folder no longer exists${myCwd ? ` (${myCwd})` : ''}`)
     return
   }
   // Enter without a name: an automatic one after the folder, like the names Claude gives regular sessions
   // ("myapp-1f"), not used by another session of the project
-  const taken = lastList.filter(x => typeof x.cwd === 'string' && inProject(x.cwd, myCwd, home)).flatMap(x => [x.name, x.id].filter(Boolean))
-  const clean = name.trim() || autoName(myCwd, taken, hexDigit)
+  const clean = typed || autoName(myCwd, taken, hexDigit)
   const since = (await $.clock.now()) - 5000
   const refusal = await launch($, { name: clean, cwd: myCwd })
   if (refusal) {
@@ -2395,6 +2422,8 @@ async function rebind($: any) {
 // take, the ↑ mark stays and u is the way
 async function updateInPlace($: any) {
   if (!active || !myId) return
+  // Starts and wakes other plugins queued live in this module: a reload now would drop them after they were told queued
+  if (launching || waking || launches.length || wakes.length) return
   const plugin = await installedPlugin($)
   const own = lastList.find(s => s.sessionId === myId)
   const quick = reloadDecision({

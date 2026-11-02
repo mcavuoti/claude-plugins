@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { storeNamespace } from '../hooks/state'
-import { BAND, DATA, ROOT, SID, startSession, world, type World } from './world'
+import { BAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // How the mod starts in a session (the world it sees is in world.ts)
 
@@ -182,6 +182,65 @@ test("New: Enter on an empty name creates a session named after the folder, unus
   expect(w.runs[created]?.[3]).not.toBe('myapp-00')
   // In the project root, the only command that runs there
   expect(w.cwds[created]).toBe(ROOT)
+})
+
+test('New with a name the project already has: nothing created, a notice, and the field stays open for another', async ($, on) => {
+  const list = [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
+    { id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: `${ROOT}/sub`, kind: 'background', name: 'release notes' },
+  ]
+  const w = world(on, { list })
+  await startSession($, w)
+  const pane = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
+  const ui = await $.ui.mount(pane)
+  // The panel has the keyboard (the field closes when it loses it)
+  w.panes.find(p => p.id === 'sessions').isFocused = true
+  await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface: 'terminal' })
+  await $.ui.input({ plugin: 'sessions', key: 'name', text: ' release notes ', requestId: 'sessions', surface: 'terminal' })
+  await w.clock.advance(2000)
+  expect(w.runs.some(a => a[1] === '--bg')).toBe(false)
+  expect(w.toasts.at(-1)).toBe('“release notes” is already a session of this project: type another name (Esc cancels)')
+  expect(await ui.find({ key: 'name' })).toBeDefined()
+  // Another name goes through
+  await $.ui.input({ plugin: 'sessions', key: 'name', text: 'release notes 2', requestId: 'sessions', surface: 'terminal' })
+  await w.clock.advance(4000)
+  expect(w.runs.find(a => a[1] === '--bg')?.slice(0, 4)).toEqual(['/bin/claude', '--bg', '-n', 'release notes 2'])
+  await ui.unmount()
+})
+
+test('the cleanup trusts no listing that lacks this very session; one that has it drops the data of the gone', SLOW, async ($, on) => {
+  const GONE = 'zzzzzzzz-0000-0000-0000-000000000000'
+  const list: any[] = [{ id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'two' }]
+  const w = world(on, { list, store: { [`state:${GONE}`]: { created: 0 }, [`title:${GONE}`]: 'old' } })
+  await startSession($, w)
+  // A short listing (this session isn't in it): nothing deleted
+  expect(w.store.has(`state:${GONE}`)).toBe(true)
+  list.push({ id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' })
+  await w.clock.advance(600000)
+  expect(w.store.has(`state:${GONE}`)).toBe(false)
+  expect(w.store.has(`title:${GONE}`)).toBe(false)
+})
+
+test('the reopen after a memory shortage runs under its lock, and reopens the session once', SLOW, async ($, on) => {
+  const list = [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
+    { id: 'dddddddd', sessionId: 'dddddddd-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', name: 'phone one' },
+  ]
+  const w = world(on, { list })
+  w.files.set('/Users/x/jobs/pins.json', '["dddddddd"]')
+  w.files.set('/Users/x/jobs/dddddddd/state.json', '{"bridgeSessionId": "x"}')
+  w.files.set('/Users/x/daemon.log', '[1970-01-12T13:00:00.000Z] [bg] bg retire dddddddd: idle-prompt [low memory, pinned]\n')
+  await startSession($, w)
+  const respawns = () => w.runs.filter(a => a[1] === 'respawn' && a[2] === 'dddddddd').length
+  // Memory has been normal for 3 minutes: the next pass reopens it
+  for (let i = 0; i < 15 && respawns() === 0; i++) await w.clock.advance(20000)
+  expect(respawns()).toBe(1)
+  // It runs again
+  ;(list[1] as any).pid = 4250
+  await w.clock.advance(60000)
+  expect(respawns()).toBe(1)
+  expect(w.runs.some(a => a[0] === 'mkdir' && a[1] === `${DATA}/reopen.lock`)).toBe(true)
+  expect(w.dirs.has(`${DATA}/reopen.lock`)).toBe(false)
 })
 
 for (const reason of ['clear', 'resume'] as const) {
