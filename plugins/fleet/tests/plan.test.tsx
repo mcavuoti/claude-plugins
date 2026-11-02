@@ -77,6 +77,37 @@ test('a derived document goes stale when a cited record is revised; its owner he
   expect(json(w, `${FLEET}/state/suspects.json`).derived).toBe(undefined)
 })
 
+test('the owner who read a revised input hears it with the derived line, once the inputs are quiet, not at its next step', WITH_SESSIONS, async ($, on) => {
+  const w = await planner($, on)
+  for (let i = 0; i < 10; i++) await tick(w)
+  await $.tool.call({ tool: 'Read', file_path: `${ROOT}/req/R-1.md` } as any)
+  w.touch(`${ROOT}/req/R-1.md`, '---\nchange: "revision: the target is 8"\n---\n# R-1\n\nThe target is 8.\n')
+  for (let i = 0; i < 12; i++) await tick(w)
+  // Its next step doesn't carry "changed since you read it" for R-1: that waits for the debounce
+  const step: any = await $.tool.call({ tool: 'Bash', command: 'ls' } as any)
+  expect((step.context ?? []).join('\n')).not.toContain('req/R-1.md')
+  expect(w.submits.length).toBe(1)
+  for (let i = 0; i < 150; i++) await tick(w)
+  expect(w.submits.length).toBe(2)
+  expect(w.submits[1]).toContain('- req/R-1.md: changed at ')
+  expect(w.submits[1]).toContain('- plan/business-plan.md (businessplan): R-1@1 → v2; the last moved at ')
+})
+
+test('inputs that keep moving: the owner is told anyway 8 × debounceMin after the first move, that they are still moving', WITH_SESSIONS, async ($, on) => {
+  const w = await planner($, on)
+  for (let i = 0; i < 10; i++) await tick(w)
+  // R-1 revised every 4 minutes (the debounce is 5): never quiet
+  const first = w.clock.now()
+  for (let n = 2; w.clock.now() - first < 45 * 60000 && w.submits.length < 2; n++) {
+    w.touch(`${ROOT}/req/R-1.md`, `---\nchange: "revision: the target is ${n}"\n---\n# R-1\n\nThe target is ${n}.\n`)
+    for (let i = 0; i < 24 && w.submits.length < 2; i++) await tick(w, 10000)
+  }
+  expect(w.submits.length).toBe(2)
+  expect(w.clock.now() - first).toBeGreaterThan(40 * 60000)
+  expect(w.clock.now() - first).toBeLessThan(43 * 60000)
+  expect(w.submits[1]).toMatch(/- plan\/business-plan\.md \(businessplan\): R-1@1 → v\d+; the last moved at \d\d:\d\d: its inputs are still moving, so refresh what has settled/)
+})
+
 test('no circular authority: a change to a requirement resting only on the plan that cites it is flagged, never applied as filed', WITH_SESSIONS, async ($, on) => {
   const w = await planner($, on)
   // The person is attached and types this turn: a change filed in it would be applied as filed, but for the circle

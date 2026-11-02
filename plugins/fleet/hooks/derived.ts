@@ -47,9 +47,10 @@ export function ownsKind(k: Pick<DerivedKind, 'owner'>, inst: { name: string; ro
   return inst.name.toLowerCase() === o || inst.role.toLowerCase() === o
 }
 
-/** A stale derived document: the pins whose records were revised or retracted since, and when the newest of those
- * landed (the debounce counts from there: inputs still moving keep it waiting) */
-export type DerivedStale = { path: string; kind: string; owner: string; debounceMin: number; pins: { pin: string; now: number }[]; movedAt: number; key: string }
+/** A stale derived document: the pins whose records were revised or retracted since, when the newest of those landed
+ * (the debounce counts from there: inputs still moving keep it waiting) and when the oldest did (firstAt: the longest
+ * wait counts from there) */
+export type DerivedStale = { path: string; kind: string; owner: string; debounceMin: number; pins: { pin: string; now: number }[]; movedAt: number; firstAt?: number; key: string }
 
 /** The derived documents among the suspects that are stale (a cited record moved by a revision or a retraction) */
 export function staleDerived(suspects: readonly Suspect[], kinds: readonly DerivedKind[]): DerivedStale[] {
@@ -60,21 +61,34 @@ export function staleDerived(suspects: readonly Suspect[], kinds: readonly Deriv
     const moved = s.reasons.filter(r => r.why === 'stale' && r.moved)
     if (!moved.length) continue
     const pins = moved.map(r => ({ pin: r.pin, now: r.now ?? 0 }))
-    out.push({ path: s.path, kind: k.kind, owner: k.owner, debounceMin: k.debounceMin, pins, movedAt: Math.max(...moved.map(r => (r.moved as Pick<Rev, 'at'>).at)), key: `${s.path}|${pins.map(p => `${p.pin}>${p.now}`).join(',')}` })
+    out.push({ path: s.path, kind: k.kind, owner: k.owner, debounceMin: k.debounceMin, pins, movedAt: Math.max(...moved.map(r => (r.moved as Pick<Rev, 'at'>).at)), firstAt: Math.min(...moved.map(r => r.first ?? (r.moved as Pick<Rev, 'at'>).at)), key: `${s.path}|${pins.map(p => `${p.pin}>${p.now}`).join(',')}` })
   }
   return out
 }
 
-/** Its inputs have been quiet long enough: the owner is told (and, retired, woken) */
-export function quietEnough(d: Pick<DerivedStale, 'movedAt' | 'debounceMin'>, now: number): boolean {
-  return now - d.movedAt >= d.debounceMin * 60000
+/** The longest a stale derived document waits for its inputs to be quiet: 8 × debounceMin from the first move, a day
+ * at most (inputs revised more often than the debounce would keep it waiting for good) */
+export function maxWaitMs(d: Pick<DerivedStale, 'debounceMin'>): number {
+  return Math.min(8 * d.debounceMin, 24 * 60) * 60000
 }
 
-/** What the owner reads: each stale document, what moved, and that "inputs unchanged" is a landing */
-export function derivedText(items: readonly DerivedStale[], me: Me): string {
+/** Its owner is told now (and, retired, woken): its inputs have been quiet debounceMin, or they have kept moving for the
+ * longest wait since the first move (or since the owner was last told of it: since) */
+export function quietEnough(d: Pick<DerivedStale, 'movedAt' | 'firstAt' | 'debounceMin'>, now: number, since = 0): boolean {
+  return now - d.movedAt >= d.debounceMin * 60000 || now - Math.max(d.firstAt ?? d.movedAt, since) >= maxWaitMs(d)
+}
+
+/** When its owner is told at the latest, inputs still moving or not */
+export function toldBy(d: Pick<DerivedStale, 'movedAt' | 'firstAt' | 'debounceMin'>, since = 0): number {
+  return Math.min(d.movedAt + d.debounceMin * 60000, Math.max(d.firstAt ?? d.movedAt, since) + maxWaitMs(d))
+}
+
+/** What the owner reads: each stale document, what moved, and that "inputs unchanged" is a landing. now: one whose
+ * inputs are still moving (told at the longest wait) says so */
+export function derivedText(items: readonly DerivedStale[], me: Me, now = 0): string {
   const lines = [
     'fleet: documents you own are derived from records that moved since they cited them (nothing is held; refresh them when you can):',
-    ...items.map(d => `- ${d.path} (${d.kind}): ${d.pins.map(p => `${p.pin} → v${p.now}`).join(', ')}; the last moved at ${clock(d.movedAt, me.offsetMin)}`),
+    ...items.map(d => `- ${d.path} (${d.kind}): ${d.pins.map(p => `${p.pin} → v${p.now}`).join(', ')}; the last moved at ${clock(d.movedAt, me.offsetMin)}${now && now - d.movedAt < d.debounceMin * 60000 ? ': its inputs are still moving, so refresh what has settled' : ''}`),
     'Read what moved, update what rests on it and cite the new versions; when nothing in it changes, land it citing the versions as they are now ("inputs unchanged since" its last version is a valid landing). A contradiction between inputs goes to their owners (a note, or mcp__fleet__decide), never smoothed over here.',
   ]
   return lines.join('\n')

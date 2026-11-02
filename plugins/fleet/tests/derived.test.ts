@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { circularOf, derivedKindOf, derivedOf, derivedText, ownsKind, quietEnough, staleDerived } from '../hooks/derived'
+import { circularOf, derivedKindOf, derivedOf, derivedText, maxWaitMs, ownsKind, quietEnough, staleDerived, toldBy } from '../hooks/derived'
 import type { Suspect } from '../hooks/records'
 
 // Derived documents' pure parts: world.json's "derived", which documents a revised record made stale, the debounce,
@@ -33,11 +33,31 @@ test('stale: a derived document citing a record revised since; the debounce coun
     { path: 'proposal/p.md', id: null, owner: null, reasons: [{ why: 'ahead', pin: 'R-1@9', of: 'R-1', now: 2 }] },
   ]
   const stale = staleDerived(suspects, d.kinds)
-  expect(stale).toEqual([{ path: 'plan/business-plan.md', kind: 'businessplan', owner: 'planner', debounceMin: 10, pins: [{ pin: 'R-1@1', now: 2 }], movedAt: at, key: 'plan/business-plan.md|R-1@1>2' }])
+  expect(stale).toEqual([{ path: 'plan/business-plan.md', kind: 'businessplan', owner: 'planner', debounceMin: 10, pins: [{ pin: 'R-1@1', now: 2 }], movedAt: at, firstAt: at, key: 'plan/business-plan.md|R-1@1>2' }])
   expect(quietEnough(stale[0] as never, at + 9 * 60000)).toBe(false)
   expect(quietEnough(stale[0] as never, at + 10 * 60000)).toBe(true)
   expect(derivedText(stale, ME)).toContain('- plan/business-plan.md (businessplan): R-1@1 → v2; the last moved at 12:00')
+  expect(derivedText(stale, ME)).not.toContain('still moving')
   expect(derivedText(stale, ME)).toContain('"inputs unchanged since" its last version is a valid landing')
+})
+
+test('the longest wait: inputs that keep moving are told 8 × debounceMin after the first move (a day at most), or after the last telling', () => {
+  const at = Date.UTC(2026, 10, 2, 12, 0, 0)
+  const moving = { debounceMin: 10, firstAt: at, movedAt: at + 75 * 60000 }
+  expect(maxWaitMs({ debounceMin: 10 })).toBe(80 * 60000)
+  expect(maxWaitMs({ debounceMin: 500 })).toBe(24 * 3600000)
+  expect(quietEnough(moving, at + 79 * 60000)).toBe(false)
+  expect(quietEnough(moving, at + 80 * 60000)).toBe(true)
+  expect(toldBy(moving)).toBe(at + 80 * 60000)
+  // Told at 80 min and still moving: the next telling waits the longest wait again, from then
+  expect(quietEnough({ ...moving, movedAt: at + 95 * 60000 }, at + 100 * 60000, at + 80 * 60000)).toBe(false)
+  expect(quietEnough({ ...moving, movedAt: at + 155 * 60000 }, at + 160 * 60000, at + 80 * 60000)).toBe(true)
+  // The first move is the oldest one since the cited version, from the reasons
+  const suspects: Suspect[] = [{ path: 'plan/business-plan.md', id: null, owner: null, reasons: [{ why: 'stale', pin: 'R-1@1', of: 'R-1', now: 4, moved: { rev: 4, kind: 'revision', at: at + 75 * 60000, by: null, hash: 'h4' }, first: at }] }]
+  const d = derivedOf(WORLD, false) as { kinds: never[] }
+  const stale = staleDerived(suspects, d.kinds)
+  expect(stale[0]).toMatchObject({ movedAt: at + 75 * 60000, firstAt: at })
+  expect(derivedText(stale, ME, at + 80 * 60000)).toContain('- plan/business-plan.md (businessplan): R-1@1 → v4; the last moved at 13:15: its inputs are still moving, so refresh what has settled')
 })
 
 test('no circular authority: a change to a record whose only cited authority is a derived document resting on it', () => {

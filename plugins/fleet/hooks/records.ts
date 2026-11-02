@@ -223,14 +223,17 @@ export type PinState = {
   now: number
   /** The newest revision or retraction after the cited version */
   moved?: Rev
+  /** When the oldest of them landed: since when the pin has been stale */
+  firstAt?: number
 }
 
 export function pinState(pin: Pin, revs: readonly Rev[] | undefined): PinState {
   if (!revs || !revs.length) return { pin, state: 'unknown', now: 0 }
   const now = Math.max(...revs.map(r => r.rev))
   if (pin.rev > now) return { pin, state: 'ahead', now }
-  const moved = revs.filter(r => r.rev > pin.rev && STALE_KINDS.has(r.kind)).sort((a, b) => b.rev - a.rev)[0]
-  return moved ? { pin, state: 'stale', now, moved } : { pin, state: 'current', now }
+  const movers = revs.filter(r => r.rev > pin.rev && STALE_KINDS.has(r.kind)).sort((a, b) => b.rev - a.rev)
+  const moved = movers[0]
+  return moved ? { pin, state: 'stale', now, moved, firstAt: Math.min(...movers.map(r => r.at)) } : { pin, state: 'current', now }
 }
 
 /** How the writing thread read a record: the version there now, an older one, or never in this conversation */
@@ -332,6 +335,8 @@ export type Reason = {
   /** blind: why the command's thread should have read it (stale, unread, ahead) */
   detail?: string
   moved?: Pick<Rev, 'rev' | 'kind' | 'at' | 'by' | 'hash'>
+  /** stale: when the oldest move since the cited version landed (a derived document's longest wait counts from it) */
+  first?: number
 }
 export type Suspect = { path: string; id: string | null; owner: Who | null; reasons: Reason[]; via?: string[] }
 /** derived: the derived documents among the suspects a revised record made stale (derived.ts), for their owners */
@@ -352,7 +357,7 @@ export function suspectsOf(files: readonly Facts[], stateOf: (p: Pin) => PinStat
       const st = stateOf(pin)
       if (st.state === 'current' || (st.state === 'stale' && f.confirmed?.includes(`${s}>${st.now}`))) continue
       const m = st.moved
-      reasons.push({ why: st.state, pin: s, of: pin.id, ...(st.now ? { now: st.now } : {}), ...(m ? { moved: { rev: m.rev, kind: m.kind, at: m.at, by: m.by, hash: m.hash } } : {}) })
+      reasons.push({ why: st.state, pin: s, of: pin.id, ...(st.now ? { now: st.now } : {}), ...(m ? { moved: { rev: m.rev, kind: m.kind, at: m.at, by: m.by, hash: m.hash } } : {}), ...(st.firstAt !== undefined ? { first: st.firstAt } : {}) })
     }
     for (const b of f.blind ?? []) {
       const [pin = '', detail = ''] = b.split(':')

@@ -76,6 +76,7 @@ import {
   windowFolders,
   worldText,
   type ChangeEvent,
+  type DigestItem,
   type Me,
   type ReadsFile,
   type Snapshot,
@@ -138,7 +139,7 @@ import {
 } from './decisions'
 import { applyEdits, applyVerdict, changeDelivery, changeTicket, checkChange, diffHead, draftName, lineDiff, sameHash, shortHash, type ChangeSpec } from './drafts'
 import { afterSend, alertMessage, alertsDue, channelKey, channelScript, channelWords, inQuiet, mcpSendArgs, personOf, RESERVED_PER_DAY, type Alert, type AlertsFile, type Channel, type SendOutcome } from './channel'
-import { circularOf, circularWords, derivedKindOf, derivedOf, derivedText, ownsKind, quietEnough, staleDerived, type DerivedKind } from './derived'
+import { circularOf, circularWords, derivedKindOf, derivedOf, derivedText, ownsKind, quietEnough, staleDerived, toldBy, type DerivedKind, type DerivedStale } from './derived'
 import {
   CHARTER,
   JUDGE_SYSTEM,
@@ -1814,7 +1815,7 @@ async function digestFor($: any, thread: string, withBudget = true): Promise<{ l
   await eventsTick($)
   const mine = (await read($, reads))[thread]
   const me = await meNow($)
-  const items = mine && latest.size ? digestItems(mine, latest, me, thread) : []
+  const items = await holdInputs($, mine && latest.size ? digestItems(mine, latest, me, thread) : [], await $.clock.now())
   let own: { lines: string[]; keys: string[] } = { lines: [], keys: [] }
   let intake: { lines: string[]; ids: string[]; at: number } = { lines: [], ids: [], at: 0 }
   if (thread === 'main') {
@@ -2810,7 +2811,7 @@ async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   }
   const now = await $.clock.now()
   const inst = myInstance
-  const derived = inst ? (flagged.suspects?.derived ?? []).filter(d => ownsKind(d, inst) && quietEnough(d, now) && !told[`d|${d.key}`]) : []
+  const derived = inst ? (flagged.suspects?.derived ?? []).filter(d => ownsKind(d, inst) && quietEnough(d, now, derivedToldAt(told, d.path)) && !told[`d|${d.key}`]) : []
   if (!items.length && !checks.length && !derived.length) return { lines: [], keys: [] }
   const lines: string[] = []
   const group = (lead: string, all: { line: string }[]) => {
@@ -2819,8 +2820,46 @@ async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   }
   if (items.length) group('fleet: shared files you wrote last are flagged (nothing is held; fix them when you can: read what they cite, then update them, or say why they still hold):', items)
   if (checks.length) group("fleet: shared files you wrote last fail the project's checks (nothing is held; fix them so the check passes, or say why it's wrong):", checks)
-  if (derived.length) lines.push(derivedText(derived.slice(0, MAX_LINES), words))
+  if (derived.length) lines.push(derivedText(derived.slice(0, MAX_LINES), words, now))
   return { lines, keys: [...items.map(i => i.key), ...checks.map(i => i.key), ...derived.map(d => `d|${d.key}`)] }
+}
+
+/** When this conversation was last told a derived document of its was stale (ownTold's d|<path>|… keys), or 0 */
+function derivedToldAt(told: Readonly<Record<string, number>>, path: string): number {
+  let at = 0
+  for (const [k, t] of Object.entries(told)) if (k.startsWith(`d|${path}|`) && t > at) at = t
+  return at
+}
+
+/** For an instance that owns derived documents: the digest's lines about the records they cite wait while those
+ * documents wait for their inputs to be quiet, so the owner refreshes once, when it hears the derived line too. A
+ * record's move the sweeper hasn't reckoned yet waits the debounce from its landing */
+async function holdInputs($: any, items: DigestItem[], now: number): Promise<DigestItem[]> {
+  const inst = myInstance
+  if (!inst || !items.length || !records) return items
+  const kinds = derivedKinds.filter(k => ownsKind(k, inst))
+  if (!kinds.length) return items
+  await loadFlags($)
+  const told = await read($, ownTold)
+  const stale = new Map<string, DerivedStale>((flagged.suspects?.derived ?? []).map(d => [d.path, d]))
+  // Each input's path → the debounce of the documents that cite it and wait, or that might (not reckoned yet)
+  const waits = new Map<string, number[]>()
+  for (const [doc, k] of known) {
+    const kind = kinds.find(x => x.res.some(r => r.test(doc)))
+    if (!kind) continue
+    const d = stale.get(doc)
+    if (d && quietEnough(d, now, derivedToldAt(told, doc))) continue
+    for (const pin of k.pins ?? []) {
+      const p = idIndex.get(parsePin(pin)?.id ?? '')
+      if (p) waits.set(p, [...(waits.get(p) ?? []), d ? Infinity : kind.debounceMin])
+    }
+  }
+  return items.filter(i => {
+    const w = waits.get(i.path)
+    if (!w) return true
+    const moving = !!i.event.id && (i.event.to === null || i.event.kind === 'revision' || i.event.kind === 'retraction')
+    return !w.some(min => min === Infinity || (moving && now - i.event.at < min * 60000))
+  })
 }
 
 // ---- Intake: items from outside, read by the sweeper with one model call each, routed to who subscribes (intake.ts) ----
@@ -4452,7 +4491,7 @@ async function derivedFor(inst: Instance): Promise<string[]> {
   const mine = derivedKinds.filter(k => ownsKind(k, inst))
   if (!mine.length) return []
   return [
-    `You own derived documents: ${mine.map(k => `${globList(k.globs)} (${k.kind})`).join(', ')}. Each claim in them cites what it rests on by version (R-12@4); when a cited record is revised, fleet tells you once its inputs have been quiet ${mine[0]?.debounceMin ?? 30} min, and you refresh it ("inputs unchanged since" its last version is a valid landing). A derived document is never the sole authority for changing its own inputs.`,
+    `You own derived documents: ${mine.map(k => `${globList(k.globs)} (${k.kind})`).join(', ')}. Each claim in them cites what it rests on by version (R-12@4); when a cited record is revised, fleet tells you once its inputs have been quiet ${mine[0]?.debounceMin ?? 30} min (or, while they keep moving, ${Math.round(Math.min(8 * (mine[0]?.debounceMin ?? 30), 1440) / 60)} h after they first moved), what changed in those records with it, and you refresh it ("inputs unchanged since" its last version is a valid landing). A derived document is never the sole authority for changing its own inputs.`,
   ]
 }
 
@@ -7137,7 +7176,7 @@ async function outsideStatus($: any): Promise<string[]> {
     if (worldOn()) await loadFlags($)
     const stale = flagged.suspects?.derived ?? []
     lines.push(`derived: ${derivedKinds.map(k => `${k.kind} (${globList(k.globs)}, owner ${k.owner})`).join(', ')}${stale.length ? '' : '; none stale'}`)
-    for (const d of stale) lines.push(`  stale: ${d.path} (${d.kind}): ${d.pins.map(x => `${x.pin} → v${x.now}`).join(', ')}; ${quietEnough(d, now) ? `its owner (${d.owner}) is told` : `its owner (${d.owner}) is told once its inputs are quiet ${d.debounceMin} min`}`)
+    for (const d of stale) lines.push(`  stale: ${d.path} (${d.kind}): ${d.pins.map(x => `${x.pin} → v${x.now}`).join(', ')}; ${quietEnough(d, now) ? `its owner (${d.owner}) is told` : `its owner (${d.owner}) is told once its inputs are quiet ${d.debounceMin} min, at ${clock(toldBy(d), me.offsetMin)} at the latest`}`)
   }
   const list = await loadSlots($)
   if (slotsProblem) lines.push(`slots: ${slotsProblem}`)

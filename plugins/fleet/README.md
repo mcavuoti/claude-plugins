@@ -378,7 +378,7 @@ A document that rests on records (a business plan, the proposal, a gap matrix) i
 ```
 
 - It cites what each of its claims rests on by version (`R-12@4`), like any record: one of its records revised or retracted makes it **stale** (`/fleet status`, the brief).
-- **Its owner** (a role or an instance, `owner`) hears it once the stale inputs have been quiet for `debounceMin` minutes (inputs still moving keep it waiting), once per state, as a nudge within its wakes and budget, or woken when retired: what moved, and that "inputs unchanged since" its last version is a valid landing. Whoever wrote it last isn't told instead.
+- **Its owner** (a role or an instance, `owner`) hears it once the stale inputs have been quiet for `debounceMin` minutes (inputs still moving keep it waiting, but not past 8 × `debounceMin` from their first move, a day at most: then it hears they're still moving, and refreshes what has settled), once per state, as a nudge within its wakes and budget, or woken when retired: what moved, and that "inputs unchanged since" its last version is a valid landing. Whoever wrote it last isn't told instead. The owner's own "changed since you read it" about those inputs waits with it, and comes in the same message.
 - **No circular authority**: a `change` to a record whose only cited authority (the pins its draft adds, what its summary names) is a derived document resting on that record is flagged for you ("its only cited authority is a derived document … that rests on this very record") and never applied as filed, even when you typed the turn.
 
 The `proposal` template has three: the business plan (the planner), the proposal (the integrator) and the gap matrix (the requirements owner).
