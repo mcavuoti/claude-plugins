@@ -8,7 +8,8 @@ import { changeLine, clock, type ChangeEvent, type Me } from './changes'
 import { ago } from './decisions'
 import { hoursText, usd } from './roster'
 
-export type BriefNeed = { id: string; kind: 'choice' | 'change' | 'resource' | 'outbound'; what: string; who: string; at: number; blocks?: string; outside?: string }
+/** judge: what the judge proposed on a choice, in a few words ("a) SQLite, citing D-3") */
+export type BriefNeed = { id: string; kind: 'choice' | 'change' | 'resource' | 'outbound'; what: string; who: string; at: number; blocks?: string; outside?: string; judge?: string }
 export type BriefFacts = {
   now: number
   me: Me
@@ -83,7 +84,7 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   out.push('', what.length ? `1. Needs you: ${what.join(', ')} (/fleet lists them to answer)` : '1. Nothing needs you.')
   const needsAt = out.length - 1
   for (const n of [...f.needs].sort((a, b) => a.at - b.at).slice(0, SHOWN)) {
-    out.push(`   - ${n.id} ${n.kind === 'choice' ? 'question' : n.kind}: ${n.what} · ${n.who} · ${ago(f.now - n.at)} ago${n.blocks ? ` · blocks: ${n.blocks}` : ''}${n.outside ? ` · drafted after reading outside content (${n.outside})` : ''}`)
+    out.push(`   - ${n.id} ${n.kind === 'choice' ? 'question' : n.kind}: ${n.what} · ${n.who} · ${ago(f.now - n.at)} ago${n.blocks ? ` · blocks: ${n.blocks}` : ''}${n.outside ? ` · ${n.kind === 'choice' ? 'asked' : 'drafted'} after reading outside content (${n.outside})` : ''}${n.judge ? ` · ${n.judge}` : ''}`)
   }
   if (f.needs.length > SHOWN) out.push(`   - and ${f.needs.length - SHOWN} more`)
   if (f.waiting) out.push(`   ${f.waiting} answered, not delivered yet`)

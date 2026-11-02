@@ -72,15 +72,16 @@ test('/fleet init refuses the home folder and a config.json from a newer fleet',
 test('decide is offered in a background session of a fleet project only, in the first request', WITH_SESSIONS, async ($, on) => {
   const w = world(on)
   await startSession($, w)
-  expect(w.tools.map(t => [t.name, t.isDeferred])).toEqual([['decide', false], ['send', false], ['slot', false]])
-  expect(w.tools[0].inputSchema.properties.questions.maxItems).toBe(4)
+  expect(w.tools.map(t => [t.name, t.isDeferred])).toEqual([['taste', false], ['decide', false], ['send', false], ['slot', false]])
+  expect(w.tools[1].inputSchema.properties.questions.maxItems).toBe(4)
   expect(w.commands).toEqual(['fleet'])
 })
 
 test('decide is not offered outside a background session, nor where the job folder names another session', async ($, on) => {
   const w = world(on, { background: false })
   await startSession($, w)
-  expect(w.tools).toEqual([])
+  // The person's taste is heard where he types: taste is offered in every session of a fleet project
+  expect(w.tools.map(t => t.name)).toEqual(['taste'])
   expect(await fleet($, 'status')).toContain("decide: not offered here: this isn't a background session")
 })
 
@@ -88,7 +89,7 @@ test('a claude started from a background session’s shell inherits CLAUDE_JOB_D
   const w = world(on)
   w.files.set(`${HOME}/.claude/jobs/${REF}/state.json`, JSON.stringify({ sessionId: 'bbbbbbbb-0000-0000-0000-000000000000' }))
   await startSession($, w)
-  expect(w.tools).toEqual([])
+  expect(w.tools.map(t => t.name)).toEqual(['taste'])
 })
 
 test('decide answers at once with a ticket and queues the record; refuses subagents and bad input', WITH_SESSIONS, async ($, on) => {
