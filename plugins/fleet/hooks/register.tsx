@@ -2652,8 +2652,12 @@ async function bashHook($: any, e: any, next: any) {
  * started, and nobody's landing explains, lands as its thread's, blind (what to tell its model goes to the log: no
  * tool result carries it) */
 async function bgDone($: any, task: string) {
-  const b = (await read($, bgCommands))[task]
-  await update($, bgCommands, m => omit(m, [task]))
+  // Taken in the update itself: the stop and the notification can both say it's done
+  let b: FleetBg | undefined
+  await update($, bgCommands, m => {
+    b = m[task]
+    return b ? omit(m, [task]) : m
+  })
   saveReadsSoon($)
   if (!b || !worldOn()) return
   const before: Snapshot = new Map(b.before.map(([p, mtimeMs, size]) => [p, { mtimeMs, size }]))
