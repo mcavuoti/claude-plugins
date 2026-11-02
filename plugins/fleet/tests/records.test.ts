@@ -64,7 +64,10 @@ test('world.json: ids by default, idPattern, strict, checks and commits; what is
   expect(c.commitEveryMin).toBe(60)
   expect((recordsOf({ worldFormat: 1, paths: [], checks: [{ glob: 'x/**', argv: [] }] }, false) as any).problem).toContain('argv')
   expect((recordsOf({ worldFormat: 1, paths: [], checks: [{ glob: '/x', argv: ['a'] }] }, false) as any).problem).toContain('relative')
-  expect(scriptsOf(c.checks)).toEqual(['checks/board.py', 'checks/links.sh'])
+  expect(scriptsOf(c.checks)).toEqual(['checks/board.py', 'checks/links.sh', 'python3'])
+  // R8: a script named with no slash, by an absolute path inside the project, or behind make and npm run
+  const r8 = recs({ checks: [{ glob: 'a/**', argv: ['python3', 'check.py'] }, { glob: 'b/**', argv: ['bash', '/Users/x/proj/tools/lint.sh', '--fix'] }, { glob: 'c/**', argv: ['make', 'lint'] }, { glob: 'd/**', argv: ['npm', 'run', 'check'] }, { glob: 'e/**', argv: ['bash', '/elsewhere/x.sh', '../up.sh'] }] })
+  expect(scriptsOf(r8.checks, ['/Users/x/proj'])).toEqual(['GNUmakefile', 'Makefile', 'bash', 'check', 'check.py', 'lint', 'make', 'makefile', 'npm', 'package.json', 'python3', 'run', 'tools/lint.sh'])
   expect(checksKey(c.checks, new Map([['checks/board.py', 'h1']]))).not.toBe(checksKey(c.checks, new Map([['checks/board.py', 'h2']])))
 })
 

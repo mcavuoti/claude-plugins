@@ -255,6 +255,45 @@ test('check scripts: run only once the person stamps them; a failure reaches the
   expect(await fleet($, 'status')).toContain('not stamped, so not run')
 })
 
+test('R8: a check script named with no slash or by its absolute path, and the Makefile behind make, are stamped and command-level', WITH_SESSIONS, async ($, on) => {
+  const checks = [
+    { glob: 'board/**', argv: ['python3', 'check.py'] },
+    { glob: 'req/**', argv: ['bash', `${ROOT}/tools/lint.sh`] },
+    { glob: 'notes/**', argv: ['make', 'lint'] },
+  ]
+  const roster = { rosterFormat: 1, roles: { owner: { agent: 'owner' } }, instances: [{ name: 'TEST W', role: 'owner' }] }
+  const w = world(on, {
+    env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'TEST W' },
+    files: {
+      [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['req/**', 'board/**', 'notes/**'], checks }),
+      [`${FLEET}/roster.json`]: JSON.stringify(roster),
+      [`${ROOT}/check.py`]: 'print()\n',
+      [`${ROOT}/tools/lint.sh`]: 'echo\n',
+      [`${ROOT}/Makefile`]: 'lint:\n\ttrue\n',
+    },
+  })
+  w.exec.value = argv => (['python3', 'bash', 'make'].includes(argv[0] as string) ? { exitCode: 0 } : undefined)
+  await begin($, w)
+  expect(await fleet($, 'accept checks')).toContain('Stamped:')
+  expect(await fleet($, 'status')).not.toContain('not stamped, so not run')
+  // Each one is the person's: changed, the checks stop until he stamps them again
+  for (const f of [`${ROOT}/check.py`, `${ROOT}/tools/lint.sh`, `${ROOT}/Makefile`]) {
+    const before = w.files.get(f) as string
+    w.touch(f, `${before}# changed\n`)
+    await tick(w, 11000)
+    expect(await fleet($, 'status')).toContain('not stamped, so not run')
+    w.touch(f, before)
+    await tick(w, 11000)
+    expect(await fleet($, 'status')).not.toContain('not stamped, so not run')
+  }
+  // ... and an instance's own tools don't write them
+  await tick(w, 31000)
+  for (const f of [`${ROOT}/check.py`, `${ROOT}/tools/lint.sh`, `${ROOT}/Makefile`]) {
+    const r = await call($, { tool: 'Write', file_path: f, content: 'x' })
+    expect(r.deny).toContain('command-level')
+  }
+})
+
 test('the world commit: only the shared files, with --only so other staged work stays staged; never in a worktree, nor without changes', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], commit: { everyMin: 60 } }), [PLAN]: 'plan\n' } })
   const git: string[][] = []

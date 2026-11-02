@@ -464,9 +464,30 @@ export function checkOutcome(paths: readonly string[], r: { exitCode: number; st
   return out
 }
 
-/** The files a check script names on its command line (relative to the project): stamped with the checks */
-export function scriptsOf(checks: readonly Check[]): string[] {
-  return [...new Set(checks.flatMap(c => c.argv.slice(1).concat(c.argv[0] as string).filter(a => !a.startsWith('-') && /\//.test(a) && !a.startsWith('/'))))].sort()
+/** What a check's command line may name of the project, relative to it: every word that isn't an option, the command
+ * included (check.py, ./tools/lint.sh, an absolute path inside one of the project's roots), and the file an
+ * indirection reads (make: the Makefile; npm, yarn or pnpm run: package.json). The ones that exist are stamped with
+ * the checks and command-level (fleet runs them as the person, with no prompt) */
+export function scriptsOf(checks: readonly Check[], roots: readonly string[] = []): string[] {
+  const out = new Set<string>()
+  for (const c of checks) {
+    const words = c.argv.filter(a => !a.startsWith('-'))
+    const cmd = (c.argv[0] as string).slice((c.argv[0] as string).lastIndexOf('/') + 1)
+    if (cmd === 'make' || cmd === 'gmake') for (const m of ['Makefile', 'makefile', 'GNUmakefile']) out.add(m)
+    if (['npm', 'yarn', 'pnpm'].includes(cmd)) out.add('package.json')
+    for (const w of words) {
+      let rel = w
+      if (w.startsWith('/')) {
+        const r = roots.find(x => x && (w === x || w.startsWith(`${x.replace(/\/+$/, '')}/`)))
+        if (!r) continue
+        rel = w.slice(r.replace(/\/+$/, '').length + 1)
+      }
+      rel = rel.replace(/^(\.\/)+/, '')
+      if (!rel || rel.split('/').some(s => s === '..' || s === '.' || s === '') || /[*?$`|;&<>]/.test(rel)) continue
+      out.add(rel)
+    }
+  }
+  return [...out].sort()
 }
 
 /** The stamp of a set of checks: their definitions and their scripts' versions */

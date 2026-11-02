@@ -2808,7 +2808,20 @@ async function intakeOne($: any, c: IntakeConfig, f: { source: string; name: str
 
 // ---- Check scripts: the project's own, run on landing and by the sweeper, stamped by the person ----
 
-const checkState = { stampAt: 0, stamp: { ok: false, key: '' }, errors: new Map<string, string>() }
+const checkState = { stampAt: 0, stamp: { ok: false, key: '' }, errors: new Map<string, string>(), scripts: { key: '', at: 0, list: [] as string[] } }
+
+/** The files of the project the checks' command lines name (records.ts scriptsOf), those that exist: stamped with the
+ * checks and command-level. A few seconds' cache */
+async function checkScripts($: any): Promise<string[]> {
+  if (!records?.checks.length) return []
+  const now = await $.clock.now()
+  const key = JSON.stringify(records.checks.map(c => c.argv))
+  if (checkState.scripts.key === key && now - checkState.scripts.at < 10000) return checkState.scripts.list
+  const list: string[] = []
+  for (const x of scriptsOf(records.checks, [root ?? '', realRoot])) if ((await mtimeOf($, `${realRoot || root}/${x}`)) !== null) list.push(x)
+  checkState.scripts = { key, at: now, list }
+  return list
+}
 
 // A check runs only while its definitions and scripts are the ones the person stamped (/fleet accept checks): fleet
 // runs them as the person, in every session of the project, with no permission prompt
@@ -2818,7 +2831,7 @@ async function checksStamp($: any, fresh = false): Promise<{ ok: boolean; key: s
   checkState.stampAt = now
   if (!records?.checks.length) return (checkState.stamp = { ok: false, key: '' })
   const scripts = new Map<string, string | null>()
-  for (const s of scriptsOf(records.checks)) scripts.set(s, (await versionOf($, `${realRoot}/${s}`)).v)
+  for (const s of await checkScripts($)) scripts.set(s, (await versionOf($, `${realRoot}/${s}`)).v)
   const key = checksKey(records.checks, scripts)
   let stamped = ''
   try {
@@ -4019,7 +4032,7 @@ async function commandLevelNow($: any): Promise<{ files: string[]; globs: string
   const w = await readWorldFile($)
   await loadRoster($)
   const channel = channelScript(personOf(roster?.r ?? null).person.channel)
-  return commandLevel(w && 'world' in w ? w.world : null, [...(records ? scriptsOf(records.checks) : []), ...(channel ? [channel] : [])])
+  return commandLevel(w && 'world' in w ? w.world : null, [...(await checkScripts($)), ...(channel ? [channel] : [])])
 }
 
 // An instance's Write or Edit of a command-level file, or of fleet's instances/: refused every time (its settings deny
