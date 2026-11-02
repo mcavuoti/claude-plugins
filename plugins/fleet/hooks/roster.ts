@@ -79,7 +79,17 @@ type Overrides = {
   /** What items from outside reach it (intake.ts): their tags, their kinds, the records they ask to change; a role's
    * and its instance's add up */
   subscribe?: { tags?: string[]; kinds?: string[]; paths?: string[] }
+  /** Where it works in each repository of world.json's code watch (code.ts), by the repository's name: a role's and its
+   * instance's add up, the instance's fields winning */
+  code?: Record<string, CodeSeat>
+  /** The roles or instances whose work it verifies: /fleet up --dry-run marks one that runs its model, since a
+   * different model reads their work afresh */
+  verifies?: string[]
 }
+/** An instance's place in a repository fleet watches: its worktrees (git: paths or globs relative to the project, or
+ * absolute on the repository's host; {slug} and {name} filled), its client workspace (Perforce; a command repository's
+ * open command gets it as {client}) */
+export type CodeSeat = { worktree?: string | string[]; client?: string }
 export type RoleSpec = Overrides
 export type InstanceSpec = Overrides & { name: string; role: string; section?: string; parent?: string; wave?: number; brief?: string }
 export type Zone = { permissions?: Permissions; settings?: Record<string, unknown> }
@@ -120,6 +130,10 @@ export type Instance = {
   settings: Record<string, unknown>
   /** What items from outside reach it: tags, kinds, the paths of the records they ask to change (globs) */
   subscribe: Subscription
+  /** Where it works in the repositories it names (code.ts): its worktrees as given (none: the defaults) and its client */
+  code: Record<string, { worktrees: string[]; client: string | null }>
+  /** The roles or instances whose work it verifies */
+  verifies: string[]
 }
 export type Subscription = { tags: string[]; kinds: string[]; paths: string[] }
 
@@ -244,6 +258,8 @@ export function instancesOf(r: Roster): Instance[] {
       permissions: mergePermissions(zone?.permissions, role.permissions, spec.permissions),
       settings: mergeSettings(isObject(r.settings) ? r.settings : undefined, zone?.settings, role.settings, spec.settings),
       subscribe: mergeSubscriptions(role.subscribe, spec.subscribe),
+      code: mergeCode(name, role.code, spec.code),
+      verifies: [...new Set([...strings(role.verifies), ...strings(spec.verifies)].map(v => v.trim()).filter(Boolean))],
     })
   }
   return out
@@ -259,6 +275,25 @@ function mergeSubscriptions(...layers: unknown[]): Subscription {
     out.paths.push(...strings(l.paths).filter(g => !checkGlob(g)))
   }
   return { tags: [...new Set(out.tags)], kinds: [...new Set(out.kinds)], paths: [...new Set(out.paths)] }
+}
+
+/** A role's code seats and its instance's, per repository: the instance's fields win; {slug} and {name} filled */
+function mergeCode(name: string, ...layers: unknown[]): Instance['code'] {
+  const out: Instance['code'] = {}
+  const fill = (s: string) => fillName(s.trim(), name, slugOf(name))
+  for (const l of layers) {
+    if (!isObject(l)) continue
+    for (const [repo, seat] of Object.entries(l)) {
+      if (!isObject(seat)) continue
+      const had = out[repo] ?? { worktrees: [], client: null }
+      const trees = typeof seat.worktree === 'string' ? [seat.worktree] : strings(seat.worktree)
+      out[repo] = {
+        worktrees: trees.length ? trees.map(fill).filter(Boolean) : had.worktrees,
+        client: typeof seat.client === 'string' && seat.client.trim() ? fill(seat.client) : had.client,
+      }
+    }
+  }
+  return out
 }
 
 /** The front door: the instance roster.json's person.front names, else the first whose role is chief; null without
@@ -403,6 +438,18 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
       errors.push(`"${i.name}": its journal "${i.journal}" is a path relative to the project, without . or .., and outside .claude/ (Claude asks before any write there, and nobody would answer)`)
     }
   }
+  // A verifier reads the others' work afresh only on another model: a mark when one whose work it verifies runs its own
+  for (const v of instances) {
+    for (const target of v.verifies) {
+      const of = Object.hasOwn(r.roles, target) ? instances.filter(i => i.role === target) : instances.filter(i => i.name.toLowerCase() === target.toLowerCase())
+      if (!of.length) {
+        warnings.push(`"${v.name}" verifies "${target}", which is no role or instance of the roster`)
+        continue
+      }
+      const same = of.filter(i => i !== v && modelKey(i.model) === modelKey(v.model))
+      if (same.length) warnings.push(`"${v.name}" runs ${v.model ?? 'the default model'}, as ${same.map(i => i.name).join(', ')}, whose work it verifies: a different model reads that work afresh (give one of them another "model")`)
+    }
+  }
   for (const spec of [...Object.values(r.roles), ...r.instances]) {
     if (isObject(spec) && spec.context !== undefined && spec.context !== 'long' && spec.context !== 'fresh') errors.push(`context is "long" or "fresh" (it's "${String(spec.context)}")`)
   }
@@ -421,7 +468,7 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
  * project). checkScripts: the scripts fleet runs as the person (the checks', the command channel's). instances/ is
  * denied too (its settings and state are fleet's), but it isn't changed through a change */
 export function commandLevel(world: WorldConfig | null, checkScripts: readonly string[]): { files: string[]; globs: string[] } {
-  const files = ['.claude/fleet/charter.md', '.claude/fleet/principles.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/fleet/outbound.json', '.claude/fleet/slots.json', ...checkScripts]
+  const files = ['.claude/fleet/charter.md', '.claude/fleet/principles.md', '.claude/fleet/verify.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/fleet/outbound.json', '.claude/fleet/slots.json', ...checkScripts]
   const globs = ['.claude/agents/**', ...commandGlobs(world)]
   return { files: [...new Set(files)], globs: [...new Set(globs)] }
 }
@@ -490,6 +537,16 @@ export function priceOf(model: string | null): { price: Price; by: 'id' | 'famil
   if (m in PRICES) return { price: PRICES[m as Family], by: 'id' }
   const f = familyOf(m)
   return f ? { price: PRICES[f], by: 'family' } : null
+}
+
+/** Which model a name runs, to tell two apart: an alias is its family's current generation; no model, Claude's default */
+export function modelKey(model: string | null): string {
+  if (!model) return 'default'
+  let m = model.trim().toLowerCase().replace(/\[[^\]]*\]$/, '')
+  const at = m.indexOf('claude-')
+  if (at > 0) m = m.slice(at)
+  m = m.replace(/@.*$/, '').replace(/-v\d+(:\d+)?$/, '').replace(/-\d{8}$/, '')
+  return m in PRICES ? `${m} (current)` : m.replace(/^claude-(haiku|sonnet|opus)-5-5$|^claude-(fable)-5-1$/, (_x, a, b) => `${a ?? b} (current)`)
 }
 
 /** What /fleet up --dry-run and /fleet status say of a model priced by its family only (null for one priced as itself) */
@@ -891,6 +948,47 @@ export function blocksLines(name: string, f: BlocksFile, offsetMin: number): str
     ? [`it goes in ${name}'s entry in roster.json (yours: edit it, then /fleet accept roster.json; /fleet up "${name}" rewrites its settings and u restarts it with them). A list without "$defaults" replaces auto mode's own rules`]
     : []
   return [head, ...fixes, ...where]
+}
+
+// ---- Trust before a later wave: what the earlier waves landed and how it stands, shown, never a refusal ----
+
+/** One instance of an earlier wave as /fleet up --wave n shows it: its landings outside its journal in the days kept
+ * (and on how many files), how many of those files are valid now (no check fails them, they carry their proof where
+ * one is due, they aren't suspect), the checks green and failing on them, proofs missing, suspects; the decisions of
+ * its the person rejected and the judge's answers on them he overruled (the register); today's spend */
+export type WaveFacts = {
+  name: string
+  landings: number
+  files: number
+  valid: number
+  green: number
+  failing: number
+  unproven: number
+  suspect: number
+  rejected: string[]
+  overruled: string[]
+  usd: number
+  cap: number | null
+}
+
+/** The record of the waves before n, a line each, and a warning for each one with nothing valid landed */
+export function waveRecordText(n: number, facts: readonly WaveFacts[], days: number): { lines: string[]; warnings: string[] } {
+  const before = n === 2 ? 'Wave 1' : `Waves 1 to ${n - 1}`
+  const lines = [`${before}'s record, what wave ${n} builds on (landings of the last ${days} days outside each one's journal; checks, proofs and suspects as they stand now; the register's rejections and overrules):`]
+  const warnings: string[] = []
+  const ids = (l: readonly string[]) => `${l.slice(0, 4).join(', ')}${l.length > 4 ? ` and ${l.length - 4} more` : ''}`
+  for (const f of facts) {
+    const parts: string[] = [f.landings ? `${f.landings} landing${f.landings === 1 ? '' : 's'} on ${f.files} file${f.files === 1 ? '' : 's'}, ${f.valid} valid` : 'nothing landed']
+    if (f.green || f.failing) parts.push(`checks ${f.green} green, ${f.failing} failing`)
+    if (f.unproven) parts.push(`${f.unproven} without ${f.unproven === 1 ? 'its' : 'their'} proof`)
+    if (f.suspect) parts.push(`${f.suspect} suspect`)
+    if (f.rejected.length) parts.push(`you rejected ${ids(f.rejected)}`)
+    if (f.overruled.length) parts.push(`you overruled the judge on ${ids(f.overruled)}`)
+    parts.push(`${usdOf(f.usd, f.cap)} today`)
+    lines.push(`  ${f.name}: ${parts.join('; ')}`)
+    if (!f.valid) warnings.push(`${f.name} has nothing valid landed (a file outside its journal it landed in the last ${days} days that no check fails, carries its proof where one is due and isn't suspect): wave ${n} builds on its work, so look first (/fleet up --wave ${n} starts the wave anyway)`)
+  }
+  return { lines, warnings }
 }
 
 // ---- Versions: an instance still running an older fleet ----

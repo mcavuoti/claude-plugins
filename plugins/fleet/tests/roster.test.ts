@@ -45,6 +45,8 @@ import {
   blocksLines,
   blocksMark,
   blocksToday,
+  modelKey,
+  waveRecordText,
   type Roster,
 } from '../hooks/roster'
 
@@ -147,7 +149,7 @@ test('the lints: what stops /fleet up, and what it only says', () => {
 
 test("the settings fleet writes: the roster's, then its env, model, effort and the denies of the command-level files", () => {
   const level = commandLevel({ worldFormat: 1, paths: ['req/**', 'notes/**'], command: ['req/**', 'spec/{a,b}.md', '../bad'] }, ['checks/board.sh'])
-  expect(level).toEqual({ files: ['.claude/fleet/charter.md', '.claude/fleet/principles.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/fleet/outbound.json', '.claude/fleet/slots.json', 'checks/board.sh'], globs: ['.claude/agents/**', 'req/**', 'spec/{a,b}.md'] })
+  expect(level).toEqual({ files: ['.claude/fleet/charter.md', '.claude/fleet/principles.md', '.claude/fleet/verify.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/fleet/outbound.json', '.claude/fleet/slots.json', 'checks/board.sh'], globs: ['.claude/agents/**', 'req/**', 'spec/{a,b}.md'] })
   expect(isCommandLevel('req/R-1.md', level, false)).toBe(true)
   expect(isCommandLevel('.claude/agents/chief.md', level, false)).toBe(true)
   expect(isCommandLevel('notes/a.md', level, false)).toBe(false)
@@ -156,6 +158,7 @@ test("the settings fleet writes: the roster's, then its env, model, effort and t
   expect(deny).toEqual([
     'Edit(//Users/x/proj/.claude/fleet/charter.md)',
     'Edit(//Users/x/proj/.claude/fleet/principles.md)',
+    'Edit(//Users/x/proj/.claude/fleet/verify.md)',
     'Edit(//Users/x/proj/.claude/fleet/roster.json)',
     'Edit(//Users/x/proj/.claude/fleet/world.json)',
     'Edit(//Users/x/proj/.claude/fleet/outbound.json)',
@@ -375,4 +378,41 @@ test('plan B: the sessions key settings.local.json repeats from the user setting
   ])
   expect(localSessionsRecords(list, '/Users/x/proj/')).toEqual([{ id: 'sessions@m', version: '0.13.0' }])
   expect(localSessionsRecords('oops', '/Users/x/proj')).toEqual([])
+})
+
+test('a verifier reads the work afresh only on another model: a mark when one it verifies runs its own', () => {
+  const r = roster({
+    roles: {
+      chief: { agent: 'chief', model: 'opus' },
+      worker: { agent: 'worker', model: 'sonnet' },
+      verifier: { agent: 'worker', model: 'claude-sonnet-5-5', verifies: ['worker', 'Nobody'] },
+    },
+    instances: [
+      { name: 'Lead', role: 'worker' },
+      { name: 'Area A', role: 'worker', model: 'opus' },
+      { name: 'Verifier', role: 'verifier' },
+    ],
+  })
+  const w = lintRoster(r, FILES).warnings
+  expect(w).toContain('"Verifier" verifies "Nobody", which is no role or instance of the roster')
+  expect(w).toContain('"Verifier" runs claude-sonnet-5-5, as Lead, whose work it verifies: a different model reads that work afresh (give one of them another "model")')
+  expect(w.filter(x => x.includes('Area A'))).toEqual([])
+  expect([modelKey('sonnet'), modelKey('claude-sonnet-5-5'), modelKey('us.anthropic.claude-sonnet-5-5-20261001'), modelKey('claude-sonnet-4-6'), modelKey(null)]).toEqual(['sonnet (current)', 'sonnet (current)', 'sonnet (current)', 'claude-sonnet-4-6', 'default'])
+})
+
+test("the record of the waves before a later one: each one's landings and how they stand, and a warning for nothing valid", () => {
+  const facts = [
+    { name: 'Chief', landings: 5, files: 3, valid: 2, green: 2, failing: 1, unproven: 1, suspect: 0, rejected: ['D-4'], overruled: ['D-7'], usd: 3.2, cap: 10 },
+    { name: 'Integrator', landings: 0, files: 0, valid: 0, green: 0, failing: 0, unproven: 0, suspect: 0, rejected: [], overruled: [], usd: 0, cap: null },
+  ]
+  const r = waveRecordText(2, facts, 7)
+  expect(r.lines).toEqual([
+    "Wave 1's record, what wave 2 builds on (landings of the last 7 days outside each one's journal; checks, proofs and suspects as they stand now; the register's rejections and overrules):",
+    '  Chief: 5 landings on 3 files, 2 valid; checks 2 green, 1 failing; 1 without its proof; you rejected D-4; you overruled the judge on D-7; $3.20 of $10.00 today',
+    '  Integrator: nothing landed; $0.00 today',
+  ])
+  expect(r.warnings).toEqual([
+    "Integrator has nothing valid landed (a file outside its journal it landed in the last 7 days that no check fails, carries its proof where one is due and isn't suspect): wave 2 builds on its work, so look first (/fleet up --wave 2 starts the wave anyway)",
+  ])
+  expect(waveRecordText(3, [], 7).lines[0]).toContain("Waves 1 to 2's record, what wave 3 builds on")
 })
