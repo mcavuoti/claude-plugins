@@ -698,6 +698,54 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
+// ---- Plan B: sessions from the person's user settings, never a copy pinned to the project ----
+// `claude plugin enable fleet@<m> --scope local` also writes `sessions@<m>: true` into the project's
+// settings.local.json; the first session there then makes a local install record of sessions at that version, which
+// `claude plugin update sessions@<m>` (user scope) never reaches. With the key gone, fleet's dependency is met by the
+// user's sessions.
+
+/** The sessions keys the project's settings.local.json enables that the person's user settings enable too */
+export function redundantSessionsKeys(local: unknown, user: unknown): string[] {
+  const on = (s: unknown) => (isObject(s) && isObject(s.enabledPlugins) ? s.enabledPlugins : {})
+  const mine = on(user)
+  return Object.entries(on(local))
+    .filter(([id, v]) => /^sessions@/.test(id) && !id.endsWith('@inline') && v === true && mine[id] === true)
+    .map(([id]) => id)
+}
+
+/** settings.local.json without those keys, everything else as it was (null: not an object fleet can rewrite) */
+export function withoutPlugins(text: string, ids: readonly string[]): string | null {
+  let v: unknown
+  try {
+    v = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (!isObject(v) || !isObject(v.enabledPlugins)) return null
+  const enabled = Object.fromEntries(Object.entries(v.enabledPlugins).filter(([id]) => !ids.includes(id)))
+  return `${JSON.stringify({ ...v, enabledPlugins: enabled }, null, 2)}\n`
+}
+
+/** The local install records of sessions for this project, from `claude plugin list --json` */
+export function localSessionsRecords(listJson: string, projectRoot: string): { id: string; version: string }[] {
+  let v: unknown
+  try {
+    v = JSON.parse(listJson)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(v)) return []
+  const norm = (p: string) => p.replace(/\/+$/, '')
+  return v
+    .filter((r): r is Record<string, unknown> => isObject(r) && typeof r.id === 'string' && /^sessions@/.test(r.id) && r.scope === 'local' && typeof r.projectPath === 'string' && norm(r.projectPath) === norm(projectRoot))
+    .map(r => ({ id: String(r.id), version: typeof r.version === 'string' ? r.version : '?' }))
+}
+
+/** The line that says so, and the one command that fixes it, run in the project */
+export function localRecordLine(r: { id: string; version: string }): string {
+  return `${r.id} ${r.version} is installed for this project alone (a local record), and \`claude plugin update ${r.id}\` never updates it: run \`claude plugin uninstall ${r.id} --scope local\` in the project (it warns that fleet requires it; fleet then uses your user-scope ${r.id.split('@')[0]})`
+}
+
 // ---- Picking instances by what the person typed ----
 
 /** The instances the words name (a name, any case, or its slug); quoted words keep their spaces. The whole line as

@@ -63,7 +63,7 @@ That writes `<project>/.claude/settings.local.json` in the project (yours only, 
 /fleet init <template>
 ```
 
-(Installing with `--scope local` instead also works, but it adds a second install record of `sessions` for that project, which a later update of `sessions` doesn't reach.)
+**`sessions` stays the one of your user settings.** The `enable` above also writes `sessions@mcavuoti: true` into `settings.local.json` ("also enabled 1 dependency"), and with that key the first session of the project installs a copy of `sessions` pinned to the project (a local install record) that `claude plugin update sessions@mcavuoti` never reaches. `/fleet init` takes the key out when your user settings enable `sessions` (it backs the file up first, as `settings.local.json.bak-antes-fleet`, and says so); `fleet` then loads with the `sessions` of your user settings. `/fleet init`, `/fleet status` and `/fleet up --dry-run` name a local copy that's already there, with the command that removes it, run in the project: `claude plugin uninstall sessions@mcavuoti --scope local` (it warns that `fleet` requires it: `fleet` goes on with your user-scope `sessions`). Installing `fleet` with `--scope local` instead makes the same copy, so it's the same fix.
 
 Whatever the install says about versions, `fleet` asks `sessions` at run time which API it serves. Without it (`sessions` missing, failed or too old), `fleet` still queues and delivers decisions but shows no session names or states and no section, can't start instances (`/fleet up` prints the `claude --bg` lines to paste instead), and `/fleet status` says to restart.
 
@@ -75,7 +75,7 @@ claude plugin update fleet@mcavuoti
 claude plugin update sessions@mcavuoti
 ```
 
-The one update at user scope reaches every project that turned `fleet` on. A running session keeps the `fleet` it started with: restart every session of each fleet project, the instances included (`u` on each row in the panel). Until you do, the sweeper marks an instance that runs an older `fleet` than its own (`u`, "runs fleet 0.6.0, installed 0.7.0: u restarts it"), and `/fleet status` says it on its line; sessions on another wire format act on nothing and say to restart.
+The one update at user scope reaches every project that turned `fleet` on, unless a project kept a copy of `sessions` of its own: `/fleet status` names it, with the command that removes it ([Install](#install)). A running session keeps the `fleet` it started with: restart every session of each fleet project, the instances included (`u` on each row in the panel). Until you do, the sweeper marks an instance that runs an older `fleet` than its own (`u`, "runs fleet 0.6.0, installed 0.7.0: u restarts it"), and `/fleet status` says it on its line; sessions on another wire format act on nothing and say to restart.
 
 ## Kickstart: from nothing to a running fleet
 

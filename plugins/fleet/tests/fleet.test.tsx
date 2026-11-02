@@ -345,3 +345,30 @@ test('dropping the decision of a session gone from the list closes it at once', 
   expect(json(w, `${DEC}/register/2026-11/D-5.json`)).toMatchObject({ state: 'abandoned', why: 'no longer needed' })
   expect(under(w, `${DEC}/queue`)).toEqual([])
 })
+
+test('plan B: /fleet init takes the sessions key out of settings.local.json, backed up; status and the dry run name a local record', WITH_SESSIONS, async ($, on) => {
+  const LOCAL = `${ROOT}/.claude/settings.local.json`
+  const before = JSON.stringify({ enabledPlugins: { 'fleet@m': true, 'sessions@m': true } }, null, 2)
+  const w = world(on, { fleet: false, background: false, env: { FLEET_CLAUDE: '/opt/x/claude' }, files: { [LOCAL]: before } })
+  on('settings.read', (_, e) => (e.source === 'user' ? { value: { enabledPlugins: { 'sessions@m': true } } } : undefined) as any)
+  const listed = JSON.stringify([
+    { id: 'sessions@m', version: '0.13.1', scope: 'user', enabled: true },
+    { id: 'sessions@m', version: '0.13.0', scope: 'local', enabled: true, projectPath: ROOT },
+  ])
+  w.exec.value = argv => (argv[0] === '/opt/x/claude' && argv.slice(1).join(' ') === 'plugin list --json' ? { exitCode: 0, stdout: listed } : undefined)
+  await startSession($, w)
+  const said = await fleet($, 'init')
+  expect(said).toContain('Took sessions@m out of .claude/settings.local.json (backed up as settings.local.json.bak-antes-fleet)')
+  expect(json(w, LOCAL)).toEqual({ enabledPlugins: { 'fleet@m': true } })
+  expect(w.files.get(`${LOCAL}.bak-antes-fleet`)).toBe(before)
+  expect(said).toContain('sessions@m 0.13.0 is installed for this project alone (a local record)')
+  expect(said).toContain('`claude plugin uninstall sessions@m --scope local`')
+  // Once the key is gone only the record is said; a second init keeps the first backup
+  w.files.set(LOCAL, JSON.stringify({ enabledPlugins: { 'fleet@m': true, 'sessions@m': true } }))
+  expect(await fleet($, 'status')).toContain('plan B: .claude/settings.local.json enables sessions@m for this project too')
+  await fleet($, 'init')
+  expect(w.files.get(`${LOCAL}.bak-antes-fleet`)).toBe(before)
+  const status = await fleet($, 'status')
+  expect(status).toContain('plan B: sessions@m 0.13.0 is installed for this project alone')
+  expect(status).not.toContain('enables sessions@m for this project too')
+})

@@ -29,6 +29,9 @@ import {
   slugOf,
   usd,
   usdOf,
+  localSessionsRecords,
+  redundantSessionsKeys,
+  withoutPlugins,
   wakeUsd,
   wakeVerdict,
   wakesOf,
@@ -250,4 +253,23 @@ test('the permission mode an instance runs in: managed, its own, the project\'s,
   expect(compareVersions('0.6.0', '0.7.0')).toBe(-1)
   expect(compareVersions('0.10.0', '0.9.2')).toBe(1)
   expect(compareVersions('0.7.1', '0.7.1')).toBe(0)
+})
+
+test('plan B: the sessions key settings.local.json repeats from the user settings, and a local record of it', () => {
+  const local = { enabledPlugins: { 'fleet@m': true, 'sessions@m': true, 'other@m': true }, env: { A: '1' } }
+  expect(redundantSessionsKeys(local, { enabledPlugins: { 'sessions@m': true, 'fleet@m': false } })).toEqual(['sessions@m'])
+  // the user's sessions isn't enabled (or this is a test copy, inline): the key stays
+  expect(redundantSessionsKeys(local, { enabledPlugins: { 'sessions@m': false } })).toEqual([])
+  expect(redundantSessionsKeys({ enabledPlugins: { 'sessions@inline': true } }, { enabledPlugins: { 'sessions@inline': true } })).toEqual([])
+  expect(redundantSessionsKeys(null, {})).toEqual([])
+  expect(JSON.parse(withoutPlugins(JSON.stringify(local), ['sessions@m']) as string)).toEqual({ enabledPlugins: { 'fleet@m': true, 'other@m': true }, env: { A: '1' } })
+  expect(withoutPlugins('not json', ['sessions@m'])).toBeNull()
+  const list = JSON.stringify([
+    { id: 'sessions@m', version: '0.13.1', scope: 'user', enabled: true },
+    { id: 'sessions@m', version: '0.13.0', scope: 'local', enabled: true, projectPath: '/Users/x/proj' },
+    { id: 'sessions@m', version: '0.12.0', scope: 'local', enabled: true, projectPath: '/Users/x/other' },
+    { id: 'fleet@m', version: '0.7.1', scope: 'local', projectPath: '/Users/x/proj' },
+  ])
+  expect(localSessionsRecords(list, '/Users/x/proj/')).toEqual([{ id: 'sessions@m', version: '0.13.0' }])
+  expect(localSessionsRecords('oops', '/Users/x/proj')).toEqual([])
 })

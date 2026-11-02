@@ -244,6 +244,8 @@ import {
   isCommandLevel,
   lintRoster,
   localDay,
+  localRecordLine,
+  localSessionsRecords,
   markRow,
   modeOf,
   modeWaits,
@@ -253,6 +255,7 @@ import {
   parseRoster,
   pickInstances,
   projectCap,
+  redundantSessionsKeys,
   settingsFor,
   settingsText,
   usd,
@@ -260,6 +263,7 @@ import {
   wakeUsd,
   wakeVerdict,
   wakesOf,
+  withoutPlugins,
   writesFiles,
   type BudgetState,
   type Instance,
@@ -5004,6 +5008,68 @@ async function settingsLayers($: any): Promise<{ policy: unknown; local: unknown
   return { policy: await source('policy'), local: await file(`${root}/.claude/settings.local.json`), project: await file(`${root}/.claude/settings.json`), user: await source('user') }
 }
 
+// ---- Plan B: sessions comes from the person's user settings, never from a copy pinned to the project (roster.ts) ----
+
+let claudeBin: string | null = null
+/** The claude command (FLEET_CLAUDE in a test), found once */
+async function claudeCommand($: any): Promise<string | null> {
+  if (claudeBin) return claudeBin
+  const fixed = await $.env.get('FLEET_CLAUDE')
+  if (fixed) return (claudeBin = String(fixed))
+  const which = await run($, ['/bin/sh', '-lc', 'command -v claude'])
+  const found = which.exitCode === 0 ? which.stdout.trim().split('\n').pop()?.trim() : ''
+  return found ? (claudeBin = found) : null
+}
+
+async function userSettings($: any): Promise<unknown> {
+  try {
+    return await $.settings.read({ source: 'user' })
+  } catch {
+    return {}
+  }
+}
+
+/** What keeps this project on its own copy of sessions: the key in settings.local.json that `claude plugin enable
+ * fleet… --scope local` added, and a local install record made from it. Lines only; /fleet init takes the key out */
+async function planBLines($: any, dir: string): Promise<string[]> {
+  const out: string[] = []
+  const text = await readText($, `${dir}/.claude/settings.local.json`)
+  let local: unknown = {}
+  try {
+    local = text === null ? {} : JSON.parse(text)
+  } catch {}
+  const keys = redundantSessionsKeys(local, await userSettings($))
+  if (keys.length) out.push(`.claude/settings.local.json enables ${keys.join(', ')} for this project too (\`claude plugin enable fleet… --scope local\` adds it): the next session here would install a copy pinned to this project that \`claude plugin update\` doesn't reach. /fleet init takes the key out (your user settings enable it already)`)
+  const bin = await claudeCommand($)
+  if (bin) {
+    const list = await run($, [bin, 'plugin', 'list', '--json'], { timeoutMs: 15000 })
+    if (list.exitCode === 0) out.push(...localSessionsRecords(list.stdout, dir).map(localRecordLine))
+  }
+  return out
+}
+
+/** /fleet init: the sessions key of settings.local.json that the person's user settings enable too goes, the file
+ * backed up first (settings.local.json.bak-antes-fleet, kept from the first time) */
+async function dropLocalSessions($: any, dir: string): Promise<string> {
+  const path = `${dir}/.claude/settings.local.json`
+  const text = await readText($, path)
+  if (text === null) return ''
+  let local: unknown
+  try {
+    local = JSON.parse(text)
+  } catch {
+    return ''
+  }
+  const keys = redundantSessionsKeys(local, await userSettings($))
+  const next = keys.length ? withoutPlugins(text, keys) : null
+  if (next === null) return ''
+  const backup = `${path}.bak-antes-fleet`
+  if (!(await exists($, backup))) await $.fs.write(backup, text)
+  if (!(await replace($, path, next))) return `Couldn't rewrite .claude/settings.local.json to take ${keys.join(', ')} out: take it out by hand (your user settings enable it).`
+  log($, `plan B: ${keys.join(', ')} taken out of ${path}`)
+  return `Took ${keys.join(', ')} out of .claude/settings.local.json (backed up as settings.local.json.bak-antes-fleet): your user settings enable it, and that key would make Claude install a copy pinned to this project that \`claude plugin update\` doesn't reach. Restart the sessions running here (u) to load it from your user settings.`
+}
+
 async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: string): Promise<string> {
   if (!c.dryRun && origin !== 'composer') return `${onlyPerson('starts instances', origin)}; /fleet up --dry-run shows the plan`
   const none = await freshRoster($)
@@ -5029,6 +5095,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   for (const k of derivedKinds) if (!all.some(i => ownsKind(k, i))) lint.warnings.push(`world.json: the owner of derived ${k.kind} ("${k.owner}") is no role or instance of the roster: nobody is told to refresh it`)
   await loadSlots($)
   if (slotsProblem) lint.warnings.push(slotsProblem)
+  lint.warnings.push(...(await planBLines($, root as string)))
   const down = await downSet($)
   const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: chosen.map(i => i.name) })) : null
   const plan = chosen.map(inst => {
@@ -6504,6 +6571,7 @@ async function statusCommand($: any): Promise<string> {
       if (await read($, stopped)) lines.push('delivery: waiting for you to type something here (an Esc stopped this session)')
     }
     lines.push(...(await rosterStatus($)))
+    lines.push(...(await planBLines($, root)).map(l => `plan B: ${l}`))
     lines.push(...(await outsideStatus($)))
     lines.push(...(await worldStatus($)))
   }
@@ -6568,6 +6636,9 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   if (fresh) worldReady = null
   roster = null
   await writeStamps($, await configFiles($))
+  // Plan B: sessions from the person's user settings, never a copy pinned here
+  const dropped = await dropLocalSessions($, here)
+  const planB = await planBLines($, here)
   timers($)
   if (!offered && (jobRef || !tasteOffered)) await offer($).catch(() => {})
   if (!jobRef) whyNot = "this isn't a background session: here the model asks with AskUserQuestion, and fleet records the answers"
@@ -6587,6 +6658,8 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
       : 'decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
     ...next,
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
+    dropped,
+    ...planB,
   ]
     .filter(Boolean)
     .join('\n')
