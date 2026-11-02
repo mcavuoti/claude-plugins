@@ -1179,6 +1179,12 @@ async function maybePrune($: any, records: QueueRecord[]) {
   for (const d of await names($, stateDir('alerts'))) {
     if (/^\d{4}-\d{2}-\d{2}$/.test(d) && now - Date.parse(`${d}T00:00:00Z`) > 2 * 24 * HOUR) await run($, ['rm', '-rf', stateDir(`alerts/${d}`)])
   }
+  // Intake's items as they arrived, duplicates and the ones set aside: a month; its dedup marks: three months (a poller
+  // that lists older mail again is rare)
+  await old(intakeDir('raw'), 30 * 24 * HOUR, () => false)
+  await old(intakeDir('dup'), 30 * 24 * HOUR, () => false)
+  await old(intakeDir('failed'), 30 * 24 * HOUR, () => false)
+  await old(intakeDir('seen'), 90 * 24 * HOUR, () => false)
   await pruneWorld($, now)
 }
 

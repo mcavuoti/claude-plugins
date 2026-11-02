@@ -260,6 +260,34 @@ test('the daily prune closes the decisions of a session gone from the list, keep
   expect(under(w, `${DEC}/prune`)).toEqual(['2026-11-02'])
 })
 
+test('the daily prune: intake’s raw items, duplicates and set-aside ones after 30 days, its dedup marks after 90', WITH_SESSIONS, async ($, on) => {
+  const DAY = 24 * 3600000
+  const intake = `${FLEET}/intake`
+  const w = world(on, {
+    background: false,
+    files: {
+      [`${intake}/raw/I-1.json`]: '{}',
+      [`${intake}/dup/k1-1.json`]: '{}',
+      [`${intake}/failed/mail-x.json`]: '{}',
+      [`${intake}/failed/mail-x.why`]: 'the model replied with no text, 3 tries\n',
+      [`${intake}/seen/k1.json`]: '{"format": 1}',
+    },
+  })
+  sessionsSay(w, { rows: {} })
+  const t0 = w.clock.now()
+  // A month on (the clock set with no session timers running): /fleet's beat runs that day's prune
+  await w.clock.set(t0 + 31 * DAY)
+  w.touch(`${intake}/raw/I-2.json`, '{}')
+  await fleet($, '')
+  await w.clock.settle()
+  expect(under(w, intake)).toEqual(['raw/I-2.json', 'seen/k1.json'])
+  // Three months on: the dedup mark goes too (and I-2, a month old by then)
+  await w.clock.set(t0 + 91 * DAY)
+  await fleet($, '')
+  await w.clock.settle()
+  expect(under(w, intake)).toEqual([])
+})
+
 test("the model's AskUserQuestion is recorded as the person answered it; Esc and chat as not answered", WITH_SESSIONS, async ($, on) => {
   const w = world(on, { background: false })
   const questions = [{ question: 'Which color?', header: 'Color', options: [{ label: 'Red', description: '' }, { label: 'Blue', description: '' }], multiSelect: false }]
