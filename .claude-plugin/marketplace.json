@@ -11,6 +11,13 @@
       "description": "Side panel with this folder's Claude Code sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, spend and token usage, a status line, and an API for other plugins",
       "category": "productivity",
       "tags": ["sessions", "background", "panel", "remote-control", "status-line"]
+    },
+    {
+      "name": "fleet",
+      "source": "./plugins/fleet",
+      "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost. Needs sessions",
+      "category": "productivity",
+      "tags": ["agents", "decisions", "background", "coordination"]
     }
   ]
 }

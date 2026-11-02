@@ -1,0 +1,9 @@
+{
+  "name": "fleet",
+  "version": "0.1.0",
+  "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost",
+  "author": { "name": "mcavuoti" },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "dependencies": [{ "name": "sessions", "version": ">=0.11.0" }]
+}
