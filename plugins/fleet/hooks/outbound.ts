@@ -485,12 +485,18 @@ function baseName(w: string): string {
 
 const KEYWORDS = new Set(['{', '}', '!', 'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', 'for', 'in', 'case', 'esac'])
 
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
+
 /** A simple command without what runs it: VAR=x, the shell's own words (if, then, do, {…), sudo, env, nohup, time,
- * command, exec, nice, timeout, xargs */
-export function stripPrefixes(words: readonly string[]): string[] {
+ * command, exec, nice, timeout, xargs. vars, when given, gets the VAR=x words it took off (before the command, or
+ * env's) */
+export function stripPrefixes(words: readonly string[], vars?: string[]): string[] {
   let w = [...words]
   for (let guard = 0; guard < 10 && w.length; guard++) {
-    while (w.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0] as string) || KEYWORDS.has(w[0] as string))) w = w.slice(1)
+    while (w.length && (ASSIGNMENT.test(w[0] as string) || KEYWORDS.has(w[0] as string))) {
+      if (vars && ASSIGNMENT.test(w[0] as string)) vars.push(w[0] as string)
+      w = w.slice(1)
+    }
     const c = baseName(w[0] ?? '')
     if (c === 'sudo' || c === 'doas') {
       let k = 1
@@ -498,7 +504,10 @@ export function stripPrefixes(words: readonly string[]): string[] {
       w = w.slice(k)
     } else if (c === 'env') {
       let k = 1
-      while (k < w.length && ((w[k] as string).startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[k] as string))) k += /^-[uCS]$/.test(w[k] as string) ? 2 : 1
+      while (k < w.length && ((w[k] as string).startsWith('-') || ASSIGNMENT.test(w[k] as string))) {
+        if (vars && ASSIGNMENT.test(w[k] as string)) vars.push(w[k] as string)
+        k += /^-[uCS]$/.test(w[k] as string) ? 2 : 1
+      }
       w = w.slice(k)
     } else if (c === 'nohup' || c === 'time' || c === 'command' || c === 'builtin' || c === 'exec' || c === 'caffeinate') {
       let k = 1
@@ -579,6 +588,70 @@ const LFTP_VALUE = /^-[eupcf]$/
 const SMB_VALUE = /^(-[UWcApIOmnsDTlRtdbLM]|--(user|workgroup|command|authentication-file|port|ip-address|socket-options|max-protocol|netbiosname|configfile|directory|tar|debuglevel|log-basename|list|message|name-resolve))$/
 const TAR_VALUE = /^(-[fCbTXgVKNLH]|--(file|directory|exclude|files-from|exclude-from|transform|xform|owner|group|mode|mtime|label|newer|after-date|newer-mtime|blocking-factor|use-compress-program|format|level|index-file|exclude-tag))$/
 
+/** The value a command's environment gives a variable (the last one that matches), or undefined */
+function envValue(vars: readonly string[], name: RegExp): string | undefined {
+  let out: string | undefined
+  for (const v of vars) {
+    const eq = v.indexOf('=')
+    if (eq > 0 && name.test(v.slice(0, eq)) && v.slice(eq + 1).trim()) out = v.slice(eq + 1).trim()
+  }
+  return out
+}
+
+/** Where a command's environment points what it sends (VAR=x before it, env VAR=x, or an export earlier on the line):
+ * the hosts an endpoint, registry or proxy variable names, which are destinations too (they must be allowed); and the
+ * variables that redirect it in a way fleet can't read (git's ssh command or configuration naming a url, a proxy
+ * command). A variable with no such meaning (DEBUG=1) says nothing */
+export function envDestinations(vars: readonly string[], cmd: string): { hosts: string[]; blind: string[]; names: string[] } {
+  const hosts: string[] = []
+  const blind: string[] = []
+  // The variables that point somewhere
+  const names: string[] = []
+  let name = ''
+  const add = (h: string | null) => {
+    if (h && !hosts.includes(h)) hosts.push(h)
+    if (h && !names.includes(name)) names.push(name)
+  }
+  for (const v of vars) {
+    const eq = v.indexOf('=')
+    name = v.slice(0, eq)
+    const value = v.slice(eq + 1).trim()
+    if (!value || /^no_proxy$/i.test(name)) continue
+    if ((cmd === 'git' && /^GIT_SSH_COMMAND$/i.test(name)) || (cmd === 'rsync' && /^RSYNC_RSH$/i.test(name))) {
+      // An ssh command line: the jump hosts and the host name it sets are destinations too; a proxy command can't be
+      // read
+      const { opts } = operands(commandsOf(value)[0]?.slice(1) ?? [], SSH_VALUE)
+      for (const o of opts) {
+        if (o.name === '-J') for (const j of (o.value ?? '').split(',')) add(hostOf(j))
+        const m = o.name === '-o' ? /^\s*(ProxyJump|HostName|ProxyCommand)\s*[= ]\s*(.*)$/i.exec(o.value ?? '') : null
+        if (m && /^proxycommand$/i.test(m[1] as string)) blind.push(name)
+        else if (m) for (const j of (m[2] as string).split(',')) add(hostOf(j.trim()))
+      }
+      continue
+    }
+    if (cmd === 'git' && /^(GIT_SSH|GIT_PROXY_COMMAND|GIT_CONFIG|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM)$/i.test(name)) blind.push(name)
+    else if (cmd === 'git' && /^(GIT_CONFIG_KEY_\d+|GIT_CONFIG_PARAMETERS)$/i.test(name)) {
+      if (/url|insteadof|proxy|sshcommand/i.test(value)) blind.push(name)
+    } else if (cmd === 'rsync' && /^RSYNC_CONNECT_PROG$/i.test(name)) blind.push(name)
+    else if (/^AZURE_STORAGE_CONNECTION_STRING$/i.test(name)) {
+      const endpoint = /BlobEndpoint=([^;]+)/i.exec(value)?.[1]
+      const account = /AccountName=([^;]+)/i.exec(value)?.[1]
+      add(endpoint ? hostOf(endpoint) : account ? cleanHost(`${account}.blob.core.windows.net`) : null)
+    } else if (/^AZURE_STORAGE_ACCOUNT$/i.test(name)) add(cleanHost(`${value}.blob.core.windows.net`))
+    // A proxy for the web's protocols (ssh, scp, nc and mail don't go through one)
+    else if (/PROXY/i.test(name)) {
+      if (!/^(ssh|scp|sftp|nc|ncat|netcat|mail|mailx|sendmail|mutt|smbclient)$/.test(cmd)) add(hostOf(value))
+    } else if (/ENDPOINT|REGISTR(Y|IES)|REPOSITORY_URL$|PUBLISH_URL$|^POETRY_REPOSITORIES_\w+_URL$|^(GH|GITLAB|GL|DOCKER|RUBYGEMS)_HOST$/i.test(name)) add(hostOf(value))
+  }
+  for (const n of blind) if (!names.includes(n)) names.push(n)
+  return { hosts, blind, names }
+}
+
+/** Words as a shell line again, each quoted */
+function quoted(words: readonly string[]): string {
+  return words.map(x => `'${x.replace(/'/g, `'\\''`)}'`).join(' ')
+}
+
 /** The registry an image name names (registry.example.com/x:1, localhost:5000/x); null when it names none (docker's
  * own default is docker.io, podman's is its configuration's) */
 export function registryOf(image: string): string | null {
@@ -624,11 +697,33 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
   const of = (files: readonly string[]): string => (files.length ? ` of ${files.join(', ')}` : '')
   const targets: string[] = []
   const archived: string[] = []
+  // The line's environment (an export earlier on it, VAR=x alone) and the sends it points elsewhere
+  const lineVars: string[] = []
+  const envSends: Send[] = []
   for (const raw of commandsOf(line, 0, targets)) {
-    const w = stripPrefixes(raw)
-    if (!w.length) continue
+    const own: string[] = []
+    const w = stripPrefixes(raw, own)
+    if (!w.length || baseName(w[0] as string) === 'export') {
+      lineVars.push(...own, ...w.slice(1).filter(x => ASSIGNMENT.test(x)))
+      continue
+    }
+    const vars = [...lineVars, ...own]
     const cmd = baseName(w[0] as string)
     const rest = w.slice(1)
+    // An endpoint, registry or proxy its environment names is a destination too, when the command sends at all
+    const env = vars.length ? envDestinations(vars, cmd) : { hosts: [], blind: [], names: [] }
+    const elsewhere = env.hosts.filter(h => !hostAllowed(h, c))
+    if (elsewhere.length || env.blind.length) {
+      const alone = classifyBash(quoted(w), newOutbound())
+      if (alone.sends.length || alone.pushes.length) {
+        envSends.push({
+          what: `${cmd} with ${env.names.join(', ')}`,
+          to: [...elsewhere, ...env.blind.map(n => `where ${n} points`)],
+          files: [...new Set(alone.sends.flatMap(s => s.files))],
+          ...(elsewhere.length && !env.blind.length ? { hosts: elsewhere } : {}),
+        })
+      }
+    }
     if (c.commands.some(x => x === cmd)) {
       sends.push({ what: cmd, to: ['outside'], files: [] })
       continue
@@ -720,7 +815,8 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
     if (cmd === 'gh' || cmd === 'glab') {
       // GitHub's CLI, and GitLab's with the same verbs (and note, its comment)
       const { args, opts } = operands(rest, GH_VALUE)
-      const host = (opts.find(o => o.name === '--hostname')?.value ?? (cmd === 'gh' ? 'github.com' : 'gitlab.com')).toLowerCase()
+      const named = opts.find(o => o.name === '--hostname')?.value ?? envValue(vars, cmd === 'gh' ? /^GH_HOST$/i : /^(GITLAB_HOST|GL_HOST)$/i)
+      const host = (named ? hostOf(named) : null) ?? (cmd === 'gh' ? 'github.com' : 'gitlab.com')
       if (hostAllowed(host, c)) continue
       const [group = '', verb = ''] = args
       const writes = ['create', 'comment', 'edit', 'upload', 'review', ...(cmd === 'glab' ? ['note'] : [])]
@@ -746,7 +842,7 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       const { args, opts } = operands(rest, PKG_VALUE)
       const berry = cmd === 'yarn' && args[0] === 'npm'
       if ((berry ? args[1] : args[0]) !== 'publish' || opts.some(o => o.name === '--dry-run')) continue
-      const registry = opts.find(o => o.name === '--registry')?.value
+      const registry = opts.find(o => o.name === '--registry')?.value ?? envValue(vars, /^(npm_config_registry|yarn_registry|yarn_npm_publish_registry|yarn_npm_registry_server)$/i)
       const files = locals(args.slice(berry ? 2 : 1))
       toHost(`${cmd} publish${of(files)}`, registry ? hostOf(registry) : null, `the registry ${cmd} is set to`, files)
       continue
@@ -763,7 +859,7 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       const verb = cmd === 'twine' ? 'upload' : cmd === 'poetry' ? 'publish' : 'push'
       if (args[0] !== verb || opts.some(o => o.name === '--dry-run')) continue
       // poetry's --repository is a name of its configuration, not an address
-      const url = cmd === 'poetry' ? undefined : opts.find(o => o.name === (cmd === 'twine' ? '--repository-url' : '--host'))?.value
+      const url = cmd === 'poetry' ? undefined : (opts.find(o => o.name === (cmd === 'twine' ? '--repository-url' : '--host'))?.value ?? envValue(vars, cmd === 'twine' ? /^TWINE_REPOSITORY_URL$/i : /^RUBYGEMS_HOST$/i))
       const files = cmd === 'poetry' ? [] : locals(args.slice(1))
       toHost(`${cmd} ${verb}${of(files)}`, url ? hostOf(url) : null, cmd === 'gem' ? 'the gem server gem is set to' : `the package index ${cmd} is set to`, files)
       continue
@@ -804,7 +900,7 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
         bucket = opts.find(o => o.name === '--bucket')?.value ?? null
         files = locals([opts.find(o => o.name === '--body')?.value ?? ''])
       } else continue
-      const endpoint = opts.find(o => o.name === '--endpoint-url')?.value
+      const endpoint = opts.find(o => o.name === '--endpoint-url')?.value ?? envValue(vars, /^AWS_ENDPOINT_URL_S3$/i) ?? envValue(vars, /^AWS_ENDPOINT_URL$/i)
       toHost(`aws ${service} ${sub}${of(files)}`, endpoint ? hostOf(endpoint) : bucket ? cleanHost(`${bucket}.s3.amazonaws.com`) : null, 'a bucket fleet can’t read', files)
       continue
     }
@@ -887,6 +983,11 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
   for (const t of targets) {
     const m = /^\/dev\/(tcp|udp)\/([^/]+)\/[^/]+$/.exec(t)
     if (m) toHost(`a redirection to /dev/${m[1]}`, cleanHost(m[2] as string), t)
+  }
+  // What the environment points elsewhere, where the command's own sends don't name it already
+  for (const s of envSends) {
+    const to = s.to.filter(h => !sends.some(x => x.to.includes(h)))
+    if (to.length) sends.push({ ...s, to, ...(s.hosts ? { hosts: s.hosts.filter(h => to.includes(h)) } : {}) })
   }
   const first = sends[0]
   if (first && archived.length) first.files = [...new Set([...first.files, ...archived])]
