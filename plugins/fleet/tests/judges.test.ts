@@ -86,7 +86,7 @@ test('the gates, before any model: money, the outside world, what can’t be und
   expect(gateOf({ ...f, text: 'Pay the Invoice now?' }, c)).toBe('it matches world.json\'s judges.hold "invoice"')
   expect(gateOf({ ...f, asker: { name: 'Janitor', role: 'janitor' } }, c)).toBe("its asker is in world.json's judges.skip")
   // The money pattern the templates ship: a question about spending holds even when its asker said touchesMoney false
-  const money = judgesOf({ worldFormat: 1, paths: [], judges: { hold: ['\\b(spend\\w*|spent|pric\\w*|pay|paid|payments?|invoic\\w*|purchas\\w*|refund\\w*|dollars?|euros?|usd|eur)\\b|[$€£]\\s?\\d'] } }).judges
+  const money = judgesOf({ worldFormat: 1, paths: [], judges: { hold: ['\\b(spend\\w*|spent|pric\\w*|pay|paid|payments?|invoic\\w*|purchas\\w*|refund\\w*|dollars?|euros?|usd|eur)\\b|[$€£]\\s?\\d|\\d\\s?[$€£]'] } }).judges
   const asked = (question: string) => gateOf({ ...f, touchesMoney: false, text: decisionText({ questions: [{ ...DB, question }] }) }, money)
   expect(asked('What is the most you want to spend on the first year?')).toContain("it matches world.json's judges.hold")
   expect(asked('Renew the hosting plan at €40 a month?')).toContain('judges.hold')
@@ -98,6 +98,9 @@ test('the gates, before any model: money, the outside world, what can’t be und
   expect(asked('Owner C is over its budget: wait for tomorrow?')).toBe(null)
   expect(asked('Set $HOME in the script?')).toBe(null)
   expect(asked('Buy 3 seats at 20 USD?')).toContain('judges.hold')
+  // An amount written before its sign, as in Spanish or French
+  expect(asked('Comprar el dominio por 15 €?')).toContain('judges.hold')
+  expect(asked('100 € per month for the plan?')).toContain('judges.hold')
 })
 
 test('the case law: only the person’s answers (never a judge’s own), dialogs, corrections, and taste he typed', () => {

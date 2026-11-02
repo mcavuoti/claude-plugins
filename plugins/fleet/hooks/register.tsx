@@ -1236,14 +1236,22 @@ async function beat($: any) {
   const n = heldCount(records, present)
   if ((await read($, held)) !== n) await update($, held, () => n)
   await loadRoster($)
-  // Over budget and running (its fleet beat in the last 3 min): one that's stopped spends nothing more today
+  // Over budget and running: one that's stopped spends nothing more today. Running as sessions sees it (as /fleet
+  // status says); its fleet's heartbeat (beat in the last 3 min) only when sessions doesn't answer
   let o = 0
   if (roster) {
-    const now = await $.clock.now()
-    for (const b of await budgets($)) {
-      if (b.state !== 'over') continue
-      const hb = await heartbeatOf($, b.inst.slug)
-      if (hb && now - hb.at < HEARTBEAT_STALE_MS) o++
+    const over = (await budgets($)).filter(b => b.state === 'over')
+    if (over.length) {
+      const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: over.map(b => b.inst.name) })) : null
+      const now = await $.clock.now()
+      for (const b of over) {
+        if (st?.ready) {
+          if (rowsOf(b.inst, st.rows).running) o++
+          continue
+        }
+        const hb = await heartbeatOf($, b.inst.slug)
+        if (hb && now - hb.at < HEARTBEAT_STALE_MS) o++
+      }
     }
   }
   if ((await read($, overBudget)) !== o) await update($, overBudget, () => o)
@@ -5881,7 +5889,7 @@ async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, n
   if (shown.length) lines.push('```diff', ...shown, '```')
   if (more) lines.push(`   and ${more} more lines in ${fleetDir()}/${spec.diff}`)
   // Its file moved since it was drafted (another change applied, or an edit): apply would refuse it as stale
-  if (moved) lines.push(`   ⚠ stale: ${spec.path} changed since this was drafted, so it can't apply as it is: /fleet ${n} reject (its asker can draft it again on the file as it is)`)
+  if (moved) lines.push(`   ⚠ stale: ${spec.path} changed since this was drafted, so it can't apply as it is: /fleet ${n} reject closes it as stale (its asker hears the file moved and can draft it again on the file as it is; with a note, it's your rejection)`)
   else lines.push(`   draft ${fleetDir()}/${spec.draft} (${shortHash(spec.result)}) · /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit to change the draft first`)
   if (spec.circular?.length) lines.push(`   ⚠ ${circularWords(spec.circular)}.`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
@@ -5915,6 +5923,13 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   }
   const say = (label: string, text?: string) => publish($, answerPath, json({ format: FORMAT, id: rec.id, q: 1, label, ...(text ? { text } : {}), origin, session: here, at: now, ...(pre ? { pre: true, quoted: pre.quoted } : {}) }))
   if (it.verb === 'reject') {
+    // A change whose file moved since it was drafted, rejected with no note of his: it couldn't apply anyway, so its
+    // asker hears that (stale: read it again, file it anew), and it isn't his rejection (the wave record, the judges)
+    if (!it.note && (await changeMoved($, spec))) {
+      const why = `${spec.path} changed after ${rec.id} was drafted`
+      const r = await say('stale', why)
+      return r === 'ok' ? { line: `${n}: closed ${rec.id} as stale (${why}). ${(await askerViews($, [rec]))(rec).name} hears the file moved, and can draft it again.`, done: true } : { line: `${n}: ${r === 'exists' ? `${rec.id} was answered meanwhile` : "couldn't save the answer"}`, done: false }
+    }
     await saveNote($, rec.id, it.note, origin)
     const r = await say('rejected')
     return r === 'ok' ? { line: `${n}: rejected ${rec.id} (the change to ${spec.path}). ${(await askerViews($, [rec]))(rec).name} hears it.`, done: true } : { line: `${n}: ${r === 'exists' ? `${rec.id} was answered meanwhile` : "couldn't save the answer"}`, done: false }
@@ -5961,7 +5976,7 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   const { records } = await queueRecords($)
   const present = await answerNames($)
   const rivals = records.filter(r => r.id !== rec.id && r.kind === 'change' && r.change?.path === spec.path && !progress(r.id, slots(r), present).complete).map(r => r.id)
-  const stale = rivals.length ? ` ${rivals.join(', ')} ${rivals.length === 1 ? 'changes' : 'change'} ${spec.path} too, drafted on the version it just left, so ${rivals.length === 1 ? "it can't" : "they can't"} apply: /fleet ${rivals.map(id => `${id} reject`).join(' ')}` : ''
+  const stale = rivals.length ? ` ${rivals.join(', ')} ${rivals.length === 1 ? 'changes' : 'change'} ${spec.path} too, drafted on the version it just left, so ${rivals.length === 1 ? "it can't" : "they can't"} apply: /fleet ${rivals.map(id => `${id} reject`).join(' ')} closes ${rivals.length === 1 ? 'it' : 'them'} as stale (${rivals.length === 1 ? 'its asker hears' : 'their askers hear'} the file moved, and can draft again)` : ''
   return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effectOf(spec.path)}. ${who} hears it.${stale}`, done: true, applied: true }
 }
 
@@ -6260,7 +6275,7 @@ async function userSettings($: any): Promise<unknown> {
 
 /** What keeps this project on its own copy of sessions: the key in settings.local.json that `claude plugin enable
  * fleet… --scope local` added, and a local install record made from it. Lines only; /fleet init takes the key out */
-async function planBLines($: any, dir: string): Promise<string[]> {
+async function planBLines($: any, dir: string, skip: readonly string[] = []): Promise<string[]> {
   const out: string[] = []
   const text = await readText($, `${dir}/.claude/settings.local.json`)
   let local: unknown = {}
@@ -6272,7 +6287,7 @@ async function planBLines($: any, dir: string): Promise<string[]> {
   const bin = await claudeCommand($)
   if (bin) {
     const list = await run($, [bin, 'plugin', 'list', '--json'], { timeoutMs: 15000 })
-    if (list.exitCode === 0) out.push(...localSessionsRecords(list.stdout, dir).map(localRecordLine))
+    if (list.exitCode === 0) out.push(...localSessionsRecords(list.stdout, dir).filter(r => !skip.includes(r.id)).map(localRecordLine))
   }
   return out
 }
@@ -6329,21 +6344,28 @@ async function keepInMainCheckout($: any, here: string, path: string): Promise<s
 
 /** /fleet init: a copy of sessions installed for this project alone (the first session here made it, before init took
  * the key out) is uninstalled, run in the project as Claude's own command needs (its warning that fleet requires it is
- * expected: fleet goes on with the user-scope sessions). Lines saying what was done, and to restart (u) */
-async function uninstallLocalSessions($: any, dir: string): Promise<string[]> {
+ * expected: fleet goes on with the user-scope sessions), only when the person's user settings enable that sessions
+ * (the same test as the key's; otherwise the project would be left without one). Lines saying what was done, and to
+ * restart (u), and the records it tried (their line isn't said again) */
+async function uninstallLocalSessions($: any, dir: string): Promise<{ lines: string[]; tried: string[] }> {
+  const none = { lines: [], tried: [] }
   const bin = await claudeCommand($)
-  if (!bin) return []
+  if (!bin) return none
   const list = await run($, [bin, 'plugin', 'list', '--json'], { timeoutMs: 15000 })
-  if (list.exitCode !== 0) return []
+  if (list.exitCode !== 0) return none
+  const user = await userSettings($)
+  const enabled = (id: string) => plainObject(user) && plainObject(user.enabledPlugins) && user.enabledPlugins[id] === true
   const out: string[] = []
-  for (const r of localSessionsRecords(list.stdout, dir)) {
+  const tried: string[] = []
+  for (const r of localSessionsRecords(list.stdout, dir).filter(r => enabled(r.id))) {
+    tried.push(r.id)
     const u = await run($, [bin, 'plugin', 'uninstall', r.id, '--scope', 'local'], { cwd: dir, timeoutMs: 30000 })
     if (u.exitCode === 0) {
       log($, `plan B: the local record of ${r.id} ${r.version} uninstalled in ${dir}`)
       out.push(`Uninstalled ${r.id} ${r.version}, which was installed for this project alone (a local record that \`claude plugin update\` never reaches): fleet uses your user-scope ${r.id.split('@')[0]}. Restart the sessions running here (u) to load it.`)
     } else out.push(`${localRecordLine(r)} (fleet tried: ${(u.stderr || u.stdout).trim().split('\n').pop()?.slice(0, 200) || `exit ${u.exitCode}`})`)
   }
-  return out
+  return { lines: out, tried }
 }
 
 /** The record of the instances of the waves before n (roster.ts waveRecordText), from the project's files: the landings
@@ -7627,7 +7649,7 @@ async function listCommand($: any): Promise<string> {
     // The example names no option: a letter in it would read as a suggestion
     const how = asked ? `answer with /fleet ${firstAsked}<letter>, or ${firstAsked} "your words"` : count.change ? 'answer with /fleet 1 apply' : count.resource ? 'answer with /fleet 1 done' : 'answer with /fleet 1 send'
     out.push(`${what} for you · ${how} · /fleet help`, '', shown.join('\n\n'))
-    if (stale.length > 1) out.push('', `${stale.length} changes can't apply any more (their files moved since they were drafted): /fleet ${stale.join(' ')} rejects them all`)
+    if (stale.length > 1) out.push('', `${stale.length} changes can't apply any more (their files moved since they were drafted): /fleet ${stale.join(' ')} closes them all as stale (their askers hear the files moved, and can draft again)`)
   } else out.push('Nothing is waiting for you in this project.')
   if (waiting.length) out.push('', 'Answered, not delivered yet:', ...waiting)
   if (other) out.push('', `${other} decision${other === 1 ? ' was' : 's were'} asked by a fleet with another format: restart the sessions (u)`)
@@ -8304,7 +8326,7 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   // Plan B: sessions from the person's user settings, never a copy pinned here
   const dropped = await dropLocalSessions($, here)
   const uninstalled = await uninstallLocalSessions($, here)
-  const planB = await planBLines($, here)
+  const planB = await planBLines($, here, uninstalled.tried)
   timers($)
   if (!offered && (jobRef || !tasteOffered)) await offer($).catch(() => {})
   if (!jobRef) whyNot = "this isn't a background session: here the model asks with AskUserQuestion, and fleet records the answers"
@@ -8326,7 +8348,7 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
     isolation,
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
     dropped,
-    ...uninstalled,
+    ...uninstalled.lines,
     ...planB,
   ]
     .filter(Boolean)

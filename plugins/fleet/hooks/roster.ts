@@ -421,9 +421,12 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
     }
     const f = parseRoleFile(text)
     if (f.name !== null && f.name !== agent) errors.push(`.claude/agents/${agent}.md is named "${f.name}" in its front matter: --agent ${agent} finds a role by that name`)
-    // AskUserQuestion stays in a role's tools: sessions' Stop and Restart ask through it in that session, and fleet
-    // refuses the model's own call there (it asks with decide)
     if (!seesFleet(f.tools)) errors.push(`.claude/agents/${agent}.md: its tools don't list mcp__fleet__*, so fleet's tools would be hidden from it (and its start would hold 8 s)`)
+    // sessions' Stop and Restart (s and u in the panel) ask in that session through AskUserQuestion and hand the answer
+    // back through SendMessage: a tools line without them leaves s doing nothing there (fleet refuses the model's own
+    // AskUserQuestion in an instance, so it still asks with decide). No tools line has them all
+    const lacking = f.tools === null || f.tools.includes('*') ? [] : ['AskUserQuestion', 'SendMessage'].filter(t => !(f.tools as string[]).includes(t))
+    if (lacking.length) warnings.push(`.claude/agents/${agent}.md: its tools don't list ${lacking.join(' or ')}: add ${lacking.length > 1 ? 'them' : 'it'}, or s and u in the panel can't ask that session (the stop or restart is asked there and answered back)`)
   }
   for (const i of instances) {
     if (i.model !== null && !priceOf(i.model)) warnings.push(`"${i.name}": no price known for the model "${i.model}": the forecast leaves it out`)

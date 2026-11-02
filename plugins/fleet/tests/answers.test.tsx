@@ -129,7 +129,7 @@ test('Remote Control: answers are taken (pick, change, resource); what changes t
   expect(await fleet($, '1a', { kind: 'plugin', name: 'other' })).toContain('Only the person answers, typing /fleet at a terminal or over Remote Control (this came from plugin)')
 })
 
-test('a change applied leaves the others to its file stale: the list says so and rejects them all in one go', WITH_SESSIONS, async ($, on) => {
+test('a change applied leaves the others to its file stale: the list says so, and reject closes them as stale (with a note, it is his rejection)', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Owner A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
   await startSession($, w)
@@ -138,13 +138,16 @@ test('a change applied leaves the others to its file stale: the list says so and
   expect(list).toContain('3 changes for you')
   const applied = await fleet($, '1 apply')
   expect(applied).toContain('1: applied D-1: fleet wrote .claude/fleet/charter.md as drafted')
-  expect(applied).toContain('D-2, D-3 change .claude/fleet/charter.md too, drafted on the version it just left, so they can\'t apply: /fleet D-2 reject D-3 reject')
+  expect(applied).toContain("D-2, D-3 change .claude/fleet/charter.md too, drafted on the version it just left, so they can't apply: /fleet D-2 reject D-3 reject closes them as stale (their askers hear the file moved, and can draft again)")
   const again = await fleet($, '')
   expect(again).toContain('⚠ stale: .claude/fleet/charter.md changed since this was drafted')
-  expect(again).toContain("2 changes can't apply any more (their files moved since they were drafted): /fleet 1 reject 2 reject rejects them all")
-  const rejected = await fleet($, 'D-2 reject D-3 reject')
-  expect(rejected).toContain('D-2: rejected D-2')
-  expect(rejected).toContain('D-3: rejected D-3')
+  expect(again).toContain("2 changes can't apply any more (their files moved since they were drafted): /fleet 1 reject 2 reject closes them all as stale (their askers hear the files moved, and can draft again)")
+  const closed = await fleet($, 'D-2 reject D-3 reject "not this goal"')
+  expect(closed).toContain('D-2: closed D-2 as stale (.claude/fleet/charter.md changed after D-2 was drafted). Owner A hears the file moved, and can draft it again.')
+  expect(closed).toContain('D-3: rejected D-3')
+  // The asker hears the stale outcome (draft again), not "don't make it another way"; the noted one is his rejection
+  expect(json(w, `${DEC}/answers/D-2.1.json`)).toMatchObject({ label: 'stale', text: '.claude/fleet/charter.md changed after D-2 was drafted' })
+  expect(json(w, `${DEC}/answers/D-3.1.json`)).toMatchObject({ label: 'rejected' })
 })
 
 test('the person answers in the asker’s own session: the turn hears which question waits, and decide kind answered takes it off the queue with their words', WITH_SESSIONS, async ($, on) => {

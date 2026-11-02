@@ -51,7 +51,7 @@ import {
 } from '../hooks/roster'
 
 const ROOT = '/Users/x/proj'
-const ROLE = (name: string, tools = 'Read, Write, mcp__fleet__*') => `---\nname: ${name}\ndescription: a role\ntools: ${tools}\n---\nThe charter.\n`
+const ROLE = (name: string, tools = 'Read, Write, AskUserQuestion, SendMessage, mcp__fleet__*') => `---\nname: ${name}\ndescription: a role\ntools: ${tools}\n---\nThe charter.\n`
 
 function roster(extra: Partial<Roster> = {}): Roster {
   return {
@@ -101,7 +101,7 @@ test("instances: the role's fields under the instance's, sections in order after
 })
 
 test('role files: the name and the tools of the front matter, in each form', () => {
-  expect(parseRoleFile(ROLE('chief'))).toEqual({ name: 'chief', tools: ['Read', 'Write', 'mcp__fleet__*'] })
+  expect(parseRoleFile(ROLE('chief'))).toEqual({ name: 'chief', tools: ['Read', 'Write', 'AskUserQuestion', 'SendMessage', 'mcp__fleet__*'] })
   expect(parseRoleFile('---\nname: "x"\ntools: [Read, "Bash"]\n---\n')).toEqual({ name: 'x', tools: ['Read', 'Bash'] })
   expect(parseRoleFile('---\nname: x\ntools:\n  - Read\n  - mcp__fleet\n---\n')).toEqual({ name: 'x', tools: ['Read', 'mcp__fleet'] })
   expect(parseRoleFile('---\nname: x\n---\nall tools')).toEqual({ name: 'x', tools: null })
@@ -138,11 +138,17 @@ test('the lints: what stops /fleet up, and what it only says', () => {
   const over = lintRoster(roster({ budget: { usdDay: 10 } }), FILES)
   expect(over.warnings[0]).toContain("the instances' budgets add up to $17.00 a day, over the project's $10.00")
   expect(lintRoster(roster({ instances: [] }), FILES).warnings).toEqual(['the roster has no instances yet: nothing to start'])
-  // AskUserQuestion in a role's tools (or every tool, with no tools line) is fine: sessions' Stop asks through it, and
-  // fleet refuses the model's own call in a background session
-  const every = lintRoster(roster(), new Map([['chief', '---\nname: chief\n---\nall tools'], ['worker', ROLE('worker', 'Read, AskUserQuestion, mcp__fleet__*')]]))
+  // AskUserQuestion and SendMessage in a role's tools (or every tool, with no tools line) are what sessions' Stop needs
+  // there; a tools line without them is marked with what to add
+  const every = lintRoster(roster(), new Map([['chief', '---\nname: chief\n---\nall tools'], ['worker', ROLE('worker', 'Read, AskUserQuestion, SendMessage, mcp__fleet__*')]]))
   expect(every.errors).toEqual([])
   expect(every.warnings).toEqual([])
+  const old = lintRoster(roster(), new Map([['chief', ROLE('chief', 'Read, mcp__fleet__*')], ['worker', ROLE('worker', 'Read, AskUserQuestion, mcp__fleet__*')]]))
+  expect(old.errors).toEqual([])
+  expect(old.warnings).toEqual([
+    ".claude/agents/chief.md: its tools don't list AskUserQuestion or SendMessage: add them, or s and u in the panel can't ask that session (the stop or restart is asked there and answered back)",
+    ".claude/agents/worker.md: its tools don't list SendMessage: add it, or s and u in the panel can't ask that session (the stop or restart is asked there and answered back)",
+  ])
 })
 
 test("the settings fleet writes: the roster's, then its env, model, effort and the denies of the command-level files", () => {

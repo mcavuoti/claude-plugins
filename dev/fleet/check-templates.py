@@ -186,6 +186,10 @@ for t in templates:
         tools = [x.strip() for x in fm.get('tools', '').strip('[]').split(',') if x.strip()]
         if 'tools' in fm and not any(x in ('mcp__fleet__*', 'mcp__fleet') for x in tools):
             say(path, "its tools don't list mcp__fleet__*")
+        # sessions' Stop and Restart ask in the instance through AskUserQuestion and answer back through SendMessage
+        for need in ('AskUserQuestion', 'SendMessage'):
+            if 'tools' in fm and '*' not in tools and need not in tools:
+                say(path, f"its tools don't list {need} (s and u in the panel need it in that session)")
         seed = t / 'fleet' / spec.get('seed', f'seeds/{role}.md')
         if not seed.is_file():
             say(seed, f'missing: the seed of {role}')
