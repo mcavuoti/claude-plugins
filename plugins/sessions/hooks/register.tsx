@@ -230,8 +230,16 @@ function sys($: any): Run {
   return (argv, init) => runSafe($, argv, init)
 }
 
+// This session's short id, the one `claude attach` takes and the agent view shows: the official list's. It stays across
+// /clear while the session id changes, so it isn't the session id's start once the session was cleared; that start is
+// only the fallback until the list has this session
+function myShortId(): string {
+  const id = lastList.find(s => s.sessionId === myId)?.id
+  return typeof id === 'string' && id ? id : myId.slice(0, 8)
+}
+
 function me(): Me {
-  return { shortId: myId.slice(0, 8), pid: myPid || undefined, background: lastList.find(s => s.sessionId === myId)?.kind === 'background' }
+  return { shortId: myShortId(), pid: myPid || undefined, background: lastList.find(s => s.sessionId === myId)?.kind === 'background' }
 }
 
 // Work started and not awaited: a failure (or the mod being reloaded meanwhile) is dropped quietly
@@ -333,8 +341,7 @@ async function switchInPlace($: any, target: WindowTarget, front: string): Promi
 
 async function myWindows($: any): Promise<string[]> {
   const v = await windows($)
-  const short = myId.slice(0, 8)
-  const list = [...(v.byId[short] ?? [])]
+  const list = [...(v.byId[myShortId()] ?? [])]
   const own = myPid ? v.byPid[String(myPid)] : undefined
   if (own) list.push(own)
   return list
@@ -351,7 +358,7 @@ async function markSeenIfLooking($: any) {
   if (!tty || !(await platform.userPresent(sys($)))) return
   let looking = (await myWindows($)).includes(tty)
   if (!looking && (await windows($)).agentsViews.some(c => c.tty === tty)) {
-    looking = (await platform.readWindow(sys($), tty)).includes(`⟨${myId.slice(0, 8)}⟩`)
+    looking = (await platform.readWindow(sys($), tty)).includes(`⟨${myShortId()}⟩`)
   }
   if (looking) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
@@ -760,6 +767,7 @@ async function refresh($: any) {
   listedAt = await $.clock.now()
   const own = list.find(s => s.sessionId === myId)
   if (own?.pid) myPid = own.pid
+  if (myShortId() !== (await read($, shortId))) await update($, shortId, () => myShortId())
   await followFolder($)
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const now = await $.clock.now()
@@ -987,8 +995,8 @@ async function focusElement($: any, key: string) {
 }
 
 // The window of an agent view that's showing a session right now (its ⟨id⟩ tag is on screen), except the front one
-async function agentsViewShowing($: any, v: { agentsViews: { pid: string; tty: string }[] }, sessionId: string, except: string): Promise<string | undefined> {
-  const tag = `⟨${sessionId.slice(0, 8)}⟩`
+async function agentsViewShowing($: any, v: { agentsViews: { pid: string; tty: string }[] }, f: Row, except: string): Promise<string | undefined> {
+  const tag = `⟨${f.id ?? f.sessionId.slice(0, 8)}⟩`
   for (const c of v.agentsViews) {
     if (c.tty === except) continue
     if ((await platform.readWindow(sys($), c.tty)).includes(tag)) return c.tty
@@ -1041,7 +1049,7 @@ async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
   // If it's already open in another window, bring that one: never the same session in two windows. Look among the
   // viewers (claude attach <id>) and among the agent views, which don't say which session they show: read their
   // screen looking for its tag
-  const target = (f.id ? v.byId[f.id]?.find(t => t !== front) : undefined) ?? (await agentsViewShowing($, v, f.sessionId, front))
+  const target = (f.id ? v.byId[f.id]?.find(t => t !== front) : undefined) ?? (await agentsViewShowing($, v, f, front))
   if (target) {
     if (await platform.bringWindow(sys($), target, f.title)) return true
     // Where it can't be brought forward (Linux without wmctrl/xdotool, or Wayland), show it in this window too
@@ -1680,7 +1688,7 @@ async function rebind($: any) {
   const old = myId
   myId = id
   debugLine($, `rebind: ${old} → ${id}`)
-  await update($, shortId, () => id.slice(0, 8))
+  // The short id stays what the official list says (myShortId): the refresh below sets it
   const previous = await readState($, old)
   const existing = await readState($, id)
   const now = await $.clock.now()

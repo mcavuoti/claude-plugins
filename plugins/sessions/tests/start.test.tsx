@@ -184,14 +184,17 @@ test("New: Enter on an empty name creates a session named after the folder, unus
 })
 
 for (const reason of ['clear', 'resume'] as const) {
-  test(`/${reason}: the session id changes and the mod follows it (record, heartbeat, short id), with no new start`, async ($, on) => {
-    const w = world(on)
+  test(`/${reason}: the session id changes and the mod follows it (record, heartbeat), keeping the official short id, with no new start`, async ($, on) => {
+    const list = [{ id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' }]
+    const w = world(on, { list })
     await startSession($, w)
     w.store.set(`title:${SID}`, 'old first prompt')
     w.store.set(`seen:${SID}`, 5)
     const NEW = 'dddddddd-0000-0000-0000-000000000000'
     await $.session.end({ reason, sessionId: SID, resume: { id: SID } } as any)
     w.id.value = NEW
+    // The official list follows the new session id; its short id, the one claude attach takes, stays
+    list[0]!.sessionId = NEW
     await w.clock.advance(1000)
     expect(w.files.has(`${DATA}/alive/${SID}`)).toBe(false)
     expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain('format=1\n')
@@ -202,7 +205,9 @@ for (const reason of ['clear', 'resume'] as const) {
     expect(w.store.get(`seen:${NEW}`)).toBe(5)
     expect(w.registered).toEqual(['sessions'])
     const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-    expect(JSON.stringify(await ui.drawn())).toContain('"dddddddd"')
+    const band = JSON.stringify(await ui.drawn())
+    expect(band).toContain('"aaaaaaaa"')
+    expect(band).not.toContain('"dddddddd"')
     await ui.unmount()
     // A request for the new id is heard
     w.files.set(`${DATA}/inbox/${NEW}`, `format=1\naction=focus\nat=${w.clock.now()}\n`)
