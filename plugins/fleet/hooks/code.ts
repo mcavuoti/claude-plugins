@@ -153,6 +153,11 @@ export function viaHost(host: string | null, argv: readonly string[]): string[] 
   return host ? ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', host, '--', argv.map(shellWord).join(' ')] : [...argv]
 }
 
+/** The host an ssh target reaches, as outbound.json's hosts name it: me@dev is dev */
+export function sshHost(target: string): string {
+  return target.replace(/^[^@]*@/, '').toLowerCase()
+}
+
 /** git in a folder, paths printed as they are (not octal-quoted) */
 export function gitArgv(r: GitRepo, dir: string, args: readonly string[]): string[] {
   return viaHost(r.host, ['git', '-C', dir, '-c', 'core.quotePath=false', ...args])

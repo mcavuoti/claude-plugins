@@ -38,6 +38,7 @@ import {
   parseUpstream,
   parseWorktrees,
   parseZtag,
+  sshHost,
   takesPart,
   treeOwners,
   type CodeConfig,
@@ -3715,7 +3716,7 @@ async function pollRepo($: any, repo: Repo, had: RepoState | null, now: number):
     unseen: new Set(),
   })
   const host = repo.kind === 'command' ? null : repo.host
-  if (host && !hostAllowed(host, await outboundConfig($))) return fail(`it's on ${host}, which outbound.json doesn't list as yours ("hosts"): fleet reaches a host over ssh only there`)
+  if (host && !hostAllowed(sshHost(host), await outboundConfig($))) return fail(`it's on ${host}, which outbound.json doesn't list as yours ("hosts"): fleet reaches a host over ssh only there`)
   try {
     if (repo.kind === 'git') return await pollGit($, repo, had, now, fail)
     if (repo.kind === 'p4') return await pollP4($, repo, had, now, fail)
@@ -5123,6 +5124,8 @@ async function nudgeTick($: any) {
 /** What an instance's model reads at the start of its conversation (classic.SessionStart, again after /clear and
  * compaction): who it is, what it can't write, its budget. The same text every time, so it caches */
 async function instanceContext($: any, inst: Instance): Promise<string> {
+  // What world.json says of proofs and code, read before the first words
+  await ensureWorld($)
   const level = await commandLevelNow($)
   const extra = level.globs.filter(g => g !== '.claude/agents/**')
   const w = await readWorldFile($)
@@ -6283,7 +6286,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (slotsProblem) lint.warnings.push(slotsProblem)
   // The code watch: a host that isn't the person's, a depot nobody's client is in, commands not stamped
   const oc = await outboundConfig($)
-  lint.warnings.push(...codeLints(codeCfg, all, h => hostAllowed(h, oc), (await checksStamp($)).ok))
+  lint.warnings.push(...codeLints(codeCfg, all, h => hostAllowed(sshHost(h), oc), (await checksStamp($)).ok))
   lint.warnings.push(...(await planBLines($, root as string)))
   const down = await downSet($)
   const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: chosen.map(i => i.name) })) : null

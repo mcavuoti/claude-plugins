@@ -31,6 +31,7 @@ import {
   parseWorktrees,
   parseZtag,
   shellWord,
+  sshHost,
   takesPart,
   treeOwners,
   type Overlap,
@@ -106,6 +107,7 @@ test('the commands: read-only, and through ssh with each word quoted for the rem
   expect(p4Argv({ ...p, host: null }, 'project-area-a', P4.opened(p))).toEqual(['p4', '-u', 'me', '-c', 'project-area-a', '-ztag', 'opened', '//depot/project/...'])
   expect(P4.describe(['1234', '1235'])).toEqual(['describe', '-s', '1234', '1235'])
   expect(shellWord("it's")).toBe(`'it'\\''s'`)
+  expect([sshHost('me@Dev.example.invalid'), sshHost('dev')]).toEqual(['dev.example.invalid', 'dev'])
   expect(fillWords(['tools/up.sh', '--since={marker}', '{instance}', '{slug}', '{client}', '{other}'], { marker: '41', instance: 'Area A', slug: 'area-a' })).toEqual(['tools/up.sh', '--since=41', 'Area A', 'area-a', '', '{other}'])
 })
 
