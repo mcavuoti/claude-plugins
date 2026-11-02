@@ -251,6 +251,8 @@ export function commandsOf(line: string, depth = 0): string[][] {
   let word = ''
   let inWord = false
   let skip = false
+  const heredocs: { delim: string; strip: boolean }[] = []
+  const bodies: string[] = []
   const endWord = () => {
     if (inWord) {
       if (skip) skip = false
@@ -355,6 +357,20 @@ export function commandsOf(line: string, depth = 0): string[][] {
       }
       endSeg()
       i++
+      // A here-document's lines are text fed to the command, not commands: they end at their delimiter's line
+      if (ch === '\n' && heredocs.length) {
+        for (const h of heredocs.splice(0)) {
+          const body: string[] = []
+          while (i < line.length) {
+            const end = line.indexOf('\n', i)
+            const row = line.slice(i, end < 0 ? line.length : end)
+            i = end < 0 ? line.length : end + 1
+            if ((h.strip ? row.replace(/^\t+/, '') : row) === h.delim) break
+            body.push(row)
+          }
+          bodies.push(body.join('\n'))
+        }
+      }
       continue
     }
     if (ch === '<' || ch === '>') {
@@ -365,6 +381,31 @@ export function commandsOf(line: string, depth = 0): string[][] {
       } else endWord()
       let j = i
       while (j < line.length && (line[j] === '<' || line[j] === '>')) j++
+      const op = line.slice(i, j)
+      if (op === '<<') {
+        // A here-document (<<EOF, <<-'EOF'): its delimiter, without quotes; its lines are skipped at the next line
+        const strip = line[j] === '-'
+        if (strip) j++
+        while (line[j] === ' ' || line[j] === '\t') j++
+        let delim = ''
+        while (j < line.length && !/[\s;&|<>()]/.test(line[j] as string)) {
+          const q = line[j] as string
+          if (q === "'" || q === '"') {
+            const end = line.indexOf(q, j + 1)
+            delim += line.slice(j + 1, end < 0 ? line.length : end)
+            j = end < 0 ? line.length : end + 1
+          } else if (q === '\\') {
+            delim += line[j + 1] ?? ''
+            j += 2
+          } else {
+            delim += q
+            j++
+          }
+        }
+        if (delim) heredocs.push({ delim, strip })
+        i = j
+        continue
+      }
       if (line[j] === '&') {
         j++
         while (j < line.length && /[\d-]/.test(line[j] as string)) j++
@@ -382,18 +423,25 @@ export function commandsOf(line: string, depth = 0): string[][] {
     i++
   }
   endSeg()
-  // What a shell or eval runs, as commands of their own
+  // What a shell or eval runs, as commands of their own; and a here-document's lines when a shell (or ssh) on the line
+  // reads its commands from them
   const more: string[][] = []
+  let script = false
   for (const s of out) {
     const w = stripPrefixes(s)
     const cmd = baseName(w[0] ?? '')
-    if (['bash', 'sh', 'zsh', 'dash', 'ksh'].includes(cmd)) {
+    if (SHELLS.includes(cmd)) {
       const k = w.findIndex((x, n) => n > 0 && /^-[a-z]*c[a-z]*$/.test(x))
       if (k > 0 && w[k + 1] !== undefined) more.push(...commandsOf(w[k + 1] as string, depth + 1))
+      else if (!w.slice(1).some(x => !x.startsWith('-')) || w.includes('-s')) script = true
     } else if (cmd === 'eval' && w.length > 1) more.push(...commandsOf(w.slice(1).join(' '), depth + 1))
+    else if (cmd === 'ssh') script = true
   }
+  if (script) for (const b of bodies) more.push(...commandsOf(b, depth + 1))
   return [...out, ...more]
 }
+
+const SHELLS = ['bash', 'sh', 'zsh', 'dash', 'ksh']
 
 function baseName(w: string): string {
   return w.slice(w.lastIndexOf('/') + 1)
