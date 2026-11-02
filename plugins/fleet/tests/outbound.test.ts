@@ -9,15 +9,19 @@ import {
   draftText,
   hostAllowed,
   hostOf,
+  hostsNamed,
   newOutbound,
+  outboundDelivery,
   outboundHash,
   outboundRefusal,
+  outboundText,
   parseDraft,
   parseOutbound,
   patternOf,
   recipientsOf,
   remoteAllowed,
   treeVersion,
+  widenOutbound,
   type OutboundConfig,
 } from '../hooks/outbound'
 
@@ -32,6 +36,31 @@ test('outbound.json: its lists, a newer one left alone, junk said', () => {
   })
   expect(parseOutbound('{"outboundFormat": 2}')).toEqual({ problem: 'outbound.json is from a newer fleet (outboundFormat 2): restart this session (u) to load it' })
   expect(parseOutbound('nope')).toEqual({ problem: "outbound.json isn't valid JSON" })
+})
+
+test('send --allow widens outbound.json: every other field kept, nothing twice; a newer one left alone', () => {
+  const text = JSON.stringify({ outboundFormat: 1, hosts: ['devbox'], remotes: [], recipients: ['me@example.com'], keep: { x: 1 } })
+  const w = widenOutbound(text, { hosts: ['DevBox', 'build.example.invalid'], remotes: ['git@example.invalid:me/proj.git'] })
+  expect(w).toEqual({
+    text: `${JSON.stringify({ outboundFormat: 1, hosts: ['devbox', 'build.example.invalid'], remotes: ['git@example.invalid:me/proj.git'], recipients: ['me@example.com'], keep: { x: 1 } }, null, 2)}\n`,
+    added: { hosts: ['build.example.invalid'], remotes: ['git@example.invalid:me/proj.git'] },
+  })
+  expect((widenOutbound(null, { hosts: ['devbox'], remotes: [] }) as any).text).toBe(outboundText({ ...newOutbound(), hosts: ['devbox'] }))
+  expect(widenOutbound('{"outboundFormat": 2}', { hosts: ['devbox'], remotes: [] })).toEqual({ problem: 'outbound.json is from a newer fleet (outboundFormat 2): restart this session (u) to load it' })
+})
+
+test('the hosts a note names: after ssh, an scp target, a URL other than the web’s; not prose, an address or this machine', () => {
+  expect(hostsNamed('a Linux VM is ready: ssh ci@linuxbox.invalid (the key is in the vault).')).toEqual(['linuxbox.invalid'])
+  expect(hostsNamed('ssh -p 2222 devbox, or copy to me@build.example.invalid:/srv')).toEqual(['devbox', 'build.example.invalid'])
+  expect(hostsNamed('the bucket is s3://team-bucket/drop and sftp://files.example.invalid/in')).toEqual(['team-bucket.s3.amazonaws.com', 'files.example.invalid'])
+  expect(hostsNamed('done at 12:30, ready: yes; docs at https://docs.example.invalid; write to me@example.com; ssh localhost')).toEqual([])
+})
+
+test('the asker of an outbound sent with --allow hears what is allowed from now on', () => {
+  const spec = { to: 'devbox', why: 'w', what: 'ssh running a command', how: 'command' as const, draft: 'decisions/drafts/D-1.json', files: [], cwd: '/Users/x/proj', hash: 'h0' }
+  expect(outboundDelivery('D-1', spec, { label: 'sent', text: 'it ran', allowed: ['devbox'] }, null)).toBe(
+    "[D-1] The person approved your outbound (ssh running a command to devbox), and fleet ran it exactly as drafted, once: it ran. Don't run it again. The person also allowed devbox in outbound.json: from now on a send there needs no draft.",
+  )
 })
 
 test('hosts: a URL, an scp target, an ssh destination, a bare host; this machine and the allowlist', () => {

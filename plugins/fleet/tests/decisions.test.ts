@@ -67,6 +67,12 @@ test('a resource is answered done or no, an outbound send (with its version afte
   expect(parseAnswers('3 send h1a2b3c4d, 4 reject “not yet”')).toEqual([{ n: 3, verb: 'send', hash: 'h1a2b3c4d' }, { n: 4, verb: 'reject', note: 'not yet' }])
   expect(parseAnswers('5 "free text" 6a')).toEqual([{ n: 5, text: 'free text' }, { n: 6, letter: 'a' }])
   expect(typeof parseAnswers('1 nope')).toBe('string')
+  // send --allow: it also adds where it goes to outbound.json; with the version, in either order
+  expect(parseAnswers('1 send --allow 2 send h1a2b3c --allow "mine"')).toEqual([{ n: 1, verb: 'send', allow: true }, { n: 2, verb: 'send', hash: 'h1a2b3c', allow: true, note: 'mine' }])
+  expect(parseAnswers('3 send --allow h1a2b3c4d')).toEqual([{ n: 3, verb: 'send', hash: 'h1a2b3c4d', allow: true }])
+  expect(parseAnswers('1 apply --allow')).toBe('1: --allow goes with send (/fleet 1 send --allow)')
+  expect(typeof parseAnswers('1 send --allowed')).toBe('string')
+  expect(parseAnswers('1 send h1a2b3c h4d5e6f')).toBe('1: one version at most')
   expect(parseCommand('brief')).toEqual({ kind: 'brief', chief: false })
   expect(parseCommand('brief --chief')).toEqual({ kind: 'brief', chief: true })
   expect(parseCommand('brief all').kind).toBe('bad')

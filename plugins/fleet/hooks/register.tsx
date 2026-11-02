@@ -13,6 +13,8 @@ import {
   classifyBash,
   classifyMcp,
   draftText,
+  hostAllowed,
+  hostsNamed,
   matches,
   mcpParts,
   newOutbound,
@@ -27,6 +29,7 @@ import {
   remoteAllowed,
   sendWords,
   treeVersion,
+  widenOutbound,
   type OutboundConfig,
   type OutboundSpec,
   type Send,
@@ -715,7 +718,7 @@ async function outcomesOf($: any, r: QueueRecord, present: ReadonlySet<string>) 
       if (p && 'value' in p) {
         const a = p.value
         // A choice has a label or a text; a change's answer may have both (applied, and how; stale, and why)
-        o = { ...(a.label !== undefined ? { label: a.label } : { text: a.text ?? '' }), ...(a.label !== undefined && a.text !== undefined ? { text: a.text } : {}), origin: a.origin, session: a.session, at: a.at, ...(a.pre ? { pre: true as const } : {}), ...(a.judge ? { judge: a.judge } : {}) }
+        o = { ...(a.label !== undefined ? { label: a.label } : { text: a.text ?? '' }), ...(a.label !== undefined && a.text !== undefined ? { text: a.text } : {}), origin: a.origin, session: a.session, at: a.at, ...(a.pre ? { pre: true as const } : {}), ...(a.allowed?.length ? { allowed: a.allowed } : {}), ...(a.judge ? { judge: a.judge } : {}) }
       } else skew = true
     }
     if (o && present.has(noteName(r.id, q))) {
@@ -4093,6 +4096,16 @@ async function unstamped($: any): Promise<string[]> {
   return out
 }
 
+/** Whether a config file is as fleet wrote it or the person stamped it (with no stamps yet, what's there is) */
+async function stampedNow($: any, rel: string): Promise<boolean> {
+  const s = await readWire<Stamps>($, stateDir('stamps.json'))
+  if (!s) return true
+  const t = await readText($, `${root}/${rel}`)
+  const v = t === null ? null : hashText(t)
+  const had = s.files[rel]
+  return had === undefined ? v === null : had === v
+}
+
 /** A command-level config file's draft that fleet couldn't use: the reason, or null */
 function configProblemOf(rel: string, text: string): string | null {
   if (rel === '.claude/fleet/roster.json') {
@@ -4331,7 +4344,9 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
     if (body.length > 12) lines.push(`   and ${body.length - 12} more lines in ${abs}`)
   }
   const send = cut ? `/fleet ${n} send ${shortHash(hashNow)}` : `/fleet ${n} send`
-  lines.push(`   draft ${draftAbs} (${shortHash(hashNow)}) · ${send}, /fleet ${n} reject, /fleet ${n} edit to change it first, or /fleet ${n} done if you sent it yourself`)
+  // A command's hosts and remotes can be allowed as it goes (an MCP call's service can't)
+  const allow = call && 'command' in call ? ' (with --allow it also allows where it goes)' : ''
+  lines.push(`   draft ${draftAbs} (${shortHash(hashNow)}) · ${send}${allow}, /fleet ${n} reject, /fleet ${n} edit to change it first, or /fleet ${n} done if you sent it yourself`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
   lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin)})` : ''}`)
   return lines.join('\n')
@@ -4419,7 +4434,9 @@ async function answerResource($: any, it: AnswerItem, rec: QueueRecord, origin: 
   if (r === 'exists') return `${n}: ${rec.id} was answered already`
   if (r === 'failed') return `${n}: couldn't save the answer`
   const who = (await askerViews($, [rec]))(rec).name
-  return `${n}: ${rec.id} (${x.what}): ${verb === 'done' ? 'you got it' : 'no'}${it.note ? `, "${it.note}"` : ''}. ${who} hears it when it's idle.`
+  // A note naming a host (a machine he got for it): how its first use gets through the outbound gate
+  const hint = verb === 'done' && it.note ? await allowHint($, it.note) : ''
+  return `${n}: ${rec.id} (${x.what}): ${verb === 'done' ? 'you got it' : 'no'}${it.note ? `, "${it.note}"` : ''}. ${who} hears it when it's idle.${hint}`
 }
 
 // The person answers an outbound (typed at a terminal). send: the draft and its files still as he saw them (or the
@@ -4457,6 +4474,21 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   if (shown.more && !sameHash(it.hash, hashNow)) {
     return `${n}: /fleet showed ${rec.id}'s ${'command' in call ? 'command' : 'input'} cut (${shown.more} more line${shown.more === 1 ? '' : 's'} in ${draftAbs}), so a plain send doesn't send it: read it whole there, then /fleet ${n} send ${shortHash(hashNow)} sends it.`
   }
+  // send --allow: what it adds to outbound.json, checked before anything goes out
+  let allow: Allow | null = null
+  if (it.allow) {
+    const a = await allowOf($, call, o)
+    if (!a.hosts.length && !a.remotes.length) {
+      return a.rest.length
+        ? `${n}: --allow adds a host or a git remote to outbound.json, and ${rec.id} goes where fleet can name neither (${a.rest.join(', ')}): /fleet ${n} send sends it once.`
+        : `${n}: outbound.json allows where ${rec.id} goes already: /fleet ${n} send sends it.`
+    }
+    const before = await readText($, `${root}/${OUTBOUND_JSON}`)
+    const p = before === null ? null : parseOutbound(before)
+    if (p && 'problem' in p) return `${n}: ${p.problem}, so fleet doesn't add to it: /fleet ${n} send sends ${rec.id} once.`
+    if (!(await stampedNow($, OUTBOUND_JSON))) return `${n}: outbound.json changed outside fleet since it was stamped, so fleet doesn't add to it: if that edit is yours, /fleet accept outbound.json, then /fleet ${n} send --allow again (or /fleet ${n} send sends ${rec.id} once).`
+    allow = { ...a, before }
+  }
   // Once: the first claim wins
   const claimPath = dec(`applied/${rec.id}.json`)
   const claim = await publish($, claimPath, json({ format: FORMAT, id: rec.id, at: now, session: here, origin, hash: hashNow }))
@@ -4485,9 +4517,76 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
     result = res?.timeout ? "it didn't answer within a minute" : res?.isError ? `it answered an error${text ? `: ${text}` : ''}` : `it answered${text ? `: ${text}` : ' with no text'}`
   }
   await saveNote($, rec.id, it.note, origin)
-  await say('sent', { text: result, hash: hashNow })
+  // It went out; then what --allow adds, as the person's
+  const allowed = allow ? await allowNow($, allow) : null
+  await say('sent', { text: result, hash: hashNow, ...(allowed?.added.length ? { allowed: allowed.added } : {}) })
   log($, `${rec.id} sent: ${o.what.slice(0, 80)} (${result.slice(0, 80)})`)
-  return `${n}: sent ${rec.id} (${o.what} to ${o.to}), exactly as shown: ${result}. ${who} hears it.`
+  return `${n}: sent ${rec.id} (${o.what} to ${o.to}), exactly as shown: ${result}. ${who} hears it.${allowed ? `\n${allowed.line}` : ''}`
+}
+
+const OUTBOUND_JSON = '.claude/fleet/outbound.json'
+
+/** What send --allow adds: the hosts and push remotes not allowed yet; rest: where else it goes, with no host fleet
+ * can name (an MCP tool's service, a registry a configuration sets); before: outbound.json as it was checked */
+type Allow = { hosts: string[]; remotes: string[]; rest: string[]; before?: string | null }
+
+/** Where a draft goes that outbound.json could allow: the hosts its command names (Send.hosts) and its pushes' remote
+ * URLs, those not allowed yet */
+async function allowOf($: any, call: { command: string } | { tool: string; input: Record<string, unknown> }, o: OutboundSpec): Promise<Allow> {
+  if (!('command' in call)) return { hosts: [], remotes: [], rest: [o.to] }
+  const c = await outboundConfig($)
+  const r = classifyBash(call.command, c)
+  const hosts: string[] = []
+  const rest: string[] = []
+  for (const s of r.sends) {
+    if (s.hosts?.length) hosts.push(...s.hosts)
+    else rest.push(...s.to)
+  }
+  const remotes: string[] = []
+  const base = (await exists($, o.cwd)) ? o.cwd : (root as string)
+  for (const p of r.pushes) {
+    const { name, url } = await remoteOf($, p.cwd ? (p.cwd.startsWith('/') ? p.cwd : `${base}/${p.cwd}`) : base, p.remote)
+    if (remoteAllowed(name, url, c)) continue
+    if (url) remotes.push(url)
+    else rest.push(`the remote ${name ?? 'of the push'}`)
+  }
+  return { hosts: [...new Set(hosts)], remotes: [...new Set(remotes)], rest: [...new Set(rest)] }
+}
+
+/** send --allow, once the draft went out: its hosts and remotes added to outbound.json as the person's (he typed it),
+ * stamped, and the diff he reads */
+async function allowNow($: any, a: Allow): Promise<{ added: string[]; line: string }> {
+  const abs = `${root}/${OUTBOUND_JSON}`
+  const list = [...a.hosts, ...a.remotes].join(', ')
+  // Read again: the send took a while, and someone may have edited it meanwhile
+  const before = await readText($, abs)
+  if (before !== a.before && !(await stampedNow($, OUTBOUND_JSON))) return { added: [], line: `outbound.json changed outside fleet while it ran, so fleet didn't add ${list}: add it yourself, then /fleet accept outbound.json.` }
+  const w = widenOutbound(before, a)
+  if ('problem' in w) return { added: [], line: `fleet couldn't add ${list} to outbound.json: ${w.problem}.` }
+  const added = [...w.added.hosts, ...w.added.remotes]
+  if (!added.length) return { added: [], line: `outbound.json allows ${list} already.` }
+  if (!(await replace($, abs, w.text))) {
+    try {
+      await $.fs.write(abs, w.text)
+    } catch (err) {
+      return { added: [], line: `fleet couldn't write outbound.json (${String(err).slice(0, 160)}): add ${list} yourself, then /fleet accept outbound.json.` }
+    }
+  }
+  await landApplied($, OUTBOUND_JSON, before)
+  log($, `allowed in outbound.json: ${added.join(', ')} (the person's send --allow)`)
+  const diff = lineDiff(before, w.text, OUTBOUND_JSON).text.split('\n').slice(2).filter(Boolean)
+  const rest = a.rest.length ? `\nStill held: ${a.rest.join(', ')} (no host fleet can name).` : ''
+  return { added, line: `outbound.json now allows ${added.join(', ')}, stamped as yours (from now on a send there needs no draft):\n\`\`\`diff\n${diff.join('\n')}\n\`\`\`${rest}` }
+}
+
+/** A resource's "done" note that names a host outbound.json doesn't allow: how its first use gets through */
+async function allowHint($: any, note: string): Promise<string> {
+  const c = await outboundConfig($)
+  const hosts = hostsNamed(note).filter(h => !hostAllowed(h, c))
+  if (!hosts.length) return ''
+  const list = hosts.join(', ')
+  const one = hosts.length === 1
+  return `\n   ${list} ${one ? "isn't" : "aren't"} in outbound.json, so a send there from a background session comes back to you as an outbound draft: /fleet <n> send --allow sends it and allows ${list} from then on (or add ${one ? 'it' : 'them'} to outbound.json's hosts yourself, then /fleet accept outbound.json).`
 }
 
 /** /fleet lists a change: its file, summary and size, the first lines of its diff, where the draft is, who asked */
@@ -4570,16 +4669,18 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
     await remove($, [claimPath])
     return { line: `${n}: couldn't write ${spec.path}: ${String(err).slice(0, 200)}`, done: false }
   }
-  await landApplied($, spec, cur)
+  await landApplied($, spec.path, cur)
   await saveNote($, rec.id, it.note, origin)
   await say('applied', v.edited ? 'edited' : undefined)
   log($, `${rec.id} applied: ${spec.path}`)
   return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effectOf(spec.path)}. ${who} hears it.`, done: true, applied: true }
 }
 
-// What follows fleet's write of an applied change: a shared file's landing (the person's, through an answer), the
-// stamp of a config file, world.json read again
-async function landApplied($: any, spec: ChangeSpec, before: string | null) {
+// What follows fleet's write of a command-level file the person answered for (an applied change, the outbound.json of
+// a send --allow): a shared file's landing (the person's, through an answer), the stamp of a config file, the file read
+// again
+async function landApplied($: any, path: string, before: string | null) {
+  const spec = { path }
   try {
     const w = await worldFile($, `${realRoot || root}/${spec.path}`)
     if (w && !w.copy) {
@@ -4601,6 +4702,7 @@ async function landApplied($: any, spec: ChangeSpec, before: string | null) {
   }
   if (spec.path === '.claude/fleet/roster.json') roster = null
   if (spec.path === '.claude/fleet/slots.json') slotsCfg = null
+  if (spec.path === '.claude/fleet/outbound.json') outboundCfg = null
 }
 
 // ---- The sweeper's part: marks on the instances' rows, and wakes of retired ones (coalesced) ----

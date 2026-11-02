@@ -95,7 +95,7 @@ test('mcp__fleet__send: drafted, shown exactly in /fleet, sent once by fleet as 
   expect(list).toContain('1 outbound draft for you · answer with /fleet 1 send · /fleet help')
   expect(list).toContain('1. Send outside: curl sending data (notes/x.md) to example.invalid\n   why: the vendor asked for the notes\n```sh\ncurl -d @notes/x.md https://example.invalid/upload\n```')
   expect(list).toContain(`   notes/x.md (2 lines, ${hashText(NOTE).slice(0, 9)}):\n\`\`\`\nLine one of the notes\nLine two\n\`\`\``)
-  expect(list).toContain('/fleet 1 send, /fleet 1 reject, /fleet 1 edit to change it first, or /fleet 1 done if you sent it yourself')
+  expect(list).toContain('/fleet 1 send (with --allow it also allows where it goes), /fleet 1 reject, /fleet 1 edit to change it first, or /fleet 1 done if you sent it yourself')
   // The file changes after it was drafted: what would go out isn't what was drafted
   w.touch(`${ROOT}/notes/x.md`, `${NOTE}Line three\n`)
   const moved = await fleet($, '1 send')
@@ -120,6 +120,80 @@ test('mcp__fleet__send: drafted, shown exactly in /fleet, sent once by fleet as 
   expect(under(w, `${DEC}/drafts`)).toEqual([])
 })
 
+test('send --allow: it sends, then adds the host to outbound.json as the person’s and shows the diff; the asker hears it and the next one passes', WITH_SESSIONS, async ($, on) => {
+  const w = project(on)
+  const runs: string[][] = []
+  w.exec.value = argv => {
+    if (argv[0] !== '/bin/sh') return undefined
+    runs.push(argv)
+    return { exitCode: 0, stdout: 'ok\n' }
+  }
+  await startSession($, w)
+  expect((await bash($, 'ssh ci@linuxbox.invalid make test')).deny).toContain('(ssh running a command to linuxbox.invalid)')
+  await $.tool.call({ tool: 'mcp__fleet__send', to: 'linuxbox.invalid', why: 'run the tests on the Linux machine', command: 'ssh ci@linuxbox.invalid make test' } as any)
+  await fleet($, '')
+  const r = await fleet($, '1 send --allow')
+  expect(r).toContain('1: sent D-1 (ssh running a command to linuxbox.invalid), exactly as shown: it ran: ok. ')
+  expect(r).toContain('\noutbound.json now allows linuxbox.invalid, stamped as yours (from now on a send there needs no draft):\n```diff\n')
+  expect(r).toContain('\n+    "linuxbox.invalid"\n')
+  expect(runs.length).toBe(1)
+  // Every other field as it was
+  expect(json(w, `${FLEET}/outbound.json`)).toEqual({ outboundFormat: 1, hosts: ['devbox', 'linuxbox.invalid'], remotes: ['origin'], recipients: ['me@example.com'] })
+  expect(json(w, `${DEC}/answers/D-1.1.json`)).toMatchObject({ label: 'sent', allowed: ['linuxbox.invalid'], origin: 'composer' })
+  // Stamped as his: not a change made outside fleet
+  expect(await fleet($, 'accept')).not.toContain('.claude/fleet/outbound.json: changed outside fleet')
+  expect(w.logs.some(l => l.includes("allowed in outbound.json: linuxbox.invalid (the person's send --allow)"))).toBe(true)
+  // The asker hears it, and its next ssh there passes
+  await tick(w)
+  expect(w.submits[w.submits.length - 1]).toContain("Don't run it again. The person also allowed linuxbox.invalid in outbound.json: from now on a send there needs no draft.")
+  expect((await bash($, 'ssh ci@linuxbox.invalid make test')).deny).toBe(undefined)
+})
+
+test('send --allow: a git push adds its remote’s URL; with no host to name, or an outbound.json changed outside fleet, it sends nothing and says why', WITH_SESSIONS, async ($, on) => {
+  const w = project(on)
+  const runs: string[][] = []
+  w.exec.value = argv => {
+    if (argv.includes('get-url')) return { exitCode: 0, stdout: 'git@example.invalid:me/proj.git\n' }
+    if (argv[0] !== '/bin/sh') return undefined
+    runs.push(argv)
+    return { exitCode: 0, stdout: 'pushed\n' }
+  }
+  await startSession($, w)
+  const send = (to: string, command: string) => $.tool.call({ tool: 'mcp__fleet__send', to, why: 'the release', command } as any)
+  // A registry set only in a configuration: no host fleet can name
+  await send('the registry', 'npm publish')
+  await fleet($, '')
+  expect(await fleet($, '1 send --allow')).toBe('1: --allow adds a host or a git remote to outbound.json, and D-1 goes where fleet can name neither (the registry npm is set to): /fleet 1 send sends it once.')
+  expect(await fleet($, '1 reject')).toContain('1: rejected D-1')
+  // A push: its remote's URL
+  await send('fork', 'git push fork main')
+  await fleet($, '')
+  expect(await fleet($, '1 send --allow')).toContain('outbound.json now allows git@example.invalid:me/proj.git, stamped as yours')
+  expect(json(w, `${FLEET}/outbound.json`).remotes).toEqual(['origin', 'git@example.invalid:me/proj.git'])
+  expect(runs.length).toBe(1)
+  // An outbound.json edited outside fleet since it was stamped isn't widened (nor sent with --allow)
+  w.touch(`${FLEET}/outbound.json`, JSON.stringify({ outboundFormat: 1, hosts: ['devbox', 'other.invalid'] }))
+  await send('far.invalid', 'scp notes/x.md me@far.invalid:/tmp/')
+  await fleet($, '')
+  expect(await fleet($, '1 send --allow')).toBe("1: outbound.json changed outside fleet since it was stamped, so fleet doesn't add to it: if that edit is yours, /fleet accept outbound.json, then /fleet 1 send --allow again (or /fleet 1 send sends D-3 once).")
+  expect(runs.length).toBe(1)
+  expect(json(w, `${FLEET}/outbound.json`).hosts).toEqual(['devbox', 'other.invalid'])
+})
+
+test('a resource done with a note naming a host says how its first use gets through: the --allow line', WITH_SESSIONS, async ($, on) => {
+  const w = project(on)
+  await startSession($, w)
+  await decide($, { kind: 'resource', what: 'a Linux machine for the tests', why: 'the CI runs there' })
+  await fleet($, '')
+  const r = await fleet($, '1 done "a Linux VM is ready: ssh ci@linuxbox.invalid"')
+  expect(r).toContain('1: D-1 (a Linux machine for the tests): you got it, "a Linux VM is ready: ssh ci@linuxbox.invalid".')
+  expect(r).toContain("\n   linuxbox.invalid isn't in outbound.json, so a send there from a background session comes back to you as an outbound draft: /fleet <n> send --allow sends it and allows linuxbox.invalid from then on (or add it to outbound.json's hosts yourself, then /fleet accept outbound.json).")
+  // A host it allows already: nothing to say
+  await decide($, { kind: 'resource', what: 'the dev machine', why: 'builds' })
+  await fleet($, '')
+  expect(await fleet($, '1 done "ssh devbox"')).not.toContain('outbound.json')
+})
+
 test('a command longer than /fleet shows: the cut is said, and only its version typed sends it', WITH_SESSIONS, async ($, on) => {
   const w = project(on)
   const runs: string[][] = []
@@ -140,7 +214,7 @@ test('a command longer than /fleet shows: the cut is said, and only its version 
   expect(plain).toContain(`1: /fleet showed D-1's command cut (1 more line in ${DEC}/drafts/D-1.json), so a plain send doesn't send it: read it whole there, then /fleet 1 send h`)
   expect(runs).toEqual([])
   const v = /\/fleet 1 send (h[0-9a-f]{8})/.exec(plain)?.[1] as string
-  expect(list).toContain(` · /fleet 1 send ${v}, /fleet 1 reject`)
+  expect(list).toContain(` · /fleet 1 send ${v} (with --allow it also allows where it goes), /fleet 1 reject`)
   // Six characters of it are enough
   expect(await fleet($, `1 send ${v.slice(0, 7)}`)).toContain('1: sent D-1 (curl sending data (/tmp/x) to example.invalid), exactly as shown: it ran: uploaded.')
   expect(runs).toEqual([['/bin/sh', '-c', command]])

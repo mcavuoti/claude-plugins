@@ -97,15 +97,16 @@ export type QueueRecord = {
 }
 /** origin: how the person typed it (composer: a terminal); session: the session it was typed in. pre: a change applied
  * as it was filed, because the person typed the turn that filed it (quoted: the start of what he typed); hash: the
- * version of an outbound the person approved */
-export type AnswerFile = { format: number; id: string; q: number; label?: string; text?: string; origin: string; session: string; at: number; pre?: true; quoted?: string; hash?: string; judge?: JudgeCite }
+ * version of an outbound the person approved; allowed: the hosts and remotes his send --allow added to outbound.json */
+export type AnswerFile = { format: number; id: string; q: number; label?: string; text?: string; origin: string; session: string; at: number; pre?: true; quoted?: string; hash?: string; allowed?: string[]; judge?: JudgeCite }
 export type NoteFile = { format: number; id: string; q: number; text: string; origin: string; at: number }
 /** A drop by the judge (origin judge, 0.7.0) sends the decision back to its asker, with why */
 export type DropFile = { format: number; id: string; why?: string; origin: string; session: string; at: number; sentBack?: true }
 /** What a judge's own answer rests on (origin judge): the precedents or statute lines it cites; repeat: an exact repeat */
 export type JudgeCite = { cites: string[]; repeat?: true }
-/** One question's outcome in the register: the option picked or the text typed, and any note */
-export type Outcome = { label?: string; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true; judge?: JudgeCite }
+/** One question's outcome in the register: the option picked or the text typed, and any note (allowed: an outbound's
+ * hosts and remotes the person allowed as he sent it) */
+export type Outcome = { label?: string; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true; allowed?: string[]; judge?: JudgeCite }
 export type RegisterState = 'delivered' | 'dropped' | 'abandoned' | 'answered' | 'not answered'
 export type RegisterRecord = {
   registerFormat: number
@@ -391,10 +392,11 @@ export function bracketedIds(textIn: string): string[] {
 // ---- /fleet ----
 
 /** The other kinds are answered with a verb: a change with apply (with the draft's new version when the person edited
- * it), reject or edit; a resource with done or no; an outbound with send (with its new version after an edit), reject,
- * edit, or done (he sent it himself). A note in quotes may follow */
+ * it), reject or edit; a resource with done or no; an outbound with send (with its new version after an edit; allow:
+ * --allow, which also adds where it goes to outbound.json), reject, edit, or done (he sent it himself). A note in
+ * quotes may follow */
 export type Verb = 'apply' | 'reject' | 'edit' | 'send' | 'done' | 'no'
-export type AnswerItem = { n: number; letter?: string; text?: string; verb?: Verb; hash?: string; note?: string }
+export type AnswerItem = { n: number; letter?: string; text?: string; verb?: Verb; hash?: string; allow?: true; note?: string }
 export type Command =
   | { kind: 'list' }
   | { kind: 'answer'; items: AnswerItem[] }
@@ -418,20 +420,27 @@ export type Command =
 
 /** `1a 2b`, `1a2b`, `1) a 2) b`, `1a, 2b`, `3 "free text"` (straight or curly quotes); for a change `1 apply`,
  * `1 apply h1a2b3c4d` (the draft's version, after editing it), `1 reject`, `1 edit`; for a resource `1 done`, `1 no`;
- * for an outbound `1 send` (`1 send h1a2b3c4d`), `1 reject`, `1 edit`, `1 done`. A verb may carry a note in quotes:
- * `1 done "the key is in the vault"` */
+ * for an outbound `1 send` (`1 send h1a2b3c4d`, `1 send --allow`), `1 reject`, `1 edit`, `1 done`. A verb may carry a
+ * note in quotes: `1 done "the key is in the vault"` */
 export function parseAnswers(args: string): AnswerItem[] | string {
   const items: AnswerItem[] = []
   let rest = args.trim()
   while (rest) {
-    const m = /^(\d+)\s*[).:]?\s*(?:(apply|reject|edit|send|done|no)(?:\s+(h[0-9a-f]{6,14}))?(?![A-Za-z0-9])(?:\s*(?:"([^"]*)"|“([^”]*)”))?|([a-dA-D])(?![a-zA-Z])|"([^"]*)"|“([^”]*)”)\s*[,;]?\s*/i.exec(rest)
+    const m = /^(\d+)\s*[).:]?\s*(?:(apply|reject|edit|send|done|no)((?:\s+(?:h[0-9a-f]{6,14}|--allow))*)(?![A-Za-z0-9-])(?:\s*(?:"([^"]*)"|“([^”]*)”))?|([a-dA-D])(?![a-zA-Z])|"([^"]*)"|“([^”]*)”)\s*[,;]?\s*/i.exec(rest)
     if (!m) return `can't read "${rest.slice(0, 30)}": answer like /fleet 1a 2b, 3 "your words", 4 apply or 5 done "a note"`
     const n = Number(m[1])
     if (items.some(i => i.n === n)) return `${n} is answered twice`
     const said = m[7] ?? m[8]
     const note = (m[4] ?? m[5])?.trim()
-    if (m[2]) items.push({ n, verb: m[2].toLowerCase() as Verb, ...(m[3] ? { hash: m[3].toLowerCase() } : {}), ...(note ? { note: note.slice(0, 1000) } : {}) })
-    else if (said !== undefined) {
+    if (m[2]) {
+      const verb = m[2].toLowerCase() as Verb
+      const extra = (m[3] ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+      const hashes = extra.filter(x => x !== '--allow')
+      if (hashes.length > 1) return `${n}: one version at most`
+      const allow = extra.includes('--allow')
+      if (allow && verb !== 'send') return `${n}: --allow goes with send (/fleet ${n} send --allow)`
+      items.push({ n, verb, ...(hashes[0] ? { hash: hashes[0] } : {}), ...(allow ? { allow: true as const } : {}), ...(note ? { note: note.slice(0, 1000) } : {}) })
+    } else if (said !== undefined) {
       if (!said.trim()) return `${n}: the quotes are empty`
       items.push({ n, text: said.trim().slice(0, 2000) })
     } else items.push({ n, letter: (m[6] as string).toLowerCase() })
@@ -591,6 +600,7 @@ export const HELP = [
   '/fleet 4 apply         apply the change of item 4 as drafted (also 4 reject, and 4 edit to change the draft first)',
   '/fleet 5 done "note"   you got what item 5 asks for (a license, an access…); 5 no "why" if not',
   '/fleet 6 send          send the outbound of item 6 exactly as shown (also 6 reject, 6 edit, and 6 done if you sent it yourself)',
+  '/fleet 6 send --allow  send it, and add its host or git remote to outbound.json as yours, so the next one needs no draft',
   '/fleet brief [--chief] what needs you, what changed and who changed it, what’s blocked, the spend, the inputs and ideas',
   '/fleet stats [area]    what the judges proposed per area, how often you agreed, what they cost',
   '/fleet judges          the live areas, the areas back in shadow, your taste; /fleet judges live <area> [--force "why"], /fleet judges off <area>',

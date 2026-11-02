@@ -76,6 +76,29 @@ export function parseOutbound(text: string): { outbound: OutboundConfig } | { pr
   }
 }
 
+/** outbound.json with hosts and remotes added (the person's send --allow): every other field kept as it is, an entry
+ * already there not added twice; null text: a new one. Or why it can't be changed (a newer one, or not JSON) */
+export function widenOutbound(text: string | null, add: { hosts: readonly string[]; remotes: readonly string[] }): { text: string; added: { hosts: string[]; remotes: string[] } } | { problem: string } {
+  if (text !== null) {
+    const p = parseOutbound(text)
+    if ('problem' in p) return p
+  }
+  const o: Record<string, unknown> = text === null ? newOutbound() : JSON.parse(text)
+  const added = { hosts: [] as string[], remotes: [] as string[] }
+  for (const key of ['hosts', 'remotes'] as const) {
+    const list: unknown[] = Array.isArray(o[key]) ? [...(o[key] as unknown[])] : []
+    const have = new Set(list.filter((x): x is string => typeof x === 'string').map(x => x.trim().toLowerCase()))
+    for (const x of add[key]) {
+      if (have.has(x.toLowerCase())) continue
+      have.add(x.toLowerCase())
+      list.push(x)
+      added[key].push(x)
+    }
+    o[key] = list
+  }
+  return { text: `${JSON.stringify(o, null, 2)}\n`, added }
+}
+
 // ---- Hosts ----
 
 /** The host a destination names: a URL (scheme://user@host:port/…), an scp or rsync target (user@host:path,
@@ -868,6 +891,41 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
   return { sends, pushes, reads: [...new Set(reads)] }
 }
 
+/** The hosts a note names as places to reach (a resource's "done: ssh ci@vm.example …"): what follows ssh, sftp or
+ * mosh, a user@host:path or host.domain:path target, and a URL other than the web's (ssh://, sftp://, ftp://, s3://…);
+ * not this machine. A best effort: the person reads the hint it gives */
+export function hostsNamed(text: string): string[] {
+  const out: string[] = []
+  const add = (h: string | null) => {
+    if (h && !isLocalHost(h) && /[a-z]/i.test(h) && !out.includes(h)) out.push(h)
+  }
+  const words = text
+    .split(/\s+/)
+    .map(w => w.replace(/^[("'`“‘<[]+|[)"'`”’>\],;.!?…]+$/g, ''))
+    .filter(Boolean)
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i] as string
+    const url = /^([a-z][a-z0-9+.-]*):\/\//i.exec(w)
+    if (url) {
+      // A bucket is named as the classifier names it: its own host
+      const bucket = hostOf(w)
+      const scheme = (url[1] as string).toLowerCase()
+      if (scheme === 's3' || scheme === 'gs') add(bucket && cleanHost(`${bucket}.${scheme === 's3' ? 's3.amazonaws.com' : 'storage.googleapis.com'}`))
+      else if (scheme !== 'http' && scheme !== 'https' && scheme !== 'file') add(bucket)
+      continue
+    }
+    if (/^(ssh|sftp|mosh)$/i.test(w)) {
+      const { args } = operands(words.slice(i + 1), SSH_VALUE)
+      if (args[0]) add(hostOf(args[0]))
+      continue
+    }
+    // An scp-like target: user@host:path, or host.domain:path (a word ending in a colon is prose)
+    const t = /^(?:([^@/:\s]+)@)?([^/:@\s]+):(\S*)$/.exec(w)
+    if (t && (t[1] || (t[3] && (t[2] as string).includes('.')))) add(hostOf(w))
+  }
+  return out
+}
+
 // ---- Words ----
 
 export function sendWords(sends: readonly Send[]): string {
@@ -999,11 +1057,14 @@ export function outboundTicket(id: string, spec: OutboundSpec): string {
 }
 
 /** What the asker reads when its outbound was answered. It stands on its own (after a /clear too) */
-export function outboundDelivery(id: string, spec: OutboundSpec, outcome: { label?: string; text?: string; note?: string } | null, dropped: { why?: string } | null): string {
+export function outboundDelivery(id: string, spec: OutboundSpec, outcome: { label?: string; text?: string; note?: string; allowed?: string[] } | null, dropped: { why?: string } | null): string {
   const what = `${spec.what} to ${spec.to}`
   const note = outcome?.note ? ` (note: ${outcome.note})` : ''
   if (dropped) return `[${id}] The person dropped your outbound (${what}) without sending it${dropped.why ? ` (${dropped.why})` : ''}. Don't send it another way.`
-  if (outcome?.label === 'sent') return `[${id}] The person approved your outbound (${what}), and fleet ran it exactly as drafted, once: ${outcome.text ?? 'done'}${note}. Don't run it again.`
+  if (outcome?.label === 'sent') {
+    const allowed = outcome.allowed?.length ? ` The person also allowed ${outcome.allowed.join(', ')} in outbound.json: from now on a send there needs no draft.` : ''
+    return `[${id}] The person approved your outbound (${what}), and fleet ran it exactly as drafted, once: ${outcome.text ?? 'done'}${note}. Don't run it again.${allowed}`
+  }
   if (outcome?.label === 'done') return `[${id}] The person sent it themselves (${what})${note}. Don't send it again.`
   return `[${id}] The person rejected your outbound (${what})${note}. Don't send it another way; go on without it, or ask with mcp__fleet__decide.`
 }
