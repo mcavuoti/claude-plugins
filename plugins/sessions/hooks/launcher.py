@@ -4,6 +4,7 @@
     launcher.py start --tty TTY --file FILE [--new | --agents] [--exclude ID] [NAME...]
     launcher.py pick [--tty TTY] [--new] [NAME...]      the decision only, as JSON (tests and debugging)
     launcher.py tell [--in DIR] NAME|ID [TEXT... | -]   ccc tell: hand a background session text (see tell() below)
+    launcher.py section [--session NAME|ID] [TITLE | -]  ccc section: the person's section for a session (section())
 
 start decides and, when something should open in this window, writes it to FILE (the window's file, which visor.sh
 reads): the project's top session, the session NAME (created if there's none), the agent view (--agents). In order:
@@ -21,8 +22,8 @@ asks whether to restart it first. On arrival the panel takes the keyboard: a req
 
 The files it reads and writes are the mod's (hooks/state.ts has the formats): <data>/alive/<sessionId> (heartbeats),
 <data>/order/<root> (the panel's order), <data>/inbox/<sessionId> (requests), <data>/windows/<tty> (what a window opens
-next), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), with <data> =
-~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
+next), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), <data>/sections.json (the
+person's sections, which ccc section changes), with <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
 Other environment: SESSIONS_CLAUDE (the claude command), SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the
 installed plugin, from the ccc command), SESSIONS_START_WAIT (seconds to wait for a new session's mod).
 """
@@ -32,8 +33,10 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 
 FORMAT = 2
+SECTIONS_FORMAT = 1
 TELL_MAX_BYTES = 4096
 HEARTBEAT_VERSION = (0, 10, 0)
 HEARTBEAT_FRESH_MS = 45000
@@ -221,14 +224,16 @@ def order_rows(rows, order):
     return sorted(rest, key=lambda s: position.get(s['sessionId'], len(position)))
 
 
-# Which windows show which session, from ps (parseWindows in state.ts): viewers (claude attach <id>), launchers
+# Which windows show which session, from ps (parseWindows in state.ts): viewers (claude attach <id>), launchers, and
+# every process's terminal (by_pid: a regular session's own window)
 def parse_windows(ps):
-    by_id, clients, launchers = {}, {}, {}
+    by_id, by_pid, clients, launchers = {}, {}, {}, {}
     for line in ps.split('\n'):
         parts = line.split()
         if len(parts) < 3 or parts[1] in ('??', '?', '-'):
             continue
         pid, tty, command = parts[0], '/dev/' + parts[1], ' '.join(parts[2:])
+        by_pid[pid] = tty
         m = re.match(r'^(\S*/)?claude attach ([0-9a-f]{8})$', command)
         if m:
             by_id.setdefault(m.group(2), []).append(tty)
@@ -237,7 +242,7 @@ def parse_windows(ps):
             clients[tty] = pid
         if re.match(r'^(\S*/)?bash \S*/visor\.sh( |$)', command):
             launchers[tty] = pid
-    return {'by_id': by_id, 'clients': clients, 'launchers': launchers}
+    return {'by_id': by_id, 'by_pid': by_pid, 'clients': clients, 'launchers': launchers}
 
 
 def read_windows():
@@ -695,9 +700,191 @@ def tell(argv):
     return 1 if k.get('state') == 'refused' else 0
 
 
+# --- ccc section ---------------------------------------------------------------------------------------------------
+#
+# ccc section [--session NAME|ID] [TITLE | -] puts a session in one of the person's sections from the shell, the same
+# way /sessions section does in the session: the section me:<slug> is made if needed, the person's choice wins over any
+# plugin's, and - takes it out. The session is the one this folder's project shows in a window (its viewer, or a regular
+# session's own terminal), or the one --session names (its id, or its name in this folder's project). Without a title
+# it says which section it's in. It writes <data>/sections.json, the person's data with its own version
+# (sectionsFormat), under the lock the mods take (sections.json.lock), keeping the fields it doesn't know; the panels
+# draw it on their next refresh.
+
+# slugOf in state.ts: "Big renders!" -> "big-renders"
+def slug_of(title):
+    t = unicodedata.normalize('NFD', title.lower())
+    t = re.sub(r'[̀-ͯ]', '', t)
+    t = re.sub(r'[^a-z0-9]+', '-', t)
+    return re.sub(r'^-+|-+$', '', t)[:40].rstrip('-')
+
+
+# parseSectionsFile in state.ts: the file, or why it can't be used (a newer one is never read as this one)
+def read_sections(path):
+    if not os.path.exists(path):
+        return {'sectionsFormat': SECTIONS_FORMAT, 'sections': [], 'members': {}}, None
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None, "sections.json isn't valid JSON: fix it or remove it"
+    if not isinstance(d, dict):
+        return None, "sections.json isn't an object: fix it or remove it"
+    try:
+        version = float(d.get('sectionsFormat'))
+    except (TypeError, ValueError):
+        version = 0
+    if version > SECTIONS_FORMAT:
+        return None, 'sections.json is from a newer sessions (sectionsFormat %s): update the plugin' % d.get('sectionsFormat')
+    if version != SECTIONS_FORMAT:
+        return None, 'sections.json has no sectionsFormat %d: fix it or remove it' % SECTIONS_FORMAT
+    d['sections'] = d['sections'] if isinstance(d.get('sections'), list) else []
+    d['members'] = d['members'] if isinstance(d.get('members'), dict) else {}
+    return d, None
+
+
+def section_title(d, section_id):
+    for s in d['sections']:
+        if isinstance(s, dict) and s.get('id') == section_id and isinstance(s.get('title'), str):
+            return s['title']
+    return None
+
+
+# personAssign in state.ts (with setMember and dropEmptyPersonSections): the file with the session in the person's
+# section of that title (made if needed, order 100), or out of any (None); or why not
+def person_assign(d, ref, title):
+    members = dict(d['members'])
+    if title is None:
+        members.pop(ref, None)
+        section = None
+        sections = list(d['sections'])
+    else:
+        clean = ' '.join(title.split())
+        slug = slug_of(clean)
+        if not slug:
+            return None, None, 'A section title needs a letter or a digit'
+        if len(clean) > 60:
+            return None, None, 'A section title is up to 60 characters'
+        sid = 'me:' + slug
+        existing = section_title(d, sid)
+        section = {'id': sid, 'title': existing if existing is not None else clean, 'order': 100, 'owner': 'person'}
+        sections = list(d['sections']) if existing is not None else list(d['sections']) + [dict(section)]
+        kept = {k: v for k, v in (members.get(ref) or {}).items() if k != 'parent'} if isinstance(members.get(ref), dict) else {}
+        members[ref] = dict(kept, section=sid, by='person')
+    used = {m.get('section') for m in members.values() if isinstance(m, dict)}
+    sections = [s for s in sections if not (isinstance(s, dict) and isinstance(s.get('id'), str) and s['id'].startswith('me:') and s['id'] not in used)]
+    return dict(d, sections=sections, members=members), section, None
+
+
+# The lock the mods take to change sections.json (withLock in register.tsx): a folder, stale after 5 s
+def with_sections_lock(path, body):
+    lock = path + '.lock'
+    for _ in range(40):
+        try:
+            os.mkdir(lock)
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > 5:
+                    os.rmdir(lock)
+            except OSError:
+                pass
+            time.sleep(0.05)
+            continue
+        try:
+            return body()
+        finally:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+    return 'busy'
+
+
+def section_target(sessions, rows, name, root):
+    if name:
+        if re.match(r'^[0-9a-f]{8}$', name):
+            for s in sessions:
+                if s.get('id') == name:
+                    return s, None
+        for test in (lambda s: s.get('name') == name, lambda s: str(s.get('name') or '').casefold() == name.casefold()):
+            found = [s for s in rows if test(s)]
+            if found:
+                return found[0], None
+        return None, 'no session is named “%s” in %s' % (name, root)
+    w = read_windows()
+    shown = [s for s in rows if (s.get('id') and w['by_id'].get(s['id'])) or (s.get('kind') != 'background' and is_live(s) and str(s.get('pid')) in w['by_pid'])]
+    if len(shown) == 1:
+        return shown[0], None
+    if not shown:
+        return None, 'no window shows a session of %s: name it with --session <name|id>' % root
+    return None, 'windows show several sessions of %s (%s): name one with --session <name|id>' % (root, ', '.join('“%s”' % title_of(s) for s in shown))
+
+
+def section(argv):
+    words, name = list(argv), None
+    if '--session' in words:
+        i = words.index('--session')
+        if i + 1 >= len(words):
+            say('usage: ccc section [--session <name|id>] [<title> | -]')
+            return 2
+        name = words[i + 1]
+        words = words[:i] + words[i + 2:]
+    title = ' '.join(words).strip()
+    sessions = list_sessions()
+    if sessions is None:
+        say("Couldn't read the session list (claude agents --json)")
+        return 1
+    root = project_root(os.path.realpath(os.getcwd()))
+    rows = [s for s in sessions if in_project(s['cwd'], root, HOME)]
+    s, why = section_target(sessions, rows, name, root)
+    if not s:
+        say(why)
+        return 1
+    ref = s['id'] if isinstance(s.get('id'), str) and s['id'] else 'sid:' + s['sessionId']
+    who = '“%s”' % title_of(s)
+    path = os.path.join(DATA, 'sections.json')
+    if not title:
+        d, problem = read_sections(path)
+        if problem:
+            say(problem)
+            return 1
+        m = d['members'].get(ref) if isinstance(d['members'].get(ref), dict) else None
+        t = section_title(d, m.get('section')) if m else None
+        if t is None:
+            say("%s isn't in a section. ccc section <title> puts it in one of yours, ccc section - takes it out" % who)
+        else:
+            say('%s is in “%s”%s' % (who, t, '' if m.get('by') == 'person' else ' (put there by %s)' % m.get('by')))
+        return 0
+
+    def change():
+        d, problem = read_sections(path)
+        if problem:
+            return problem
+        out, sec, problem = person_assign(d, ref, None if title == '-' else title)
+        if problem:
+            return problem
+        os.makedirs(DATA, exist_ok=True)
+        temporary = '%s.ccc-%d.tmp' % (path, os.getpid())
+        with open(temporary, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(out, indent=2, ensure_ascii=False) + '\n')
+        os.replace(temporary, path)
+        return sec
+    os.makedirs(DATA, exist_ok=True)
+    result = with_sections_lock(path, change)
+    if result == 'busy':
+        say('Another session is changing the sections: try again')
+        return 1
+    if isinstance(result, str):
+        say(result)
+        return 1
+    say('%s is in “%s” now' % (who, result['title']) if result else '%s is in no section now' % who)
+    return 0
+
+
 def main(argv):
     if argv[:1] == ['tell']:
         return tell(argv[1:])
+    if argv[:1] == ['section']:
+        return section(argv[1:])
     import argparse
     parser = argparse.ArgumentParser(prog='launcher.py')
     parser.add_argument('mode', choices=['start', 'pick'])

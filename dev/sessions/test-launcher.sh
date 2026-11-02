@@ -311,4 +311,36 @@ grep -q "^refused: it is stopped, and no session with a running panel answered t
 expect "$(find "$data/tell/aaaaaaaa" -name '*.req' | wc -l | tr -d ' ')" 1 "the refused request is removed (the first one waits)"
 pass "tell: wakes a stopped session through a running one, refused when none answers"
 
+# 13. ccc section: the person's section for the session this project's window shows (or --session), written to
+#     sections.json as /sessions section does (made if needed, gone when empty, unknown fields kept, a parent dropped);
+#     refused with no window or several, and a newer sections.json is left untouched
+sect() { (cd "$proj" && env -u SESSIONS_TTY /bin/bash "$hooks/visor.sh" start section "$@" < /dev/null); }
+members() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps([d["members"], [s["id"] for s in d["sections"]], d.get("x")], sort_keys=True))' "$data/sections.json"; }
+reset
+sessions aaaaaaaa:alpha:idle:600 bbbbbbbb:beta:idle:600
+printf '  501 ttys901  bash /x/hooks/visor.sh start\n  502 ttys901  claude attach aaaaaaaa\n' > "$fix/ps.txt"
+mkdir -p "$data"
+printf '{"sectionsFormat": 1, "x": 1, "sections": [], "members": {"aaaaaaaa": {"section": "probe:desk", "by": "probe", "parent": "bbbbbbbb", "note": 2}}}\n' > "$data/sections.json"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+expect "$(sect Big renders!)" "“alpha” is in “Big renders!” now" "section: the window's session"
+expect "$(members)" '[{"aaaaaaaa": {"by": "person", "note": 2, "section": "me:big-renders"}}, ["me:big-renders"], 1]' "section: written as the person's, unknown fields kept, the parent dropped"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+expect "$(sect)" "“alpha” is in “Big renders!”" "section: which one"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+expect "$(sect --session beta big RENDERS)" "“beta” is in “Big renders!” now" "section: --session, the same section by title"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+expect "$(sect -)" "“alpha” is in no section now" "section: out of it"
+expect "$(members)" '[{"bbbbbbbb": {"by": "person", "section": "me:big-renders"}}, ["me:big-renders"], 1]' "section: the section stays while beta's in it"
+sect --session bbbbbbbb - > /dev/null
+expect "$(members)" '[{}, [], 1]' "section: an empty section of the person's goes"
+: > "$fix/ps.txt"
+grep -q "no window shows a session of" <<<"$(sect Renders || true)" || fail "section" "no refusal without a window"
+printf '  502 ttys901  claude attach aaaaaaaa\n  503 ttys902  claude attach bbbbbbbb\n' > "$fix/ps.txt"
+# shellcheck disable=SC1111 # the curly quotes are what the launcher prints
+grep -q "windows show several sessions of $proj (“alpha”, “beta”)" <<<"$(sect Renders || true)" || fail "section" "no refusal with two windows"
+printf '{"sectionsFormat": 2, "sections": [], "members": {}}\n' > "$data/sections.json"
+grep -q "from a newer sessions" <<<"$(sect --session alpha Renders || true)" || fail "section" "a newer sections.json was used"
+grep -q '"sectionsFormat": 2' "$data/sections.json" || fail "section" "a newer sections.json was rewritten"
+pass "section: the window's session or --session, as the person's, refused without one window, a newer file untouched"
+
 echo "launcher: ok"
