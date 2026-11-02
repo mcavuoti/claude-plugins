@@ -64,6 +64,9 @@ export type Rev = {
   pins: string[]
   /** It landed without the gate (a Bash command) citing pins its thread hadn't read as they are: what and why */
   suspect?: string[]
+  /** Stale pins it kept on purpose: the writing thread had read the cited record as it was then ("R-1@1>3": R-1@1,
+   * kept with R-1 read at v3). They don't make the file suspect until the record moves again */
+  confirmed?: string[]
 }
 
 // ---- world.json: idPattern, keys.change, strict, checks, commit ----
@@ -255,6 +258,12 @@ export function pinProblems(
 }
 
 /** What the gate remembers it told: one key per problem (a second try with nothing new passes) */
+/** The stale pins a write keeps although its thread read the record as it is now: it confirmed them, and the file
+ * isn't suspect for them until the record moves again */
+export function confirmedPins(states: readonly PinState[], readOf: (id: string) => ReadState): string[] {
+  return states.filter(s => s.state === 'stale' && readOf(s.pin.id) === 'current').map(s => `${pinKey(s.pin)}>${s.now}`)
+}
+
 export function problemKeys(problems: readonly PinProblem[]): string[] {
   return problems.map(p => `${pinKey(p.pin)}:${p.why}:${p.state.now}`).sort()
 }
@@ -320,10 +329,11 @@ export type Reason = {
 export type Suspect = { path: string; id: string | null; owner: Who | null; reasons: Reason[]; via?: string[] }
 export type SuspectsFile = { format: number; at: number; by: string; suspects: Suspect[] }
 /** One world file as the sweeper sees it: its pins, and its last landing (a record's newest version, or the last event) */
-export type Facts = { path: string; id: string | null; pins: readonly string[]; owner: Who | null; blind?: readonly string[] }
+export type Facts = { path: string; id: string | null; pins: readonly string[]; owner: Who | null; blind?: readonly string[]; confirmed?: readonly string[] }
 
-/** Direct suspects: a pin stale, ahead or of no record, or a blind landing whose pins weren't read as they were.
- * Indirect: a file that cites a suspect record (transitively). Sorted by path */
+/** Direct suspects: a pin stale (unless its last landing kept it after reading the record as it is now), ahead or of
+ * no record, or a blind landing whose pins weren't read as they were. Indirect: a file that cites a suspect record
+ * (transitively). Sorted by path */
 export function suspectsOf(files: readonly Facts[], stateOf: (p: Pin) => PinState): Suspect[] {
   const direct = new Map<string, Suspect>()
   for (const f of files) {
@@ -332,7 +342,7 @@ export function suspectsOf(files: readonly Facts[], stateOf: (p: Pin) => PinStat
       const pin = parsePin(s)
       if (!pin) continue
       const st = stateOf(pin)
-      if (st.state === 'current') continue
+      if (st.state === 'current' || (st.state === 'stale' && f.confirmed?.includes(`${s}>${st.now}`))) continue
       const m = st.moved
       reasons.push({ why: st.state, pin: s, of: pin.id, ...(st.now ? { now: st.now } : {}), ...(m ? { moved: { rev: m.rev, kind: m.kind, at: m.at, by: m.by, hash: m.hash } } : {}) })
     }

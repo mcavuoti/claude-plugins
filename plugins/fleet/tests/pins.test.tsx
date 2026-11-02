@@ -98,13 +98,16 @@ test('C10: a record cited at a version that has been revised: its owner hears it
   const fixed = await call($, { tool: 'Edit', file_path: B1, old_string: 'relies_on: [R-1@1]', new_string: 'relies_on: [R-1@2]' })
   expect(fixed.deny).toBe(undefined)
   expect(fixed.context).toContain('fleet: board/B-1.md is now B-1@3.')
-  await tick(w)
-  expect(json(w, `${STATE}/suspects.json`).suspects.map((s: any) => [s.path, s.reasons.length])).toEqual([['board/B-1.md', 1]])
-  // (the body still says R-1@1: every ID@n of the text is a pin)
-  await call($, { tool: 'Edit', file_path: B1, old_string: 'built on R-1@1', new_string: 'built on R-1@2' })
+  // The body still says R-1@1 (every ID@n of the text is a pin): kept after reading R-1 at v2, it's confirmed
+  expect(events(w).at(-1)).toMatchObject({ rev: 3, pins: ['R-1@1', 'R-1@2'], confirmed: ['R-1@1>2'] })
   await tick(w)
   expect(json(w, `${STATE}/suspects.json`).suspects).toEqual([])
   expect(await band($)).not.toContain('flagged')
+  // Until R-1 moves again
+  landByR(w, R1, 'R-1 v3\n', 3)
+  await tick(w)
+  await tick(w)
+  expect(json(w, `${STATE}/suspects.json`).suspects.map((s: any) => [s.path, s.reasons.map((r: any) => r.pin)])).toEqual([['board/B-1.md', ['R-1@1', 'R-1@2']]])
 })
 
 test('the gate tells once: a second identical try passes; a new pin of a record never read is refused once; a current pin the file had needs no read', WITH_SESSIONS, async ($, on) => {

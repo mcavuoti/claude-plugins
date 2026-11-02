@@ -51,6 +51,8 @@ export type ChangeEvent = {
   pins?: string[]
   /** A blind landing citing pins its thread hadn't read as they were: "<pin>:<stale|unread|ahead>" */
   suspect?: string[]
+  /** Stale pins the writer kept after reading the record as it was: "<pin>><version read>" (records.ts) */
+  confirmed?: string[]
 }
 /** A thread: 'main' for the main loop, else the helper's agentId */
 export type Threads = Record<string, Record<string, FleetRead>>

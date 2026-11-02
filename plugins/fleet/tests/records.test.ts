@@ -4,6 +4,7 @@ import { hashText } from '../hooks/changes'
 import {
   changeOf,
   checkOutcome,
+  confirmedPins,
   checksKey,
   commitMessage,
   copyOf,
@@ -124,8 +125,9 @@ test('the gate asks for a read: a stale pin not read as it is, a new pin never r
     ['R-2', 'unread'],
   ])
   expect(problemKeys(problems)).toEqual(['R-1@1:stale:2', 'R-2@1:unread:1'])
-  // After a read of R-1 as it is now, its stale pin passes (the file stays suspect until the pin moves)
+  // After a read of R-1 as it is now, its stale pin passes, and the landing confirms it (until R-1 moves again)
   expect(pinProblems(pins.slice(0, 1), new Set(), st, () => 'current', () => null)).toEqual([])
+  expect(confirmedPins(pins.map(st), id => (id === 'R-1' ? 'current' : 'never'))).toEqual(['R-1@1>2'])
   const text = pinsText(problems, ME, true)
   expect(text).toBe(
     [
@@ -148,6 +150,8 @@ test('suspects: a stale pin, a blind landing, a pin of no record; and whatever c
       { path: 'docs/P-1.md', id: 'P-1', pins: ['B-1@1'], owner: null },
       { path: 'notes/summary.md', id: null, pins: ['P-1@1', 'X-1@1'], owner: null },
       { path: 'notes/fine.md', id: null, pins: ['R-1@2'], owner: null },
+      { path: 'notes/kept.md', id: null, pins: ['R-1@1'], owner: null, confirmed: ['R-1@1>2'] },
+      { path: 'notes/kept-before.md', id: null, pins: ['R-1@1'], owner: null, confirmed: ['R-1@1>1'] },
     ],
     p => pinState(p, revs[p.id]),
   )
@@ -155,6 +159,7 @@ test('suspects: a stale pin, a blind landing, a pin of no record; and whatever c
     ['board/B-1.md', ['stale'], []],
     ['board/B-2.md', ['blind'], []],
     ['docs/P-1.md', [], ['B-1']],
+    ['notes/kept-before.md', ['stale'], []],
     ['notes/summary.md', ['unknown'], []],
   ])
   expect(suspectLine(list[0]!, ME)).toBe('board/B-1.md (B-1) cites R-1@1, and R-1 is at v2 (a revision at 14:02 by TEST R)')

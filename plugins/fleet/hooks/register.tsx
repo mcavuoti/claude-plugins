@@ -99,6 +99,7 @@ import {
   blindText,
   changeOf,
   checkOutcome,
+  confirmedPins,
   checksKey,
   citeText,
   commitMessage,
@@ -1411,9 +1412,11 @@ async function revsFor($: any, id: string, have?: { rel: string; v: string | nul
 
 /** A landing of a world file: a record gets its next version (no-clobber: on a name taken, the one after), with the
  * kind its change line names; the event carries it, and the pins the file cites now */
-async function landRecord($: any, rel: string, after: { v: string | null; text: string | null }, via: ChangeEvent['via'], by: Who | null, suspect: string[] = []): Promise<Partial<ChangeEvent>> {
+async function landRecord($: any, rel: string, after: { v: string | null; text: string | null }, via: ChangeEvent['via'], by: Who | null, marks: { suspect?: string[]; confirmed?: string[] } = {}): Promise<Partial<ChangeEvent>> {
   const pins = pinsFrom(after.text)
-  const extra: Partial<ChangeEvent> = { ...(pins.length ? { pins } : {}), ...(suspect.length ? { suspect } : {}) }
+  const suspect = marks.suspect ?? []
+  const confirmed = marks.confirmed ?? []
+  const extra: Partial<ChangeEvent> = { ...(pins.length ? { pins } : {}), ...(suspect.length ? { suspect } : {}), ...(confirmed.length ? { confirmed } : {}) }
   const id = records ? idOf(rel, records) : null
   if (!records || !id) return extra
   const revs = await revsOf($, id)
@@ -1423,7 +1426,7 @@ async function landRecord($: any, rel: string, after: { v: string | null; text: 
   const kind = landingKind(change, prev, after.v === null)
   const at = await $.clock.now()
   for (let n = (prev?.rev ?? 0) + 1, tries = 0; tries < 20; tries++, n++) {
-    const entry: Rev = { format: FORMAT, id, path: rel, rev: n, hash: after.v, kind, changeHash: change?.hash ?? null, at, by, via, pins, ...(suspect.length ? { suspect } : {}) }
+    const entry: Rev = { format: FORMAT, id, path: rel, rev: n, hash: after.v, kind, changeHash: change?.hash ?? null, at, by, via, pins, ...(suspect.length ? { suspect } : {}), ...(confirmed.length ? { confirmed } : {}) }
     const r = await publish($, `${revDir(id)}/${n}.json`, json(entry))
     if (r === 'ok') {
       forget(id)
@@ -1436,7 +1439,7 @@ async function landRecord($: any, rel: string, after: { v: string | null; text: 
   return { id, ...extra }
 }
 
-type PinCheck = { problems: ReturnType<typeof pinProblems>; keys: string[]; states: PinState[] }
+type PinCheck = { problems: ReturnType<typeof pinProblems>; keys: string[]; states: PinState[]; confirmed: string[] }
 
 /** The pins of a text a thread is about to land, against the pins the file cited before: the problems to tell
  * (records.ts pinProblems), and every pin's state */
@@ -1461,8 +1464,9 @@ async function checkPins($: any, thread: string, text: string, before: ReadonlyS
     const now = st.state === 'stale' || st.state === 'ahead' ? (await versionOf($, `${realRoot}/${rel}`)).v : r.v
     readStates.set(p.id, r.v === now ? 'current' : 'older')
   }
-  const problems = pinProblems(pins, before, p => states.get(pinKey(p)) as PinState, id => readStates.get(id) ?? 'never', id => idIndex.get(id) ?? null)
-  return { problems, keys: problemKeys(problems), states: [...states.values()] }
+  const readOf = (id: string): ReadState => readStates.get(id) ?? 'never'
+  const problems = pinProblems(pins, before, p => states.get(pinKey(p)) as PinState, readOf, id => idIndex.get(id) ?? null)
+  return { problems, keys: problemKeys(problems), states: [...states.values()], confirmed: confirmedPins([...states.values()], readOf) }
 }
 
 /** What a Write or Edit leaves in the file (null: it can't be told, or the edit won't apply) */
@@ -1525,7 +1529,7 @@ async function gate($: any, e: any, next: any) {
     await pullEvents($)
     const before = latest.get(w.rel)
     const by = await whoAmI($, thread)
-    const fields = await landRecord($, w.rel, after, 'tool', by)
+    const fields = await landRecord($, w.rel, after, 'tool', by, { confirmed: pins?.confirmed ?? [] })
     await writeEvent($, { path: w.rel, from: replaced ?? cur.v, to: after.v, via: 'tool', tool: String(e.tool), blind: false, by, ...(raced ? { overwrote: true } : {}), ...fields })
     setKnown(w.rel, { mtimeMs: after.mtimeMs, size: after.size, v: after.v, pins: fields.pins ?? [] })
     unexplained.delete(w.rel)
@@ -1643,7 +1647,7 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     const id = records ? idOf(rel, records) : null
     if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
     const by = await whoAmI($, thread)
-    const fields = await landRecord($, rel, f, 'bash', by, suspect)
+    const fields = await landRecord($, rel, f, 'bash', by, { suspect, confirmed: pc?.confirmed ?? [] })
     await writeEvent($, { path: rel, from: last && last.to !== v ? last.to : (k?.v ?? null), to: v, via: 'bash', tool: 'Bash', blind: true, by, ...fields })
     settle()
     await setRead($, thread, rel, v, fields.rev)
@@ -1859,6 +1863,7 @@ async function computeSuspects($: any) {
     const id = idOf(rel, records)
     let owner: Who | null = null
     let blind: string[] | undefined
+    let confirmed: string[] | undefined
     if (id && idIndex.get(id) === rel) {
       let revs = await revsOf($, id)
       if (!revs.length && k.v !== null) {
@@ -1867,13 +1872,13 @@ async function computeSuspects($: any) {
       }
       const last = revs[revs.length - 1]
       owner = last?.by ?? null
-      if (last && last.hash === k.v) blind = last.suspect
+      if (last && last.hash === k.v) ({ suspect: blind, confirmed } = last)
     } else {
       const e = latest.get(rel)
       owner = e?.by ?? null
-      if (e && e.to === k.v) blind = e.suspect
+      if (e && e.to === k.v) ({ suspect: blind, confirmed } = e)
     }
-    if (k.pins?.length || blind?.length) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}) })
+    if (k.pins?.length || blind?.length) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}), ...(confirmed ? { confirmed } : {}) })
   }
   const cited = new Map<string, Rev[]>()
   for (const id of new Set(facts.flatMap(f => f.pins.map(p => parsePin(p)?.id ?? '')))) if (id) cited.set(id, await revsFor($, id))
@@ -2553,6 +2558,7 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   if (fresh) worldReady = null
   timers($)
   if (jobRef && !offered) await offer($).catch(() => {})
+  if (!jobRef) whyNot = "this isn't a background session: here the model asks with AskUserQuestion, and fleet records the answers"
   log($, `init ${dir}`)
   return [
     `${fresh ? 'Set up' : 'Up to date'} in ${dir}/ (template blank).`,
@@ -2562,8 +2568,8 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
       ? parsed.problem
       : `Shared files (world.json): ${globs.length ? globList(globs) : 'none'}. A session's write of one that changed since it read it is refused once with who changed it, and it hears of such changes at its next step. /fleet world changes the list.`,
     config.commitRegister
-      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/ and reads/ stay out of git.'
-      : 'decisions/, events/ and reads/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
+      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/ and state/ stay out of git.'
+      : 'decisions/, events/, reads/ and state/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
   ].join('\n')
 }
