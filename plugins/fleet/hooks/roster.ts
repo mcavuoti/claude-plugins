@@ -39,6 +39,11 @@ type Overrides = {
   effort?: string
   budget?: { usdDay?: number }
   cadenceH?: number
+  /** long: the instance keeps one context (leads, the integrator, the chief); fresh (the default): at each cadence
+   * boundary, idle and with its journal landed, fleet clears it and hands it its journal (decision 4a) */
+  context?: string
+  /** Its journal, relative to the project ({name}, {slug}); journals/{slug}.md by default */
+  journal?: string
   seed?: string
   zone?: string
   permissions?: Permissions
@@ -72,6 +77,9 @@ export type Instance = {
   effort: string | null
   usdDay: number | null
   cadenceH: number | null
+  context: 'long' | 'fresh'
+  /** Its journal, relative to the project (it writes it with its own tools: a shared file, when the world has it) */
+  journal: string
   /** The seed's file, relative to <project>/.claude/fleet/ */
   seed: string
   brief: string
@@ -98,6 +106,14 @@ export function parseRoster(text: string): { roster: Roster } | { problem: strin
   if (!r.roles || typeof r.roles !== 'object' || Array.isArray(r.roles)) return { problem: 'roster.json: roles is an object, role name → { agent, model, … }' }
   if (!Array.isArray(r.instances)) return { problem: 'roster.json: instances is a list of { name, role, … }' }
   return { roster: r as Roster }
+}
+
+/** Where an instance keeps its journal, unless its role or itself says otherwise: a shared file in the templates */
+export const DEFAULT_JOURNAL = 'journals/{slug}.md'
+
+/** {name} and {slug} in a roster's text, as one instance's */
+export function fillName(text: string, name: string, slug: string): string {
+  return text.replace(/\{name\}/g, name).replace(/\{slug\}/g, slug)
 }
 
 /** The name an instance's files go under: instances/<slug>.json, instances/<slug>/ */
@@ -165,6 +181,7 @@ export function instancesOf(r: Roster): Instance[] {
     const pick = <T>(f: (o: Overrides) => T | undefined): T | undefined => f(spec) ?? f(role)
     const name = spec.name.trim()
     const sectionId = typeof spec.section === 'string' ? spec.section : null
+    const journal = pick(o => (typeof o.journal === 'string' && o.journal.trim() ? o.journal.trim() : undefined)) ?? DEFAULT_JOURNAL
     out.push({
       name,
       slug: slugOf(name),
@@ -177,6 +194,8 @@ export function instancesOf(r: Roster): Instance[] {
       effort: pick(o => (typeof o.effort === 'string' && o.effort ? o.effort : undefined)) ?? null,
       usdDay: pick(o => num(o.budget?.usdDay) ?? undefined) ?? null,
       cadenceH: pick(o => num(o.cadenceH) ?? undefined) ?? null,
+      context: pick(o => (o.context === 'long' || o.context === 'fresh' ? (o.context as 'long' | 'fresh') : undefined)) ?? 'fresh',
+      journal: fillName(journal, name, slugOf(name)),
       seed: pick(o => (typeof o.seed === 'string' && o.seed ? o.seed : undefined)) ?? `seeds/${spec.role}.md`,
       brief: typeof spec.brief === 'string' ? spec.brief.trim() : '',
       permissions: mergePermissions(zone?.permissions, role.permissions, spec.permissions),
@@ -309,6 +328,12 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
     }
     const env = isObject(i.settings.env) ? Object.keys(i.settings.env) : []
     if (env.some(k => k.startsWith('FLEET_'))) warnings.push(`"${i.name}": its settings set ${env.filter(k => k.startsWith('FLEET_')).join(', ')}, which fleet sets itself`)
+    if (i.journal.startsWith('/') || i.journal.split('/').some(s => s === '..' || s === '.' || s === '') || /^\.claude(\/|$)/.test(i.journal)) {
+      errors.push(`"${i.name}": its journal "${i.journal}" is a path relative to the project, without . or .., and outside .claude/ (Claude asks before any write there, and nobody would answer)`)
+    }
+  }
+  for (const spec of [...Object.values(r.roles), ...r.instances]) {
+    if (isObject(spec) && spec.context !== undefined && spec.context !== 'long' && spec.context !== 'fresh') errors.push(`context is "long" or "fresh" (it's "${String(spec.context)}")`)
   }
   const cap = projectCap(r)
   const sum = instances.reduce((s, i) => s + (i.usdDay ?? 0), 0)
@@ -471,6 +496,59 @@ export function wakeVerdict(mine: WakeCount | null, others: number, now: number,
 
 export function countWake(mine: WakeCount | null, now: number, day: string): WakeCount {
   return { day, count: (mine && mine.day === day ? mine.count : 0) + 1, last: now }
+}
+
+// ---- Cadence: an instance lands something every cadenceH hours (a negative result, in its journal, counts) ----
+
+const HOUR_MS = 3600000
+
+/** From when its period counts (its last landing, or when it started), and whether it's past it */
+export function cadenceOf(p: { cadenceH: number | null; lastLanding: number | null; startedAt: number; now: number }): { due: boolean; anchor: number; hours: number } {
+  const anchor = Math.max(p.lastLanding ?? 0, p.startedAt)
+  const hours = (p.now - anchor) / HOUR_MS
+  return { due: p.cadenceH !== null && p.cadenceH > 0 && hours >= p.cadenceH, anchor, hours }
+}
+
+/** Hours as the person reads them: 20 min, 1 h, 7 h, 2 d */
+export function hoursText(h: number): string {
+  if (h < 1) return `${Math.max(1, Math.round(h * 60))} min`
+  return h >= 48 ? `${Math.floor(h / 24)} d` : `${Math.floor(h)} h`
+}
+
+export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number): string {
+  return `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. This is fleet's one nudge for this period.`
+}
+
+/** Decision 4a: an instance that doesn't keep a long context starts each cadence period afresh. Due when its
+ * conversation is a period old, it's idle, nothing of fleet's is on its way to it, and it wrote its journal since the
+ * conversation started (that's what the next one is handed) */
+export function freshDue(p: { context: 'long' | 'fresh'; cadenceH: number | null; conversationAt: number; journalAt: number | null; now: number; idleMs: number; pending: boolean }): boolean {
+  if (p.context !== 'fresh' || p.cadenceH === null || p.cadenceH <= 0 || p.pending || p.idleMs < 60000) return false
+  if (p.now - p.conversationAt < p.cadenceH * HOUR_MS) return false
+  return p.journalAt !== null && p.journalAt > p.conversationAt
+}
+
+/** The last lines of a journal, at most max characters (whole lines) */
+export function journalTail(text: string, max = 4000): string {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\n+$/, '').split('\n')
+  const out: string[] = []
+  let size = 0
+  for (let k = lines.length - 1; k >= 0; k--) {
+    const l = lines[k] as string
+    if (size + l.length + 1 > max && out.length) break
+    out.unshift(l)
+    size += l.length + 1
+  }
+  return out.join('\n')
+}
+
+/** fleet's own prompt to the cleared conversation: who it is, and its journal's last entries */
+export function handoffText(inst: Pick<Instance, 'name' | 'role' | 'cadenceH' | 'journal'>, root: string, tail: string, whole: boolean): string {
+  return [
+    `You are ${inst.name}, the ${inst.role} of this project's fleet (the project folder is ${root}). This is a fresh period: fleet cleared your context after ${hoursText(inst.cadenceH ?? 0)}, as it does every period, and hands you your journal (${inst.journal}) to go on from.`,
+    `${whole ? 'Your journal' : "Your journal's last entries"}:\n\n${tail}`,
+    'Read what it points to that you need (the charter, your claimed items, the records you cite) and continue. Keep your journal as you go: the next period starts from it.',
+  ].join('\n\n')
 }
 
 // ---- Picking instances by what the person typed ----

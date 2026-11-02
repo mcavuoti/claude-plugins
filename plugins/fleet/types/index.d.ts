@@ -9,6 +9,9 @@ export type FleetInflight = { at: number; epoch: string }
  * for a record, the version number fleet gave what it read */
 export type FleetRead = { v: string; at: number; told?: string; rev?: number }
 
+/** The outside content this conversation read (a web page, an outside service's result): when, and what it was */
+export type FleetMark = { at: number; what: string }
+
 declare module 'claude-code' {
   interface PluginState {
     fleet: {
@@ -46,6 +49,21 @@ declare module 'claude-code' {
       budgetTold: string
       /** When this instance's fleet submitted a nudge whose turn hasn't started yet (0: none) */
       nudgeAt: number
+      /** This conversation read outside content (until /clear; kept through compaction and a restart): it can still do
+       * everything, but a change it files waits for the person's apply */
+      outside: FleetMark | null
+      /** The person typed the prompt of the main thread's running turn, or into it: the turn, and the start of his words */
+      personTurn: { turnId: string; quoted: string } | null
+      /** The person's prompt that is about to start a turn (prompt.submit comes before turn.start) */
+      pendingPerson: { text: string; at: number } | null
+      /** Main-thread turns started in this process (a background session's first prompt can be its launch prompt) */
+      turns: number
+      /** When this conversation started (the session's start, or its last /clear): its period, for fresh periods */
+      conversationAt: number
+      /** When this session last landed something in the shared world (an instance's cadence) */
+      landedAt: number
+      /** When fleet last cleared this instance for a fresh period (0: never) */
+      freshAt: number
     }
   }
 }

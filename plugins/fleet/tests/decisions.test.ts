@@ -62,6 +62,16 @@ test('a change is answered with a verb: apply (with the edited draft’s version
   expect(typeof parseAnswers('1 apply 1a')).toBe('string')
 })
 
+test('a resource is answered done or no, an outbound send (with its version after an edit), reject, edit or done; a note may follow', () => {
+  expect(parseAnswers('1 done "the key is in the vault" 2 no')).toEqual([{ n: 1, verb: 'done', note: 'the key is in the vault' }, { n: 2, verb: 'no' }])
+  expect(parseAnswers('3 send h1a2b3c4d, 4 reject “not yet”')).toEqual([{ n: 3, verb: 'send', hash: 'h1a2b3c4d' }, { n: 4, verb: 'reject', note: 'not yet' }])
+  expect(parseAnswers('5 "free text" 6a')).toEqual([{ n: 5, text: 'free text' }, { n: 6, letter: 'a' }])
+  expect(typeof parseAnswers('1 nope')).toBe('string')
+  expect(parseCommand('brief')).toEqual({ kind: 'brief', chief: false })
+  expect(parseCommand('brief --chief')).toEqual({ kind: 'brief', chief: true })
+  expect(parseCommand('brief all').kind).toBe('bad')
+})
+
 test("/fleet up, down, remove, budget, worktrees: their words and what's refused", () => {
   expect(parseCommand('up')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [] })
   expect(parseCommand('up --dry-run --wave 2')).toEqual({ kind: 'up', dryRun: true, wave: 2, names: [] })
@@ -84,7 +94,7 @@ test("/fleet up, down, remove, budget, worktrees: their words and what's refused
 
 test('a change waits for one answer and counts for the band; a kind this fleet doesn’t know is never counted', () => {
   const change: QueueRecord = { ...record('D-5', 0), kind: 'change' }
-  const other = { ...record('D-6', 0), kind: 'resource' } as unknown as QueueRecord
+  const other = { ...record('D-6', 0), kind: 'judge' } as unknown as QueueRecord
   expect(heldCount([change, other, record('D-7', 2)], new Set())).toBe(3)
   expect(heldCount([change], new Set(['D-5.1.json']))).toBe(0)
   // The delivery: a change's own words, and "Go on with what depended on it." only after a choice

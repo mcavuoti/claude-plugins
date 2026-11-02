@@ -35,7 +35,9 @@
 //   instances/<slug>/spend.json, nudges.json, seed-<ref>.json  wire: its spend today, its nudges, its seed sent
 // A reader that meets another format acts on nothing and says to restart (u): there is no code for older formats.
 
+import type { OutsideMark, ResourceSpec } from './authority'
 import type { ChangeSpec } from './drafts'
+import type { OutboundSpec } from './outbound'
 
 /** The format of the wire files: queue/, answers/, applied/, last, prune/, events/, reads/, state/, instances/. Raise it
  * when a key or its meaning changes */
@@ -52,7 +54,9 @@ export type Option = { label: string; description?: string }
 export type Question = { question: string; header?: string; options: Option[]; recommended: string; why: string }
 /** Who asked: the session's official short id (it stays across /clear and restarts), id, name and project */
 export type Asker = { ref: string | null; sessionId: string; name: string | null; root: string }
-/** kind change (drafts.ts): questions is empty, so a fleet that doesn't know the kind can't answer it */
+/** The kinds besides a choice: change (drafts.ts), resource (authority.ts), outbound (outbound.ts). Their questions are
+ * empty, so a fleet that doesn't know the kind can't answer it */
+export type Kind = 'change' | 'resource' | 'outbound'
 export type QueueRecord = {
   format: number
   fleet: string
@@ -61,11 +65,17 @@ export type QueueRecord = {
   asker: Asker
   questions: Question[]
   blocks?: string
-  kind?: 'change'
+  kind?: Kind
   change?: ChangeSpec
+  resource?: ResourceSpec
+  outbound?: OutboundSpec
+  /** The asker's context had read outside content when it filed this (decision 2b): what, and when */
+  outside?: OutsideMark
 }
-/** origin: how the person typed it (composer: a terminal); session: the session it was typed in */
-export type AnswerFile = { format: number; id: string; q: number; label?: string; text?: string; origin: string; session: string; at: number }
+/** origin: how the person typed it (composer: a terminal); session: the session it was typed in. pre: a change applied
+ * as it was filed, because the person typed the turn that filed it (quoted: the start of what he typed); hash: the
+ * version of an outbound the person approved */
+export type AnswerFile = { format: number; id: string; q: number; label?: string; text?: string; origin: string; session: string; at: number; pre?: true; quoted?: string; hash?: string }
 export type NoteFile = { format: number; id: string; q: number; text: string; origin: string; at: number }
 export type DropFile = { format: number; id: string; why?: string; origin: string; session: string; at: number }
 /** One question's outcome in the register: the option picked or the text typed, and any note */
@@ -84,10 +94,16 @@ export type RegisterRecord = {
   answers: (Outcome | null)[]
   state: RegisterState
   why?: string
-  delivered?: { at: number; turnId?: string; how: 'submit' }
+  /** submit: in a prompt of fleet's own; result: in the result of the tool call that filed it (a change applied at once) */
+  delivered?: { at: number; turnId?: string; how: 'submit' | 'result' }
   closedAt: number
-  kind?: 'change'
+  kind?: Kind
   change?: ChangeSpec
+  resource?: ResourceSpec
+  outbound?: OutboundSpec
+  outside?: OutsideMark
+  /** An outbound's call as its draft held it when it closed (what was sent, or would have been) */
+  call?: string
 }
 export type DialogQuestion = { question: string; header?: string; options: Option[]; multiSelect?: boolean }
 export type Config = { configFormat: number; template: string; commitRegister: boolean; [key: string]: unknown }
@@ -127,14 +143,15 @@ export function parseAnswerName(name: string): { id: string; q: number; kind: 'a
   return null
 }
 
-/** How many answers a decision waits for: one per question, and one for a change (applied, rejected, or why not) */
+/** How many answers a decision waits for: one per question, and one for each other kind (a change applied, rejected or
+ * why not; a resource got or not; an outbound sent, rejected, or sent by the person himself) */
 export function slots(r: Pick<QueueRecord, 'questions' | 'kind'>): number {
-  return r.kind === 'change' ? 1 : r.questions.length
+  return r.kind === undefined ? r.questions.length : 1
 }
 
-/** A kind this fleet knows: a choice (no kind) or a change */
+/** A kind this fleet knows: a choice (no kind), a change, a resource or an outbound */
 export function knownKind(r: Pick<QueueRecord, 'kind'>): boolean {
-  return r.kind === undefined || r.kind === 'change'
+  return r.kind === undefined || r.kind === 'change' || r.kind === 'resource' || r.kind === 'outbound'
 }
 
 /** Where a decision stands, from the names in answers/: which questions have an answer, and whether it was dropped */
@@ -184,9 +201,9 @@ export const DECIDE_SCHEMA = {
   properties: {
     kind: {
       type: 'string',
-      enum: ['choice', 'change'],
+      enum: ['choice', 'change', 'resource'],
       description:
-        "choice (the default): questions for the person. change: a change to a command-level file of this project (the charter, roster.json, world.json, a role file in .claude/agents/, a check script, or the records world.json lists under command), which your own tools can't write: fleet writes your draft once the person applies it",
+        "choice (the default): questions for the person. change: a change to a command-level file of this project (the charter, roster.json, world.json, outbound.json, a role file in .claude/agents/, a check script, or the records world.json lists under command), which your own tools can't write: fleet writes your draft once the person applies it. resource: something only the person can get for you (a license, an access, a machine, more budget), with what, why and optionally cost, byWhen and alternatives",
     },
     questions: {
       type: 'array',
@@ -230,11 +247,16 @@ export const DECIDE_SCHEMA = {
       },
     },
     content: { type: 'string', description: 'kind change: the whole new text instead of edits (for a new file, or a rewrite)' },
+    what: { type: 'string', maxLength: 200, description: 'kind resource: what you need' },
+    why: { type: 'string', maxLength: 300, description: 'kind resource: what it is for, in one line' },
+    cost: { type: 'string', maxLength: 200, description: 'kind resource, optional: what it costs, roughly' },
+    byWhen: { type: 'string', maxLength: 200, description: 'kind resource, optional: when you need it by' },
+    alternatives: { type: 'string', maxLength: 200, description: 'kind resource, optional: what you would do without it' },
   },
 } as const
 
 export const DECIDE_DESCRIPTION =
-  "Ask the person to decide something without stopping your work. This is a background session: nobody may be watching it, so AskUserQuestion or a question in your reply would leave the work waiting until the person comes by. Use this tool instead whenever you need the person's choice. It answers at once with a ticket (D-<n>); the person answers from any session of this project, and the answer reaches you later as a message from the fleet plugin that starts with [D-<n>]. Meanwhile keep working on whatever doesn't depend on the answer, or end your turn. 1-4 questions, each with 2-4 options, the option you recommend and one line on why. With kind change, it files a change to a command-level file instead (path, summary, and edits or content): the person reads its diff and applies it, and fleet writes your draft if the file is still as it was."
+  "Ask the person to decide something without stopping your work. This is a background session: nobody may be watching it, so AskUserQuestion or a question in your reply would leave the work waiting until the person comes by. Use this tool instead whenever you need the person's choice. It answers at once with a ticket (D-<n>); the person answers from any session of this project, and the answer reaches you later as a message from the fleet plugin that starts with [D-<n>]. Meanwhile keep working on whatever doesn't depend on the answer, or end your turn. 1-4 questions, each with 2-4 options, the option you recommend and one line on why. With kind change, it files a change to a command-level file instead (path, summary, and edits or content): the person reads its diff and applies it, and fleet writes your draft if the file is still as it was. With kind resource, it asks the person for something only they can get (a license, an access, hardware, budget: what, why, and optionally cost, byWhen, alternatives), apart from the questions of taste."
 
 /** Checks and tidies decide's input. The engine may not enforce the schema, so this is what holds */
 export function checkDecide(input: any): { ok: true; questions: Question[]; blocks?: string } | { ok: false; reason: string } {
@@ -317,9 +339,11 @@ export function bracketedIds(textIn: string): string[] {
 
 // ---- /fleet ----
 
-/** A change is answered with a verb: apply (with the draft's new version when the person edited it), reject, edit */
-export type Verb = 'apply' | 'reject' | 'edit'
-export type AnswerItem = { n: number; letter?: string; text?: string; verb?: Verb; hash?: string }
+/** The other kinds are answered with a verb: a change with apply (with the draft's new version when the person edited
+ * it), reject or edit; a resource with done or no; an outbound with send (with its new version after an edit), reject,
+ * edit, or done (he sent it himself). A note in quotes may follow */
+export type Verb = 'apply' | 'reject' | 'edit' | 'send' | 'done' | 'no'
+export type AnswerItem = { n: number; letter?: string; text?: string; verb?: Verb; hash?: string; note?: string }
 export type Command =
   | { kind: 'list' }
   | { kind: 'answer'; items: AnswerItem[] }
@@ -334,25 +358,29 @@ export type Command =
   | { kind: 'remove'; names: string[]; yes: boolean }
   | { kind: 'worktrees'; prune: boolean; yes: boolean }
   | { kind: 'budget'; target: string; amount: string }
+  | { kind: 'brief'; chief: boolean }
   | { kind: 'help' }
   | { kind: 'bad'; reason: string }
 
 /** `1a 2b`, `1a2b`, `1) a 2) b`, `1a, 2b`, `3 "free text"` (straight or curly quotes); for a change `1 apply`,
- * `1 apply h1a2b3c4d` (the draft's version, after editing it), `1 reject`, `1 edit` */
+ * `1 apply h1a2b3c4d` (the draft's version, after editing it), `1 reject`, `1 edit`; for a resource `1 done`, `1 no`;
+ * for an outbound `1 send` (`1 send h1a2b3c4d`), `1 reject`, `1 edit`, `1 done`. A verb may carry a note in quotes:
+ * `1 done "the key is in the vault"` */
 export function parseAnswers(args: string): AnswerItem[] | string {
   const items: AnswerItem[] = []
   let rest = args.trim()
   while (rest) {
-    const m = /^(\d+)\s*[).:]?\s*(?:(apply|reject|edit)(?:\s+(h[0-9a-f]{6,14}))?(?![A-Za-z0-9])|([a-dA-D])(?![a-zA-Z])|"([^"]*)"|“([^”]*)”)\s*[,;]?\s*/i.exec(rest)
-    if (!m) return `can't read "${rest.slice(0, 30)}": answer like /fleet 1a 2b, 3 "your words", or 4 apply`
+    const m = /^(\d+)\s*[).:]?\s*(?:(apply|reject|edit|send|done|no)(?:\s+(h[0-9a-f]{6,14}))?(?![A-Za-z0-9])(?:\s*(?:"([^"]*)"|“([^”]*)”))?|([a-dA-D])(?![a-zA-Z])|"([^"]*)"|“([^”]*)”)\s*[,;]?\s*/i.exec(rest)
+    if (!m) return `can't read "${rest.slice(0, 30)}": answer like /fleet 1a 2b, 3 "your words", 4 apply or 5 done "a note"`
     const n = Number(m[1])
     if (items.some(i => i.n === n)) return `${n} is answered twice`
-    const said = m[5] ?? m[6]
-    if (m[2]) items.push({ n, verb: m[2].toLowerCase() as Verb, ...(m[3] ? { hash: m[3].toLowerCase() } : {}) })
+    const said = m[7] ?? m[8]
+    const note = (m[4] ?? m[5])?.trim()
+    if (m[2]) items.push({ n, verb: m[2].toLowerCase() as Verb, ...(m[3] ? { hash: m[3].toLowerCase() } : {}), ...(note ? { note: note.slice(0, 1000) } : {}) })
     else if (said !== undefined) {
       if (!said.trim()) return `${n}: the quotes are empty`
       items.push({ n, text: said.trim().slice(0, 2000) })
-    } else items.push({ n, letter: (m[4] as string).toLowerCase() })
+    } else items.push({ n, letter: (m[6] as string).toLowerCase() })
     rest = rest.slice(m[0].length)
   }
   return items.length ? items : 'nothing to answer'
@@ -373,6 +401,10 @@ export function parseCommand(args: string): Command {
       return { kind: 'status' }
     case 'help':
       return { kind: 'help' }
+    case 'brief': {
+      if (more.some(w => w !== '--chief')) return { kind: 'bad', reason: 'write /fleet brief, or /fleet brief --chief for the chief’s lines too' }
+      return { kind: 'brief', chief: more.includes('--chief') }
+    }
     case 'init': {
       const flags = more.filter(w => w.startsWith('--'))
       const names = more.filter(w => !w.startsWith('--'))
@@ -450,6 +482,9 @@ export const HELP = [
   '/fleet accept [path]   stamp a change made outside fleet (your editor, a script) as yours; alone, lists them',
   '/fleet accept checks   let fleet run the check scripts world.json lists, as they are now',
   '/fleet 4 apply         apply the change of item 4 as drafted (also 4 reject, and 4 edit to change the draft first)',
+  '/fleet 5 done "note"   you got what item 5 asks for (a license, an access…); 5 no "why" if not',
+  '/fleet 6 send          send the outbound of item 6 exactly as shown (also 6 reject, 6 edit, and 6 done if you sent it yourself)',
+  '/fleet brief [--chief] what needs you, what changed and who changed it, what’s blocked, the spend, the inputs and ideas',
   '/fleet init [template] set fleet up in this project (.claude/fleet/): blank, solo, software or proposal',
   '/fleet up [--dry-run] [--wave n] [name…]  start the roster\'s instances that aren\'t running (--dry-run: the plan, the lints, the cost)',
   '/fleet down [name…]    take instances down: no wakes or nudges, /fleet up skips them (s in the panel stops one)',

@@ -54,11 +54,14 @@ export type ChangeEvent = {
   suspect?: string[]
   /** Stale pins the writer kept after reading the record as it was: "<pin>><version read>" (records.ts) */
   confirmed?: string[]
+  /** The writer's context had read outside content (authority.ts): provenance for the brief, never a mark on readers */
+  outside?: true
 }
 /** A thread: 'main' for the main loop, else the helper's agentId */
 export type Threads = Record<string, Record<string, FleetRead>>
-/** <project>/.claude/fleet/reads/<sessionId>.json: what a session's threads read, for /fleet status and a restart */
-export type ReadsFile = { format: number; sessionId: string; ref: string | null; name: string | null; at: number; threads: Threads }
+/** <project>/.claude/fleet/reads/<sessionId>.json: what a session's threads read, for /fleet status and a restart; and
+ * the outside content its context read, if any (it stays until /clear, through a restart) */
+export type ReadsFile = { format: number; sessionId: string; ref: string | null; name: string | null; at: number; threads: Threads; outside?: { at: number; what: string } }
 
 // ---- world.json ----
 
