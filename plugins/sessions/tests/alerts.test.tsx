@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { addSpend, dueWaits, inQuietHours, parseQuietHours, spendBurst, spendIsHigh, spendLine, spendText, waitText, type SpendAlert } from '../hooks/state'
-import { COMMAND, ROOT, SID, startSession, world, type World } from './world'
+import { COMMAND, ROOT, SID, startSession, world, type World, SLOW } from './world'
 
 // Telling the person: a push when a session of the project waits too long (once per wait, one session for the
 // project, quiet hours and a cap a day), the ⧗ on rows working or unseen for long, and a session whose spend runs far
@@ -111,7 +111,7 @@ test('spend running high: four times its usual hour and $3 at list price, until 
   expect(spendText('one', { ...alert, rise: null }, 'subscription')).toBe('“one” is spending 12× its usual hour: check it isn\'t looping')
 })
 
-test('a session waiting past waitPushMinutes: one push for that wait, its name only, and the notification channel when the phone is not reached', async ($, on) => {
+test('a session waiting past waitPushMinutes: one push for that wait, its name only, and the notification channel when the phone is not reached', SLOW, async ($, on) => {
   const sessions = list('waiting')
   const w = world(on, { list: sessions })
   await startSession($, w)
@@ -136,7 +136,7 @@ test('a session waiting past waitPushMinutes: one push for that wait, its name o
   expect(w.pushes).toHaveLength(2)
 })
 
-test('with Remote Control the push goes at the threshold and reaches the phone; the notification channel is not needed', async ($, on) => {
+test('with Remote Control the push goes at the threshold and reaches the phone; the notification channel is not needed', SLOW, async ($, on) => {
   const w = world(on, { list: list('waiting') })
   remoteControl(w)
   w.pushAnswer.value = { pushSent: true, localSent: false }
@@ -146,7 +146,7 @@ test('with Remote Control the push goes at the threshold and reaches the phone; 
   expect(w.notifies).toEqual([])
 })
 
-test('a wait another session already pushed is not pushed again', async ($, on) => {
+test('a wait another session already pushed is not pushed again', SLOW, async ($, on) => {
   const w = world(on, { list: list('waiting'), store: { [`waiting:${BRAVO}`]: 1, [`pushed:${BRAVO}`]: 1 } })
   remoteControl(w)
   await startSession($, w)
@@ -154,7 +154,7 @@ test('a wait another session already pushed is not pushed again', async ($, on) 
   expect(w.pushes).toEqual([])
 })
 
-test('quiet hours hold pushes back, and the cap a day counts every notification', { options: { quietHours: '0-24' } }, async ($, on) => {
+test('quiet hours hold pushes back, and the cap a day counts every notification', { ...SLOW, options: { quietHours: '0-24' } }, async ($, on) => {
   const w = world(on, { list: list('waiting') })
   remoteControl(w)
   await startSession($, w)
@@ -163,7 +163,7 @@ test('quiet hours hold pushes back, and the cap a day counts every notification'
   expect(await status($)).toContain(', none 0-24, 0 of 5 today')
 })
 
-test('the cap a day: once reached, no more notifications that day', { options: { notificationsPerDay: 1 } }, async ($, on) => {
+test('the cap a day: once reached, no more notifications that day', { ...SLOW, options: { notificationsPerDay: 1 } }, async ($, on) => {
   const sessions = list('waiting')
   const w = world(on, { list: sessions })
   remoteControl(w)
@@ -179,7 +179,7 @@ test('the cap a day: once reached, no more notifications that day', { options: {
   expect(w.pushes).toHaveLength(1)
 })
 
-test('a session another plugin marks as needing the person waits from when a panel first saw it so', { options: { waitPushMinutes: 2 } }, async ($, on) => {
+test('a session another plugin marks as needing the person waits from when a panel first saw it so', { ...SLOW, options: { waitPushMinutes: 2 } }, async ($, on) => {
   const w = world(on, { list: list('idle') })
   remoteControl(w)
   const until = w.clock.now() + 10 * HOUR
@@ -192,7 +192,7 @@ test('a session another plugin marks as needing the person waits from when a pan
   expect((w.store.get(`needsSince:${BRAVO}`) as any)?.since).toBeGreaterThan(0)
 })
 
-test('waitPushMinutes 0: no pushes', { options: { waitPushMinutes: 0 } }, async ($, on) => {
+test('waitPushMinutes 0: no pushes', { ...SLOW, options: { waitPushMinutes: 0 } }, async ($, on) => {
   const w = world(on, { list: list('waiting') })
   remoteControl(w)
   await startSession($, w)
@@ -200,7 +200,7 @@ test('waitPushMinutes 0: no pushes', { options: { waitPushMinutes: 0 } }, async 
   expect(w.pushes).toEqual([])
 })
 
-test('⧗ on a row working, or done and unseen in the background, for staleMinutes; nothing moves', async ($, on) => {
+test('⧗ on a row working, or done and unseen in the background, for staleMinutes; nothing moves', SLOW, async ($, on) => {
   const now = 1_000_000_000
   const sessions = [
     { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },

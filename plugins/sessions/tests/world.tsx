@@ -10,6 +10,9 @@ export const ROOT = '/Users/x/myapp'
 export const DATA = '/Users/x/.claude/mods/sessions-data'
 export const BAND = { plugin: 'sessions', component: 'AbovePrompt', requestId: 'band', props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 80, scroll: { offset: 0, bodyRows: 3 }, view: {} } } as const
 export const COMMAND = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
+// For a test that starts the mod and moves the mocked clock through many minutes: 30 s rather than the kit's 5 s,
+// which a slow or busy machine (the CI runners) can run past
+export const SLOW = { timeoutMs: 30000 } as const
 
 export type World = {
   files: Map<string, string>
