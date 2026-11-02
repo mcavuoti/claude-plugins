@@ -8,8 +8,12 @@ const SPEC: ChangeSpec = { path: 'req/R-1.md', summary: 'the target goes down', 
 test("a change's input: path and summary, and edits or content, never both", () => {
   expect(checkChange({ summary: 'x', content: 'y' })).toMatchObject({ ok: false, reason: expect.stringContaining('path') })
   expect(checkChange({ path: 'a.md', content: 'y' })).toMatchObject({ ok: false, reason: expect.stringContaining('summary') })
-  expect(checkChange({ path: 'a.md', summary: 's' })).toMatchObject({ ok: false, reason: expect.stringContaining('either edits') })
-  expect(checkChange({ path: 'a.md', summary: 's', content: 'y', edits: [{ old_string: 'a', new_string: 'b' }] })).toMatchObject({ ok: false })
+  expect(checkChange({ path: 'a.md', summary: 's' })).toMatchObject({ ok: false, reason: 'the change itself is missing: give edits (a list of { "old_string": …, "new_string": … }, as with Edit) or content (the whole new text of a.md)' })
+  expect(checkChange({ path: 'a.md', summary: 's', content: 'y', edits: [{ old_string: 'a', new_string: 'b' }] })).toMatchObject({ ok: false, reason: expect.stringContaining('edits or content, not both') })
+  // edits as one JSON string of the list is read as the list; anything else that isn't a list says what it came as
+  expect(checkChange({ path: 'a.md', summary: 's', edits: '[{"old_string":"a","new_string":"b"}]' })).toEqual({ ok: true, path: 'a.md', summary: 's', edits: [{ old_string: 'a', new_string: 'b' }] })
+  expect(checkChange({ path: 'a.md', summary: 's', edits: 'a → b' })).toMatchObject({ ok: false, reason: expect.stringContaining('edits: a list of { "old_string": …, "new_string": … } objects, as with Edit (it came as text)') })
+  expect(checkChange({ path: 'a.md', summary: 's', edits: { old_string: 'a', new_string: 'b' } })).toMatchObject({ ok: false, reason: expect.stringContaining('(it came as object)') })
   expect(checkChange({ path: 'a.md', summary: 's', edits: [{ old_string: '', new_string: 'b' }] })).toMatchObject({ ok: false, reason: expect.stringContaining('old_string is empty') })
   expect(checkChange({ path: ' a.md ', summary: '  the   why ', edits: [{ old_string: 'a', new_string: 'b', replace_all: true }], blocks: 'B-1' })).toEqual({
     ok: true,

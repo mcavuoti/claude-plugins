@@ -264,9 +264,9 @@ export const DECIDE_SCHEMA = {
   properties: {
     kind: {
       type: 'string',
-      enum: ['choice', 'change', 'resource'],
+      enum: ['choice', 'change', 'resource', 'answered'],
       description:
-        "choice (the default): questions for the person. change: a change to a command-level file of this project (the charter, roster.json, world.json, outbound.json, a role file in .claude/agents/, a check script, or the records world.json lists under command), which your own tools can't write: fleet writes your draft once the person applies it. resource: something only the person can get for you (a license, an access, a machine, more budget), with what, why and optionally cost, byWhen and alternatives",
+        "choice (the default): questions for the person. change: a change to a command-level file of this project (the charter, roster.json, world.json, outbound.json, a role file in .claude/agents/, a check script, or the records world.json lists under command), which your own tools can't write: fleet writes your draft once the person applies it. resource: something only the person can get for you (a license, an access, a machine, more budget), with what, why and optionally cost, byWhen and alternatives. answered: with id, one of your own open questions the person just answered by typing in this session (fleet records their words as its answer and takes it off their queue)",
     },
     questions: {
       type: 'array',
@@ -319,11 +319,12 @@ export const DECIDE_SCHEMA = {
     cost: { type: 'string', maxLength: 200, description: 'kind resource, optional: what it costs, roughly' },
     byWhen: { type: 'string', maxLength: 200, description: 'kind resource, optional: when you need it by' },
     alternatives: { type: 'string', maxLength: 200, description: 'kind resource, optional: what you would do without it' },
+    id: { type: 'string', description: 'kind answered: the decision (D-<n>) the person just answered here' },
   },
 } as const
 
 export const DECIDE_DESCRIPTION =
-  "Ask the person to decide something without stopping your work. This is a background session: nobody may be watching it, so AskUserQuestion or a question in your reply would leave the work waiting until the person comes by. Use this tool instead whenever you need the person's choice, after settling first what running something or reading the project's files can settle: send the person only decisions of taste, product or priority. It answers at once with a ticket (D-<n>); the person answers from any session of this project, and the answer reaches you later as a message from the fleet plugin that starts with [D-<n>]. Meanwhile keep working on whatever doesn't depend on the answer, or end your turn. 1-4 questions, each with 2-4 options, the option you recommend and one line on why; give its area (one of the project's tags) and say honestly whether it's reversible and whether it touchesMoney or reaches the outsideWorld: a judge may propose an answer from what the person decided before, and never touches one that spends money, reaches outside or can't be undone. The flags are the whole call's: ask a question that touches money or reaches the outside world in a call of its own, so it doesn't hold the other questions from the judge. With kind change, it files a change to a command-level file instead (path, summary, and edits or content): the person reads its diff and applies it, and fleet writes your draft if the file is still as it was. With kind resource, it asks the person for something only they can get (a license, an access, hardware, budget: what, why, and optionally cost, byWhen, alternatives), apart from the questions of taste."
+  "Ask the person to decide something without stopping your work. This is a background session: nobody may be watching it, so AskUserQuestion or a question in your reply would leave the work waiting until the person comes by. Use this tool instead whenever you need the person's choice, after settling first what running something or reading the project's files can settle: send the person only decisions of taste, product or priority. It answers at once with a ticket (D-<n>); the person answers from any session of this project, and the answer reaches you later as a message from the fleet plugin that starts with [D-<n>]. Meanwhile keep working on whatever doesn't depend on the answer, or end your turn. 1-4 questions, each with 2-4 options, the option you recommend and one line on why; give its area (one of the project's tags) and say honestly whether it's reversible and whether it touchesMoney or reaches the outsideWorld: a judge may propose an answer from what the person decided before, and never touches one that spends money, reaches outside or can't be undone. The flags are the whole call's: ask a question that touches money or reaches the outside world in a call of its own, so it doesn't hold the other questions from the judge. With kind change, it files a change to a command-level file instead (path, summary, and edits or content): the person reads its diff and applies it, and fleet writes your draft if the file is still as it was. With kind resource, it asks the person for something only they can get (a license, an access, hardware, budget: what, why, and optionally cost, byWhen, alternatives), apart from the questions of taste. If the person answers one of your open questions by typing in this session instead, call it with kind answered and its id: fleet records what they typed as the answer and takes it off their queue."
 
 /** Checks and tidies decide's input. The engine may not enforce the schema, so this is what holds */
 /** The asker's own word on a choice, which only the judges' gates read (a flag that isn't a boolean says nothing) */
@@ -432,11 +433,13 @@ export function bracketedIds(textIn: string): string[] {
  * --allow, which also adds where it goes to outbound.json), reject, edit, or done (he sent it himself). A note in
  * quotes may follow */
 export type Verb = 'apply' | 'reject' | 'edit' | 'send' | 'done' | 'no'
-export type AnswerItem = { n: number; letter?: string; text?: string; verb?: Verb; hash?: string; allow?: true; note?: string }
+/** n: the item's number in the last list, or the decision's id as typed (D-3): an id needs no list, and names its only
+ * open question */
+export type AnswerItem = { n: number | string; letter?: string; text?: string; verb?: Verb; hash?: string; allow?: true; note?: string }
 export type Command =
   | { kind: 'list' }
   | { kind: 'answer'; items: AnswerItem[] }
-  | { kind: 'note'; n: number; text: string }
+  | { kind: 'note'; n: number | string; text: string }
   | { kind: 'drop'; target: string; why: string }
   | { kind: 'status' }
   | { kind: 'init'; template: string; commitRegister: boolean }
@@ -457,14 +460,15 @@ export type Command =
 /** `1a 2b`, `1a2b`, `1) a 2) b`, `1a, 2b`, `3 "free text"` (straight or curly quotes); for a change `1 apply`,
  * `1 apply h1a2b3c4d` (the draft's version, after editing it), `1 reject`, `1 edit`; for a resource `1 done`, `1 no`;
  * for an outbound `1 send` (`1 send h1a2b3c4d`, `1 send --allow`), `1 reject`, `1 edit`, `1 done`. A verb may carry a
- * note in quotes: `1 done "the key is in the vault"` */
+ * note in quotes: `1 done "the key is in the vault"`. The decision's id goes where the number does: `D-3 apply`,
+ * `D-7 b` */
 export function parseAnswers(args: string): AnswerItem[] | string {
   const items: AnswerItem[] = []
   let rest = args.trim()
   while (rest) {
-    const m = /^(\d+)\s*[).:]?\s*(?:(apply|reject|edit|send|done|no)((?:\s+(?:h[0-9a-f]{6,14}|--allow))*)(?![A-Za-z0-9-])(?:\s*(?:"([^"]*)"|“([^”]*)”))?|([a-dA-D])(?![a-zA-Z])|"([^"]*)"|“([^”]*)”)\s*[,;]?\s*/i.exec(rest)
+    const m = /^(\d+|[Dd]-\d+)\s*[).:]?\s*(?:(apply|reject|edit|send|done|no)((?:\s+(?:h[0-9a-f]{6,14}|--allow))*)(?![A-Za-z0-9-])(?:\s*(?:"([^"]*)"|“([^”]*)”))?|([a-dA-D])(?![a-zA-Z])|"([^"]*)"|“([^”]*)”)\s*[,;]?\s*/i.exec(rest)
     if (!m) return `can't read "${rest.slice(0, 30)}": answer like /fleet 1a 2b, 3 "your words", 4 apply or 5 done "a note"`
-    const n = Number(m[1])
+    const n = /^\d+$/.test(m[1] as string) ? Number(m[1]) : (m[1] as string).toUpperCase()
     if (items.some(i => i.n === n)) return `${n} is answered twice`
     const said = m[7] ?? m[8]
     const note = (m[4] ?? m[5])?.trim()
@@ -562,9 +566,10 @@ export function parseCommand(args: string): Command {
       return { kind: 'budget', target: (amount ? w.slice(0, -1) : w).join(' '), amount }
     }
     case 'note': {
-      const m = /^(\d+)\s+([\s\S]+)$/.exec(tail)
-      if (!m) return { kind: 'bad', reason: 'write /fleet note <n> <text>' }
-      return { kind: 'note', n: Number(m[1]), text: cut((m[2] as string).trim(), 1000) }
+      const m = /^(\d+|D-\d+)\s+([\s\S]+)$/i.exec(tail)
+      if (!m) return { kind: 'bad', reason: 'write /fleet note <n> <text> (or the decision, D-<n>)' }
+      const n = /^\d+$/.test(m[1] as string) ? Number(m[1]) : (m[1] as string).toUpperCase()
+      return { kind: 'note', n, text: cut((m[2] as string).trim(), 1000) }
     }
     case 'drop': {
       const m = /^(\d+|D-\d+)\b\s*([\s\S]*)$/i.exec(tail)
@@ -660,7 +665,8 @@ export function ago(ms: number): string {
 export type AskerView = { name: string; state: string | null }
 
 /** One numbered question, as /fleet shows it; judge: what the judge proposed on it (judges.ts proposalLine) */
-export function heldText(n: number, record: QueueRecord, q: number, asker: AskerView, now: number, judge: string | null = null): string {
+/** also: the other askers of the same question (listedItems), each with its decision: one answer goes to each */
+export function heldText(n: number, record: QueueRecord, q: number, asker: AskerView, now: number, judge: string | null = null, also: readonly { name: string; id: string; q: number; of: number }[] = []): string {
   const question = record.questions[q - 1] as Question
   const lines = [`${n}. ${question.question}`]
   for (const [i, o] of question.options.entries()) lines.push(`   ${letter(i)}) ${o.label}${o.description ? `: ${o.description}` : ''}`)
@@ -670,7 +676,65 @@ export function heldText(n: number, record: QueueRecord, q: number, asker: Asker
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
   const of = record.questions.length > 1 ? ` (${q} of ${record.questions.length})` : ''
   lines.push(`   ${who} · ${record.id}${of} · ${ago(now - record.at)} ago${record.blocks ? ` · blocks: ${record.blocks}` : ''}`)
+  if (also.length) lines.push(`   Asked the same: ${also.map(a => `${a.name} · ${a.id}${a.of > 1 ? ` (${a.q} of ${a.of})` : ''}`).join('; ')}. Your answer goes to each.`)
   return lines.join('\n')
+}
+
+// ---- The list /fleet shows ----
+
+/** One numbered item of /fleet's list: a change, a resource or an outbound (its decision), or one open question. A
+ * question alike one listed before it (its words and its option labels, alike() says), asked by another session,
+ * joins that item: one number, and one answer goes to every asker */
+export type Listed = { members: { id: string; q: number }[] }
+
+export function listedItems(records: readonly QueueRecord[], present: ReadonlySet<string>, alike: (a: Question, b: Question) => boolean): Listed[] {
+  const out: { members: { id: string; q: number }[]; question?: Question; askers: Set<string> }[] = []
+  const askerOf = (r: QueueRecord) => r.asker.sessionId || r.asker.ref || r.id
+  for (const r of records) {
+    if (!knownKind(r)) continue
+    const p = progress(r.id, slots(r), present)
+    if (p.complete) continue
+    if (r.kind !== undefined) {
+      out.push({ members: [{ id: r.id, q: 1 }], askers: new Set() })
+      continue
+    }
+    // Joined only across askers: one that asks the same thing twice sees each answered
+    const asker = askerOf(r)
+    for (let q = 1; q <= r.questions.length; q++) {
+      if (p.answered[q - 1]) continue
+      const question = r.questions[q - 1] as Question
+      const like = out.find(x => x.question && !x.askers.has(asker) && alike(x.question, question))
+      if (like) {
+        like.members.push({ id: r.id, q })
+        like.askers.add(asker)
+      } else out.push({ members: [{ id: r.id, q }], question, askers: new Set([asker]) })
+    }
+  }
+  return out.map(x => ({ members: x.members }))
+}
+
+/** A listed item as the list's state keeps it: D-3.1, or D-3.1+D-5.2 for a question several asked */
+export function listedKey(l: Listed): string {
+  return l.members.map(m => `${m.id}.${m.q}`).join('+')
+}
+
+export function listedMembers(key: string): { id: string; q: number }[] {
+  return key
+    .split('+')
+    .map(k => {
+      const [id = '', q = '0'] = k.split('.')
+      return { id, q: Number(q) }
+    })
+    .filter(m => isDecisionId(m.id) && m.q > 0)
+}
+
+/** The list item a typed answer points at instead of saying it ("the same as question 2", "#2", "like 2", "la 2"): its
+ * asker never sees this list, so the words would reach it meaning nothing. null when it names none */
+export function pointsAtItem(text: string): number | null {
+  const m =
+    /(?:\b(?:questions?|q|preguntas?|items?|ítem|numbers?|número|numero|nro|answers?|respuestas?)\s*#?\s*(\d{1,2})\b|#(\d{1,2})\b|\b(?:same as|same answer as|like|as in|igual (?:que|a)|lo mismo que|como (?:en )?)\s+(?:(?:la|el|the|in|en)\s+)?#?(\d{1,2})\b|^\s*(?:la|el)\s+(\d{1,2})\s*$)/i.exec(text)
+  if (!m) return null
+  return Number(m[1] ?? m[2] ?? m[3] ?? m[4])
 }
 
 /** What the person is told about a decision that's answered but not delivered yet, by its asker's state */

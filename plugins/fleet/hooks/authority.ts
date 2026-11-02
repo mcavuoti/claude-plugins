@@ -10,21 +10,32 @@
 import { globRegex, type WorldConfig } from './changes'
 import { cut } from './decisions'
 
-/** The origins that are the person: his own Enter at a terminal (composer). Remote Control (bridge) isn't taken until
- * it's tried (G7); anything else (a plugin's prompt, a peer, a schedule, a notification, a kind added later) never is */
+/** The origins that are the person's own word on the project: his Enter at a terminal (composer). Remote Control
+ * (bridge) answers decisions (ANSWER_ORIGINS) but changes nothing of the project; anything else (a plugin's prompt, a
+ * peer, a schedule, a notification, a kind added later) never is */
 export const PERSON_ORIGINS: ReadonlySet<string> = new Set(['composer'])
 
 export function isPersonOrigin(kind: string | undefined): boolean {
   return !!kind && PERSON_ORIGINS.has(kind)
 }
 
-/** A background session's launch prompt (claude --bg "<prompt>") reads as composer too, though nobody typed it then: the
- * first prompt of the process, before any turn, when the job says nobody has attached to it yet, or its text is the
- * job's own intent */
-export function isLaunchPrompt(p: { background: boolean; turnsBefore: number; text: string; intent: string | null; attached: boolean }): boolean {
+/** The origins whose /fleet answers are taken: the terminal, and Remote Control from the phone (G7, tried 02/11: /fleet
+ * typed in the Claude app runs). An answer picks, notes, applies or rejects a drafted change, or says a resource is got
+ * or not; what changes the project itself (init, up, down, accept, budget, world, the judges' areas) stays the terminal's */
+export const ANSWER_ORIGINS: ReadonlySet<string> = new Set(['composer', 'bridge'])
+
+export function isAnswerOrigin(kind: string | undefined): boolean {
+  return !!kind && ANSWER_ORIGINS.has(kind)
+}
+
+/** A background session's launch prompt (claude --bg "<prompt>") reads as composer too, though nobody typed it then:
+ * the first prompt of the process, before any turn, when its text is the job's own intent. A job started with no prompt
+ * (ccc, a bare claude --bg) has an empty intent, so its first prompt is the person's; whether someone attached tells
+ * nothing (a session opened with ccc shows none). A job whose state can't be read (intent null) is taken as a launch */
+export function isLaunchPrompt(p: { background: boolean; turnsBefore: number; text: string; intent: string | null }): boolean {
   if (!p.background || p.turnsBefore > 0) return false
-  if (p.intent && p.intent.trim() && p.intent.trim() === p.text.trim()) return true
-  return !p.attached
+  if (p.intent === null) return true
+  return !!p.intent.trim() && p.intent.trim() === p.text.trim()
 }
 
 /** What marked a context: when, and what it read (a tool and where, never what it said) */

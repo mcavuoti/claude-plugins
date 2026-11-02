@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { FAKE_LOG, FLEET, HOME, ROOT, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
+import { BAND, FAKE_LOG, FLEET, HOME, ROOT, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 
 // The roster from the person's side: /fleet init <template>, /fleet up (--dry-run), down, remove, budget, worktrees,
 // and the sweeper's marks and wakes. The instances' own side is in instance.test.tsx
@@ -71,6 +71,24 @@ test('/fleet init <template> copies its files, never over yours, and stamps the 
   expect(w.files.get(`${ROOT}/.claude/agents/owner.md`)).toBe(`${OWNER}Mine.\n`)
   expect(await fleet($, 'init nothing')).toBe('No template "nothing": there are blank, solo')
   expect(await fleet($, 'init solo', { kind: 'plugin', name: 'other' })).toContain('Only the person sets a project up')
+})
+
+test('/fleet init in a git repository: the roster it writes keeps the instances in the main checkout; one that says so already is left alone', WITH_SESSIONS, async ($, on) => {
+  const SAYS = { ...SOLO, 'fleet/roster.json': JSON.stringify({ ...ROSTER, settings: { worktree: { bgIsolation: 'worktree' } } }) }
+  const w = world(on, { fleet: false, background: false, templates: { solo: SOLO, says: SAYS } })
+  w.exec.value = argv => (argv[0] === 'git' && argv.includes('rev-parse') ? { exitCode: 0, stdout: `${ROOT}\n${ROOT}/.git\n${ROOT}/.git\n` } : undefined)
+  await startSession($, w)
+  const said = await fleet($, 'init solo')
+  expect(said).toContain('This project is in a git repository: roster.json keeps the instances in the main checkout ("worktree": { "bgIsolation": "none" })')
+  expect(json(w, `${FLEET}/roster.json`).settings).toEqual({ env: { SESSIONS_DATA_DIR: '/tmp/x/data' }, worktree: { bgIsolation: 'none' } })
+  // Stamped as written: the dry run doesn't flag it as changed outside fleet
+  expect(json(w, `${FLEET}/state/stamps.json`).files['.claude/fleet/roster.json']).toBeTruthy()
+  expect(await fleet($, 'up --dry-run')).not.toContain('changed outside fleet')
+  // A roster already saying where its instances work is the person's word
+  w.files.delete(`${FLEET}/roster.json`)
+  const other = await fleet($, 'init says')
+  expect(other).not.toContain('keeps the instances in the main checkout')
+  expect(json(w, `${FLEET}/roster.json`).settings).toEqual({ worktree: { bgIsolation: 'worktree' } })
 })
 
 test('/fleet up --dry-run: the plan, the cost and the lints, and nothing started; /fleet up writes the settings and starts', WITH_SESSIONS, async ($, on) => {
@@ -188,6 +206,28 @@ test('/fleet budget: the day’s spend and caps; the person sets or raises one f
   expect(json(w, `${STATE}/lifts.json`)).toMatchObject({ format: 1, day, instances: { 'owner-a': 3 } })
   expect(await fleet($, 'budget owner-a')).toBe('Owner A: $1.20 of $3.00 today')
   expect(await fleet($, 'budget project 8')).toContain('the project: $8.00 for today')
+})
+
+test('the band counts an instance over its budget only while it runs: stopped, it spends nothing more', WITH_SESSIONS, async ($, on) => {
+  const day = '2026-11-02'
+  const beat = (at: number) => JSON.stringify({ format: 1, instance: 'Owner A', slug: 'owner-a', ref: 'aaaaaaa1', sessionId: 'aaaaaaa1-0000-0000-0000-000000000000', at, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 1.2 })
+  const w = world(on, { background: false, worldPaths: ['notes/**'], files: { ...PROJECT, [`${FLEET}/instances/owner-a/spend.json`]: JSON.stringify({ format: 1, slug: 'owner-a', day, usd: 1.2, sessionId: 's', last: 1.2, at: 0 }) } })
+  w.files.set(`${FLEET}/instances/owner-a/state.json`, beat(w.clock.now()))
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  w.band.value = ''
+  await tick(w, 10100)
+  let ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await ui.drawn())).toContain('$ 1 over budget')
+  await ui.unmount()
+  // Its fleet hasn't beaten for 3 minutes: stopped
+  w.files.set(`${FLEET}/instances/owner-a/state.json`, beat(w.clock.now() - 4 * 60000))
+  await tick(w, 10100)
+  ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await ui.drawn())).not.toContain('over budget')
+  await ui.unmount()
+  // /fleet budget still says what it spent
+  expect(await fleet($, 'budget')).toContain('  Owner A: $1.20 of $1.00 today, used up')
 })
 
 test('the sweeper marks an instance that runs with no fleet, and one over its budget; it wakes a retired one with answers', WITH_SESSIONS, async ($, on) => {

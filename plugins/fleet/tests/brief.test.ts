@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { checkResource, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, preAnswer, resourceDelivery } from '../hooks/authority'
+import { checkResource, isAnswerOrigin, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, preAnswer, resourceDelivery } from '../hooks/authority'
 import { briefText, chiefLines, closedLine, type BriefFacts } from '../hooks/brief'
 import { globList, type ChangeEvent } from '../hooks/changes'
 import { cadenceOf, freshDue, handoffText, hoursText, instancesOf, journalTail, lintRoster } from '../hooks/roster'
@@ -11,13 +11,20 @@ import { cadenceOf, freshDue, handoffText, hoursText, instancesOf, journalTail, 
 const HOUR = 3600000
 const NOW = Date.UTC(2026, 10, 2, 12, 0, 0)
 
-test('the person: his own Enter at a terminal, never a plugin, a peer, Remote Control (not tried) or a launch prompt', () => {
+test('the person: his own Enter at a terminal, never a plugin, a peer, Remote Control or a launch prompt', () => {
   expect(isPersonOrigin('composer')).toBe(true)
   for (const k of ['plugin', 'bridge', 'peer', 'channel', 'sdk', 'task-notification', 'unclassified', 'something-new', undefined]) expect(isPersonOrigin(k)).toBe(false)
-  const launch = { background: true, turnsBefore: 0, text: 'Do x', intent: null, attached: false }
+  // Answers: the terminal and Remote Control
+  expect(isAnswerOrigin('composer')).toBe(true)
+  expect(isAnswerOrigin('bridge')).toBe(true)
+  for (const k of ['plugin', 'peer', 'channel', 'sdk', 'task-notification', 'unclassified', undefined]) expect(isAnswerOrigin(k)).toBe(false)
+  const launch = { background: true, turnsBefore: 0, text: 'Do x', intent: 'Do x' }
   expect(isLaunchPrompt(launch)).toBe(true)
-  expect(isLaunchPrompt({ ...launch, attached: true })).toBe(false)
-  expect(isLaunchPrompt({ ...launch, attached: true, intent: 'Do x' })).toBe(true)
+  // A job started with no prompt (ccc): its first prompt is the person's, whether the job shows an attach or not
+  expect(isLaunchPrompt({ ...launch, intent: '' })).toBe(false)
+  expect(isLaunchPrompt({ ...launch, intent: 'Something else' })).toBe(false)
+  // A job whose state can't be read is taken as a launch
+  expect(isLaunchPrompt({ ...launch, intent: null })).toBe(true)
   expect(isLaunchPrompt({ ...launch, turnsBefore: 1 })).toBe(false)
   expect(isLaunchPrompt({ ...launch, background: false })).toBe(false)
 })

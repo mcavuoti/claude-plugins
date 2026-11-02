@@ -47,9 +47,18 @@ export function checkChange(input: any): { ok: true; path: string; summary: stri
   if (!path) return { ok: false, reason: 'path: name the file to change, relative to the project folder' }
   const summary = typeof input?.summary === 'string' ? cut(input.summary.trim().replace(/\s+/g, ' '), SUMMARY_MAX) : ''
   if (!summary) return { ok: false, reason: 'summary: say in one line what the change does and why' }
-  const hasEdits = Array.isArray(input?.edits) && input.edits.length > 0
+  // edits sent as a JSON string of the list (some calls arrive so) is read as the list
+  let list: unknown = input?.edits
+  if (typeof list === 'string' && list.trim().startsWith('[')) {
+    try {
+      list = JSON.parse(list)
+    } catch {}
+  }
+  if (list !== undefined && list !== null && !Array.isArray(list)) return { ok: false, reason: `edits: a list of { "old_string": …, "new_string": … } objects, as with Edit (it came as ${typeof list === 'string' ? 'text' : typeof list})` }
+  const hasEdits = Array.isArray(list) && list.length > 0
   const hasContent = typeof input?.content === 'string'
-  if (hasEdits === hasContent) return { ok: false, reason: 'give either edits (old_string → new_string, as with Edit) or content (the whole new text), not both' }
+  if (hasEdits && hasContent) return { ok: false, reason: 'give edits or content, not both: edits change the file as it is, content replaces it whole' }
+  if (!hasEdits && !hasContent) return { ok: false, reason: `the change itself is missing: give edits (a list of { "old_string": …, "new_string": … }, as with Edit) or content (the whole new text of ${path})` }
   const blocks = typeof input?.blocks === 'string' ? cut(input.blocks.trim(), 200) : ''
   const more = blocks ? { blocks } : {}
   if (hasContent) {
@@ -57,7 +66,7 @@ export function checkChange(input: any): { ok: true; path: string; summary: stri
     return { ok: true, path, summary, content: input.content, ...more }
   }
   const edits: Edit[] = []
-  for (const [i, e] of (input.edits as any[]).entries()) {
+  for (const [i, e] of (list as any[]).entries()) {
     if (typeof e?.old_string !== 'string' || typeof e?.new_string !== 'string') return { ok: false, reason: `edit ${i + 1}: old_string and new_string are text` }
     if (!e.old_string) return { ok: false, reason: `edit ${i + 1}: old_string is empty (for a new file give content)` }
     edits.push({ old_string: e.old_string, new_string: e.new_string, ...(e.replace_all === true ? { replace_all: true } : {}) })

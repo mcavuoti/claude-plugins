@@ -138,13 +138,11 @@ test('the lints: what stops /fleet up, and what it only says', () => {
   const over = lintRoster(roster({ budget: { usdDay: 10 } }), FILES)
   expect(over.warnings[0]).toContain("the instances' budgets add up to $17.00 a day, over the project's $10.00")
   expect(lintRoster(roster({ instances: [] }), FILES).warnings).toEqual(['the roster has no instances yet: nothing to start'])
-  // A role that can open a dialog nobody answers: marked, never refused
+  // AskUserQuestion in a role's tools (or every tool, with no tools line) is fine: sessions' Stop asks through it, and
+  // fleet refuses the model's own call in a background session
   const every = lintRoster(roster(), new Map([['chief', '---\nname: chief\n---\nall tools'], ['worker', ROLE('worker', 'Read, AskUserQuestion, mcp__fleet__*')]]))
   expect(every.errors).toEqual([])
-  expect(every.warnings).toEqual([
-    '.claude/agents/chief.md: with no tools line it has every tool, AskUserQuestion included: a question it asks that way waits for nobody (an instance asks with mcp__fleet__decide); list its tools without it',
-    '.claude/agents/worker.md: its tools include AskUserQuestion: a question it asks that way waits for nobody (an instance asks with mcp__fleet__decide); list its tools without it',
-  ])
+  expect(every.warnings).toEqual([])
 })
 
 test("the settings fleet writes: the roster's, then its env, model, effort and the denies of the command-level files", () => {

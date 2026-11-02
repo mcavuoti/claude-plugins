@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { clock, hashText, hourFolder } from '../hooks/changes'
-import { FLEET, REF, ROOT, SID, fleet, json, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
+import { FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
 // The shared files (the world) in one session, with the engine's file tools and shell standing in beneath fleet.
 // Another session's landings are written as its fleet would write them: the file, then its event
@@ -413,6 +413,11 @@ test('/fleet status: the world, the latest changes, and who is behind, in this s
   expect(s).toMatch(/ {2}TEST C: notes\/plan\.md, changed at/)
   expect(s).toContain('  TEST C: notes/todo.md')
   expect(s).toContain('formats: files 1, register 1, config 1, world 1')
+  // Stopped, TEST C is behind nobody: what it read waits in its file until it runs again
+  sessionsSay(w, { rows: { cccccccc: { ...row('cccccccc', 'TEST C', 'stopped') } } })
+  const later = await fleet($, 'status')
+  expect(later).not.toContain('TEST C: notes/')
+  expect(later).toMatch(/ {2}this session: notes\/plan\.md/)
 })
 
 test('after a restart the reads come back from the file; a /clear forgets them', WITH_SESSIONS, async ($, on) => {

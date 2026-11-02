@@ -18,5 +18,5 @@
   },
   "proofs": { "paths": ["findings/**/*.md", "poc/results/**/*.md"], "kinds": ["finding", "result"], "rerun": [], "timeoutS": 30 },
   "checks": [{ "name": "proofs", "glob": "{findings,poc/results}/**/*.md", "argv": ["python3", ".claude/fleet/checks/proof-check.py", "--budget", "100"], "timeoutMs": 120000 }],
-  "judges": { "model": "haiku", "hold": ["\\b(spend\\w*|spent|costs?|budget\\w*|pric\\w*|pay|paid|payment\\w*|invoice\\w*|dollars?|euros?)\\b|[$€£]"], "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
+  "judges": { "model": "haiku", "hold": ["\\b(spend\\w*|spent|pric\\w*|pay|paid|payments?|invoic\\w*|purchas\\w*|refund\\w*|dollars?|euros?|usd|eur)\\b|[$€£]\\s?\\d"], "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
 }
