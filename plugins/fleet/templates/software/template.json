@@ -1,7 +1,7 @@
 {
   "templateFormat": 1,
   "description": "a codebase: a chief, an integrator, owners per area, a reviewer and a janitor, coordinating through the board and the spec",
-  "folders": ["spec", "board", "docs", "notes", "journals"],
+  "folders": ["spec", "board", "docs", "notes", "journals", "ideas"],
   "next": [
     "Next: /fleet up --dry-run (the plan, the lints and the cost), then /fleet up Chief and answer its interview with /fleet as its questions come. It drafts the charter, the roster and the shared files as changes for you to apply (/fleet <n> apply); then /fleet up --wave 1."
   ]

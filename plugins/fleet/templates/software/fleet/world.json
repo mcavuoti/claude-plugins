@@ -1,5 +1,6 @@
 {
   "worldFormat": 1,
-  "paths": ["spec/**", "board/**", "docs/**", "notes/**", "journals/**"],
-  "command": ["spec/**"]
+  "paths": ["spec/**", "board/**", "docs/**", "notes/**", "journals/**", "ideas/**"],
+  "command": ["spec/**"],
+  "proposal": ["ideas/**"]
 }

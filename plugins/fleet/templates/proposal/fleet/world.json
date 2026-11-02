@@ -1,6 +1,8 @@
 {
   "worldFormat": 1,
-  "paths": ["req/**", "findings/**", "board/**", "poc/**", "proposal/**", "plan/**", "brief/**", "notes/**", "journals/**"],
+  "paths": ["req/**", "findings/**", "board/**", "poc/**", "proposal/**", "plan/**", "brief/**", "notes/**", "journals/**", "ideas/**", "inputs/**"],
   "command": ["req/**"],
+  "proposal": ["ideas/**"],
+  "information": ["inputs/**"],
   "commit": { "everyMin": 60 }
 }
