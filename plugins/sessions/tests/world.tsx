@@ -31,6 +31,8 @@ export type World = {
   toasts: string[]
   // What $.session.usage() answers
   usage: { value: any }
+  // What Claude (and the mods beneath this one) draw in the band above the prompt: nothing, or a line
+  band: { value: string }
 }
 
 export type WorldOptions = {
@@ -56,6 +58,11 @@ export function world(on: On, options: WorldOptions = {}): World {
   const id = { value: options.id ?? SID }
   const panes: any[] = []
   const usage = { value: { context: { percent: 10 }, rateLimits: [] } as any }
+  const band = { value: '' }
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    return band.value ? <Text>{band.value}</Text> : <Box />
+  })
   const clock = mock.clock(on, { now: 1_000_000_000 })
   // The store, in memory (readable by the tests)
   const store = new Map<string, unknown>(Object.entries(options.store ?? {}))
@@ -170,7 +177,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: undefined }
   })
   on('ui.log', () => ({ value: undefined }))
-  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage }
+  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

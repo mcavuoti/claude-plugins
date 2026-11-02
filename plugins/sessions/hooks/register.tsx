@@ -121,7 +121,7 @@ const paneNote = atom({ plugin: 'sessions', key: 'paneNote' } as const, '' as Pa
 // line above the prompt
 const limits = atom({ plugin: 'sessions', key: 'limits' } as const, [] as RateLimit[])
 // About all the project's rows, whatever is shown: the f filter, how many there are, what they spent
-const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, spent: null } as PanelSummary)
+const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, waiting: 0, unseen: 0, spent: null } as PanelSummary)
 
 let claude = 'claude'
 let myId = ''
@@ -855,7 +855,14 @@ async function layout($: any, focused: boolean, reflow = false) {
   const shown = keepPlaces(members ? grouped.filter(f => members.has(f.sessionId)) : grouped, shownBefore, frozen)
   await update($, rows, () => shown)
   const spends = projectRows.filter(f => f.usd !== null)
-  const next: PanelSummary = { waitingOnly, sessions: projectRows.length, spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null }
+  const others = projectRows.filter(f => !f.current)
+  const next: PanelSummary = {
+    waitingOnly,
+    sessions: projectRows.length,
+    waiting: others.filter(f => f.color === 'red').length,
+    unseen: others.filter(f => f.color === 'yellow').length,
+    spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
+  }
   if (JSON.stringify(next) !== JSON.stringify(await read($, summary))) await update($, summary, () => next)
   const before = shownBefore.map(f => f.sessionId)
   const after = shown.map(f => f.sessionId)
@@ -2249,10 +2256,11 @@ export const register: Register = (on, options) => {
   })
 
   // The line above the prompt: how many sessions wait for you (red) or have something unseen (yellow), why the panel
-  // isn't shown (with a button that opens it: shift+→ then Enter, or a click), and this session's short id. One row.
-  // Its first draw starts the mod when nothing else did (a session draws even with no window attached; a draw only
-  // draws, so the start runs from a timer)
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
+  // isn't shown (with a button that opens it: shift+→ then Enter, or a click), the account's windows on a subscription,
+  // and this session's short id. One row, with whatever other mods (and Claude) draw there after it: the band is
+  // shared. Its first draw starts the mod when nothing else did (a session draws even with no window attached; a draw
+  // only draws, so the start runs from a timer)
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     if (!starting && !renderScheduled) {
       renderScheduled = true
@@ -2260,9 +2268,12 @@ export const register: Register = (on, options) => {
         bg(ensureStarted($, 'first draw'))
       })
     }
-    const others = (await read($, rows)).filter(f => !f.current)
-    const reds = others.filter(f => f.color === 'red').length
-    const yellows = others.filter(f => f.color === 'yellow').length
+    const beneath = await next(e)
+    // A survey holds the band: it goes first
+    if (e.props.hasSurvey) return beneath
+    const about = await read($, summary)
+    const reds = about.waiting
+    const yellows = about.unseen
     const id = await read($, shortId)
     const note = await read($, paneNote)
     const why = note === 'closed' ? 'panel closed · /sessions to open' : note === 'narrow' ? 'panel hidden: window too narrow · /sessions to show' : ''
@@ -2277,20 +2288,24 @@ export const register: Register = (on, options) => {
         {reds + yellows > 0 && !why && '/sessions  '}
       </Text>
     )
-    if (!why || e.surface !== 'terminal') {
-      return (
+    const own =
+      !why || e.surface !== 'terminal' ? (
         <Text dimColor>
           {counts}
           {why && `${why}  `}
           {account && `${account}  `}⟨{id}⟩
         </Text>
+      ) : (
+        <Box flexDirection="row">
+          {counts}
+          <Button key="show-panel" plain dimColor label={why} onPress={() => { bg(openByYou($)) }} />
+          <Text dimColor>{`  ${account ? `${account}  ` : ''}⟨${id}⟩`}</Text>
+        </Box>
       )
-    }
     return (
-      <Box flexDirection="row">
-        {counts}
-        <Button key="show-panel" plain dimColor label={why} onPress={() => { bg(openByYou($)) }} />
-        <Text dimColor>{`  ${account ? `${account}  ` : ''}⟨${id}⟩`}</Text>
+      <Box flexDirection="column">
+        {own}
+        {beneath}
       </Box>
     )
   })

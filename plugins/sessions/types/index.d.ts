@@ -32,8 +32,9 @@ export type Row = {
 // One rate-limit window of the account, as a session's last response reported it (five_hour, seven_day, …)
 export type RateLimit = { kind: string; percent: number }
 // About all the project's rows, whatever the panel shows: whether the f filter is on (only the sessions waiting for
-// you), how many sessions the project has, and what they spent at list price (null: none is on an API account)
-export type PanelSummary = { waitingOnly: boolean; sessions: number; spent: number | null }
+// you), how many sessions the project has, how many others wait for you (red) or have something unseen (yellow), and
+// what they spent at list price (null: none is on an API account)
+export type PanelSummary = { waitingOnly: boolean; sessions: number; waiting: number; unseen: number; spent: number | null }
 
 // The usage block. usage.py builds the summary: totals per day and per hour, split by the session's folder; each total
 // is [input, output, cache read, cache written, thinking] (thinking is part of the output)

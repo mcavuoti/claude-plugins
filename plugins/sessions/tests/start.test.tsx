@@ -20,6 +20,23 @@ test('session.start starts the mod once: heartbeat, panel and /sessions; a draw 
   await ui.unmount()
 })
 
+test('the band is shared: what Claude and other mods draw there stays, after this line, and a survey has it alone', async ($, on) => {
+  const w = world(on)
+  w.band.value = 'a line from another mod'
+  await startSession($, w)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).toContain('"aaaaaaaa"')
+  expect(drawn).toContain('a line from another mod')
+  expect(drawn.indexOf('aaaaaaaa')).toBeLessThan(drawn.indexOf('a line from another mod'))
+  await ui.unmount()
+  const survey = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, hasSurvey: true } })
+  const alone = JSON.stringify(await survey.drawn())
+  expect(alone).toContain('a line from another mod')
+  expect(alone).not.toContain('aaaaaaaa')
+  await survey.unmount()
+})
+
 test("without session.start, the first draw starts the mod (the old pre-started process case)", async ($, on) => {
   const w = world(on)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
