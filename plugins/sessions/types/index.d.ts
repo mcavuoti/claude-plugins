@@ -90,7 +90,8 @@ export type SessionsCurrent = {
   /** The project root the panel uses */
   root: string
   background: boolean
-  /** The agent the session runs as (`claude --agent <name>`), from its transcript's first row; null for none */
+  /** The agent the session runs as (`claude --agent <name>`), from its transcript's last `agent-setting` row (kept
+   * across /clear, whose new transcript has none); null for none */
   agent: string | null
 }
 /** working: in a turn; waiting: for the person (a permission, a question); idle; stopped: no process; gone: not in the
