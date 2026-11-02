@@ -49,8 +49,8 @@ test('/fleet init sets the project up: config, decisions folders, .gitignore; ag
   expect(json(w, `${FLEET}/config.json`)).toEqual({ configFormat: 1, template: 'blank', commitRegister: false })
   expect(w.files.get(`${FLEET}/.gitignore`)).toContain('\ndecisions/\n')
   for (const d of ['queue', 'answers', 'register', 'tmp', 'prune']) expect(w.dirs.has(`${DEC}/${d}`)).toBe(true)
-  // Not a background session: no decide here
-  expect(w.tools).toEqual([])
+  // Not a background session: no decide here; the person's taste is heard from now on
+  expect(w.tools.map(t => t.name)).toEqual(['taste'])
   expect(await fleet($, 'init --commit-register')).toContain('Up to date')
   expect(json(w, `${FLEET}/config.json`).commitRegister).toBe(true)
   expect(w.files.get(`${FLEET}/.gitignore`)).toContain('!decisions/register/')

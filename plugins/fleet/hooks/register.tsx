@@ -628,7 +628,7 @@ async function start($: any) {
           worldReady = null
           look.cancel()
           timers($)
-          if (jobRef && !offered) await offer($)
+          if (!offered && (jobRef || !tasteOffered)) await offer($)
         })(),
       )
     })
@@ -6003,7 +6003,7 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   roster = null
   await writeStamps($, await configFiles($))
   timers($)
-  if (jobRef && !offered) await offer($).catch(() => {})
+  if (!offered && (jobRef || !tasteOffered)) await offer($).catch(() => {})
   if (!jobRef) whyNot = "this isn't a background session: here the model asks with AskUserQuestion, and fleet records the answers"
   log($, `init ${dir} (${name})`)
   const next = (Array.isArray(tpl.meta.next) ? tpl.meta.next : []).filter((x: unknown): x is string => typeof x === 'string')
