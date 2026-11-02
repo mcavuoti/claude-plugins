@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
+import { storeNamespace } from '../hooks/state'
 import { BAND, DATA, ROOT, SID, startSession, world, type World } from './world'
 
 // How the mod starts in a session (the world it sees is in world.ts)
@@ -261,6 +262,21 @@ test('a missing auto-pin record is rebuilt once, under the pins lock, from the p
   expect(w.runs.some(a => a[0] === 'rmdir' && a[1] === '/Users/x/jobs/pins.json.lock')).toBe(true)
   // Nothing was pinned or unpinned
   expect(w.files.get('/Users/x/jobs/pins.json')).toBe('[\n  "aaaaaaaa",\n  "bbbbbbbb"\n]')
+})
+
+test('a test session (any SESSIONS_* override) keeps every store key under a namespace of its own', async ($, on) => {
+  expect(storeNamespace([undefined, '', undefined, undefined, undefined, undefined])).toBe('')
+  const one = storeNamespace([undefined, '/Users/x/jobs', '/Users/x/daemon.log', '/bin/claude', undefined, undefined])
+  expect(one).toMatch(/^@[0-9a-f]{8}\/$/)
+  expect(storeNamespace([undefined, '/Users/x/jobs', '/Users/x/daemon.log', '/bin/claude', undefined, undefined])).toBe(one)
+  expect(storeNamespace(['/tmp/t/data', '/Users/x/jobs', '/Users/x/daemon.log', '/bin/claude', undefined, undefined])).not.toBe(one)
+  // The tests' world sets overrides: the list cache, the pins record, the marks and the person's choices, all inside it
+  const w = world(on)
+  await startSession($, w)
+  await w.clock.advance(20000)
+  expect(w.namespace).toBe(one)
+  expect([...w.storeKeys].length).toBeGreaterThan(5)
+  expect([...w.storeKeys].filter(k => !k.startsWith(one))).toEqual([])
 })
 
 // A session that changes folder: EnterWorktree and ExitWorktree move $.session.root() (and its row in the official

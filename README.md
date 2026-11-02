@@ -57,9 +57,9 @@ Developing on macOS and Linux (some code can only be tried on its own system): s
 
 
 - Work on a clone of this repository, not on the installed copy (`~/.claude/plugins/cache/…`).
-- Try a plugin from the clone without installing it, in a throwaway session, by loading its folder for that session only (the `env` in `--settings` overrides the one in your `settings.json`). A folder loaded that way shows up as `<name>@inline`; enable it explicitly in case your settings disable it:
+- Try a plugin from the clone without installing it, in a throwaway session, by loading its folder for that session only (the `env` in `--settings` overrides the one in your `settings.json`). A folder loaded that way shows up as `<name>@inline`; enable it explicitly in case your settings disable it. For `sessions`, also point its files, Claude's background service folder and its log elsewhere, and turn its notifications off, so the test session never touches the files, pins and panels of the sessions you use (with those overrides its store keys live apart too) nor notifies you:
   ```sh
-  claude --bg --settings '{"env":{"CLAUDE_CODE_PLUGIN_DIRS":"/path/to/claude-plugins/plugins/sessions"},"enabledPlugins":{"sessions@inline":true}}' -n "TEST A" "Reply only: ok"
+  claude --bg --settings '{"env":{"CLAUDE_CODE_PLUGIN_DIRS":"/path/to/claude-plugins/plugins/sessions","SESSIONS_DATA_DIR":"/tmp/t/data","SESSIONS_JOBS_DIR":"/tmp/t/jobs","SESSIONS_DAEMON_LOG":"/tmp/t/daemon.log"},"enabledPlugins":{"sessions@inline":true},"pluginConfigs":{"sessions@inline":{"options":{"notificationsPerDay":0}}}}' -n "TEST A" "Reply only: ok"
   ```
   An enabled `@inline` copy wins over the installed plugin with the same name.
 - `claude plugin test plugins/<name>` runs a plugin's tests (for mods, the `tests/` folder).

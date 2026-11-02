@@ -7,6 +7,19 @@ import type { Color, Period, RateLimit, SessionsMark, SessionsMember, SessionsRe
 // The launcher (hooks/launcher.py, hooks/visor.sh) reads and writes the same formats: change them together.
 export const FORMAT = 2
 
+// Where a session keeps its keys in the shared store: '' for the sessions you use, and @<hash>/ for one started with any
+// SESSIONS_* override (a test session: SESSIONS_DATA_DIR, SESSIONS_JOBS_DIR, SESSIONS_DAEMON_LOG, SESSIONS_CLAUDE,
+// SESSIONS_PLUGIN_VERSION, SESSIONS_PLUGIN_SINCE, in that order), so test sessions never read nor write theirs: the
+// session list they cache from a stand-in claude, the pins they record, the notifications they count, their marks and
+// the choices made in their panels, nor the prune of keys of sessions missing from their list. The hash is FNV-1a of
+// the values, one per line
+export function storeNamespace(values: readonly (string | undefined)[]): string {
+  if (!values.some(v => v)) return ''
+  let h = 0x811c9dc5
+  for (const c of new TextEncoder().encode(values.map(v => v ?? '').join('\n'))) h = Math.imul(h ^ c, 0x01000193) >>> 0
+  return `@${h.toString(16).padStart(8, '0')}/`
+}
+
 // The first version of the mod that writes heartbeats: sessions started after this version was installed are
 // expected to have one
 export const HEARTBEAT_VERSION = '0.10.0'

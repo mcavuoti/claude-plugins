@@ -1,6 +1,8 @@
 import type { On } from 'claude-code'
 import { mock } from 'claude-code/testing'
 
+import { storeNamespace } from '../hooks/state'
+
 // The world the mod sees in the tests, with the engine's own test kit: every hook here stands for the engine (files,
 // processes, the clock, the store and the environment are answered from memory). Shared by the test files that start
 // the mod
@@ -22,6 +24,9 @@ export type World = {
   id: { value: string }
   panes: any[]
   store: Map<string, unknown>
+  // Every store key the mod asked for, as it asked (with its namespace), and that namespace
+  storeKeys: Set<string>
+  namespace: string
   runs: string[][]
   // The folder each command ran in
   cwds: (string | undefined)[]
@@ -88,19 +93,29 @@ export function world(on: On, options: WorldOptions = {}): World {
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
   const clock = mock.clock(on, { now: 1_000_000_000 })
-  // The store, in memory (readable by the tests)
+  const env: Record<string, string> = { HOME: '/Users/x', SESSIONS_CLAUDE: '/bin/claude', SESSIONS_JOBS_DIR: '/Users/x/jobs', SESSIONS_DAEMON_LOG: '/Users/x/daemon.log', ...options.env }
+  mock.env(on, env)
+  // The store, in memory (readable by the tests). These overrides put the mod's keys under a namespace of their own
+  // (storeNamespace): the tests read and write them without it, and storeKeys keeps every key the mod used, as it used it
+  const namespace = storeNamespace(['SESSIONS_DATA_DIR', 'SESSIONS_JOBS_DIR', 'SESSIONS_DAEMON_LOG', 'SESSIONS_CLAUDE', 'SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE'].map(k => env[k]))
+  const plain = (key: string) => (key.startsWith(namespace) ? key.slice(namespace.length) : key)
+  const storeKeys = new Set<string>()
   const store = new Map<string, unknown>(Object.entries(options.store ?? {}))
-  on('store.get', (_, e) => ({ value: store.get(e.key) as any }))
+  on('store.get', (_, e) => {
+    storeKeys.add(e.key)
+    return { value: store.get(plain(e.key)) as any }
+  })
   on('store.set', (_, e) => {
-    store.set(e.key, e.value)
+    storeKeys.add(e.key)
+    store.set(plain(e.key), e.value)
     return { value: undefined }
   })
   on('store.delete', (_, e) => {
-    store.delete(e.key)
+    storeKeys.add(e.key)
+    store.delete(plain(e.key))
     return { value: undefined }
   })
-  on('store.keys', () => ({ value: [...store.keys()] }))
-  mock.env(on, { HOME: '/Users/x', SESSIONS_CLAUDE: '/bin/claude', SESSIONS_JOBS_DIR: '/Users/x/jobs', SESSIONS_DAEMON_LOG: '/Users/x/daemon.log', ...options.env })
+  on('store.keys', () => ({ value: [...store.keys()].map(k => `${namespace}${k}`) }))
   const list = options.list ?? [{ id: id.value.slice(0, 8), sessionId: id.value, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' }]
   on('session.id', () => ({ value: id.value }))
   on('session.root', () => ({ value: root.value }))
@@ -223,7 +238,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

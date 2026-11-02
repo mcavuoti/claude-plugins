@@ -60,6 +60,7 @@ import {
   buildNotice,
   sparkline,
   stopReasons,
+  storeNamespace,
   isRef,
   type StopReason,
   colorOf,
@@ -327,10 +328,27 @@ function debugLine($: any, text: string) {
 // (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
 // and the window in front, shared for 1.5 s by the seen check: at, windows / tty).
-// When a stored value changes meaning, it gets a new key: sessions on another version never misread it
+// When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
+// A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
+// (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
+let namespaceNow: string | undefined
+async function storeNamespaceOf($: any): Promise<string> {
+  if (namespaceNow !== undefined) return namespaceNow
+  // Each variable's name written out: the $ another plugin's call lends has only these
+  namespaceNow = storeNamespace([
+    await $.env.get('SESSIONS_DATA_DIR'),
+    await $.env.get('SESSIONS_JOBS_DIR'),
+    await $.env.get('SESSIONS_DAEMON_LOG'),
+    await $.env.get('SESSIONS_CLAUDE'),
+    await $.env.get('SESSIONS_PLUGIN_VERSION'),
+    await $.env.get('SESSIONS_PLUGIN_SINCE'),
+  ])
+  return namespaceNow
+}
+
 async function storeGet($: any, key: string): Promise<any> {
   try {
-    return await $.store.get(key)
+    return await $.store.get(`${await storeNamespaceOf($)}${key}`)
   } catch {
     return undefined
   }
@@ -338,14 +356,25 @@ async function storeGet($: any, key: string): Promise<any> {
 
 async function storeSet($: any, key: string, value: unknown) {
   try {
-    await $.store.set(key, value)
+    await $.store.set(`${await storeNamespaceOf($)}${key}`, value)
   } catch {}
 }
 
 async function storeDelete($: any, key: string) {
   try {
-    await $.store.delete(key)
+    await $.store.delete(`${await storeNamespaceOf($)}${key}`)
   } catch {}
+}
+
+// The keys of this session's namespace, without it
+async function storeKeys($: any): Promise<string[]> {
+  try {
+    const ns = await storeNamespaceOf($)
+    const all: string[] = await $.store.keys()
+    return ns ? all.filter(k => k.startsWith(ns)).map(k => k.slice(ns.length)) : all.filter(k => !k.startsWith('@'))
+  } catch {
+    return []
+  }
 }
 
 async function seenAt($: any, sessionId: string): Promise<number> {
@@ -515,10 +544,7 @@ async function prune($: any) {
   if (typeof list === 'string') return
   const alive = new Set(list.map(s => String(s.sessionId)))
   const ids = new Set<string>()
-  let keys: string[] = []
-  try {
-    keys = await $.store.keys()
-  } catch {}
+  const keys = await storeKeys($)
   for (const k of keys) {
     const m = k.match(/^(state|seen|title|waiting|restarted|reopened|needsSince|pushed|spend):(.+)$/)
     if (m?.[2] && !alive.has(m[2])) ids.add(m[2])
@@ -927,10 +953,7 @@ async function writeOrder($: any, list: Row[], now: number) {
 let marksNow: Record<string, RowMark> = {}
 let markSources: { source: string; rows: number; until: number }[] = []
 async function readMarks($: any, now: number) {
-  let keys: string[] = []
-  try {
-    keys = (await $.store.keys()).filter((k: string) => k.startsWith('marks:'))
-  } catch {}
+  const keys = (await storeKeys($)).filter(k => k.startsWith('marks:'))
   const slots: MarkSlot[] = []
   const sources: typeof markSources = []
   for (const k of keys) {
@@ -2569,7 +2592,7 @@ function sessionsApi($: any): Sessions {
         sid ||= String(await $.session.id())
       } catch {}
       if (!sid) return { ok: false, reason: 'not-ready', detail: "this session's id isn't known yet: try again in a moment" }
-      const key = `marks:${v.source}:${sid}`
+      const key = `${await storeNamespaceOf($)}marks:${v.source}:${sid}`
       try {
         const now = await $.clock.now()
         if (Object.keys(v.rows).length === 0) await $.store.delete(key)
@@ -2729,8 +2752,25 @@ export const register: Register = (on, options) => {
   on('engine.create', async (_, e, next) => {
     const $ = await next(e)
     const calls = {
-      // Only what dataFolder reads (Claude wants each variable's name written out)
-      env: { get: (key: string) => (key === 'HOME' ? $.env.get('HOME') : key === 'SESSIONS_DATA_DIR' ? $.env.get('SESSIONS_DATA_DIR') : Promise.resolve(undefined)) },
+      // Only what dataFolder and storeNamespaceOf read (Claude wants each variable's name written out)
+      env: {
+        get: (key: string) =>
+          key === 'HOME'
+            ? $.env.get('HOME')
+            : key === 'SESSIONS_DATA_DIR'
+              ? $.env.get('SESSIONS_DATA_DIR')
+              : key === 'SESSIONS_JOBS_DIR'
+                ? $.env.get('SESSIONS_JOBS_DIR')
+                : key === 'SESSIONS_DAEMON_LOG'
+                  ? $.env.get('SESSIONS_DAEMON_LOG')
+                  : key === 'SESSIONS_CLAUDE'
+                    ? $.env.get('SESSIONS_CLAUDE')
+                    : key === 'SESSIONS_PLUGIN_VERSION'
+                      ? $.env.get('SESSIONS_PLUGIN_VERSION')
+                      : key === 'SESSIONS_PLUGIN_SINCE'
+                        ? $.env.get('SESSIONS_PLUGIN_SINCE')
+                        : Promise.resolve(undefined),
+      },
       fs: {
         read: (path: string) => $.fs.read(path),
         write: (path: string, text: string) => $.fs.write(path, text),
@@ -2740,7 +2780,12 @@ export const register: Register = (on, options) => {
       },
       process: { run: (argv: string[], init?: { stdin?: string; timeoutMs?: number; cwd?: string }) => $.process.run(argv, init) },
       clock: { now: () => $.clock.now(), sleep: (ms: number) => $.clock.sleep(ms) },
-      store: { get: (key: string) => $.store.get(key), set: (key: string, value: unknown) => $.store.set(key, value as any), delete: (key: string) => $.store.delete(key) },
+      store: {
+        get: (key: string) => $.store.get(key),
+        set: (key: string, value: unknown) => $.store.set(key, value as any),
+        delete: (key: string) => $.store.delete(key),
+        keys: () => $.store.keys(),
+      },
       session: { id: () => $.session.id() },
     }
     return { ...$, sessions: sessionsApi(calls) }

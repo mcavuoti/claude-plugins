@@ -310,6 +310,8 @@ test('setMarks: checked, kept per source and session for ttlMs, drawn in the pan
   // Before the mod has started here too: the session's own id names them
   expect(await call($, 'setMarks', ok)).toEqual({ ok: true })
   expect(w.store.get(`marks:probe:${SID}`)).toEqual({ at: w.clock.now(), until: w.clock.now() + 60000, rows: { aaaaaaaa: { badge: '?2' } } })
+  // In the test environment's namespace, as the mod's own keys (another plugin's call has the overrides too)
+  expect([...w.storeKeys].filter(k => !k.startsWith(w.namespace))).toEqual([])
   await startSession($, w)
   // A regular session of the project, marked as needing the person
   expect(await call($, 'setMarks', { source: 'probe', rows: { aaaaaaaa: { badge: '?2', tint: 'warning' }, [`sid:${REGULAR}`]: { line: ' blocked on   D-3 ', needsPerson: true } }, ttlMs: 60000 })).toEqual({ ok: true })
