@@ -1,4 +1,4 @@
 {
   "worldFormat": 1,
-  "paths": ["notes/**"]
+  "paths": ["notes/**", "journals/**"]
 }

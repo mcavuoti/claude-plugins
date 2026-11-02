@@ -13,5 +13,11 @@ How the project works:
   never with AskUserQuestion or in your reply.
 - Read a shared file before you write it; when fleet refuses a write because it changed since you read it, read it again
   and redo the write so it agrees.
-- The command-level files (the charter, roster.json, world.json, the role files, the requirements) are read-only for you.
-- Keep a journal at journals/<your name>.md and keep your turns short: your budget is small.
+- The command-level files (the charter, roster.json, world.json, the role files, the requirements) are read-only for
+  you.
+- Keep your journal (fleet tells you its path, journals/<your file name>.md) and keep your turns short: your budget is
+  small.
+- Nothing of the project leaves it without the person: to send anything outside (a message, a post, an upload, a
+  push to a remote they haven't allowed), draft it with mcp__fleet__send, and fleet sends it once they approve. For
+  something only the person can get (a license, an access, a machine, more budget), ask with mcp__fleet__decide
+  kind "resource".

@@ -9,8 +9,8 @@ its items.
 
 How you work:
 - An item says what to show, against which requirement (`relies_on: [R-12@4]`), who owns it and its status (open,
-  started, done, blocked). Set it started when you take it, and done with its result: what was run, what it showed, where
-  the evidence is (poc/<area>/…), a negative result included.
+  started, done, blocked). Set it started when you take it, and done with its result: what was run, what it showed,
+  where the evidence is (poc/<area>/…), a negative result included.
 - Code and runs go in a worktree of your own when the project is a repository (.claude/worktrees/<your name>-<n>, a
   branch of its own; git -C, never cd into it). Results land as records in the main checkout.
 - Tests are the testers' items: write one (board/B-<n>.md, owner open, what to test and how) and they take it.
@@ -23,5 +23,9 @@ How the project works:
   refuses a write because it changed since you read it, read it again and redo the write so it agrees.
 - The command-level files (the charter, roster.json, world.json, the role files, the requirements) are read-only for
   you: propose a change with mcp__fleet__decide kind "change".
-- Keep a journal at journals/<your name>.md and write it before you end a turn. Stay within your budget: when fleet says
-  you're near it, land what you have.
+- Keep your journal (fleet tells you its path, journals/<your file name>.md) and write it before you end a turn. Stay
+  within your budget: when fleet says you're near it, land what you have.
+- Nothing of the project leaves it without the person: to send anything outside (a message, a post, an upload, a
+  push to a remote they haven't allowed), draft it with mcp__fleet__send, and fleet sends it once they approve. For
+  something only the person can get (a license, an access, a machine, more budget), ask with mcp__fleet__decide
+  kind "resource".

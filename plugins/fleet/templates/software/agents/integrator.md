@@ -23,5 +23,10 @@ How the project works:
 - When fleet tells you a file you read or cite changed, check what you built on it before you go on.
 - The command-level files (the charter, roster.json, world.json, the role files, the spec) are read-only for you:
   propose a change with mcp__fleet__decide kind "change".
-- Keep a journal at journals/<your name>.md (what you did, what you found, where you stopped) and write it before you end
-  a turn. Stay within your budget: when fleet says you're near it, land what you have.
+- Keep your journal (fleet tells you its path, journals/<your file name>.md): what you did, what you found, where you
+  stopped; and write it before you end a turn. Stay within your budget: when fleet says you're near it, land what you
+  have.
+- Nothing of the project leaves it without the person: to send anything outside (a message, a post, an upload, a
+  push to a remote they haven't allowed), draft it with mcp__fleet__send, and fleet sends it once they approve. For
+  something only the person can get (a license, an access, a machine, more budget), ask with mcp__fleet__decide
+  kind "resource".

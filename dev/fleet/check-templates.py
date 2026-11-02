@@ -50,6 +50,14 @@ for t in templates:
             say(t / 'fleet/world.json', 'needs worldFormat and paths')
     except (OSError, ValueError) as e:
         say(t / 'fleet/world.json', e)
+    outbound = t / 'fleet/outbound.json'
+    if outbound.exists():
+        try:
+            o = json.loads(outbound.read_text())
+            if not isinstance(o.get('outboundFormat'), int) or any(not isinstance(o.get(k, []), list) for k in ('hosts', 'remotes', 'recipients', 'commands', 'outside')):
+                say(outbound, 'needs outboundFormat, and hosts, remotes, recipients, commands and outside as lists')
+        except ValueError as e:
+            say(outbound, e)
     try:
         roster = json.loads((t / 'fleet/roster.json').read_text())
     except (OSError, ValueError) as e:
@@ -69,6 +77,8 @@ for t in templates:
             say(where, f"its role {i.get('role')} isn't in roles")
         if 'section' in i and i['section'] not in sections:
             say(where, f"its section {i['section']} isn't in sections")
+        if i.get('context', roles.get(i.get('role'), {}).get('context', 'fresh')) not in ('long', 'fresh'):
+            say(where, 'context is long or fresh')
         if 'parent' in i and i['parent'].lower() not in names:
             say(where, f"its parent {i['parent']} isn't an instance")
     for role, spec in roles.items():

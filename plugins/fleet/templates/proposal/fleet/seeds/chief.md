@@ -4,7 +4,7 @@ Start the project's kickstart interview with the person, from .claude/fleet/inte
   come by. At most 4 questions per call, each with 2 to 4 options, the one you recommend and one line on why; the
   person can always answer in their own words.
 - Ask the first batch now, then end your turn. Each answer comes back as a message from fleet: write it in your journal
-  (journals/{name}.md), then ask the next batch, until the interview's topics are covered (skip what the answers
+  ({journal}), then ask the next batch, until the interview's topics are covered (skip what the answers
   already settled).
 - Then file your drafts, each as mcp__fleet__decide with kind "change" and a one-line summary: the charter (path
   .claude/fleet/charter.md, the whole content), the roster (path .claude/fleet/roster.json, edits to it as it is now),

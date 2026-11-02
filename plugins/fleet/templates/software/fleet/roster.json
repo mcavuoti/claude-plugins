@@ -6,8 +6,8 @@
     { "id": "checks", "title": "Checks" }
   ],
   "roles": {
-    "chief": { "agent": "chief", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24 },
-    "integrator": { "agent": "integrator", "model": "opus", "budget": { "usdDay": 20 }, "cadenceH": 8 },
+    "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24 },
+    "integrator": { "agent": "integrator", "context": "long", "model": "opus", "budget": { "usdDay": 20 }, "cadenceH": 8 },
     "area-owner": { "agent": "area-owner", "model": "sonnet", "budget": { "usdDay": 15 }, "cadenceH": 6 },
     "reviewer": { "agent": "reviewer", "model": "sonnet", "budget": { "usdDay": 8 }, "cadenceH": 8 },
     "janitor": { "agent": "janitor", "model": "haiku", "budget": { "usdDay": 2 }, "cadenceH": 12 }

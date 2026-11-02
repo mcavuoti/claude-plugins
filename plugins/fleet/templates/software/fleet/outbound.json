@@ -1,0 +1,12 @@
+{
+  "outboundFormat": 1,
+  "hosts": [],
+  "remotes": [],
+  "recipients": [],
+  "tools": {
+    "outbound": [],
+    "free": []
+  },
+  "commands": [],
+  "outside": []
+}
