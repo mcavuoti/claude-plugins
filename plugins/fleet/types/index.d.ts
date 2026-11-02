@@ -76,9 +76,12 @@ declare module 'claude-code' {
       handoff: { text: string; at: number } | null
       /** What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing) */
       bandNote: string
-      /** The intake records routed to this instance that its model was told of: id → when */
+      /** The intake records routed to this instance that its model was told of: id → when (first told) */
       intakeTold: Record<string, number>
-      /** The slot leases this session's model was told it holds: "<slot>/<n>/<taken at>" → when */
+      /** The intake records the conversation a /clear ended was told of: the new one hears them once more */
+      intakeAgain: string[]
+      /** The slot leases this session's model was told it holds: "<slot>/<n>/<taken at>" → when (0: held from before
+       * a /clear, not told in this conversation yet) */
       slotTold: Record<string, number>
       /** The slots this session waits in line for */
       slotWait: string[]

@@ -369,6 +369,8 @@ const conversationAt = atom({ plugin: 'fleet', key: 'conversationAt' } as const,
 const landedAt = atom({ plugin: 'fleet', key: 'landedAt' } as const, 0)
 const freshAt = atom({ plugin: 'fleet', key: 'freshAt' } as const, 0)
 const intakeTold = atom({ plugin: 'fleet', key: 'intakeTold' } as const, {} as Record<string, number>)
+// The intake records told in a conversation a /clear ended: the new one hears them once more
+const intakeAgain = atom({ plugin: 'fleet', key: 'intakeAgain' } as const, [] as string[])
 const slotTold = atom({ plugin: 'fleet', key: 'slotTold' } as const, {} as Record<string, number>)
 const slotWait = atom({ plugin: 'fleet', key: 'slotWait' } as const, [] as string[])
 const overruling = atom({ plugin: 'fleet', key: 'overruling' } as const, {} as Record<string, FleetInflight>)
@@ -1774,6 +1776,13 @@ async function clearReads($: any, oldSessionId: string) {
   if (await read($, outside)) log($, 'the outside-content mark ends with the conversation (/clear)')
   await update($, outside, () => null)
   await update($, personTurn, () => null)
+  // Nor what it was told of its budget, of the slot leases it holds (0: held, not told in this conversation) and of the
+  // items from outside the conversation that ended was pointed to: it hears them again, once
+  await update($, budgetTold, () => '')
+  await update($, slotTold, m => Object.fromEntries(Object.keys(m).map(k => [k, 0])))
+  const since = await read($, conversationAt)
+  const pointed = Object.entries(await read($, intakeTold)).filter(([, t]) => t >= since).map(([id]) => id)
+  await update($, intakeAgain, () => pointed)
   const now = await $.clock.now()
   await update($, conversationAt, () => now)
   if (root && oldSessionId) await remove($, [readsPath(oldSessionId)])
@@ -1838,10 +1847,12 @@ async function digestFor($: any, thread: string, withBudget = true): Promise<{ l
       }
       if (intake.ids.length) {
         const at = await $.clock.now()
+        // One told again after a /clear keeps when it was first told: the next /clear doesn't bring it back
         await update($, intakeTold, m => {
           const kept = Object.fromEntries(Object.entries(m).filter(([, t]) => at - t < 4 * 24 * HOUR))
-          return { ...kept, ...Object.fromEntries(intake.ids.map(id => [id, at])) }
+          return { ...kept, ...Object.fromEntries(intake.ids.map(id => [id, kept[id] ?? at])) }
         })
+        await update($, intakeAgain, l => l.filter(id => !intake.ids.includes(id)))
         intakeSeen.at = Math.max(intakeSeen.at, intake.at)
         log($, `intake to ${myInstance?.name ?? thread}: ${intake.ids.join(', ')}`)
         // A pointer carries outside text (a model's summary of the item, its sender): the conversation is marked
@@ -2805,7 +2816,9 @@ async function intakeLines($: any): Promise<{ lines: string[]; ids: string[]; at
   if (!inst || !intakeEvents.size) return { lines: [], ids: [], at: 0 }
   await carryIntake($, inst)
   const told = await read($, intakeTold)
-  const mine = [...intakeEvents.values()].filter(e => e.id && e.intake && e.intake.to.includes(inst.name) && e.at > intakeSeen.at && !told[e.id]).sort((a, b) => a.at - b.at)
+  // Those not told yet, and those told in a conversation a /clear ended (the new one doesn't remember them)
+  const again = new Set(await read($, intakeAgain))
+  const mine = [...intakeEvents.values()].filter(e => e.id && e.intake && e.intake.to.includes(inst.name) && (again.has(e.id) || (e.at > intakeSeen.at && !told[e.id]))).sort((a, b) => a.at - b.at)
   if (!mine.length) return { lines: [], ids: [], at: 0 }
   const text = pointerText(
     mine.map(e => ({ id: e.id as string, path: e.path, meta: e.intake as IntakeMeta })),
@@ -3400,19 +3413,30 @@ async function slotLines($: any): Promise<{ lines: string[]; told: () => Promise
     const spec = list.find(x => x.name === name)
     const mine = spec ? (await leasesOf($, name)).map(x => x.lease).filter(l => sameHolder(l.holder, holder) && l.until > now) : []
     for (const l of mine) {
-      if (told[leaseKey(l)] !== undefined) continue
+      const t = told[leaseKey(l)]
+      if (t === 0) {
+        // Held from before a /clear: the new conversation doesn't know it holds it
+        lines.push(`fleet: you hold ${name} (${l.n + 1} of ${spec?.count ?? '?'}, until ${clock(l.until, me.offsetMin)}), taken before this conversation started. Release it with mcp__fleet__slot release as soon as you're done with it (take it again to extend it).`)
+        add.push(leaseKey(l))
+        continue
+      }
+      if (t !== undefined) continue
       lines.push(`fleet: ${name} is yours now (${l.n + 1} of ${spec?.count ?? '?'}, until ${clock(l.until, me.offsetMin)}): you were first in line. Go on with what needed it, and release it with mcp__fleet__slot release as soon as you're done (take it again to extend it).`)
       add.push(leaseKey(l))
       urgent = true
     }
     for (const k of Object.keys(told).filter(k => k.startsWith(`${name}/`))) {
       if (mine.some(l => leaseKey(l) === k)) continue
-      lines.push(`fleet: your lease on ${name} ran out and fleet took it back. If you still need it, take it again with mcp__fleet__slot take (you may have to wait in line).`)
       drop.push(k)
+      // One that ran out before this conversation heard of it: nothing to tell
+      if (told[k] !== 0) lines.push(`fleet: your lease on ${name} ran out and fleet took it back. If you still need it, take it again with mcp__fleet__slot take (you may have to wait in line).`)
     }
     if (waiting.includes(name) && (mine.length || !spec || !(await waitersOf($, name)).some(w => sameHolder(w.waiter.holder, holder)))) unwait.push(name)
   }
-  if (!lines.length && !unwait.length) return none
+  if (!lines.length && !unwait.length) {
+    if (drop.length) await update($, slotTold, m => omit(m, drop))
+    return none
+  }
   return {
     lines,
     urgent,

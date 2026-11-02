@@ -170,6 +170,17 @@ test('an instance hears the pointers routed to it, reading a record marks it, an
   expect(list).toContain('1. Change req/R-1.md: "R-1 becomes 8, as I-3 asks" (+1 −1 lines)')
   expect(list).toContain('drafted after reading outside content (pointers to intake records I-3, I-4 at ')
   expect(w.files.get(`${ROOT}/req/R-1.md`)).toBe('# R-1\n\nThe target is 5.\n')
+  // A /clear: the new conversation doesn't remember the pointers it was told, so it hears them once more
+  await $.session.end({ reason: 'clear', sessionId: SID } as any)
+  await w.clock.settle()
+  const again: any = await $.tool.call({ tool: 'Bash', command: 'true' } as any)
+  expect((again.context ?? []).join('\n')).toContain('fleet: 2 items from outside reached you')
+  expect((again.context ?? []).join('\n')).toContain('- I-3 (inputs/intake/I-3.md)')
+  expect(((await $.tool.call({ tool: 'Bash', command: 'true' } as any)).context ?? []).join('\n')).not.toContain('items from outside')
+  // ... and only once: the next /clear doesn't bring them back
+  await $.session.end({ reason: 'clear', sessionId: SID } as any)
+  await w.clock.settle()
+  expect(((await $.tool.call({ tool: 'Bash', command: 'true' } as any)).context ?? []).join('\n')).not.toContain('items from outside')
 })
 
 test('the MCP adapter: the sweeper calls the listing tool when due and drops what it lists in the inbox, once', WITH_SESSIONS, async ($, on) => {

@@ -69,6 +69,25 @@ test('a slot: take, take again to extend, release; list; an unknown one is said'
   expect((await $.tool.call({ tool: 'mcp__fleet__slot', action: 'take', slot: 'lab', agentId: 'helper-1' } as any)).deny).toContain('only for the main thread')
 })
 
+test('after a /clear the new conversation hears the lease it holds, once; one that ran out meanwhile is dropped unsaid', WITH_SESSIONS, async ($, on) => {
+  const w = project(on)
+  await startSession($, w)
+  await tick(w)
+  expect((await slot($, { action: 'take', slot: 'sim', minutes: 20 })).result).toMatch(/^Yours: sim/)
+  expect((await $.tool.call({ tool: 'Bash', command: 'true' } as any)).context ?? []).toEqual([])
+  await $.session.end({ reason: 'clear', sessionId: SID } as any)
+  await w.clock.settle()
+  const step: any = await $.tool.call({ tool: 'Bash', command: 'true' } as any)
+  expect((step.context ?? []).join('\n')).toMatch(/^fleet: you hold sim \(1 of 1, until \d\d:\d\d\), taken before this conversation started\. Release it with mcp__fleet__slot release/)
+  expect((await $.tool.call({ tool: 'Bash', command: 'true' } as any)).context ?? []).toEqual([])
+  // Cleared again, and the lease runs out before the next step: nothing to tell about a lease it never heard of
+  await $.session.end({ reason: 'clear', sessionId: SID } as any)
+  await w.clock.settle()
+  for (let i = 0; i < 600; i++) await tick(w)
+  expect(under(w, SLOTS)).toEqual([])
+  expect((await $.tool.call({ tool: 'Bash', command: 'true' } as any)).context ?? []).toEqual([])
+})
+
 test('a pool of one: a second taker waits; the sweeper takes back the lease that ran out and gives it to the first in line', WITH_SESSIONS, async ($, on) => {
   const w = project(on, { [`${SLOTS}/0.json`]: JSON.stringify({ format: 1, slot: 'lab', n: 0, holder: OTHER, at: NOW - 20 * 60000, until: NOW + 5 * 60000, why: 'a long run' }) })
   await startSession($, w)
