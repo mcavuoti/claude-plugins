@@ -67,7 +67,15 @@ export const FAKE_SESSIONS = {
           await note({ wake: input })
           return { ok: true, state: 'queued' }
         },
+        // With sessions' own limits (its checkMarks): one row past them refuses the whole call
         setMarks: async input => {
+          for (const m of Object.values(input.rows ?? {})) {
+            const badge = m?.badge ?? ''
+            const cols = Array.from(badge).reduce((n, c) => n + (/\p{Extended_Pictographic}/u.test(c) ? 2 : 1), 0)
+            if (cols > 3 || /\p{Cc}/u.test(badge)) return { ok: false, reason: 'invalid', detail: 'a badge is up to 3 columns' }
+            const line = (m?.line ?? '').trim().replace(/\s+/g, ' ')
+            if (Array.from(line).length > 60 || /\p{Cc}/u.test(line)) return { ok: false, reason: 'invalid', detail: 'a status line is up to 60 characters on one line' }
+          }
           await note({ setMarks: input })
           return { ok: true }
         },

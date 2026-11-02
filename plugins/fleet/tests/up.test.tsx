@@ -79,7 +79,9 @@ test('/fleet up --dry-run: the plan, the cost and the lints, and nothing started
   await startSession($, w)
   const dry = await fleet($, 'up --dry-run')
   expect(dry).toContain("The plan for 3 of the roster's 3 instance(s):")
-  expect(dry).toContain('  Owner A · owner (.claude/agents/owner.md) · Owners · wave 1 · haiku · $1.00/day, wakes ~$0.04/day · to start')
+  expect(dry).toContain('  Owner A · owner (.claude/agents/owner.md) · Owners · wave 1 · haiku · $1.00/day, wakes ~$0.04/day · mode default · to start')
+  // Nobody is at an instance: a mode that asks is marked (never refused)
+  expect(dry).toContain("  ! Owner A, Owner B, Owner C: run in default mode (Claude's default): the first write or command waits for you, with nobody to answer.")
   expect(dry).toContain('  Owner B · owner (.claude/agents/owner.md) · Owners, under Owner A · wave 1')
   expect(dry).toContain("Cost, estimated at list price: the budgets add up to $3.00 a day (the project's cap: $5.00); wakes about $0.12 a day")
   expect(dry).toContain('Nothing was started (--dry-run).')
@@ -111,7 +113,7 @@ test('/fleet up --dry-run: the plan, the cost and the lints, and nothing started
   // A running one is placed, not started again; a stopped one is woken
   sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'idle') }, aaaaaaa2: { ...row('aaaaaaa2', 'Owner B', 'stopped') }, ccccccc1: { ...row('ccccccc1', 'Owner C', 'idle'), root: `${HOME}/elsewhere` } } })
   const again = await fleet($, 'up')
-  expect(again).toContain('Owner A · owner (.claude/agents/owner.md) · Owners · wave 1 · haiku · $1.00/day, wakes ~$0.04/day · running (idle): placed, not started again')
+  expect(again).toContain('Owner A · owner (.claude/agents/owner.md) · Owners · wave 1 · haiku · $1.00/day, wakes ~$0.04/day · mode default · running (idle): placed, not started again')
   expect(again).toContain('  Owner B: waking')
   expect(again).toContain('  Owner C: starting')
   expect(calls(w, 'wake')).toEqual([{ ref: 'aaaaaaa2', reason: 'fleet up' }])
@@ -197,7 +199,7 @@ test('the sweeper marks an instance that runs with no fleet, and one over its bu
   expect(last.ttlMs).toBe(150000)
   expect(last.rows.aaaaaaa1).toEqual({ badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true })
   // Owner B, over its budget, is marked so until its missing fleet outranks it
-  expect(marks[0].rows.bbbbbbb1).toMatchObject({ badge: '$', tint: 'error', line: 'budget used up ($2.00 today): /fleet budget "Owner B" +n', needsPerson: true })
+  expect(marks[0].rows.bbbbbbb1).toMatchObject({ badge: '$', tint: 'error', line: 'over budget: /fleet budget "Owner B" +n', needsPerson: true })
   expect(last.rows.bbbbbbb1.badge).toBe('✗')
   expect(calls(w, 'wake')).toEqual([{ ref: 'ccccccc1', reason: 'fleet: the person answered it' }])
   expect(json(w, `${STATE}/wakes.json`).instances['owner-c']).toMatchObject({ count: 1 })
@@ -207,6 +209,38 @@ test('the sweeper marks an instance that runs with no fleet, and one over its bu
   expect(status).toContain('  Owner A · owner · Owners · wave 1 · idle · no fleet (u restarts it) · $0.00 of $1.00 today')
   expect(status).toContain('  Owner B · owner · Owners under Owner A · wave 1 · working · no fleet (u restarts it) · $2.00 of $1.00 today (used up)')
   expect(status).toContain('  Owner C · owner · Owners · wave 2 · stopped · $0.00 of $1.00 today · 1 wake(s) today')
+})
+
+test("the marks keep within sessions' limits: a long name over budget keeps its $ row; a session that asks gets ?n and needs the person", WITH_SESSIONS, async ($, on) => {
+  const at = Date.UTC(2026, 10, 2, 12, 0, 0)
+  const long = { ...ROSTER, instances: [...ROSTER.instances, { name: 'TEST Business Plan', role: 'owner', section: 'owners' }] }
+  const beat = (slug: string, name: string, ref: string) => JSON.stringify({ format: 1, instance: name, slug, ref, sessionId: `${ref}-0000-0000-0000-000000000000`, at, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, fleet: '0.1.0' })
+  const ask = (id: string, ref: string, name: string) => JSON.stringify({ format: 1, fleet: '0.1.0', id, at, asker: { ref, sessionId: `${ref}-0000-0000-0000-000000000000`, name, root: ROOT }, questions: [{ question: 'Go?', options: [{ label: 'Yes' }, { label: 'No' }], recommended: 'Yes', why: 'w' }] })
+  const w = world(on, {
+    background: false,
+    worldPaths: ['notes/**'],
+    files: {
+      ...PROJECT,
+      [`${FLEET}/roster.json`]: JSON.stringify(long),
+      [`${FLEET}/instances/test-business-plan/spend.json`]: JSON.stringify({ format: 1, slug: 'test-business-plan', day: '2026-11-02', usd: 2, sessionId: 's', last: 2, at: 0 }),
+      [`${FLEET}/instances/test-business-plan/state.json`]: beat('test-business-plan', 'TEST Business Plan', 'eeeeeee1'),
+      [`${FLEET}/instances/owner-a/state.json`]: beat('owner-a', 'Owner A', 'aaaaaaa1'),
+      // Owner A asks; so does a background session that isn't an instance
+      [`${FLEET}/decisions/queue/D-5.json`]: ask('D-5', 'aaaaaaa1', 'Owner A'),
+      [`${FLEET}/decisions/queue/D-6.json`]: ask('D-6', 'ddddddd1', 'TEST Helper'),
+      [`${FLEET}/decisions/queue/D-7.json`]: ask('D-7', 'ddddddd1', 'TEST Helper'),
+    },
+  })
+  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'idle'), eeeeeee1: row('eeeeeee1', 'TEST Business Plan', 'working'), ddddddd1: row('ddddddd1', 'TEST Helper', 'idle') } })
+  await startSession($, w)
+  for (let i = 0; i < 3; i++) await tick(w, 30000)
+  const marks = calls(w, 'setMarks')
+  expect(marks.length).toBeGreaterThan(0)
+  const last = marks[marks.length - 1]
+  expect(last.rows.eeeeeee1).toEqual({ badge: '$', tint: 'error', line: 'over budget: /fleet budget "TEST Business Plan" +n', needsPerson: true })
+  expect(last.rows.aaaaaaa1).toEqual({ badge: '?1', tint: 'warning', line: 'asks you 1: /fleet', needsPerson: true })
+  expect(last.rows.ddddddd1).toEqual({ badge: '?2', tint: 'warning', line: 'asks you 2: /fleet', needsPerson: true })
+  expect(w.logs.some(l => l.includes('fleet: marks refused'))).toBe(false)
 })
 
 test('/fleet worktrees lists the linked ones and removes only those no instance works in', WITH_SESSIONS, async ($, on) => {

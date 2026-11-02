@@ -2,9 +2,11 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   addSpend,
+  askBadge,
   budgetState,
   capFor,
   commandLevel,
+  compareVersions,
   countWake,
   denyRules,
   expandBraces,
@@ -13,7 +15,11 @@ import {
   instancesOf,
   isCommandLevel,
   lintRoster,
+  markRow,
   mergeSettings,
+  modeOf,
+  modeWaits,
+  overBudgetLine,
   parseAmount,
   parseRoleFile,
   parseRoster,
@@ -204,4 +210,40 @@ test('picking instances by what the person typed: names in any case, file names,
   expect(pickInstances(['chief', 'area-a'], all).picked.map(i => i.name)).toEqual(['Chief', 'Area A'])
   expect(pickInstances(['Area', 'A'], all).picked.map(i => i.name)).toEqual(['Area A'])
   expect(pickInstances(['Lead', 'Nobody'], all)).toMatchObject({ unknown: ['Nobody'] })
+})
+
+test("a row's mark within sessions' limits: the badge to 3 columns, the line to 60 characters, one line each", () => {
+  expect(markRow({ badge: '?12', tint: 'warning', line: 'asks you 12: /fleet', needsPerson: true })).toEqual({ badge: '?12', tint: 'warning', line: 'asks you 12: /fleet', needsPerson: true })
+  expect(markRow({ badge: 'abcd', tint: 'error', line: 'x' }).badge).toBe('abc')
+  expect(markRow({ badge: '🔥🔥', tint: 'error', line: 'x' }).badge).toBe('🔥')
+  const cut = markRow({ badge: '$', tint: 'error', line: `${'a'.repeat(70)}\nmore` })
+  expect(Array.from(cut.line).length).toBe(60)
+  expect(cut.line.endsWith('…')).toBe(true)
+  expect(markRow({ badge: '$', tint: 'error', line: 'two\nlines' }).line).toBe('two lines')
+  expect(markRow({ badge: '$', tint: 'error', line: 'x', needsPerson: false })).toEqual({ badge: '$', tint: 'error', line: 'x' })
+  // The over-budget line: the name, else the file name, else the name cut
+  expect(overBudgetLine('TEST Business Plan', 'test-business-plan')).toBe('over budget: /fleet budget "TEST Business Plan" +n')
+  expect(overBudgetLine('Plan: Business & Financials, v2', 'plan-business-financials-v2')).toBe('over budget: /fleet budget plan-business-financials-v2 +n')
+  const long = overBudgetLine('The Business Plan, the Financials and the Market Study', 'the-business-plan-the-financials-and-the')
+  expect(Array.from(long).length).toBeLessThanOrEqual(60)
+  expect(long).toMatch(/^over budget: \/fleet budget "The Business Plan.*…" \+n$/)
+  expect(askBadge(3)).toBe('?3')
+  expect(askBadge(250)).toBe('?99')
+})
+
+test('the permission mode an instance runs in: managed, its own, the project\'s, the person\'s; and which modes wait', () => {
+  const mode = (m: string) => ({ permissions: { defaultMode: m } })
+  expect(modeOf({})).toEqual({ mode: 'default', from: "Claude's default" })
+  expect(modeOf({ user: mode('auto') })).toEqual({ mode: 'auto', from: 'your settings' })
+  expect(modeOf({ user: mode('auto'), project: mode('acceptEdits') })).toEqual({ mode: 'acceptEdits', from: "the project's settings.json" })
+  expect(modeOf({ user: mode('auto'), instance: mode('dontAsk'), local: mode('default') })).toEqual({ mode: 'dontAsk', from: 'roster.json' })
+  expect(modeOf({ policy: mode('default'), instance: mode('auto') })).toEqual({ mode: 'default', from: 'managed settings' })
+  expect(modeWaits('default')).toContain('the first write or command waits for you')
+  expect(modeWaits('plan')).toContain('the first write or command waits for you')
+  expect(modeWaits('acceptEdits')).toContain('the first Bash command waits')
+  expect(modeWaits('auto')).toBeNull()
+  expect(modeWaits('dontAsk')).toBeNull()
+  expect(compareVersions('0.6.0', '0.7.0')).toBe(-1)
+  expect(compareVersions('0.10.0', '0.9.2')).toBe(1)
+  expect(compareVersions('0.7.1', '0.7.1')).toBe(0)
 })

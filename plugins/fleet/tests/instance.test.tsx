@@ -72,6 +72,15 @@ test("a child sits under its parent once the parent's fleet runs; an instance th
   await startSession($, w)
   await tick(w, 10100)
   expect(calls(w, 'assignSection')).toContainEqual({ source: 'fleet', ref: REF, section: 'fleet:owners', parent: 'aaaaaaa1' })
+  // While its parent asks the person (and moves to "Asking you"), the child stays in its section on its own
+  w.files.set(`${FLEET}/instances/owner-a/state.json`, JSON.stringify({ format: 1, instance: 'Owner A', slug: 'owner-a', ref: 'aaaaaaa1', sessionId: 's', at: now + 10100, cwd: ROOT, bound: true }))
+  w.files.set(
+    `${DEC}/queue/D-1.json`,
+    JSON.stringify({ format: 1, fleet: '0.1.0', id: 'D-1', at: now, asker: { ref: 'aaaaaaa1', sessionId: 's', name: 'Owner A', root: ROOT }, questions: [{ question: 'Go?', options: [{ label: 'Yes' }, { label: 'No' }], recommended: 'Yes', why: 'w' }] }),
+  )
+  await tick(w, 10100)
+  const placed = calls(w, 'assignSection')
+  expect(placed[placed.length - 1]).toEqual({ source: 'fleet', ref: REF, section: 'fleet:owners' })
   w.touch(`${FLEET}/roster.json`, JSON.stringify({ rosterFormat: 1, roles: {}, instances: [] }))
   await tick(w, 31000)
   expect(await fleet($, 'status')).toContain(`this session: "Owner B" isn't in roster.json`)
@@ -259,4 +268,28 @@ test('a nudge: an idle instance whose shared file changed is prompted by its own
   await tick(w, 31 * 60000)
   expect(w.submits.length).toBe(3)
   expect(OWNER).toContain('mcp__fleet__*')
+})
+
+test('an instance at a permission prompt: its heartbeat says so, with its mode; the sweeper marks its row, which needs the person', WITH_SESSIONS, async ($, on) => {
+  on('classic.PermissionRequest', () => ({}))
+  on('classic.PostToolUse', () => ({}))
+  const w = await instance($, on)
+  await $.classic.SessionStart({ source: 'startup', agent_type: 'owner', permission_mode: 'default' } as any)
+  await tick(w)
+  await $.classic.PermissionRequest({ tool_name: 'Write', tool_input: {}, permission_mode: 'default' } as any)
+  await tick(w, 100)
+  expect(json(w, `${HB}/state.json`)).toMatchObject({ mode: 'default', waitingOn: { kind: 'permission', tool: 'Write' }, remote: false })
+  // This session sweeps too; sessions sees it waiting
+  sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'waiting') } })
+  for (let i = 0; i < 3; i++) await tick(w, 30000)
+  const marks = calls(w, 'setMarks')
+  expect(marks[marks.length - 1].rows[REF]).toEqual({ badge: '!', tint: 'warning', line: 'waiting on a permission prompt: Enter answers it', needsPerson: true })
+  const status = await fleet($, 'status')
+  expect(status).toContain('mode default (it asks: a mode that doesn’t lets it work unattended)')
+  expect(status).toContain('waiting on a permission prompt (Write) since ')
+  expect(await fleet($, 'brief')).toContain('   - Owner A waits on a permission prompt (Write) · ')
+  // Answered: its tool ran
+  await $.classic.PostToolUse({ tool_name: 'Write', tool_input: {}, tool_response: {} } as any)
+  await tick(w, 100)
+  expect(json(w, `${HB}/state.json`).waitingOn).toBe(null)
 })

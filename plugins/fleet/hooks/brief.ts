@@ -18,6 +18,8 @@ export type BriefFacts = {
   needs: BriefNeed[]
   /** Answered, not delivered yet */
   waiting: number
+  /** Instances waiting on a permission prompt, with nobody at them (their tool, since when) */
+  prompts?: { name: string; tool: string; at: number }[]
   /** The landings of the window, any order (the newest per file is shown) */
   events: ChangeEvent[]
   /** The decisions closed in the window that changed something or sent something: a change applied, an outbound sent */
@@ -90,6 +92,10 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
     out.push(`   - ${n.id} ${n.kind === 'choice' ? 'question' : n.kind}: ${n.what} · ${n.who} · ${ago(f.now - n.at)} ago${n.blocks ? ` · blocks: ${n.blocks}` : ''}${n.outside ? ` · ${n.kind === 'choice' ? 'asked' : 'drafted'} after reading outside content (${n.outside})` : ''}${n.judge ? ` · ${n.judge}` : ''}`)
   }
   if (f.needs.length > SHOWN) out.push(`   - and ${f.needs.length - SHOWN} more`)
+  // Instances stopped at a permission prompt nobody sees
+  const prompts = f.prompts ?? []
+  if (prompts.length && !f.needs.length) out[needsAt] = `1. Needs you: ${kindWords(prompts.length, 'permission prompt', 'permission prompts')}`
+  for (const p of prompts) out.push(`   - ${p.name} waits on a permission prompt (${p.tool}) · ${ago(f.now - p.at)}: Enter on its row in the panel answers it`)
   if (f.waiting) out.push(`   ${f.waiting} answered, not delivered yet`)
   // Items from outside that reached nobody (no subscriber, no front door), and requests for a change nobody drafts
   const intake = (f.intake ?? []).filter(i => i.at >= f.since)

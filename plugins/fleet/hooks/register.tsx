@@ -207,11 +207,14 @@ import {
   HEARTBEAT_STALE_MS,
   ROSTER_FORMAT,
   addSpend,
+  askBadge,
+  bgIsolationOf,
   budgetState,
   cadenceNudgeText,
   cadenceOf,
   capFor,
   commandLevel,
+  compareVersions,
   countWake,
   denyRules,
   forecastOf,
@@ -224,7 +227,12 @@ import {
   isCommandLevel,
   lintRoster,
   localDay,
+  markRow,
+  modeOf,
+  modeWaits,
+  overBudgetLine,
   parseAmount,
+  parseRoleFile,
   parseRoster,
   pickInstances,
   projectCap,
@@ -234,10 +242,12 @@ import {
   wakeUsd,
   wakeVerdict,
   wakesOf,
+  writesFiles,
   type BudgetState,
   type Instance,
   type LiftsFile,
   type Roster,
+  type RowMark,
   type SpendFile,
   type WakeCount,
 } from './roster'
@@ -1022,11 +1032,13 @@ async function beat($: any) {
 // A background session that waits on the person sits in the panel's "Asking you" section (sessions' own, defined by
 // fleet), and leaves it once it has its answers. Never over the person's choice: sessions refuses that, and fleet lets it
 // An instance of the roster sits in its roster section (under its parent, when the roster gives one and the parent is
-// running) whenever it isn't asking
+// running) whenever it isn't asking; while its parent asks, it stays in its section on its own (only the asker moves)
 async function keepSection($: any, records: QueueRecord[], present: ReadonlySet<string>) {
-  const waiting = records.some(r => r.asker.ref === jobRef && knownKind(r) && !progress(r.id, slots(r), present).complete)
+  const asks = (ref: string | null) => !!ref && records.some(r => r.asker.ref === ref && knownKind(r) && !progress(r.id, slots(r), present).complete)
+  const waiting = asks(jobRef)
   const placed = !waiting && myInstance?.section ? myInstance.section : null
-  const parent = placed && myInstance?.parent ? await refOfInstance($, myInstance.parent) : null
+  const above = placed && myInstance?.parent ? await refOfInstance($, myInstance.parent) : null
+  const parent = above && !asks(above) ? above : null
   const want = waiting ? ASKING_SECTION : placed ? `fleet:${placed.id}` : 'none'
   const key = parent ? `${want}|${parent}` : want
   if ((await read($, section)) === key) return
@@ -3111,14 +3123,14 @@ async function alertsTick($: any) {
   const now = await $.clock.now()
   const day = today(now)
   const due: Alert[] = []
-  // A decision waiting long
+  // Decisions waiting long: one digest every six hours at most (sessions already pushes each asker the person keeps
+  // waiting, from the ?n mark that needs him)
   const { records } = await queueRecords($)
   const present = await answerNames($)
   const view = await askerViews($, records)
-  for (const r of records) {
-    if (!knownKind(r) || progress(r.id, slots(r), present).complete || now - r.at < person.waitingMin * 60000) continue
-    due.push({ key: `waiting:${r.id}`, kind: 'waiting', text: `${r.id} (${r.kind ?? 'a question'}, from ${view(r).name}) has waited ${ago(now - r.at)}` })
-  }
+  const long = records.filter(r => knownKind(r) && !progress(r.id, slots(r), present).complete && now - r.at >= person.waitingMin * 60000).sort((a, b) => a.at - b.at)
+  const oldest = long[0]
+  if (oldest) due.push({ key: `waiting:${Math.floor(now / (6 * HOUR))}`, kind: 'waiting', text: `${long.length} decision(s) have waited over ${ago(person.waitingMin * 60000)} (the oldest, ${oldest.id} from ${view(oldest).name}, ${ago(now - oldest.at)})` })
   // A budget used up (an instance's own, the project's, intake's)
   budgetCache.at = 0
   for (const b of await budgets($)) if (b.own === 'over') due.push({ key: `budget:${b.inst.slug}:${day}`, kind: 'budget', text: `${b.inst.name} used up its budget (${usd(b.usd)} today)` })
@@ -3466,7 +3478,9 @@ let settingsHash: string | null = null
 let instDirMade = ''
 /** An instance's heartbeat. startedAt: when its short id first beat (its cadence counts from there, or from its last
  * landing); lastLanding: its last landing in the shared world or its journal; conversationAt: when its conversation
- * started (a fresh period starts a new one); outside: what outside content its conversation read */
+ * started (a fresh period starts a new one); outside: what outside content its conversation read; fleet: the version
+ * of fleet it runs; mode: the permission mode it runs in (classic.SessionStart's permission_mode); waitingOn: a
+ * permission prompt it waits on, with nobody at it; remote: whether it has Remote Control (null: not known) */
 type Heartbeat = {
   format: number
   instance: string
@@ -3480,13 +3494,21 @@ type Heartbeat = {
   settingsHash: string | null
   agentType: string | null
   cost: number | null
+  fleet?: string
   startedAt?: number
   lastLanding?: number | null
   journalAt?: number | null
   conversationAt?: number
   cadenceH?: number | null
   outside?: OutsideMark | null
+  mode?: string | null
+  waitingOn?: { kind: 'permission'; tool: string; at: number } | null
+  remote?: boolean | null
 }
+// The permission mode this session runs in (classic.SessionStart, again with each permission request), and the
+// permission prompt it waits on now (classic.PermissionRequest, until its tool ran or was refused, or the turn ended)
+let permissionMode: string | null = null
+let permissionWait: { kind: 'permission'; tool: string; at: number } | null = null
 // What this instance's heartbeat carried over from the one before it (once per process)
 const carried = { done: false, startedAt: 0, lastLanding: 0 }
 type BudgetRow = { inst: Instance; usd: number; cap: number | null; own: BudgetState; state: BudgetState }
@@ -3497,7 +3519,7 @@ type Stamps = { format: number; files: Record<string, string | null> }
 const budgetCache = { at: 0, list: [] as BudgetRow[], project: { usd: 0, cap: null, state: 'ok' } as ProjectBudget }
 // The sweeper's view: since when a running instance shows no heartbeat (by ref), and the marks it set last
 const noFleetSince = new Map<string, number>()
-const marksSet = { key: '', at: 0 }
+const marksSet = { key: '', at: 0, refused: '' }
 const RUNNING = new Set(['working', 'waiting', 'idle'])
 const DEFAULT_SEED =
   "Read the project's charter (.claude/fleet/charter.md) and the shared files your role works on. Then write down your plan for this first period where your role keeps its work, and start on what needs nobody's decision. Whenever you need the person's choice, ask with mcp__fleet__decide and keep going with the rest."
@@ -3651,8 +3673,32 @@ async function heartbeat($: any) {
     context: inst.context,
     outside: mark,
     intakeSeen: intakeSeen.at || null,
+    mode: permissionMode,
+    waitingOn: permissionWait,
+    remote: await remoteControl($),
   }
   await replace($, `${dir}/state.json`, json(beat))
+}
+
+/** The permission prompt was answered (its tool ran or was refused, or the turn ended): the heartbeat says so at once */
+async function promptAnswered($: any) {
+  if (!permissionWait) return
+  permissionWait = null
+  await heartbeat($)
+}
+
+/** Whether this background session has Remote Control on: Claude's background service keeps its connection in the
+ * job's state.json (bridgeSessionId) while it's on. null: not a background session, or it can't be read */
+async function remoteControl($: any): Promise<boolean | null> {
+  if (!jobRef || !jobDir) return null
+  const t = await readText($, `${jobDir}/state.json`)
+  if (t === null) return null
+  try {
+    const s = JSON.parse(t)
+    return typeof s?.bridgeSessionId === 'string' && s.bridgeSessionId !== ''
+  } catch {
+    return null
+  }
 }
 
 async function mtimeOf($: any, path: string): Promise<number | null> {
@@ -4409,25 +4455,35 @@ async function isBehind($: any, sessionId: string): Promise<boolean> {
   return staleOf({ main: p.threads.main }, rel => known.get(rel)?.v ?? undefined).length > 0
 }
 
-// Every full sweep: each instance's row marked when its fleet isn't running (✗), it's over or near its budget ($), or
-// it's down (↓); a retired instance with answers waiting (at once) or shared files it read changed (coalesced) woken
+/** A session that asks the person: ?n on its row, and it needs him (sessions' f filter, its fold count and its push
+ * when he's waited for read that) */
+function askMark(n: number): RowMark {
+  return { badge: askBadge(n), tint: 'warning', line: `asks you ${n}: /fleet`, needsPerson: true }
+}
+
+// Every full sweep: each session that asks the person marked (?n); each instance's row marked when its fleet isn't
+// running (✗), it waits on a permission prompt (!), it's over or near its budget ($), it's down (↓), it runs an older
+// fleet (u) or it landed nothing in its cadence (◷); a retired instance with answers waiting (at once) or shared files
+// it read changed (coalesced) woken
 async function rosterTick($: any) {
   await loadRoster($)
   const now = await $.clock.now()
-  if (!roster || !roster.instances.length || !(await has($, 'status'))) return setFleetMarks($, {}, now)
+  const { records } = await queueRecords($)
+  const present = await answerNames($)
+  const asking = new Map<string, number>()
+  for (const r of records) if (r.asker.ref && knownKind(r) && !progress(r.id, slots(r), present).complete) asking.set(r.asker.ref, (asking.get(r.asker.ref) ?? 0) + 1)
+  const marks: Record<string, RowMark> = Object.fromEntries([...asking].map(([ref, n]) => [ref, askMark(n)]))
+  if (!roster || !roster.instances.length || !(await has($, 'status'))) return setFleetMarks($, marks, now)
   const st = await race<Status>($, () => $.sessions.status({ names: (roster as { instances: Instance[] }).instances.map(i => i.name) }))
   if (!st?.ready) return
   const day = today(now)
   const down = await downSet($)
   budgetCache.at = 0
   const list = await budgets($)
-  const { records } = await queueRecords($)
-  const present = await answerNames($)
   const wakes = wakesOf(roster.r)
   const had = await readWire<WakesFile>($, stateDir('wakes.json'))
   const swept: WakesFile = had && had.day === day ? had : { format: FORMAT, day, instances: {} }
   let woke = false
-  const marks: Record<string, Record<string, unknown>> = {}
   // What a retired instance may be woken for besides answers and files it read: items from outside routed to it, a
   // derived document it owns gone stale (its inputs quiet a while), a slot given to it from the line
   if (worldOn()) await loadFlags($)
@@ -4446,15 +4502,33 @@ async function rosterTick($: any) {
       const fresh = !!hb && now - hb.at < HEARTBEAT_STALE_MS && (hb.ref === running.ref || hb.sessionId === running.sessionId)
       if (fresh) noFleetSince.delete(running.ref)
       else if (!noFleetSince.has(running.ref)) noFleetSince.set(running.ref, now)
-      if (!fresh && now - (noFleetSince.get(running.ref) ?? now) >= 90000) {
+      const noFleet = !fresh && now - (noFleetSince.get(running.ref) ?? now) >= 90000
+      if (noFleet) {
         named.add(inst.name)
         if (!noFleetNames.has(inst.name)) noFleetNames.set(inst.name, { since: noFleetSince.get(running.ref) ?? now, ref: running.ref })
       }
-      if (!fresh && now - (noFleetSince.get(running.ref) ?? now) >= 90000) marks[running.ref] = { badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true }
-      else if (isDown) marks[running.ref] = { badge: '↓', tint: 'inactive', line: 'down (/fleet down): s in the panel stops it' }
-      else if (b?.state === 'over') marks[running.ref] = { badge: '$', tint: 'error', line: `budget used up (${usd(b.usd)} today): /fleet budget "${inst.name}" +n`, needsPerson: true }
-      else if (fresh && cad?.due) marks[running.ref] = { badge: '◷', tint: 'warning', line: `nothing landed in ${hoursText(cad.hours)} (cadence ${hoursText(inst.cadenceH ?? 0)})` }
-      else if (b?.state === 'warn') marks[running.ref] = { badge: '$', tint: 'warning', line: `budget: ${usd(b.usd)} of ${usd(b.cap ?? budgetCache.project.cap ?? 0)} today` }
+      // A permission prompt it waits on, as its own fleet saw it, while sessions sees it waiting too
+      const prompt = fresh && running.state === 'waiting' && hb?.waitingOn?.kind === 'permission'
+      const old = fresh && typeof hb?.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0 ? hb.fleet : ''
+      const asks = asking.get(running.ref) ?? 0
+      const m: RowMark | null = noFleet
+        ? { badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true }
+        : prompt
+          ? { badge: '!', tint: 'warning', line: 'waiting on a permission prompt: Enter answers it', needsPerson: true }
+          : b?.state === 'over'
+            ? { badge: '$', tint: 'error', line: overBudgetLine(inst.name, inst.slug), needsPerson: true }
+            : asks
+              ? askMark(asks)
+              : isDown
+                ? { badge: '↓', tint: 'inactive', line: 'down (/fleet down): s in the panel stops it' }
+                : old
+                  ? { badge: 'u', tint: 'warning', line: `runs fleet ${old}, installed ${version}: u restarts it` }
+                  : fresh && cad?.due
+                    ? { badge: '◷', tint: 'warning', line: `nothing landed in ${hoursText(cad.hours)} (cadence ${hoursText(inst.cadenceH ?? 0)})` }
+                    : b?.state === 'warn'
+                      ? { badge: '$', tint: 'warning', line: `budget: ${usd(b.usd)} of ${usd(b.cap ?? budgetCache.project.cap ?? 0)} today` }
+                      : null
+      if (m) marks[running.ref] = m
       continue
     }
     if (!retired || isDown || b?.state === 'over' || !hb?.ref || hb.ref !== retired.ref) continue
@@ -4496,19 +4570,24 @@ async function rosterTick($: any) {
   await setFleetMarks($, marks, now)
 }
 
-// The marks this session (the sweeper) keeps on the instances' rows, set again every minute (they last 150 s, so a
-// sweeper that stops leaves none behind for long)
-async function setFleetMarks($: any, rows: Record<string, Record<string, unknown>>, now: number) {
+// The marks this session (the sweeper) keeps on the rows, set again every minute (they last 150 s, so a sweeper that
+// stops leaves none behind for long). Each one within sessions' limits (markRow): it refuses the whole call over one
+async function setFleetMarks($: any, given: Record<string, RowMark>, now: number) {
+  const rows = Object.fromEntries(Object.entries(given).map(([ref, m]) => [ref, markRow(m)]))
   const key = JSON.stringify(rows)
   const empty = key === '{}'
   if (empty && !marksSet.key) return
   if (key === marksSet.key && now - marksSet.at < 60000) return
   if (!(await has($, 'setMarks'))) return
-  const r = await race<Result>($, () => $.sessions.setMarks!({ source: 'fleet', rows: rows as any, ttlMs: 150000 }))
+  const r = await race<Result>($, () => $.sessions.setMarks!({ source: 'fleet', rows, ttlMs: 150000 }))
   if (r?.ok) {
     if (key !== marksSet.key) log($, `marks: ${empty ? 'none' : Object.keys(rows).join(', ')}`)
     marksSet.key = empty ? '' : key
     marksSet.at = now
+  } else if (r && key !== marksSet.refused) {
+    // Said once per set of marks: sessions keeps none of them (the next set is tried at the next sweep)
+    log($, `marks refused: ${r.detail ?? r.reason}`)
+    marksSet.refused = key
   }
 }
 
@@ -4528,6 +4607,27 @@ async function freshRoster($: any): Promise<string | null> {
 
 function startLine(i: Instance): string {
   return `cd "${root}" && claude --bg --agent ${i.agent} --settings "${settingsPath(i.slug)}" -n "${i.name}"`
+}
+
+/** The settings an instance gets besides its own (its --settings file): managed policy, the project's local and shared
+ * files, the person's own. What one can't be read of counts as nothing */
+async function settingsLayers($: any): Promise<{ policy: unknown; local: unknown; project: unknown; user: unknown }> {
+  const source = async (s: 'policy' | 'user') => {
+    try {
+      return await $.settings.read({ source: s })
+    } catch {
+      return {}
+    }
+  }
+  const file = async (path: string) => {
+    const t = await readText($, path)
+    try {
+      return t === null ? {} : JSON.parse(t)
+    } catch {
+      return {}
+    }
+  }
+  return { policy: await source('policy'), local: await file(`${root}/.claude/settings.local.json`), project: await file(`${root}/.claude/settings.json`), user: await source('user') }
 }
 
 async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: string): Promise<string> {
@@ -4565,6 +4665,31 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   const wakes = wakesOf(r.r)
   const f = forecastOf(chosen, wakes)
   const cap = projectCap(r.r)
+  // Unattended: each instance's permission mode (a mode that asks waits for nobody) and, in a git repository, whether
+  // a background session that edits would move into a worktree copy before its first edit. Marks, never a refusal
+  const layers = await settingsLayers($)
+  const inGit = !!(await gitOf($, realRoot || (root as string)))
+  const modes = new Map<Instance, { mode: string; from: string }>()
+  const asking = new Map<string, string[]>()
+  const isolated: string[] = []
+  for (const p of plan) {
+    const i = p.inst
+    const own = settingsFor(i, root as string, [])
+    const hb = p.action === 'running' ? await heartbeatOf($, i.slug) : null
+    const m = hb?.mode ? { mode: hb.mode, from: 'as it runs now' } : modeOf({ ...layers, instance: own })
+    modes.set(i, m)
+    const waits = modeWaits(m.mode)
+    if (waits && p.action !== 'down') asking.set(`${m.mode}|${m.from}|${waits}`, [...(asking.get(`${m.mode}|${m.from}|${waits}`) ?? []), i.name])
+    const role = roleFiles.get(i.agent)
+    if (inGit && p.action !== 'down' && !bgIsolationOf({ ...layers, instance: own }) && writesFiles(role ? parseRoleFile(role).tools : null)) isolated.push(i.name)
+  }
+  for (const [key, names] of asking) {
+    const [mode, from, waits] = key.split('|')
+    lint.warnings.push(`${names.join(', ')}: ${names.length === 1 ? 'runs' : 'run'} in ${mode} mode (${from}): ${waits}. A mode that doesn't ask lets ${names.length === 1 ? 'it' : 'them'} work unattended: roster.json's settings can give one ("permissions": { "defaultMode": "auto" }, as the templates suggest); otherwise answer each prompt from the panel (Enter)`)
+  }
+  if (isolated.length) {
+    lint.warnings.push(`${isolated.join(', ')}: the project is in a git repository and ${isolated.length === 1 ? 'this instance edits' : 'these instances edit'} files with no worktree.bgIsolation, so a background session may move into a worktree copy before its first edit, and its shared files land in the copy (the README's Worktrees section; roster.json's settings can say "worktree": { "bgIsolation": "none" })`)
+  }
   const out: string[] = [`${c.dryRun ? 'The plan' : '/fleet up'} for ${chosen.length} of the roster's ${all.length} instance(s)${c.wave !== null && !c.names.length ? ` (waves 1 to ${c.wave})` : ''}:`]
   for (const p of plan) {
     const i = p.inst
@@ -4574,7 +4699,8 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day` : ''}`
     const now =
       p.action === 'start' ? 'to start' : p.action === 'running' ? `running (${p.state}): placed, not started again` : p.action === 'wake' ? 'stopped: to wake' : 'down: skipped (/fleet up <name> brings it back)'
-    out.push(`  ${i.name} · ${i.role} (.claude/agents/${i.agent}.md) · ${where} · wave ${i.wave} · ${runs} · ${cost} · ${now}`)
+    const m = modes.get(i)
+    out.push(`  ${i.name} · ${i.role} (.claude/agents/${i.agent}.md) · ${where} · wave ${i.wave} · ${runs} · ${cost} · ${m ? `mode ${m.mode} · ` : ''}${now}`)
   }
   out.push(
     `Cost, estimated at list price: the budgets add up to ${usd(f.caps)} a day${cap !== null ? ` (the project's cap: ${usd(cap)})` : ''}; wakes about ${usd(f.wakesUsd)} a day (each instance at most ${wakes.perDay} a day, one every ${wakes.everyMin} min, each reopening a ~40k-token context at the cache-write price)${f.unpriced.length ? `; not priced: ${f.unpriced.join(', ')}` : ''}. On a subscription it counts against your plan's limits instead.`,
@@ -4771,6 +4897,10 @@ async function rosterStatus($: any): Promise<string[]> {
       if (!fresh) parts.push('no fleet (u restarts it)')
       else {
         parts.push(`fleet ${ago(now - hb.at)} ago${hb.bound ? '' : `, unbound: ${hb.why ?? ''}`}`)
+        if (typeof hb.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0) parts.push(`runs fleet ${hb.fleet}, installed ${version}: u restarts it`)
+        if (hb.mode) parts.push(`mode ${hb.mode}${modeWaits(hb.mode) ? ' (it asks: a mode that doesn’t lets it work unattended)' : ''}`)
+        if (hb.waitingOn?.kind === 'permission' && running.state === 'waiting') parts.push(`waiting on a permission prompt (${hb.waitingOn.tool}) since ${ago(now - hb.waitingOn.at)}: Enter in the panel answers it`)
+        if (hb.remote) parts.push('Remote Control')
         const t = await readText($, settingsPath(inst.slug))
         if (hb.settingsHash !== null && t !== null && hb.settingsHash !== hashText(t)) parts.push('its settings changed since it started: u restarts it with them')
         if (hb.ref && (await exists($, `${instDir(inst.slug)}/seed-${hb.ref}.json`))) parts.push('seeded')
@@ -5765,6 +5895,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
   if (worldOn()) await loadFlags($)
   const cadence: BriefFacts['blocked']['cadence'] = []
   const noFleet: string[] = []
+  const prompts: NonNullable<BriefFacts['prompts']> = []
   const stale: BriefFacts['blocked']['stale'] = []
   let downNames: string[] = []
   await loadRoster($)
@@ -5779,7 +5910,9 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
       const c = cadenceOf({ cadenceH: inst.cadenceH, lastLanding: hb.lastLanding ?? null, startedAt: hb.startedAt ?? hb.at, now })
       if (c.due && inst.cadenceH !== null) cadence.push({ name: inst.name, hours: c.hours, cadenceH: inst.cadenceH })
       const running = st?.ready ? rowsOf(inst, st.rows).running : null
-      if (running && !(now - hb.at < HEARTBEAT_STALE_MS && (hb.ref === running.ref || hb.sessionId === running.sessionId))) noFleet.push(inst.name)
+      const fresh = !!running && now - hb.at < HEARTBEAT_STALE_MS && (hb.ref === running.ref || hb.sessionId === running.sessionId)
+      if (running && !fresh) noFleet.push(inst.name)
+      if (fresh && running.state === 'waiting' && hb.waitingOn?.kind === 'permission') prompts.push({ name: inst.name, tool: hb.waitingOn.tool, at: hb.waitingOn.at })
       const p = parseReads((await readText($, readsPath(hb.sessionId))) ?? '')
       if (p && 'threads' in p && p.threads.main) {
         const n = staleOf({ main: p.threads.main }, rel => known.get(rel)?.v ?? undefined).length
@@ -5801,6 +5934,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     since,
     needs,
     waiting,
+    prompts,
     events,
     closed,
     levelOf: p => levelOf(p, wc, insensitive),
@@ -6153,6 +6287,7 @@ export const register: Register = on => {
   // resume), who it is, what it can't write and its budget; fleet learns the role it runs as (agent_type)
   on('classic.SessionStart', async ($, e, next) => {
     if (typeof e.agent_type === 'string' && e.agent_type) agentType = e.agent_type
+    if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     const r = await next(e)
     try {
       await ensureWorld($)
@@ -6165,6 +6300,30 @@ export const register: Register = on => {
     } catch {
       return r
     }
+  }).catch(($, e, next) => next(e))
+
+  // A permission prompt an instance waits on, with nobody at it: its heartbeat says so at once, and the sweeper marks
+  // its row (it needs the person). Only watched: the prompt is Claude's, and so is its answer
+  on('classic.PermissionRequest', async ($, e, next) => {
+    if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
+    if (jobRef && myInstance) {
+      permissionWait = { kind: 'permission', tool: String(e.tool_name ?? '').slice(0, 80), at: await $.clock.now() }
+      bg(heartbeat($))
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+  // ... until its tool ran or was refused
+  on('classic.PostToolUse', async ($, e, next) => {
+    if (permissionWait) bg(promptAnswered($))
+    return next(e)
+  }).catch(($, e, next) => next(e))
+  on('classic.PostToolUseFailure', async ($, e, next) => {
+    if (permissionWait) bg(promptAnswered($))
+    return next(e)
+  }).catch(($, e, next) => next(e))
+  on('classic.PermissionDenied', async ($, e, next) => {
+    if (permissionWait) bg(promptAnswered($))
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('classic.FileChanged', async ($, e, next) => {
@@ -6208,6 +6367,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (e.agentId === undefined) await update($, personTurn, () => null)
+    if (e.agentId === undefined && permissionWait) bg(promptAnswered($))
     if (e.agentId === undefined && timersOn) {
       bg(
         (async () => {

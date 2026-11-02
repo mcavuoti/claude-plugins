@@ -585,6 +585,107 @@ export function handoffText(inst: Pick<Instance, 'name' | 'role' | 'cadenceH' | 
   ].join('\n\n')
 }
 
+// ---- Marks on the instances' rows ($.sessions.setMarks, which refuses a whole call when one row is past its limits) ----
+
+export type MarkTint = 'error' | 'warning' | 'suggestion' | 'success' | 'inactive'
+export type RowMark = { badge: string; tint: MarkTint; line: string; needsPerson?: boolean }
+/** sessions' limits: a badge of up to 3 columns, a status line of up to 60 characters, each on one line */
+export const MARK_BADGE_COLUMNS = 3
+export const MARK_LINE_CHARS = 60
+
+function oneLine(s: string): string {
+  return s.replace(/\p{Cc}+/gu, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** A row's mark within sessions' limits: one long instance name never costs the project every mark */
+export function markRow(m: RowMark): RowMark {
+  let badge = ''
+  let cols = 0
+  for (const c of Array.from(oneLine(m.badge))) {
+    const w = /\p{Extended_Pictographic}/u.test(c) ? 2 : 1
+    if (cols + w > MARK_BADGE_COLUMNS) break
+    badge += c
+    cols += w
+  }
+  const chars = Array.from(oneLine(m.line))
+  const line = chars.length > MARK_LINE_CHARS ? `${chars.slice(0, MARK_LINE_CHARS - 1).join('').trimEnd()}…` : chars.join('')
+  return { badge, tint: m.tint, line, ...(m.needsPerson ? { needsPerson: true } : {}) }
+}
+
+/** The over-budget row's line: how to lift it, with the instance's name when it fits, else its file name (which
+ * /fleet budget takes too), else the name cut */
+export function overBudgetLine(name: string, slug: string): string {
+  const line = (who: string) => `over budget: /fleet budget ${who} +n`
+  for (const who of [`"${name}"`, slug]) if (Array.from(line(who)).length <= MARK_LINE_CHARS) return line(who)
+  const room = MARK_LINE_CHARS - Array.from(line('""…')).length
+  return line(`"${Array.from(name).slice(0, room).join('').trimEnd()}…"`)
+}
+
+/** An asker's badge: ?n, its open decisions (99 at most, in 3 columns) */
+export function askBadge(n: number): string {
+  return `?${Math.min(99, Math.max(1, n))}`
+}
+
+// ---- Permission modes: an instance runs with nobody at it, so a mode that asks waits for nobody ----
+
+/** The mode an instance runs in, and where it comes from: managed policy wins, then its own settings (the roster's,
+ * in its --settings file), then the project's local and shared settings, then the person's own. null: none says one
+ * (Claude's default, which asks) */
+export function modeOf(layers: { policy?: unknown; instance?: unknown; local?: unknown; project?: unknown; user?: unknown }): { mode: string; from: string } {
+  const pick = (s: unknown): string | null => {
+    const p = isObject(s) && isObject(s.permissions) ? s.permissions : null
+    return p && typeof p.defaultMode === 'string' && p.defaultMode ? p.defaultMode : null
+  }
+  const order: [keyof typeof layers, string][] = [
+    ['policy', 'managed settings'],
+    ['instance', 'roster.json'],
+    ['local', "the project's settings.local.json"],
+    ['project', "the project's settings.json"],
+    ['user', 'your settings'],
+  ]
+  for (const [k, from] of order) {
+    const m = pick(layers[k])
+    if (m) return { mode: m, from }
+  }
+  return { mode: 'default', from: "Claude's default" }
+}
+
+/** worktree.bgIsolation as an instance gets it, in the same order as its mode; null when no layer sets it (then a
+ * background session in a git repository moves into a worktree copy before its first edit) */
+export function bgIsolationOf(layers: { policy?: unknown; instance?: unknown; local?: unknown; project?: unknown; user?: unknown }): string | null {
+  for (const k of ['policy', 'instance', 'local', 'project', 'user'] as const) {
+    const s = layers[k]
+    const w = isObject(s) && isObject(s.worktree) ? s.worktree : null
+    if (w && typeof w.bgIsolation === 'string' && w.bgIsolation) return w.bgIsolation
+  }
+  return null
+}
+
+/** Whether a role's tools write files (no tools line: every tool) */
+export function writesFiles(tools: string[] | null): boolean {
+  return tools === null || tools.some(t => t === '*' || /^(Write|Edit|MultiEdit|NotebookEdit)(\(|$)/.test(t))
+}
+
+/** What a mode means for an instance nobody is at: null when it doesn't ask (auto, dontAsk, bypassPermissions) */
+export function modeWaits(mode: string): string | null {
+  if (mode === 'default' || mode === 'plan') return 'the first write or command waits for you, with nobody to answer'
+  if (mode === 'acceptEdits') return 'the first Bash command waits for you, with nobody to answer'
+  return null
+}
+
+// ---- Versions: an instance still running an older fleet ----
+
+/** "0.6.0" before "0.7.0": -1, 0 or 1 (numbers compared part by part; what isn't a number counts as 0) */
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split(/[.+-]/).map(x => Number(x) || 0)
+  const pb = b.split(/[.+-]/).map(x => Number(x) || 0)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (d) return d < 0 ? -1 : 1
+  }
+  return 0
+}
+
 // ---- Picking instances by what the person typed ----
 
 /** The instances the words name (a name, any case, or its slug); quoted words keep their spaces. The whole line as

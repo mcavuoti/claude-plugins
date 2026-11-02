@@ -48,19 +48,15 @@ test('a command channel: nothing until the person stamps it; then the alerts due
   // D-1 has waited 40 min (past waitingMin, 30); D-2 not yet
   expect(ran.length).toBe(1)
   expect(ran[0]?.cwd).toBe(ROOT)
-  expect(ran[0]?.stdin).toMatch(/^fleet · proj: D-1 \(a question, from Owner B\) has waited 4\dm · \/fleet or \/fleet brief in any session of the project\n$/)
+  expect(ran[0]?.stdin).toMatch(/^fleet · proj: 1 decision\(s\) have waited over 30m \(the oldest, D-1 from Owner B, 4\dm\) · \/fleet or \/fleet brief in any session of the project\n$/)
   expect(json(w, `${FLEET}/state/alerts.json`)).toMatchObject({ format: 1, day: '2026-11-02', count: 1, last: { answer: 'command: ran' } })
-  // The next minutes: nothing new for D-1; D-2 once it has waited its 30 min
+  // The next minutes: nothing new for D-1; D-2 waits its 30 min too, but decisions waiting long are one digest per six
+  // hours (sessions pushes each asker of its own, from its ?n mark): nothing new yet
   for (let i = 0; i < 31; i++) await tick(w)
   expect(ran.length).toBe(1)
   for (let i = 0; i < 31 * 24; i++) await tick(w)
-  expect(ran.length).toBe(2)
-  expect(ran[1]?.stdin).toContain('D-2 (a question, from Owner B) has waited')
-  // The day's cap (2): a third alert waits
-  w.touch(`${DEC}/queue/D-3.json`, queued('D-3', NOW))
-  for (let i = 0; i < 31 * 30; i++) await tick(w)
-  expect(ran.length).toBe(2)
-  expect(await fleet($, 'status')).toContain('alerts: 2 of 2 sent today, 1 waiting (the cap or quiet hours)')
+  expect(ran.length).toBe(1)
+  expect(await fleet($, 'status')).toContain('alerts: 1 of 2 sent today')
   // The script is the person's: changed, it isn't run until he stamps it again
   w.touch(`${FLEET}/alert.sh`, '#!/bin/bash\ncurl -d @- https://example.invalid\n')
   expect(await fleet($, 'status')).toContain('not stamped, so nothing is sent')
@@ -77,7 +73,7 @@ test('a push channel: fleet’s own PushNotification from the sweeper passes; th
   await startSession($, w)
   for (let i = 0; i < 40; i++) await tick(w)
   expect(pushed.length).toBe(1)
-  expect(pushed[0]).toMatch(/^fleet · proj: D-1 \(a question, from Owner B\) has waited 4\dm · \/fleet or \/fleet brief in any session of the project$/)
+  expect(pushed[0]).toMatch(/^fleet · proj: 1 decision\(s\) have waited over 30m \(the oldest, D-1 from Owner B, 4\dm\) · \/fleet or \/fleet brief in any session of the project$/)
   expect(json(w, `${FLEET}/state/alerts.json`).last).toMatchObject({ answer: 'push: sent' })
   // In this (the person's own) session the model's own push isn't fleet's to refuse
   const r: any = await $.tool.call({ tool: 'PushNotification', message: 'hi', status: 'proactive' } as any)
@@ -112,7 +108,7 @@ test('an MCP channel sends to the person’s own address only; one naming anyone
   expect(calls.length).toBe(1)
   expect(calls[0]).toMatchObject({ server: 'mailbox', tool: 'send_message', args: { to: 'me@example.invalid', subject: 'fleet: proj' } })
   expect(Object.keys(calls[0].args).sort()).toEqual(['body', 'subject', 'to'])
-  expect(calls[0].args.body).toMatch(/^fleet · proj: D-1 \(a question, from Owner B\) has waited 4\dm/)
+  expect(calls[0].args.body).toMatch(/^fleet · proj: 1 decision\(s\) have waited over 30m \(the oldest, D-1 from Owner B, 4\dm\)/)
   w.touch(`${FLEET}/roster.json`, JSON.stringify({ rosterFormat: 1, roles: {}, instances: [], person: { addresses: ['me@example.invalid'], channel: { kind: 'mcp', server: 'mailbox', tool: 'send_message', to: 'team@example.invalid' } } }))
   w.touch(`${DEC}/queue/D-4.json`, queued('D-4', NOW - 60 * 60000))
   for (let i = 0; i < 40; i++) await tick(w)
