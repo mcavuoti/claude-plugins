@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { buildNotice, heartbeatText, parseNotice } from '../hooks/state'
+import { FORMAT, buildNotice, heartbeatText, parseNotice } from '../hooks/state'
 import { BAND, COMMAND, DATA, ROOT, SID, SLOW, startSession, world } from './world'
 
 // What the panel's rows show beyond each session: sections (the person's /sessions section, the headers, the freeze
@@ -424,5 +424,87 @@ test("s on a session that can't show the question: it's asked here instead, and 
   await $.session.receive({ text: buildNotice('answer', { sessionId: BRAVO, action: 'unshown', cameBack: true }), origin: PEER } as any)
   await w.clock.settle()
   expect(asked).toBe(1)
+  await ui.unmount()
+})
+
+// The asker isn't among the rows this panel shows: the f filter is on (bravo waits for nobody), or it's a session of
+// another project root (delta, in no list this session reads): it's found all the same, and the answer goes back
+const DELTA = 'dddddddd-0000-0000-0000-000000000000'
+for (const asker of ['bravo, with the f filter on', 'delta, of another project root']) {
+  test(`asked to stop by ${asker}: the answer goes back to it`, async ($, on) => {
+    const w = world(on, { list: list() })
+    const from = asker.startsWith('bravo') ? BRAVO : DELTA
+    reachableBravo(w)
+    w.store.set('waitingOnly', true)
+    const sent: any[] = []
+    on('session.send', (_: any, e: any) => {
+      const n = parseNotice(String(e.text))
+      if (n) sent.push({ to: e.to, ...n })
+      return { isDelivered: true }
+    })
+    on('tool.call', { tool: 'AskUserQuestion' }, (_: any, e: any) => ({ result: { answers: { [e.questions[0].question]: 'Stop' } } }))
+    await startSession($, w)
+    await $.session.receive({ text: buildNotice('ask', { from, topic: 'stop', detail: '', id: from.slice(0, 8), title: 'the asker', background: true }), origin: PEER } as any)
+    await w.clock.settle()
+    expect(sent.find(n => n.kind === 'answer')).toMatchObject({ to: from, data: { sessionId: SID, action: 'stop', cameBack: true } })
+    // The window went back to the asker
+    expect([...w.files].filter(([p]) => p.startsWith(`${DATA}/windows/`)).map(([, t]) => t).join()).toContain(`id=${from.slice(0, 8)}`)
+  })
+}
+
+// A session whose agent has no SendMessage can't send the answer as a notice (Claude answers not delivered): it
+// leaves it in the store, where the asker's panel takes it and does what was chosen
+test('asked to stop where no notice can be sent: the answer waits in the store, and the asker does it', async ($, on) => {
+  const w = world(on, { list: list() })
+  reachableBravo(w)
+  on('session.send', () => ({ isDelivered: false, reason: 'this session has no SendMessage tool' }))
+  on('tool.call', { tool: 'AskUserQuestion' }, (_: any, e: any) => ({ result: { answers: { [e.questions[0].question]: 'Stop' } } }))
+  await startSession($, w)
+  await $.session.receive({ text: buildNotice('ask', { from: BRAVO, topic: 'stop', detail: '', id: 'bbbbbbbb', title: 'bravo', background: true }), origin: PEER } as any)
+  await w.clock.settle()
+  expect(w.store.get(`answer:${BRAVO}`)).toMatchObject({ sessionId: SID, action: 'stop', cameBack: true })
+  expect(w.toasts.some(t => t.includes("Couldn't hand the answer"))).toBe(false)
+})
+
+test('s on a session that answers through the store: its answer is taken and done', async ($, on) => {
+  const w = world(on, { list: list() })
+  reachableBravo(w)
+  const sent = sentNotices(on)
+  await startSession($, w)
+  setFocused(w, true)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  await $.ui.focus({ requestId: 'sessions', key: `s:${BRAVO}`, element: `s:${BRAVO}`, component: 'Pane', origin: { kind: 'engine' } } as any)
+  await ui.press({ key: 'stop' })
+  await w.clock.settle()
+  // The ask carries what bravo needs to come back here even when its panel doesn't show this session
+  expect(sent.find(n => n.kind === 'ask')?.data).toMatchObject({ from: SID, topic: 'stop', id: 'aaaaaaaa', title: 'alpha', background: true })
+  // Bravo couldn't send its answer: it left it in the store
+  w.store.set(`answer:${SID}`, { format: FORMAT, sessionId: BRAVO, action: 'stop', cameBack: true, at: w.clock.now() })
+  await w.clock.advance(600)
+  await w.clock.settle()
+  expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === 'stop' && a[2] === 'bbbbbbbb')).toBe(true)
+  expect(w.store.has(`answer:${SID}`)).toBe(false)
+  await ui.unmount()
+})
+
+test("s from a session that can't send notices (no SendMessage): it asks here, without going there", async ($, on) => {
+  const w = world(on, { list: list() })
+  reachableBravo(w)
+  const sent = sentNotices(on)
+  on('tool.list', () => ({ value: [{ name: 'Read' }, { name: 'AskUserQuestion' }] as any }))
+  let asked = 0
+  on('tool.call', { tool: 'AskUserQuestion' }, (_: any, e: any) => {
+    asked++
+    return { result: { answers: { [e.questions[0].question]: 'Stop' } } }
+  })
+  await startSession($, w)
+  setFocused(w, true)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  await $.ui.focus({ requestId: 'sessions', key: `s:${BRAVO}`, element: `s:${BRAVO}`, component: 'Pane', origin: { kind: 'engine' } } as any)
+  await ui.press({ key: 'stop' })
+  await w.clock.settle()
+  expect(sent.some(n => n.kind === 'ask')).toBe(false)
+  expect(asked).toBe(1)
+  expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === 'stop' && a[2] === 'bbbbbbbb')).toBe(true)
   await ui.unmount()
 })
