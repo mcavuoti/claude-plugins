@@ -8,6 +8,7 @@
 // outside, costs him no tap: fleet applies it as it's filed.
 
 import { globRegex, type WorldConfig } from './changes'
+import { cut } from './decisions'
 
 /** The origins that are the person: his own Enter at a terminal (composer). Remote Control (bridge) isn't taken until
  * it's tried (G7); anything else (a plugin's prompt, a peer, a schedule, a notification, a kind added later) never is */
@@ -98,7 +99,7 @@ export function preAnswer(p: { personTurn: boolean; mark: OutsideMark | null; ma
 export type ResourceSpec = { what: string; why: string; cost?: string; byWhen?: string; alternatives?: string }
 
 function line(v: unknown, max: number): string {
-  return typeof v === 'string' ? v.trim().replace(/\s+/g, ' ').slice(0, max) : ''
+  return typeof v === 'string' ? cut(v.trim().replace(/\s+/g, ' '), max) : ''
 }
 
 export function checkResource(input: any): { ok: true; resource: ResourceSpec; blocks?: string } | { ok: false; reason: string } {

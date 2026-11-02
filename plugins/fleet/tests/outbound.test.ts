@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
+import { checkResource } from '../hooks/authority'
 import { hashText } from '../hooks/changes'
 import {
   checkSend,
@@ -235,6 +236,10 @@ test('mcp__fleet__send: its input, the draft fleet keeps and runs, the version t
   expect(patternOf('/x/dist/*.whl')).toEqual({ dir: '/x/dist', name: '*.whl' })
   expect(patternOf('/x/*/a.whl')).toBe(null)
   expect(patternOf('/x/dist/')).toBe(null)
+  // A long to, why or blocks is cut, never in the middle of a character
+  const long = checkSend({ to: `${'a'.repeat(299)}\u{1F600}`, why: `${'b'.repeat(299)}\u{1F600}`, command: 'x', blocks: `${'c'.repeat(199)}\u{1F600}` })
+  expect(long).toEqual({ ok: true, send: { to: 'a'.repeat(299), why: 'b'.repeat(299), command: 'x', files: [], blocks: 'c'.repeat(199) } })
+  expect(checkResource({ what: `${'d'.repeat(199)}\u{1F600}`, why: 'w' })).toEqual({ ok: true, resource: { what: 'd'.repeat(199), why: 'w' } })
   expect(outboundRefusal([{ what: 'curl sending data (notes/x.md)', to: ['example.invalid'], files: ['notes/x.md'] }], 'command')).toContain(
     "fleet: this command would send the project's content outside it (curl sending data (notes/x.md) to example.invalid), which needs the person's approval, so it was not run. If it should go out, draft it with mcp__fleet__send",
   )

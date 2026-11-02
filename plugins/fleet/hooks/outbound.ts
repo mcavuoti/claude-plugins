@@ -19,6 +19,8 @@
 //   redirection to /dev/tcp or /dev/udp; and the commands outbound.json's commands names. A program or script that
 //   sends by itself isn't seen: the models' own guardrails and the person's permission settings are the rest.
 
+import { cut } from './decisions'
+
 /** Person data: outbound.json. It only gains fields, and a write keeps the fields it doesn't know */
 export const OUTBOUND_FORMAT = 1
 
@@ -966,9 +968,9 @@ export type SendInput = { to: string; why: string; command?: string; tool?: stri
 /** mcp__fleet__send's input, tidied, or what to fix. The MCP call's name is mcp_tool: a tool call's own "tool" is the
  * name of the tool called (mcp__fleet__send itself) */
 export function checkSend(input: any): { ok: true; send: SendInput } | { ok: false; reason: string } {
-  const to = typeof input?.to === 'string' ? input.to.trim().slice(0, 300) : ''
+  const to = typeof input?.to === 'string' ? cut(input.to.trim(), 300) : ''
   if (!to) return { ok: false, reason: 'to: say who or where it goes' }
-  const why = typeof input?.why === 'string' ? input.why.trim().replace(/\s+/g, ' ').slice(0, 300) : ''
+  const why = typeof input?.why === 'string' ? cut(input.why.trim().replace(/\s+/g, ' '), 300) : ''
   if (!why) return { ok: false, reason: 'why: say in one line why it should go out' }
   const command = typeof input?.command === 'string' ? input.command.trim() : ''
   const tool = typeof input?.mcp_tool === 'string' ? input.mcp_tool.trim() : ''
@@ -978,7 +980,7 @@ export function checkSend(input: any): { ok: true; send: SendInput } | { ok: fal
   if (tool && /^mcp__fleet__/.test(tool)) return { ok: false, reason: "mcp_tool: fleet's own tools send nothing outside" }
   if (tool && input?.input !== undefined && (typeof input.input !== 'object' || input.input === null || Array.isArray(input.input))) return { ok: false, reason: "input: the tool's input, as an object" }
   const files = strings(input?.files).slice(0, 20)
-  const blocks = typeof input?.blocks === 'string' ? input.blocks.trim().slice(0, 200) : ''
+  const blocks = typeof input?.blocks === 'string' ? cut(input.blocks.trim(), 200) : ''
   return {
     ok: true,
     send: { to, why, ...(command ? { command } : { tool, input: (input?.input as Record<string, unknown>) ?? {} }), files, ...(blocks ? { blocks } : {}) },
