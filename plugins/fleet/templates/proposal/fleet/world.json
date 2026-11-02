@@ -11,5 +11,6 @@
     "proposal": { "paths": ["proposal/**"], "owner": "integrator", "debounceMin": 30 },
     "gaps": { "paths": ["notes/gaps.md"], "owner": "requirements", "debounceMin": 30 }
   },
-  "commit": { "everyMin": 60 }
+  "commit": { "everyMin": 60 },
+  "judges": { "model": "haiku", "statute": ["CLAUDE.md", ".claude/rules/*.md"] }
 }

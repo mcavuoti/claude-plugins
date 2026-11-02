@@ -2,5 +2,7 @@
   "worldFormat": 1,
   "paths": ["spec/**", "board/**", "docs/**", "notes/**", "journals/**", "ideas/**"],
   "command": ["spec/**"],
-  "proposal": ["ideas/**"]
+  "proposal": ["ideas/**"],
+  "tags": ["spec", "code", "tests", "process"],
+  "judges": { "model": "haiku", "statute": ["CLAUDE.md", ".claude/rules/*.md"] }
 }
