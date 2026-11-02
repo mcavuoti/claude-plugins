@@ -400,3 +400,29 @@ test('the sweeper is one session: a lease another session keeps is left alone; o
   expect(w.logs.join('\n')).toContain('fleet: sweeper: this session')
   expect(w.files.get(`${STATE}/.gitignore`)).toContain('*')
 })
+
+test('after a sleep the holder finds its own lease 90 s old: it holds nothing, takes it again like any taker, and backs off when another took it', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [PLAN]: 'plan\n' } })
+  await begin($, w)
+  expect(await fleet($, 'status')).toContain('sweeper: this session')
+  // Its own lease, not renewed for 100 s (the machine slept): at its next look it's free, so it takes it again and
+  // sweeps only 2 s later, still there
+  const stale = () => w.touch(`${STATE}/sweeper.json`, JSON.stringify({ format: 1, sessionId: SID, ref: REF, name: 'TEST W', at: w.clock.now() - 100000 }))
+  const lapsed = async () => {
+    const before = w.logs.filter(l => l.includes('its own lease ran out')).length
+    stale()
+    for (let i = 0; i < 12 && w.logs.filter(l => l.includes('its own lease ran out')).length === before; i++) await tick(w)
+  }
+  await lapsed()
+  expect(w.logs.join('\n')).toContain('sweeper: its own lease ran out (a sleep or a stall): taking it again')
+  expect(await fleet($, 'status')).not.toContain('sweeper: this session')
+  await tick(w)
+  expect(await fleet($, 'status')).toContain('sweeper: this session')
+  // Again, and this time another session took it meanwhile (the last write wins): this one backs off
+  await lapsed()
+  w.touch(`${STATE}/sweeper.json`, JSON.stringify({ format: 1, sessionId: R_SID, ref: 'bbbbbbbb', name: 'TEST R', at: w.clock.now() }))
+  await tick(w)
+  await tick(w)
+  expect(json(w, `${STATE}/sweeper.json`).sessionId).toBe(R_SID)
+  expect(await fleet($, 'status')).toContain('sweeper: TEST R')
+})

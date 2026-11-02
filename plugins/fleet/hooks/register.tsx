@@ -2532,7 +2532,13 @@ async function lease($: any) {
     sweep.takenAt = 0
     sweep.dirty = true
     log($, 'sweeper: this session')
-  } else if (st === 'free') sweep.takenAt = now
+  } else if (st === 'free') {
+    // Its own lease 90 s old (after a sleep or a stall, others may be taking it now): the holder holds nothing any more,
+    // and takes it again like any taker, sweeping only once it still finds itself there 2 s later
+    if (sweep.holding) log($, 'sweeper: its own lease ran out (a sleep or a stall): taking it again')
+    sweep.holding = false
+    sweep.takenAt = now
+  }
   if (!(await replace($, stateDir('sweeper.json'), json({ format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: now, remote })))) {
     await run($, ['mkdir', '-p', stateDir()])
   }
