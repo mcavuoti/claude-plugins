@@ -9,7 +9,8 @@ leaves the charter or the roster unclear.
 3. Success: how we know it worked (each measurable: a target, how it's measured).
 4. The requirements: where they come from, who owns them (only an applied change rewrites req/).
 5. Deadline and milestones.
-6. Budget: dollars a day for the fleet (at list price), or a share of the plan's weekly limit.
+6. Budget: dollars a day, at list price, for the fleet and for each role or instance (roster.json's "budget":
+   { "usdDay": n }, at its top and on a role or an instance).
 7. Scarce resources: licences, machines, people's time, and how many instances may use each at once (slots.json).
 8. Sources: repositories, folders, documents and people to learn from, inside and outside; which mail or chat feeds
    the project (a poller dropping items in .claude/fleet/inbox/, or a listing tool of an MCP server) and the tags that
@@ -30,3 +31,12 @@ content), the roster's changes (.claude/fleet/roster.json, edits: subscriptions 
 shared files' (.claude/fleet/world.json: the tags too), the scarce resources (.claude/fleet/slots.json), the person's
 own places (.claude/fleet/outbound.json: "hosts", "remotes", "recipients"), and the first requirements (req/R-<n>.md,
 one per file, new files with their whole content).
+
+The shapes fleet reads (only these keys; anything else is ignored or refused when the person applies it):
+- slots.json: `{ "slotsFormat": 1, "slots": { "lab": { "count": 2, "leaseMin": 30, "what": "the test machines" } } }`,
+  one entry per pool: a name of lowercase letters, digits and -, how many at once, how long a lease runs, what it is.
+- roster.json's "person": `{ "addresses": ["me@example.com"], "principals": ["lead@example.com"], "front": "Chief",
+  "channel": { "kind": "terminal" }, "perDay": 3, "quietHours": "22-7", "waitingMin": 120 }`. The channel's kind is
+  terminal (nothing sent), push (`{ "kind": "push" }`), mcp (`{ "kind": "mcp", "server": "<server>", "tool": "<its send
+  tool>", "to": "<one of the addresses>" }`) or command (`{ "kind": "command", "argv": ["bash",
+  ".claude/fleet/channels/append.sh", "<a file>"] }`, which the person stamps with /fleet accept channel).

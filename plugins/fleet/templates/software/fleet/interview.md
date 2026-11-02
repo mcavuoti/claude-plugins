@@ -11,7 +11,8 @@ leaves the charter or the roster unclear.
 5. How work lands: branches and worktrees, review, the tests that must pass, who merges.
 6. The spec: where the requirements live (spec/), who may change them (only through an applied change).
 7. Deadline and milestones.
-8. Budget: dollars a day for the fleet (at list price), or a share of the plan's weekly limit.
+8. Budget: dollars a day, at list price, for the fleet and for each role or instance (roster.json's "budget":
+   { "usdDay": n }, at its top and on a role or an instance).
 9. Confidentiality: what must never leave this machine or reach a third party.
 10. The person's own places: their SSH hosts (a dev machine, a CI box), the git remotes pushes may go to, their
     addresses. They go in outbound.json, so the fleet's sends there need no draft; anything else is drafted for the
