@@ -8731,15 +8731,16 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   // The model's own AskUserQuestion only: another plugin's $.ui.ask goes by untouched (sessions asks its Stop and
-  // Restart there, and the tool has to be in the session for that). In a background session of the project the
-  // model's own is refused: a dialog waits for whoever comes by, and decide asks without stopping. Elsewhere it only
-  // watches: the dialog is the usual one, and what it returns goes back unchanged
+  // Restart there, and the tool has to be in the session for that). In an instance of the roster the model's own is
+  // refused: nobody sits at it, a dialog waits for whoever comes by, and decide asks without stopping. Elsewhere (the
+  // person's own sessions, background ones too) it only watches: the dialog is the usual one, and what it returns goes
+  // back unchanged
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
     if (next.origin.plugin !== 'engine') return next(e)
     await locate($)
-    if (root && jobRef && offered) {
-      log($, "refused: the model's AskUserQuestion in a background session (it asks with decide)")
-      return { deny: 'fleet: this is a background session, where a dialog waits for whoever comes by. Ask with mcp__fleet__decide instead: the same questions and options, plus the one you recommend and why; it answers at once with a ticket and the answer reaches you later. Nothing was asked.' }
+    if (root && jobRef && offered && myInstance) {
+      log($, "refused: the model's AskUserQuestion in an instance (it asks with decide)")
+      return { deny: 'fleet: this is an instance of the roster, where a dialog waits for whoever comes by. Ask with mcp__fleet__decide instead: the same questions and options, plus the one you recommend and why; it answers at once with a ticket and the answer reaches you later. Nothing was asked.' }
     }
     let askedAt = 0
     try {

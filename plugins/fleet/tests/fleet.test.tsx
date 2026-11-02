@@ -377,14 +377,24 @@ test("another plugin's dialog isn't recorded", { plugins: [FAKE_SESSIONS, ASKER]
   expect(under(w, `${DEC}/register`)).toEqual([])
 })
 
-test("in a background session the model's own AskUserQuestion is refused toward decide; another plugin's dialog (sessions' Stop) passes", { plugins: [FAKE_SESSIONS, ASKER], timeoutMs: 30000 }, async ($, on) => {
-  const w = world(on)
+test("in an instance the model's own AskUserQuestion is refused toward decide; another plugin's dialog (sessions' Stop) passes", { plugins: [FAKE_SESSIONS, ASKER], timeoutMs: 30000 }, async ($, on) => {
+  const w = world(on, {
+    env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Owner A', FLEET_ROLE: 'owner' },
+    files: {
+      [`${FLEET}/roster.json`]: JSON.stringify({ rosterFormat: 1, sections: [{ id: 'owners', title: 'Owners' }], roles: { owner: { agent: 'owner', model: 'haiku' } }, instances: [{ name: 'Owner A', role: 'owner', section: 'owners' }] }),
+      [`${ROOT}/.claude/agents/owner.md`]: '---\nname: owner\ndescription: owns a part of the notes\ntools: Read, Write, Edit, AskUserQuestion, mcp__fleet__*\n---\nYou own a part of the notes.\n',
+      [`${FLEET}/instances/owner-a.json`]: '{}\n',
+    },
+  })
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Owner A', root: ROOT, background: true, agent: 'owner' }, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
   let asked = 0
   on('tool.call', { tool: 'AskUserQuestion' }, () => {
     asked++
     return { result: { answers: { 'Plugin?': 'A' } } }
   })
   await startSession($, w)
+  await w.clock.advance(2100)
+  await w.clock.settle()
   const questions = [{ question: 'Which color?', header: 'Color', options: [{ label: 'Red', description: '' }, { label: 'Blue', description: '' }], multiSelect: false }]
   const r: any = await $.tool.call({ tool: 'AskUserQuestion', questions } as any)
   expect(r.deny).toContain('Ask with mcp__fleet__decide instead')
@@ -392,6 +402,20 @@ test("in a background session the model's own AskUserQuestion is refused toward 
   await $.turn.start({ text: 'ask through the plugin', turnId: 't-1' })
   await w.clock.settle()
   expect(w.files.get('/fake/asker-error')).toBe(undefined)
+  expect(asked).toBe(1)
+})
+
+test("in the person's own background session (not an instance) the model's AskUserQuestion is shown, not refused", { plugins: [FAKE_SESSIONS], timeoutMs: 30000 }, async ($, on) => {
+  const w = world(on)
+  let asked = 0
+  on('tool.call', { tool: 'AskUserQuestion' }, () => {
+    asked++
+    return { result: { answers: { 'Which color?': 'Red' } } }
+  })
+  await startSession($, w)
+  const questions = [{ question: 'Which color?', header: 'Color', options: [{ label: 'Red', description: '' }, { label: 'Blue', description: '' }], multiSelect: false }]
+  const r: any = await $.tool.call({ tool: 'AskUserQuestion', questions } as any)
+  expect(r.deny).toBe(undefined)
   expect(asked).toBe(1)
 })
 
