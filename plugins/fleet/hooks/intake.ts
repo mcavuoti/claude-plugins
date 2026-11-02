@@ -11,7 +11,7 @@
 
 import { checkGlob, globRegex, hashText, type WorldConfig } from './changes'
 import { cut } from './decisions'
-import { PRICES, familyOf, type Instance } from './roster'
+import { priceOf, type Instance } from './roster'
 
 /** A poller's item: <project>/.claude/fleet/inbox/<source>/<name>.json carries itemFormat. A newer one waits in the
  * inbox until fleet is updated */
@@ -542,10 +542,11 @@ export function rollIntake(s: IntakeState | null, format: number, day: string, h
   return d.hour === hour ? d : { ...d, hour, perSource: {} }
 }
 
-/** What one call cost at list price, from its usage (a model fleet has no price for costs nothing in the count) */
+/** What one call cost at list price, from its usage: its model's own price, else its family's (a model fleet has no
+ * price for costs nothing in the count) */
 export function usageUsd(model: string, u: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined): number {
-  const f = familyOf(model)
-  if (!f || !u) return 0
-  const p = PRICES[f]
+  const found = priceOf(model)
+  if (!found || !u) return 0
+  const p = found.price
   return ((u.input_tokens ?? 0) * p.input + (u.output_tokens ?? 0) * p.output + (u.cache_creation_input_tokens ?? 0) * p.write + (u.cache_read_input_tokens ?? 0) * p.read) / 1e6
 }

@@ -205,4 +205,6 @@ test('the caps: the day counts start over at midnight, the sources at each hour;
   expect(rollIntake(used, 1, '2026-11-03', '2026-11-03T00')).toMatchObject({ usd: 0, records: 0, perSource: {}, last: 3 })
   expect(usageUsd('haiku', { input_tokens: 1000000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }).toFixed(6)).toBe('0.100000')
   expect(usageUsd('a-model-fleet-has-no-price-for', { input_tokens: 5 })).toBe(0)
+  // An older model by its own id: Haiku 4.5 costs ten times the current Haiku
+  expect(usageUsd('claude-haiku-4-5', { input_tokens: 1000000 }).toFixed(6)).toBe('1.000000')
 })

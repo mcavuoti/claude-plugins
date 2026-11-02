@@ -240,6 +240,7 @@ import {
   compareVersions,
   countWake,
   denyRules,
+  familyPriceNote,
   forecastOf,
   freshDue,
   frontOf,
@@ -5375,6 +5376,8 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   const pp = personOf(r.r).problem
   if (pp) lint.warnings.push(`${pp}: alerts wait in the brief`)
   if (intakeProblem) lint.warnings.push(intakeProblem)
+  // The models world.json's intake and judges call, priced by their family only (an instance's is in lintRoster)
+  for (const [what, m] of [['intake', intakeCfg?.model ?? null], ['judges', judgesCfg.on ? judgesCfg.model : null]] as const) if (familyPriceNote(m)) lint.warnings.push(`world.json ${what}: ${familyPriceNote(m)}`)
   for (const k of derivedKinds) if (!all.some(i => ownsKind(k, i))) lint.warnings.push(`world.json: the owner of derived ${k.kind} ("${k.owner}") is no role or instance of the roster: nobody is told to refresh it`)
   await loadSlots($)
   if (slotsProblem) lint.warnings.push(slotsProblem)
@@ -6966,6 +6969,11 @@ async function statusCommand($: any): Promise<string> {
         ? `judges: on (${judgesCfg.model}), ${liveAreas.length ? `live in ${liveAreas.join(', ')}, in shadow elsewhere` : 'in shadow'}: today ${spent.calls} call${spent.calls === 1 ? '' : 's'}, ${usdText(spent.usd)} of ${usdText(judgesCfg.usdDay)}${liveAreas.length ? `, ${spent.live} live answer${spent.live === 1 ? '' : 's'} of ${judgesCfg.perDay}` : ''}; /fleet stats, /fleet judges${judgesProblems.length ? ` (${judgesProblems.join('; ')})` : ''}`
         : 'judges: off (world.json)',
     )
+    // Models priced by their family only: an older model costs more (or less) than the current generation
+    await loadRoster($)
+    const priced = [...(roster?.instances ?? []).map(i => [i.name, i.model] as const), ['intake', intakeCfg?.model ?? null] as const, ['the judges', judgesCfg.on ? judgesCfg.model : null] as const]
+    const byFamily = priced.flatMap(([who, m]) => (familyPriceNote(m) ? [`${who}: ${familyPriceNote(m)}`] : []))
+    if (byFamily.length) lines.push(`prices: ${byFamily.join('; ')}`)
     // Overrules their reviewer hasn't heard for a day: it's down, renamed, or world.json names nobody now
     const reviews: OverruleNotice[] = []
     for (const n of (await names($, dec('overrules'))).filter(x => /^D-\d+\.review\.json$/.test(x))) {

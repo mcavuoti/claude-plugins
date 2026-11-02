@@ -11,6 +11,8 @@ import {
   denyRules,
   expandBraces,
   familyOf,
+  familyPriceNote,
+  priceOf,
   forecastOf,
   instancesOf,
   isCommandLevel,
@@ -178,6 +180,23 @@ test('the forecast: wakes at the cache-write price of each model; models with no
   expect(f.unpriced).toEqual([])
   expect(wakesOf(null)).toEqual({ everyMin: 60, perDay: 8 })
   expect(wakesOf(roster({ wakes: { everyMin: 0, perDay: 3 } }))).toEqual({ everyMin: 1, perDay: 3 })
+})
+
+test('prices: an exact id first (a prefix, a date or [1m] taken off), an alias as the current generation, else the family, said', () => {
+  expect(priceOf('claude-haiku-4-5')).toEqual({ price: { input: 1, output: 5, write: 1.25, read: 0.1 }, by: 'id' })
+  expect(priceOf('claude-haiku-4-5-20251001')?.price.input).toBe(1)
+  expect(priceOf('us.anthropic.claude-opus-4-6-v1:0')).toMatchObject({ price: { input: 5 }, by: 'id' })
+  expect(priceOf('claude-opus-4-5@20251101')?.price.input).toBe(5)
+  expect(priceOf('opus[1m]')).toMatchObject({ price: { input: 4 }, by: 'id' })
+  expect(priceOf('claude-haiku-5-5')).toMatchObject({ price: { input: 0.1 }, by: 'id' })
+  expect(priceOf('claude-sonnet-4-9')).toMatchObject({ price: { input: 2 }, by: 'family' })
+  expect(priceOf('gpt')).toBe(null)
+  expect(familyPriceNote('claude-sonnet-4-9')).toBe('the model "claude-sonnet-4-9" is priced as its family\'s current generation (sonnet), not as itself: its costs may be off')
+  expect(familyPriceNote('haiku')).toBe(null)
+  // A Haiku 4.5 wake costs ten times a Haiku 5.5 one; one priced by family only is a lint warning
+  expect(Math.round((wakeUsd('claude-haiku-4-5', 8) ?? 0) * 1000)).toBe(400)
+  const lint = lintRoster(roster({ instances: [{ name: 'Old', role: 'worker', model: 'claude-sonnet-4-9' }] }), new Map([['worker', '---\nname: worker\ntools: Read, mcp__fleet__*\n---\nWork.\n']]))
+  expect(lint.warnings).toContain('"Old": the model "claude-sonnet-4-9" is priced as its family\'s current generation (sonnet), not as itself: its costs may be off')
 })
 
 test("budgets: today's spend from the session's cost; 80% warns, 100% is over; the person's lift for the day", () => {

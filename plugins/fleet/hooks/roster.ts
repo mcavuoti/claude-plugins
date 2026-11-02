@@ -22,7 +22,8 @@ export const HEARTBEAT_STALE_MS = 3 * 60000
 /** The share of the day's budget at which an instance is told to land what it has */
 export const WARN_SHARE = 0.8
 
-/** List prices in US dollars per million tokens: input, output, a 5-minute cache write, a cache read */
+/** List prices in US dollars per million tokens: input, output, a 5-minute cache write, a cache read. Per family, the
+ * current generation's (what the aliases haiku, sonnet, opus and fable run) */
 export const PRICES = {
   fable: { input: 10, output: 50, write: 12.5, read: 0.25 },
   opus: { input: 4, output: 20, write: 5, read: 0.2 },
@@ -30,6 +31,31 @@ export const PRICES = {
   haiku: { input: 0.1, output: 0.5, write: 0.125, read: 0.01 },
 } as const
 export type Family = keyof typeof PRICES
+export type Price = { input: number; output: number; write: number; read: number }
+
+const OPUS_5 = { input: 5, output: 25, write: 6.25, read: 0.5 }
+const SONNET_4 = { input: 3, output: 15, write: 3.75, read: 0.3 }
+const FABLE_5 = { input: 10, output: 50, write: 12.5, read: 1 }
+/** The list prices of exact model ids (the API's table of 2026-10-06), older generations included: an id here is priced
+ * as itself, any other by its family */
+export const MODEL_PRICES: Record<string, Price> = {
+  'claude-fable-5-1': PRICES.fable,
+  'claude-mythos-5-1': PRICES.fable,
+  'claude-fable-5': FABLE_5,
+  'claude-mythos-5': FABLE_5,
+  'claude-opus-5-5': PRICES.opus,
+  'claude-opus-5': OPUS_5,
+  'claude-opus-4-8': OPUS_5,
+  'claude-opus-4-7': OPUS_5,
+  'claude-opus-4-6': OPUS_5,
+  'claude-opus-4-5': OPUS_5,
+  'claude-sonnet-5-5': PRICES.sonnet,
+  'claude-sonnet-5': PRICES.sonnet,
+  'claude-sonnet-4-6': SONNET_4,
+  'claude-sonnet-4-5': SONNET_4,
+  'claude-haiku-5-5': PRICES.haiku,
+  'claude-haiku-4-5': { input: 1, output: 5, write: 1.25, read: 0.1 },
+}
 
 export type Permissions = { defaultMode?: string; allow?: string[]; ask?: string[]; deny?: string[] }
 /** What a zone, a role and an instance can each say; the instance's wins, then the role's, then the zone's */
@@ -365,7 +391,8 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
       warnings.push(`.claude/agents/${agent}.md: ${f.tools === null ? 'with no tools line it has every tool, AskUserQuestion included' : 'its tools include AskUserQuestion'}: a question it asks that way waits for nobody (an instance asks with mcp__fleet__decide); list its tools without it`)
   }
   for (const i of instances) {
-    if (i.model !== null && !familyOf(i.model)) warnings.push(`"${i.name}": no price known for the model "${i.model}": the forecast leaves it out`)
+    if (i.model !== null && !priceOf(i.model)) warnings.push(`"${i.name}": no price known for the model "${i.model}": the forecast leaves it out`)
+    else if (familyPriceNote(i.model)) warnings.push(`"${i.name}": ${familyPriceNote(i.model)}`)
     for (const mode of [i.permissions.defaultMode, (i.settings.permissions as Permissions | undefined)?.defaultMode]) {
       if (mode === 'bypassPermissions') errors.push(`"${i.name}": fleet doesn't start an instance with bypassPermissions (it would send things out with nobody asked)`)
     }
@@ -449,11 +476,32 @@ export function familyOf(model: string | null): Family | null {
   return m.includes('mythos') ? 'fable' : null
 }
 
+/** A model's list price: by its exact id (a provider's prefix, a date or a [1m] taken off), an alias (haiku, sonnet,
+ * opus, fable: the current generation), or else its family's (the current generation's, which an older model may not
+ * cost: by: 'family' says so) */
+export function priceOf(model: string | null): { price: Price; by: 'id' | 'family' } | null {
+  if (!model) return null
+  let m = model.trim().toLowerCase().replace(/\[[^\]]*\]$/, '')
+  const at = m.indexOf('claude-')
+  if (at > 0) m = m.slice(at)
+  m = m.replace(/@.*$/, '').replace(/-v\d+(:\d+)?$/, '').replace(/-\d{8}$/, '')
+  if (MODEL_PRICES[m]) return { price: MODEL_PRICES[m] as Price, by: 'id' }
+  if (m in PRICES) return { price: PRICES[m as Family], by: 'id' }
+  const f = familyOf(m)
+  return f ? { price: PRICES[f], by: 'family' } : null
+}
+
+/** What /fleet up --dry-run and /fleet status say of a model priced by its family only (null for one priced as itself) */
+export function familyPriceNote(model: string | null): string | null {
+  const p = priceOf(model)
+  return p?.by === 'family' ? `the model "${model}" is priced as its family's current generation (${familyOf(model)}), not as itself: its costs may be off` : null
+}
+
 /** What a day of wakes costs an instance: each reopens its context (tokens; about WAKE_CONTEXT for one not started)
  * at the cache-write price */
 export function wakeUsd(model: string | null, perDay: number, tokens: number = WAKE_CONTEXT): number | null {
-  const f = familyOf(model)
-  return f ? (perDay * tokens * PRICES[f].write) / 1e6 : null
+  const p = priceOf(model)
+  return p ? (perDay * tokens * p.price.write) / 1e6 : null
 }
 
 /** sizes: a running instance's own context, by slug, from its heartbeat; WAKE_CONTEXT for the others */
