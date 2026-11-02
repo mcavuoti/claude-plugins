@@ -91,6 +91,7 @@ import {
   ago,
   answerName,
   checkDecide,
+  cut,
   classifyDialog,
   configText,
   dayOf,
@@ -2744,7 +2745,7 @@ async function intakeOne($: any, c: IntakeConfig, f: { source: string; name: str
     return 'skip'
   }
   if (claim === 'failed') return 'stop'
-  const body = (item.body ?? (bodyPath ? ((await readText($, bodyPath)) ?? '') : '')).slice(0, 32768)
+  const body = cut(item.body ?? (bodyPath ? ((await readText($, bodyPath)) ?? '') : ''), 32768)
   // The project's records it may ask to change (not other intake records)
   const ids = [...idIndex.entries()].filter(([, rel]) => !isIntakePath(rel)).map(([id]) => id).sort()
   let r: any
@@ -6270,7 +6271,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     r = await $.model.complete({
       model: c.model ?? 'sonnet',
       system: body || `You are ${c.name}, the chief of this project's fleet.`,
-      prompt: [`The charter:\n\n${charter.slice(0, 20000)}`, `The brief:\n\n${text}`, CHIEF_PROMPT].join('\n\n---\n\n'),
+      prompt: [`The charter:\n\n${cut(charter, 20000)}`, `The brief:\n\n${text}`, CHIEF_PROMPT].join('\n\n---\n\n'),
       maxTokens: 600,
       timeoutMs: 90000,
     })

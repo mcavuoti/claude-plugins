@@ -226,8 +226,17 @@ export function letter(i: number): string {
   return LETTERS[i] ?? '?'
 }
 
+/** At most max UTF-16 units of a text, never ending on half of a character: a lone high surrogate at the end (an emoji
+ * cut in two, here or by an earlier slice) is dropped, since the API refuses a request that carries one. Every text fleet
+ * cuts on its way to a model goes through this */
+export function cut(s: string, max: number): string {
+  const t = s.length > max ? s.slice(0, Math.max(0, max)) : s
+  const last = t.charCodeAt(t.length - 1)
+  return last >= 0xd800 && last <= 0xdbff ? t.slice(0, -1) : t
+}
+
 function text(v: unknown, max: number): string {
-  return typeof v === 'string' ? v.trim().slice(0, max) : ''
+  return typeof v === 'string' ? cut(v.trim(), max) : ''
 }
 
 /** The input of mcp__fleet__decide as JSON schema: 1-4 questions, each with 2-4 options, the recommended one and why;
@@ -439,10 +448,10 @@ export function parseAnswers(args: string): AnswerItem[] | string {
       if (hashes.length > 1) return `${n}: one version at most`
       const allow = extra.includes('--allow')
       if (allow && verb !== 'send') return `${n}: --allow goes with send (/fleet ${n} send --allow)`
-      items.push({ n, verb, ...(hashes[0] ? { hash: hashes[0] } : {}), ...(allow ? { allow: true as const } : {}), ...(note ? { note: note.slice(0, 1000) } : {}) })
+      items.push({ n, verb, ...(hashes[0] ? { hash: hashes[0] } : {}), ...(allow ? { allow: true as const } : {}), ...(note ? { note: cut(note, 1000) } : {}) })
     } else if (said !== undefined) {
       if (!said.trim()) return `${n}: the quotes are empty`
-      items.push({ n, text: said.trim().slice(0, 2000) })
+      items.push({ n, text: cut(said.trim(), 2000) })
     } else items.push({ n, letter: (m[6] as string).toLowerCase() })
     rest = rest.slice(m[0].length)
   }
@@ -482,7 +491,7 @@ export function parseCommand(args: string): Command {
       if ((a !== 'live' && a !== 'off') || !area || area.startsWith('--') || (a === 'off' && rest.length) || extra.length > 1) {
         return { kind: 'bad', reason: 'write /fleet judges, /fleet judges live <area> [--force "why"] or /fleet judges off <area>' }
       }
-      return { kind: 'judges', action: a, area: area.toLowerCase(), force, why: (extra[0] ?? '').slice(0, 300) }
+      return { kind: 'judges', action: a, area: area.toLowerCase(), force, why: cut(extra[0] ?? '', 300) }
     }
     case 'overrule':
       return parseOverrule(tail)
@@ -532,12 +541,12 @@ export function parseCommand(args: string): Command {
     case 'note': {
       const m = /^(\d+)\s+([\s\S]+)$/.exec(tail)
       if (!m) return { kind: 'bad', reason: 'write /fleet note <n> <text>' }
-      return { kind: 'note', n: Number(m[1]), text: (m[2] as string).trim().slice(0, 1000) }
+      return { kind: 'note', n: Number(m[1]), text: cut((m[2] as string).trim(), 1000) }
     }
     case 'drop': {
       const m = /^(\d+|D-\d+)\b\s*([\s\S]*)$/i.exec(tail)
       if (!m) return { kind: 'bad', reason: 'write /fleet drop <n> [why] (or the decision, D-<n>)' }
-      return { kind: 'drop', target: (m[1] as string).toUpperCase(), why: (m[2] as string).trim().replace(/^["“]|["”]$/g, '').slice(0, 300) }
+      return { kind: 'drop', target: (m[1] as string).toUpperCase(), why: cut((m[2] as string).trim().replace(/^["“]|["”]$/g, ''), 300) }
     }
     case 'world': {
       const [action = '', glob = '', ...extra] = more
@@ -578,12 +587,12 @@ export function parseOverrule(tail: string): Command {
     if (!words) return { kind: 'bad', reason: 'the quotes are empty' }
     if (!t[1] && answers.length) {
       if (why) return bad
-      why = words.slice(0, 300)
+      why = cut(words, 300)
       continue
     }
     const q = t[1] ? Number(t[1]) : 1
     if (answers.some(a => a.q === q)) return { kind: 'bad', reason: `question ${q} is answered twice` }
-    answers.push({ q, text: words.slice(0, 2000) })
+    answers.push({ q, text: cut(words, 2000) })
   }
   return answers.length ? { kind: 'overrule', id: (m[1] as string).toUpperCase(), answers, why } : bad
 }
@@ -691,7 +700,7 @@ export function classifyDialog(questions: readonly DialogQuestion[], r: any): { 
     const answers = questions.map(q => {
       const a = res.answers[q.question]
       if (typeof a !== 'string' || !a) return null
-      return q.options.some(o => o.label === a) ? { label: a } : { text: a.slice(0, 2000) }
+      return q.options.some(o => o.label === a) ? { label: a } : { text: cut(a, 2000) }
     })
     return answers.some(Boolean) ? { answers, state: 'answered' } : { answers, state: 'not answered', why: 'no answer' }
   }

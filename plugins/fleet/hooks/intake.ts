@@ -10,6 +10,7 @@
 // `change`: the person confirms it with the diff in front of him.
 
 import { checkGlob, globRegex, hashText, type WorldConfig } from './changes'
+import { cut } from './decisions'
 import { PRICES, familyOf, type Instance } from './roster'
 
 /** A poller's item: <project>/.claude/fleet/inbox/<source>/<name>.json carries itemFormat. A newer one waits in the
@@ -102,7 +103,7 @@ export type Item = {
 }
 
 function line(v: unknown, max: number): string {
-  return typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max) : ''
+  return typeof v === 'string' ? cut(v.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), max) : ''
 }
 
 /** An address out of "Name <a@b>", { address, name } or { email, name } */
@@ -182,7 +183,7 @@ export function intakePrompt(vocabulary: readonly string[], ids: readonly string
   if (item.attachments.length) head.push(`attachments: ${item.attachments.join(', ')}`)
   return [
     { text: `The project's tags: ${vocabulary.length ? vocabulary.join(', ') : '(none)'}\nThe project's record ids: ${ids.length ? ids.slice(0, 400).join(', ') : '(none)'}\n`, cache: true },
-    { text: [...head, '', body.slice(0, MODEL_CHARS), `=== ${mark} ends ===`, '', 'The JSON object for this item:'].join('\n') },
+    { text: [...head, '', cut(body, MODEL_CHARS), `=== ${mark} ends ===`, '', 'The JSON object for this item:'].join('\n') },
   ]
 }
 
@@ -270,7 +271,7 @@ function yamlString(s: string): string {
 export type RecordInput = { id: string; item: Item; body: string; cls: Classification; kind: IntakeKind; note: string | null; standing: Standing; targets: { id: string; path: string | null }[] }
 
 export function recordText(r: RecordInput): string {
-  const excerpt = r.body.replace(/\r\n/g, '\n').slice(0, EXCERPT_CHARS)
+  const excerpt = cut(r.body.replace(/\r\n/g, '\n'), EXCERPT_CHARS)
   const fence = fenceFor(excerpt)
   const head = [
     '---',

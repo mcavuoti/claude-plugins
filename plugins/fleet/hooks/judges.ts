@@ -16,7 +16,7 @@
 
 import type { OutsideMark } from './authority'
 import { hashText, type WorldConfig } from './changes'
-import { letter, type Asker, type Option, type Outcome, type Question } from './decisions'
+import { cut, letter, type Asker, type Option, type Outcome, type Question } from './decisions'
 
 /** What world.json's "judges" says, with the defaults. They're on in every project unless it says "judges": false */
 export type JudgeConfig = {
@@ -69,7 +69,7 @@ function num(v: unknown, d: number, min: number, max: number): number {
 
 function line(v: unknown, max: number): string {
   const s = typeof v === 'string' ? v.replace(/\s+/g, ' ').trim() : ''
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s
+  return s.length > max ? `${cut(s, max - 1)}…` : cut(s, max)
 }
 
 /** world.json's judges, or the defaults; problems: what was ignored (a pattern that isn't one) */
@@ -292,13 +292,13 @@ export function statuteOf(files: readonly StatuteFile[]): { text: string; lines:
   const out = ["The statute: the project's charter, the person's principles and the project's rules. Cite a line as <file>:<line>, as written before the bar."]
   let total = 0
   for (const f of files) {
-    const body = f.text.replace(/\r\n/g, '\n').slice(0, STATUTE_FILE_CHARS)
+    const body = cut(f.text.replace(/\r\n/g, '\n'), STATUTE_FILE_CHARS)
     if (!body.trim() || total >= STATUTE_CHARS) continue
     out.push('', `--- ${f.label} ---`)
     for (const [i, l] of body.split('\n').entries()) {
       if (!l.trim()) continue
       const key = `${f.label}:${i + 1}`
-      const shown = `${key} | ${l.trimEnd().slice(0, 400)}`
+      const shown = `${key} | ${cut(l.trimEnd(), 400)}`
       total += shown.length + 1
       if (total >= STATUTE_CHARS) break
       lines.set(key, l.trim())

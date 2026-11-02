@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { deliveryText, parseCommand, type Question, type QueueRecord } from '../hooks/decisions'
+import { cut, deliveryText, parseCommand, type Question, type QueueRecord } from '../hooks/decisions'
 import {
   JUDGE_SYSTEM,
   belowAgreement,
@@ -126,6 +126,13 @@ test('the prompt: the statute first (cached, line by line), the case law, then t
   expect(st.text).toContain('--- principles.md ---\nprinciples.md:1 | # Principles\nprinciples.md:3 | Prefer one file over a server.')
   expect(st.lines.get('charter.md:3')).toBe('Keep it to one machine.')
   expect(statuteOf([]).text).toContain('(none written yet)')
+  // A cut never leaves half of a character (the API refuses a lone surrogate)
+  const emoji = statuteOf([{ label: 'CLAUDE.md', text: `${'x'.repeat(399)}🎉 and more` }]).text
+  expect(emoji).toContain(`CLAUDE.md:1 | ${'x'.repeat(399)}\n`)
+  expect(cut('a🎉b', 2)).toBe('a')
+  expect(cut('a🎉b', 3)).toBe('a🎉')
+  expect(cut('x\ud83c', 10)).toBe('x')
+  expect(cut('plain', 3)).toBe('pla')
   const ps = precedentsOf([answered('D-1', DB, 'SQLite', { area: 'storage' })])
   const law = caseLawText(ps)
   expect(law).toContain('D-1 (2026-11-01, area storage): "Which database for the cache?" a) SQLite b) Redis → the person chose a) SQLite')
