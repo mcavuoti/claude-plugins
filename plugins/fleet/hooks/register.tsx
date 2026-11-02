@@ -3745,7 +3745,8 @@ async function pollGit($: any, r: Extract<Repo, { kind: 'git' }>, had: RepoState
   }
   const h = await git(base, GIT.head(r))
   const head = h.exitCode === 0 ? (h.stdout.trim().split('\n')[0] ?? '') : ''
-  if (!/^[0-9a-f]{7,64}$/.test(head)) return fail(h.exitCode === 0 || !h.stderr.trim() ? `${r.upstream} is no commit in ${r.path} (is it a git repository, and the branch there?)` : `git in ${r.path}: ${firstLine(h)}`)
+  if (/not a git repository/i.test(h.stderr)) return fail(`${r.path} isn't in a git repository: give world.json's code ${r.name} its repository's folder, or "off": true`)
+  if (!/^[0-9a-f]{7,64}$/.test(head)) return fail(h.exitCode === 0 || !h.stderr.trim() ? `${r.upstream} is no commit in ${r.path} (is the branch there?)` : `git in ${r.path}: ${firstLine(h)}`)
   const t = await git(base, GIT.trees)
   if (t.exitCode !== 0) return fail(`git worktree list in ${r.path}: ${firstLine(t)}`)
   const insts = roster?.instances ?? []
