@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { pickWindowShowingMe, terminalCommand } from '../hooks/platform/linux'
+import { exactTitlePattern, pickWindowShowingMe, terminalCommand } from '../hooks/platform/linux'
 import { parseWindows } from '../hooks/state'
 
 // The Linux platform's pure parts. They run on any system (the CI runs them on macOS and Linux)
@@ -33,6 +33,15 @@ test('window showing me, without asking the desktop: a viewer with a launcher fi
   // Shown nowhere: the only agent view with a launcher (it may be inside it)
   expect(pickWindowShowingMe(parseWindows(PS_MAC), 'zzzzzzzz')).toBe('/dev/ttys002')
   expect(pickWindowShowingMe(parseWindows(PS_LINUX), 'zzzzzzzz')).toBe(null)
+})
+
+test("bringing a window forward by its title: the whole title, its regular expression's characters escaped", () => {
+  expect(exactTitlePattern('api')).toBe('^api$')
+  const tricky = 'notes (v2) [draft].*+?{1}|^$\\'
+  const pattern = exactTitlePattern(tricky)
+  expect(new RegExp(pattern).test(tricky)).toBe(true)
+  expect(new RegExp(pattern).test(`${tricky} - Browser`)).toBe(false)
+  expect(new RegExp(exactTitlePattern('api')).test('api docs - Browser')).toBe(false)
 })
 
 test('new window: each terminal emulator takes the command its own way', () => {

@@ -24,6 +24,12 @@ export function pickWindowShowingMe(v: Windows, myShortId: string, myPid?: numbe
   return views.length === 1 ? (views[0]?.tty ?? null) : null
 }
 
+// xdotool's --name takes an extended regular expression: one that matches exactly this title, its special characters
+// escaped
+export function exactTitlePattern(title: string): string {
+  return `^${title.replace(/[.[\]()*+?{}|^$\\]/g, '\\$&')}$`
+}
+
 // The command that opens a new window of a given terminal emulator running a shell command, for the terminals found on
 // Linux desktops. Each one takes the command its own way; null for one it doesn't know
 export function terminalCommand(terminal: string, shellCommand: string): string[] | null {
@@ -93,10 +99,11 @@ export const linux: Platform = {
     return ''
   },
 
-  // By title (the launcher titles each window with its session's name), with wmctrl, else xdotool; X11 only
+  // By title (the launcher titles each window with its session's name), with wmctrl, else xdotool; X11 only. The whole
+  // title, never a part of it: a session named "api" mustn't bring up a browser whose title holds the word
   async bringWindow(run, _tty, title) {
-    if ((await run(['wmctrl', '-a', title])).exitCode === 0) return true
-    return (await run(['xdotool', 'search', '--name', title, 'windowactivate'])).exitCode === 0
+    if ((await run(['wmctrl', '-F', '-a', title])).exitCode === 0) return true
+    return (await run(['xdotool', 'search', '--name', exactTitlePattern(title), 'windowactivate'])).exitCode === 0
   },
 
   // Without a way to bring it forward (no wmctrl/xdotool, or Wayland), the session shows in the current window too

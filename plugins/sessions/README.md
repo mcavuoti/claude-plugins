@@ -168,7 +168,7 @@ On macOS the panel drives Terminal.app (which window is in front, bring one forw
 
 - **The window you're in** is the one whose launcher has your session open (found with `ps`). Open your windows with `ccc` (or the panel's Enter, New and Agents, which use the launcher too). `ccc` brings the project's window forward the same way the panel does (`wmctrl`/`xdotool`), or opens here when it can't.
 - **Switching** happens in that same window, through the launcher, exactly as on macOS.
-- **A session already open in another window** is brought forward with `wmctrl` or `xdotool` when one is installed (X11; the launcher titles each window with its session's name). On Wayland, or without either tool, the session opens in the current window too.
+- **A session already open in another window** is brought forward with `wmctrl` or `xdotool` when one is installed (X11; the launcher titles each window with its session's name, and the whole title is matched, so no other window whose title holds that name comes up). On Wayland, or without either tool, the session opens in the current window too.
 - **A new window** (for example, pressing Enter in the panel of a regular `claude` session, which can't be switched in place) opens with `$TERMINAL` if it's a known one, else `x-terminal-emulator`, GNOME Terminal (`gnome-terminal`, `kgx`, `ptyxis`), Konsole, Xfce Terminal, kitty, Alacritty, WezTerm, foot, Tilix, Terminator or xterm, whichever is found first.
 
 | Feature | On Linux |

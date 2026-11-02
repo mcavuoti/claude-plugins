@@ -24,7 +24,10 @@ the desktop (X11 or Wayland) and the terminal app.
    switches to that session.
 8. **Another window:** open a second terminal with `ccc --new`, open the other session there. From the first window,
    Enter on that session. X11 with `wmctrl` or `xdotool`: the second window comes forward. Otherwise: the first window
-   shows it too.
+   shows it too. The match is by the whole window title: name a session after a word in another window's title (open a
+   browser tab whose title holds it) and check that Enter on it never brings that other window up. If your terminal
+   adds to the title the launcher sets (`<name> — Konsole`), the window isn't found and the session opens here: note
+   which terminal.
 9. **New window:** in a plain `claude` session (no launcher), Enter on a background session: a new terminal window opens
    showing it. If not, the panel says it couldn't (check `$TERMINAL` and that one of the listed terminals is installed).
 10. **Restart your own session (`u` on your row):** the window comes back to it and says "Restarted".
