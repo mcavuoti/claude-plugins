@@ -1,12 +1,14 @@
 # fleet
 
-A Claude Code mod, turned on per project, for running a project as a fleet of permanent background sessions. In 0.3.0 it does five things:
+A Claude Code mod, turned on per project, for running a project as a fleet of permanent background sessions. In 0.4.0 it does seven things:
 
 - **a roster**: a project lists its roles and instances in `roster.json` (a template writes the first one), and `/fleet up` starts the instances that aren't running, each as a background session of its role's agent file, with its own settings, budget and place in the panel; each one seeds itself, and a chief interviews you and drafts the charter ([below](#the-roster-fleet-up));
 - a background session that needs your decision asks it without stopping, keeps working on what doesn't depend on it, and gets your answer later; you answer from any session of the project, with a slash command that spends no tokens;
 - the files the sessions share (the world: notes, plans, specs) behave like code with a compiler: a session's write of a shared file that changed since it read it is refused once, with who changed it and when, and a session hears at its next step that something it read has changed. No session has to remember to read a log ([below](#shared-files-changed-since-you-read-it));
 - shared files others rely on can be records with versions: a work item cites what it relied on as `R-12@4`, and when R-12 is revised the work item turns suspect, the session that wrote it hears it, and a landing that cites the old version without having read the new one is refused once. One session sweeps the project every minute: the suspects, the project's own check scripts, and, if you want, a commit of the shared files ([below](#records-and-pins));
-- **the command-level files** (the charter, the roster, `world.json`, the role files, the check scripts, and the records a template marks as requirements) are never written by an instance's own tools: an instance drafts a change, you read its diff, and `fleet` writes it once you apply it, if the file is still as it was drafted on ([below](#changes-to-command-level-files)).
+- **the command-level files** (the charter, the roster, `world.json`, `outbound.json`, the role files, the check scripts, and the records a template marks as requirements) are never written by an instance's own tools: an instance drafts a change, you read its diff, and `fleet` writes it once you apply it, if the file is still as it was drafted on ([below](#changes-to-command-level-files));
+- **nothing of the project leaves without you**: in a background session, a call that would send its content to a third party (a message, a post, an upload, a push to a remote you haven't allowed) is refused, and the session drafts it with `mcp__fleet__send`; you read exactly what would go out in `/fleet` and answer `send`, and `fleet` sends it once, as you saw it. Your own hosts, remotes and addresses go in `outbound.json` ([below](#nothing-leaves-without-you-outbound));
+- **who may command, and how the fleet keeps its pace**: a session that read a web page or an outside service's result is marked until `/clear`, and a change it files waits for you; a change you ask for yourself, typing in a clean session, is applied as it's filed; licenses, access and hardware are asked apart (`resource`); an instance that lands nothing in its cadence period is marked and nudged once, most roles start each period afresh from their journal, and `/fleet brief` gives you the project at a glance ([below](#who-may-command-outside-content-and-your-own-word)).
 
 It builds on [`sessions`](../sessions/README.md) (0.12.0 or newer): `fleet` starts, wakes, places and marks sessions through its API for other plugins.
 
@@ -36,7 +38,7 @@ D-3 goes to Data pipeline when it's idle
 
 Tested on macOS with Claude Code 2.1.316. It has no code that differs by system, so it runs on Linux unchanged.
 
-**Light by design.** The one thing `fleet` blocks is an instance's own tools writing a command-level file (its settings deny it). Everything else marks or flags and holds nothing: a stale write is refused once and passes after a read, a Bash write is recorded after the fact, a budget used up stops new helpers and wakes but never a turn or another tool. There is no sandbox and no zone unless a roster asks for one.
+**Light by design.** Two things block: an instance's own tools writing a command-level file (its settings deny it), and the one hard line, the project's content leaving to a third party from a background session without your approval (sending it to Claude's servers is fine: the models run there). Everything else marks or flags and holds nothing: a stale write is refused once and passes after a read, a Bash write is recorded after the fact, reading the web marks the session, a quiet instance is marked and nudged, a budget used up stops new helpers and wakes but never a turn or another tool. There is no sandbox and no zone unless a roster asks for one, and the models' own guardrails do the rest.
 
 ## Install
 
@@ -141,7 +143,7 @@ Running it again only adds what's missing and brings `.gitignore` in line with `
 ```
 
 - **A role** is a native agent file, `<project>/.claude/agents/<agent>.md`: its body is the role's charter (it replaces Claude Code's own system prompt for that session), its front matter its `name` and `tools`. The tools must list `mcp__fleet__*`, or `fleet`'s tools are hidden from it (and its start holds 8 s).
-- **An instance** is one background session of a role. Its own fields win over its role's: `model`, `effort`, `budget.usdDay`, `cadenceH` (kept for a later release), `seed` (default `seeds/<role>.md`), `permissions` (`defaultMode`, `allow`, `ask`, `deny`) and `settings` (any other settings for its session: env, plugins, `worktree`…; the roster's top-level `settings` go to every instance). `section` and `parent` place it in the panel (one level: a parent's children are drawn under it); `wave` says when `/fleet up --wave n` starts it; `brief` goes with its seed.
+- **An instance** is one background session of a role. Its own fields win over its role's: `model`, `effort`, `budget.usdDay`, `cadenceH` (it lands something every that many hours: [below](#cadence-and-fresh-periods)), `context` (`fresh`, the default: a new conversation each cadence period, handed its journal; `long`: one conversation, for the chief, the integrator and the leads), `journal` (default `journals/{slug}.md`, a shared file; never under `.claude/`, where every write asks and nobody would answer), `seed` (default `seeds/<role>.md`; `{name}`, `{slug}`, `{journal}`, `{role}` and `{root}` are filled in), `permissions` (`defaultMode`, `allow`, `ask`, `deny`) and `settings` (any other settings for its session: env, plugins, `worktree`…; the roster's top-level `settings` go to every instance). `section` and `parent` place it in the panel (one level: a parent's children are drawn under it); `wave` says when `/fleet up --wave n` starts it; `brief` goes with its seed.
 - **`zones`** (optional, off unless a roster has them): named sets of `permissions` and `settings` a role or an instance takes with `"zone": "<name>"`.
 - **`budget.usdDay`** at the top is the project's cap; **`wakes`** coalesce the nudges and wakes ([below](#budgets-and-wakes)).
 
@@ -154,12 +156,12 @@ Running it again only adds what's missing and brings `.gitignore` in line with `
 
 What each instance does when it starts (its own `fleet`):
 
-- **binds**: its name from its settings (`FLEET_INSTANCE`), its role from the agent it runs as; its conversation starts with who it is, what it can't write, and its budget (again after `/clear` and compaction);
-- **writes a heartbeat** every 30 s (`<project>/.claude/fleet/instances/<slug>/state.json`) with its spend;
+- **binds**: its name from its settings (`FLEET_INSTANCE`), its role from the agent it runs as; its conversation starts with who it is, what it can't write, that nothing leaves without you, where its journal is, its cadence and its budget (again after `/clear` and compaction);
+- **writes a heartbeat** every 30 s (`<project>/.claude/fleet/instances/<slug>/state.json`) with its spend, its last landing and its conversation's start;
 - **seeds itself once** per session: a prompt of `fleet`'s own (never typed as yours) from its role's seed and its brief;
 - **sits in its section**, under its parent once the parent's `fleet` runs, and in "Asking you" while it waits on you.
 
-The sweeper marks the instances' rows in every panel: **✗ "no fleet in this session: u in the panel restarts it"** for one running with no heartbeat for 90 s (an old pre-started process that came up without the mod), **$** near or past its budget, **↓** for one you took down that still runs.
+The sweeper marks the instances' rows in every panel: **✗ "no fleet in this session: u in the panel restarts it"** for one running with no heartbeat for 90 s (an old pre-started process that came up without the mod), **$** near or past its budget, **◷** for one that landed nothing in its cadence period, **↓** for one you took down that still runs. Without its `fleet` an instance isn't held by the outbound gate either: restart a ✗ row.
 
 | Command | Does |
 |---|---|
@@ -168,9 +170,55 @@ The sweeper marks the instances' rows in every panel: **✗ "no fleet in this se
 | `/fleet worktrees [prune [--yes]]` | the linked worktrees under `<project>/.claude/worktrees/`, which instance works in each; `prune --yes` runs `git worktree remove` on those no instance is in (git refuses one with changes not committed) |
 | `/fleet budget [name\|project] [amount\|+n]` | today's spend and caps; sets or raises one for today ([below](#budgets-and-wakes)) |
 
+## Nothing leaves without you: outbound
+
+The one hard line: the project's content doesn't go to a third party unless you approve it. Sending it to Claude's servers is fine (that's where the models run), and so is anything that stays on this machine or goes to the hosts, remotes and addresses you allow.
+
+- **Held**, in a background session of the project (your own sessions keep Claude's permission prompts, since you're at them): an MCP tool whose name has a verb that writes (send, post, create, upload, reply…), and any tool of an outside service (claude.ai's connectors to others, such as mail, files and calendars, and the browser) that doesn't only read, unless every recipient it names is yours; and in a Bash command (each part of a pipeline or list, `$( )`, `bash -c`, a here-document a shell reads, and what `ssh` runs on the other side): `curl` and `wget` with data or an upload, `scp`, `rsync` and `sftp` to a host, `ssh` to a host, `git push` to a remote, `git send-email`, `gh`'s create, comment, edit, upload and review (and `gh api` with a method or fields), `mail`, `sendmail` and `nc`. Claude's own connectors (claude.ai's documents) are Claude's servers, so they pass.
+- **Free**: reading the web (WebFetch, WebSearch, `curl` without data: it marks the session, [below](#who-may-command-outside-content-and-your-own-word)), this machine (`localhost`), and whatever `outbound.json` allows. A program or script that sends by itself isn't seen: the models' own guardrails and your permission settings are the rest.
+- **The way through.** The refusal tells the model to draft it with **`mcp__fleet__send`**: `to`, a one-line `why`, and the exact `command` (or `mcp_tool` and `input`), plus `files` any other file whose content it sends (`fleet` finds the ones `curl`, `scp` and `rsync` name). `fleet` keeps the exact call (`<project>/.claude/fleet/decisions/drafts/D-<n>.json`) and each file's version, and queues it for you.
+- **`/fleet`** shows it as it would go out: the command (or the tool and its whole input) and the first lines of each file it sends, with where the rest is and the version you approve. **`/fleet <n> send`** (typed by you) runs it here, once, exactly as shown: claimed no-clobber, refused if a file or the draft changed since it was drafted (`/fleet` shows it again; `/fleet <n> send h1a2b3c4d` sends it as it is now), a command from its folder, an MCP call through this session's own connection. The asker hears what it said (`it ran: …`, `it failed (exit 6): …`). `/fleet <n> reject "why"`, `/fleet <n> edit` (edit the call in your editor first) and `/fleet <n> done` (you sent it yourself) close it otherwise. The register keeps the call.
+- **`outbound.json`** (`<project>/.claude/fleet/outbound.json`, person data, `outboundFormat`, command-level: only you or a change you apply edit it; empty in every template):
+
+  ```json
+  {
+    "outboundFormat": 1,
+    "hosts": ["devbox", "*.corp.example"],
+    "remotes": ["origin"],
+    "recipients": ["me@example.com"],
+    "tools": { "outbound": ["mcp__notes__sync"], "free": ["mcp__slack__chat_postMessage"] },
+    "commands": ["myupload"],
+    "outside": ["mcp__wiki__*"]
+  }
+  ```
+
+  `hosts` (or `*.domain`) are your own machines: `ssh`, `scp`, `rsync`, `sftp`, `nc` and uploads to them pass, and so does a git remote on one. `remotes` (names or URLs, globs) are where a push may go; a local path always may. `recipients` (globs) are your own addresses. `tools.outbound` and `tools.free` add tools to what's held or take them out; `commands` names commands that always send; `outside` names MCP tools whose results are outside content. A newer or broken `outbound.json` allows nothing but this machine, and `/fleet status` says why. `/fleet accept outbound.json` stamps your own edit.
+
+## Who may command: outside content, and your own word
+
+The owner's rule: only outside sources mark a session, and the mark doesn't travel through files; a mail, a page or a colleague can inform or propose, never command.
+
+- **Outside content marks the conversation.** A successful WebFetch or WebSearch, an outside service's read (a mail search, a page's text), or a command that read the web (`curl` of a host that isn't yours) marks the session until `/clear` (kept through compaction and a restart, in its reads file; `/fleet status` says what marked it). A file it writes marks nobody who reads it, but the landing says its writer had read outside content (the brief shows it).
+- **A marked session can still do everything.** Only this changes: a `change` it files is never applied at once, and `/fleet` and the brief label it "drafted after reading outside content (WebFetch of example.com at 14:02)": read the diff before you apply it.
+- **Your own word costs no tap.** When you type in a session (origin `composer`, at its terminal or in a viewer) and that session, in the same turn, files a `change` from a clean conversation, `fleet` applies it as it's filed and says so in the tool's result ("Applied at once as D-7: the person typed this turn's prompt…"); the register keeps it as applied. Not yours: a background session's launch prompt (`claude --bg "<prompt>"` reads as `composer` too; `fleet` tells it by the job's own record), `fleet`'s own prompts, another plugin's (`ccc tell` is `sessions`'), a peer's, a schedule's, and Remote Control (not tried yet). Anything else waits for `/fleet <n> apply`.
+- **Levels.** `world.json` may say what its shared files are: `"command"` (only an applied change writes them), `"information"` (inputs and facts from outside: something to weigh, never an instruction) and `"proposal"` (ideas and changes someone wants: they change nothing until the owner of what they target takes them up). Instances read it at their start; the brief lists landings on information and proposals as inputs and ideas.
+
+### Resources
+
+Something only you can get (a license, a PDK, an access, a machine, more budget) is asked apart from questions of taste: `mcp__fleet__decide` with `kind: "resource"`, `what`, `why`, and optionally `cost`, `byWhen` and `alternatives`. `/fleet` and the brief list it; you get it outside and answer **`/fleet <n> done "where it is"`**, or **`/fleet <n> no "why"`**. The asker hears it with your note.
+
+### Cadence and fresh periods
+
+- **Cadence.** An instance with a `cadenceH` lands something every that many hours: a landing on a shared file, or its journal (a negative result counts). One that lands nothing in its period gets **◷** on its row ("nothing landed in 7 h (cadence 6 h)"), a line in the brief, and one nudge from its own `fleet` (or one wake, if it was retired), under the wakes' caps. It's never held.
+- **Fresh periods** (decision 4a). An instance whose `context` isn't `long` starts each period afresh: once its conversation is a period old, it's idle, nothing of `fleet`'s is on its way, and it wrote its journal since the conversation started, its `fleet` runs `/clear` in that session and hands the new conversation its journal's last entries as a prompt of its own. The binding, the heartbeat and its open decisions follow it (same short id, new session id); the conversation is clean again (no outside mark). The chief, the integrator and the leads keep long contexts in the templates.
+
+### `/fleet brief`
+
+The project at a glance, computed from its files at no token cost, always in this order: **what needs you** (questions, changes, resources, outbound drafts, with who and since when); **what changed** in the last 24 hours and who changed it (the newest landing per shared file, command-level first; the changes applied and what went out; whether a writer had read outside content); **what's blocked or stale** (decisions holding something up, suspect files, failing checks, instances quiet past their cadence, running with no fleet, down, or behind on files they read); **the spend** (today's estimate per instance and the project against the caps, the forecast, and this account's windows on a subscription); **inputs and ideas** (landings on information and proposals). `/fleet brief --chief` (typed by you, with a chief in the roster) adds at most five lines from one model call with the chief's role file and the charter over the brief; the chief's own session isn't touched.
+
 ## Changes to command-level files
 
-The command-level files change only when `fleet` writes a change you approved. They are `<project>/.claude/fleet/charter.md`, `roster.json` and `world.json`, the role files in `<project>/.claude/agents/`, the check scripts `world.json` names, and the records `world.json` lists under `"command"` (`"command": ["req/**"]` in the `proposal` template).
+The command-level files change only when `fleet` writes a change you approved. They are `<project>/.claude/fleet/charter.md`, `roster.json`, `world.json` and `outbound.json`, the role files in `<project>/.claude/agents/`, the check scripts `world.json` names, and the records `world.json` lists under `"command"` (`"command": ["req/**"]` in the `proposal` template). A change you ask for yourself, typing in a clean session, is applied as it's filed ([above](#who-may-command-outside-content-and-your-own-word)); every other one waits for your apply.
 
 - **Filing.** An instance calls `mcp__fleet__decide` with `kind: "change"`, the `path`, a one-line `summary`, and `edits` (`old_string` → `new_string`, as with Edit) or the whole `content`. `fleet` checks the path is command-level, applies the edits to the file as it is now, checks that a roster or a world draft parses, and keeps the draft and a line diff in `<project>/.claude/fleet/decisions/drafts/`. The ticket says nothing changes until you apply it.
 - **Its own tools are refused** on those files, every time, with how to file a change instead (its settings deny them too, so it holds even where `fleet` didn't load).
@@ -194,8 +242,10 @@ In a background session (`claude --bg`, or one started from the panel or `ccc`) 
 
 - 1 to 4 questions, each with 2 to 4 options, the option it recommends and one line on why, and optionally what waits on the answer (`blocks`);
 - it answers at once: `Queued as D-3 for the person … The answer arrives later as a message from the fleet plugin that starts with [D-3]`, and the model goes on with what doesn't depend on it, or ends its turn;
-- with `kind: "change"` it files a change to a command-level file instead ([above](#changes-to-command-level-files));
+- with `kind: "change"` it files a change to a command-level file instead ([above](#changes-to-command-level-files)), and with `kind: "resource"` a request for something only you can get ([above](#resources));
 - a subagent can't use it ("put the question in your report to the main thread"), and a bad call (an option recommended that isn't one of the options, no reason) is refused with what to fix.
+
+It gets **`mcp__fleet__send`** too: the draft of anything that would send the project's content outside, for you to approve ([above](#nothing-leaves-without-you-outbound)).
 
 A regular session (plain `claude`, with you at the keyboard) doesn't get the tool: there the model asks with AskUserQuestion, and `fleet` records your answer (below).
 
@@ -209,6 +259,9 @@ In any session of the project, typed by you (`fleet` takes answers only from you
 | `/fleet 1a 2b` | answers questions 1 and 2 (also `1) a 2) b`, `1a, 2b`, `1a2b`) |
 | `/fleet 3 "your words"` | answers in your own words |
 | `/fleet 4 apply` | applies the change of item 4 as drafted (`4 reject`; `4 edit` says where the draft is, and `4 apply <version>` applies your edited draft) |
+| `/fleet 5 done "note"` | you got what item 5 (a resource) asks for; `5 no "why"` if not |
+| `/fleet 6 send` | sends the outbound of item 6 exactly as shown (`6 send <version>` after an edit or a change; `6 reject "why"`; `6 edit`; `6 done` if you sent it yourself) |
+| `/fleet brief [--chief]` | the project at a glance ([above](#fleet-brief)) |
 | `/fleet note 1 <text>` | adds a note for whoever asked question 1, delivered with the answer |
 | `/fleet drop 1 [why]` | drops the decision of question 1 without answering it (also `/fleet drop D-3`): the asker is told to go on as it thinks best |
 | `/fleet status` | what `fleet` does in this session: the project, whether `decide` is offered here and why not, `sessions`' API, the counts; the shared files, the last changes to them, and which session read a version that has changed since; the roster's instances (running, their `fleet`, seeded, spend and wakes today, settings changed since they started), the command-level files changed outside fleet; the records, the suspect files, the checks and what fails them, the sweeper and the world commits |
@@ -360,15 +413,18 @@ Once a day the first session to get there closes the decisions of sessions gone 
 plugins/fleet/
 ├── .claude-plugin/plugin.json   name, version, the sessions dependency, where the state types are
 ├── hooks/hooks.json             which module Claude loads
-├── hooks/register.tsx           the mod: decide, /fleet, delivery, the recorder, the band, the section, the prune; the gate, the reads, the events, the scans, the digest; the roster, /fleet up, instances (binding, heartbeat, seed, nudges, budget), the change decision applied, the sweeper's marks and wakes
+├── hooks/register.tsx           the mod: decide, /fleet, delivery, the recorder, the band, the section, the prune; the gate, the reads, the events, the scans, the digest; the roster, /fleet up, instances (binding, heartbeat, seed, nudges, budget, cadence, fresh periods), the change decision applied (or as filed), the sweeper's marks and wakes; the outbound gate and mcp__fleet__send, outside marks, whose prompt it is, resources, /fleet brief
 ├── hooks/decisions.ts           pure logic: records and their files, decide's input, the /fleet grammar, the texts (tested)
 ├── hooks/changes.ts             pure logic of the shared files: world.json, globs, placing a path, versions, events, the gate's and the digest's words (tested)
 ├── hooks/records.ts             pure logic of records: ids, pins, change kinds, whether a pin is current, the gate's and the post-scan's verdict on pins, suspects, check results, the lease, the commit, worktree copies (tested)
-├── hooks/roster.ts              pure logic of the roster: roster.json, instances, the lints, the generated settings and their denies, the forecast, budgets, wakes (tested)
+├── hooks/roster.ts              pure logic of the roster: roster.json, instances, the lints, the generated settings and their denies, the forecast, budgets, wakes, cadence, fresh periods and the hand-off (tested)
 ├── hooks/drafts.ts              pure logic of the change decision: its input, edits, the line diff, the checks before applying, the words (tested)
+├── hooks/outbound.ts            pure logic of the outbound gate: outbound.json, what an MCP call or a Bash line sends outside (a small shell tokenizer), mcp__fleet__send's input and draft, the words (tested)
+├── hooks/authority.ts           pure logic of who may command: the person's origins, a launch prompt, outside marks, levels, changes applied as filed, the resource kind (tested)
+├── hooks/brief.ts               pure logic of /fleet brief: its five sections and the chief's lines (tested)
 ├── templates/<name>/            blank, solo, software, proposal: template.json, fleet/ and agents/, copied by /fleet init
 ├── types/index.d.ts             fleet's state ($.state)
-└── tests/                       decisions, changes, records, roster and drafts tests (pure); fleet, gate, pins, up and instance tests (the mod, with a stand-in for sessions typed by its contract and for the engine's file tools and shell); world.tsx
+└── tests/                       decisions, changes, records, roster, drafts, outbound and brief tests (pure); fleet, gate, pins, up, instance, authority and cadence tests (the mod, with a stand-in for sessions typed by its contract and for the engine's file tools and shell); world.tsx
 ```
 
 What it writes, all in the project (`fleet` keeps no store and nothing in your home folder): in `<project>/.claude/fleet/`, and on `/fleet init` the role files in `<project>/.claude/agents/` and the template's folders, never over a file that's there.
@@ -376,17 +432,18 @@ What it writes, all in the project (`fleet` keeps no store and nothing in your h
 | Path | What | Version |
 |---|---|---|
 | `config.json` | the template, `commitRegister` | `configFormat` (person data: only gains fields) |
-| `world.json` | the shared files' globs; `"command"`, the command-level records | `worldFormat` (person data) |
+| `world.json` | the shared files' globs; `"command"`, the command-level records; `"information"` and `"proposal"`, the other levels | `worldFormat` (person data) |
+| `outbound.json` | the hosts, remotes and recipients you allow; the tools and commands that send, or don't; the tools whose results are outside content | `outboundFormat` (person data) |
 | `roster.json` | roles, instances, sections, budgets, wakes, settings | `rosterFormat` (person data) |
 | `charter.md`, `interview.md`, `seeds/<role>.md` | the project's charter (command-level), the chief's interview, each role's first prompt | the template's |
-| `<project>/.claude/fleet/decisions/queue/D-<n>.json` | an open decision (a choice, or a `change` with its path, summary and versions), written once by the session that asked | `format` |
+| `<project>/.claude/fleet/decisions/queue/D-<n>.json` | an open decision (a choice; a `change` with its path, summary and versions; a `resource`; an `outbound` with where, why, its files' versions and the version you approve; with what outside content its asker had read), written once by the session that asked | `format` |
 | `<project>/.claude/fleet/decisions/answers/D-<n>.<q>.json`, `….note.json`, `D-<n>.drop.json` | answers (no-clobber: the first wins), notes, drops | `format` |
-| `<project>/.claude/fleet/decisions/drafts/D-<n>.<ext>`, `D-<n>.diff`, `<project>/.claude/fleet/decisions/applied/D-<n>.json` | a change's draft and its diff, written once; its claim when you apply it (no-clobber: applied once) | `format` (the claim) |
-| `<project>/.claude/fleet/decisions/register/<YYYY-MM>/<id>.json` | closed decisions and recorded dialogs | `registerFormat` (person data) |
+| `<project>/.claude/fleet/decisions/drafts/D-<n>.<ext>`, `D-<n>.diff`, `D-<n>.json`, `<project>/.claude/fleet/decisions/applied/D-<n>.json` | a change's draft and its diff, an outbound's exact call, written once; the claim when you apply or send it (no-clobber: once) | `format` (the claim) |
+| `<project>/.claude/fleet/decisions/register/<YYYY-MM>/<id>.json` | closed decisions (an outbound's call with them) and recorded dialogs | `registerFormat` (person data) |
 | `<project>/.claude/fleet/decisions/last`, `<project>/.claude/fleet/decisions/prune/<day>`, `<project>/.claude/fleet/decisions/tmp/` | the last number handed out, the daily prune's marker, files about to be put in place | `format` |
 | `<project>/.claude/fleet/events/<YYYY-MM-DD>/<HH>/<ms>-<session>-<n>.json` | one landing on a shared file (UTC hours), written once by the session that saw it; removed after 7 days | `format` |
 | `<project>/.claude/fleet/events/latest`, `<project>/.claude/fleet/events/claims/` | the last event's name, which every session watches; outside changes claimed no-clobber, so one session records each | `format` |
-| `<project>/.claude/fleet/reads/<session id>.json` | what that session's threads read of the shared files, written only by it (for `/fleet status` elsewhere and after a restart) | `format` |
+| `<project>/.claude/fleet/reads/<session id>.json` | what that session's threads read of the shared files, and the outside content its conversation read, written only by it (for `/fleet status` elsewhere and after a restart) | `format` |
 | `<project>/.claude/fleet/state/revs/<id>/<n>.json` | version n of a record: its file's version, the kind, who, the pins it cites, a blind landing's suspect pins, the stale pins kept on purpose; written once (no-clobber: the first wins, the next landing takes n+1) | `format` |
 | `<project>/.claude/fleet/state/suspects.json` | the suspect files and why, with who wrote each last; written by the sweeper | `format` |
 | `<project>/.claude/fleet/state/checks/<hash>.json`, `<project>/.claude/fleet/state/checks-stamp.json` | the last results of the checks on one file, by its version (the last run wins); the checks you stamped | `format` |
@@ -394,9 +451,11 @@ What it writes, all in the project (`fleet` keeps no store and nothing in your h
 | `<project>/.claude/fleet/state/stamps.json` | the command-level config files' versions as `fleet` wrote them or you stamped them (the last write wins) | `format` |
 | `<project>/.claude/fleet/state/lifts.json`, `<project>/.claude/fleet/state/down.json`, `<project>/.claude/fleet/state/wakes.json` | today's budgets you set; the instances you took down; the sweeper's wakes today | `format` |
 | `<project>/.claude/fleet/instances/<slug>.json` | an instance's `--settings` file, written by `/fleet up` | generated |
-| `<project>/.claude/fleet/instances/<slug>/state.json`, `spend.json`, `nudges.json`, `seed-<ref>.json` | its heartbeat, today's spend, its nudges today, its seed sent; written only by its own `fleet` | `format` |
+| `<project>/.claude/fleet/instances/<slug>/state.json`, `spend.json`, `nudges.json`, `seed-<ref>.json` | its heartbeat (with its last landing, when it started and its conversation's start), today's spend, its nudges today (and the cadence period it was nudged for), its seed sent; written only by its own `fleet` | `format` |
 
-A session whose `fleet` meets another `format` (a session still on an older or newer version) acts on nothing and says to restart (`u`); a `config.json`, `world.json` or `roster.json` from a newer `fleet` is left untouched (a newer roster: `/fleet up` refuses it), and a decision of a kind it doesn't know is listed apart and never answered. The rules: [`.claude/rules/fleet-wire-format.md`](../../.claude/rules/fleet-wire-format.md).
+An instance's journal is the project's own file (`journals/<slug>.md` by default), written by the instance with its own tools.
+
+A session whose `fleet` meets another `format` (a session still on an older or newer version) acts on nothing and says to restart (`u`); a `config.json`, `world.json`, `roster.json` or `outbound.json` from a newer `fleet` is left untouched (a newer roster: `/fleet up` refuses it; a newer `outbound.json` allows nothing but this machine), and a decision of a kind it doesn't know is listed apart and never answered (a `fleet` older than 0.4.0 meets `resource` and `outbound` so). The rules: [`.claude/rules/fleet-wire-format.md`](../../.claude/rules/fleet-wire-format.md).
 
 ## Turning it off
 
@@ -409,8 +468,10 @@ In a project: `claude plugin disable fleet@mcavuoti --scope local` (or remove th
   claude --bg --model claude-haiku-5-5 --settings '{"env":{"CLAUDE_CODE_PLUGIN_DIRS":"/path/to/claude-plugins/plugins/sessions:/path/to/claude-plugins/plugins/fleet","SESSIONS_DATA_DIR":"/tmp/t/data","SESSIONS_JOBS_DIR":"/tmp/t/jobs","SESSIONS_DAEMON_LOG":"/tmp/t/daemon.log"},"enabledPlugins":{"sessions@inline":true,"fleet@inline":true,"sessions@mcavuoti":false}}' -n "TEST A" "<a prompt that calls mcp__fleet__decide>"
   ```
   Attach another test session in `dev/sessions/hidden-terminal.py` to type `/fleet` there, and clean up with `dev/sessions/clean-test-sessions.sh <folder>`. With `--debug-file`, every step shows in Claude's debug log as `fleet: …` (`D-3 queued`, `delivering D-3`, `D-3 closed: delivered (turn …)`; for the shared files `notes/plan.md: tool (Edit)`, `refused once: Edit of notes/plan.md by main (stale)`, `digest to main: notes/plan.md`, `notes/plan.md: bash (Bash), landed blind`; for records `refused once: Write of board/B-3.md by main (pins R-1@1 stale)`, `board/B-2.md: landed blind citing R-1@1:stale, R-2@1:unread: suspect`, `flags to main: board/B-1.md`, `sweeper: this session`, `suspects: board/B-2.md`, `check board.sh on 1 file(s): failed board/B-2.md`, `world commit: fleet: world 2026-11-02 00:35 (1 file(s))`).
-- **A TEST fleet.** The instances `/fleet up` starts get only their settings file, not your test session's `--settings`, so the roster carries the same thing for them: in the copied `roster.json`, `"settings": { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "…/sessions:…/fleet", "SESSIONS_DATA_DIR": "…", "SESSIONS_JOBS_DIR": "…", "SESSIONS_DAEMON_LOG": "…" }, "enabledPlugins": { "sessions@inline": true, "fleet@inline": true, "sessions@mcavuoti": false } }`, and a cheap model on every role (`"model": "claude-haiku-5-5"`); then `/fleet accept roster.json`. Without them an instance would load the installed `sessions`, and its real files. `/fleet status` shows each instance's heartbeat; `<project>/.claude/fleet/instances/<slug>/state.json` says how it bound (`boundBy: env`) and as which agent. The steps show in the person's session's debug log as `fleet: start Owner A: queued`, `marks: <ref>`, `woke <name> (…)`, `<D-n> applied: <path>`, `<D-n> not applied: <path> moved`; and in an instance's (when it has one) `instance Owner A (owner)`, `seed for Owner A`, `nudge to Owner A`, `refused a helper: over budget`. Clean up with `dev/sessions/clean-test-sessions.sh <folder>`, which stops the instances too.
+- **A TEST fleet.** The instances `/fleet up` starts get only their settings file, not your test session's `--settings`, so the roster carries the same thing for them: in the copied `roster.json`, `"settings": { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "…/sessions:…/fleet", "SESSIONS_DATA_DIR": "…", "SESSIONS_JOBS_DIR": "…", "SESSIONS_DAEMON_LOG": "…" }, "enabledPlugins": { "sessions@inline": true, "fleet@inline": true, "sessions@mcavuoti": false } }`, and a cheap model on every role (`"model": "claude-haiku-5-5"`); then `/fleet accept roster.json`. Without them an instance would load the installed `sessions`, and its real files. `/fleet status` shows each instance's heartbeat; `<project>/.claude/fleet/instances/<slug>/state.json` says how it bound (`boundBy: env`) and as which agent. The steps show in the person's session's debug log as `fleet: start Owner A: queued`, `marks: <ref>`, `woke <name> (…)`, `<D-n> applied: <path>`, `<D-n> not applied: <path> moved`, `D-1 sent: curl sending data (…)`; and in an instance's `instance Owner A (owner)`, `seed for Owner A`, `nudge to Owner A`, `cadence nudge to Owner A (3 min since its last landing)`, `fresh period for Owner A: /clear, then its journal (journals/owner-a.md)`, `held: Bash sending outside (curl sending data (notes/x.md) to example.invalid) by main`, `D-1 queued: an outbound (…)`, `outside content: WebFetch of example.com; …`, `prompt from composer: the person` (or `prompt from composer, the launch prompt (not the person)`, `prompt from plugin sessions`), `D-7 applied as filed: the person typed this turn`, `refused a helper: over budget`. An instance's debug log: turn on `sessions`' **Debug logs for new sessions** in the test session's `--settings` (`"pluginConfigs": {"sessions@inline": {"options": {"debugLogs": true}}}`), and the sessions `/fleet up` starts write `<SESSIONS_DATA_DIR>/debug/<name>.log`. Clean up with `dev/sessions/clean-test-sessions.sh <folder>`, which stops the instances too.
+- **TEST permissions.** An instance with no viewer that hits a permission prompt waits for nobody: give a TEST role `"permissions": { "defaultMode": "dontAsk", "allow": [ … ] }` (what isn't allowed is refused instead of asked). Under `~/.claude` every write is a "sensitive file", so a TEST instance writes nothing there; write its journal yourself to try a fresh period. `.invalid` hosts (`example.invalid`) never resolve, so an approved TEST outbound sends nothing anywhere.
 - A test folder that is a repository's root isn't covered by the trust of the folder above it: `claude --bg` there exits with "Workspace not trusted", and accepting that prompt is yours. To try the world commit in a test folder, keep the repository's git folder outside it (move `.git` away, set its `core.worktree` to the folder, and put `"GIT_DIR": "<it>"` in the test sessions' `--settings` env): `fleet`'s commands follow `GIT_DIR`, while Claude itself then sees no repository, so worktree isolation can't be tried that way.
 - A test folder under `~/.claude` makes every Write and Edit there a "sensitive file": `claude -p` refuses them whatever the allow rules, and a session asks (auto mode lets them through). Headless probes of the gate run from a folder outside it.
-- After every change: `claude plugin validate plugins/fleet` and `claude plugin test plugins/fleet`; `dev/fleet/ci.sh` checks that `fleet` only calls `sessions`, runs every command from a folder that exists, and that each template is whole (`dev/fleet/check-templates.py`: its JSON, a role file with `fleet`'s tools for every role, a seed, sections and parents that exist).
+- After every change: `claude plugin validate plugins/fleet` and `claude plugin test plugins/fleet`; `dev/fleet/ci.sh` checks that `fleet` only calls `sessions`, runs every command from a folder that exists, and that each template is whole (`dev/fleet/check-templates.py`: its JSON, `outbound.json`, a role file with `fleet`'s tools for every role, a seed, sections and parents that exist, each `context` long or fresh).
+- **What was tried (Claude Code 2.1.316, TEST sessions).** E3: `$.command.run({ command: 'clear' })` from a mod's timer in a `--bg` session runs `/clear` (the transcript shows it), the session gets a new id with the same short id, `SessionStart` re-sends `fleet`'s context, and the prompt submitted right after is the cleared conversation's first turn; `fleet`'s tools stay. H2: a typed prompt in an attached viewer is `composer`; a `claude --bg "<prompt>"` launch prompt is `composer` too, and its job's `state.json` has it as `intent` (its `firstTerminalAt` is set at the launch, so it doesn't tell them apart); `ccc tell` is `plugin` `sessions`; `fleet`'s own prompts never reach its own `prompt.submit` hook. Not tried: Remote Control (`bridge`), a peer's message mid-turn.
 - The tests load a stand-in for `sessions` typed by its contract (`EngineInterface['sessions']`), with the same golden list of methods as `sessions`' own contract test. Type-check with `npx -p typescript@5.6.3 tsc --noEmit -p tsconfig.json` in this folder once a session has loaded it (Claude lays the types, `sessions`' contract included, in `.claude-plugin/types/`).

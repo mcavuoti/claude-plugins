@@ -5,6 +5,7 @@
 //   config.json                          person data (configFormat): the template and whether the register is committed
 //   world.json                           person data (worldFormat): the world, the globs of the shared files (changes.ts)
 //   roster.json                          person data (rosterFormat): roles and instances (roster.ts)
+//   outbound.json                        person data (outboundFormat): what may leave without asking (outbound.ts)
 //   charter.md, interview.md, seeds/     the project's charter, the chief's interview, each role's first prompt (templates)
 //   .gitignore                           written by /fleet init from config.json
 //   decisions/queue/D-<n>.json           wire (format): an open decision, written once by the session that asked
@@ -12,7 +13,9 @@
 //   decisions/answers/D-<n>.<q>.note.json  wire: a note on question q (the last one wins)
 //   decisions/answers/D-<n>.drop.json    wire: the person dropped the decision without answering it
 //   decisions/drafts/D-<n>.<ext>, .diff  a change's draft and its line diff, written once by the session that filed it
-//   decisions/applied/D-<n>.json         wire: a change claimed for applying, published no-clobber (it's applied once)
+//   decisions/drafts/D-<n>.json          an outbound's exact call (a command, or an MCP tool and its input), the same
+//   decisions/applied/D-<n>.json         wire: a change claimed for applying, or an outbound for sending, published
+//                                        no-clobber (it's applied or sent once)
 //   decisions/register/YYYY-MM/<id>.json person data (registerFormat): every closed decision and recorded dialog
 //   decisions/last                       wire: the highest D-<n> handed out (a hint for the next one)
 //   decisions/prune/YYYY-MM-DD           wire: the session that publishes it runs that day's prune
@@ -20,7 +23,8 @@
 //   events/YYYY-MM-DD/HH/<ms>-<sid8>-<n>.json  wire: one landing on a world file, written once by the session that saw it
 //   events/latest                        wire: the last event's name, rewritten by each writer; every session watches it
 //   events/claims/<hash>                 wire: an outside change claimed no-clobber, so one session records it
-//   reads/<sessionId>.json               wire: what that session's threads read of the world, written only by it
+//   reads/<sessionId>.json               wire: what that session's threads read of the world, and the outside content
+//                                        its conversation read, written only by it
 //   state/revs/<id>/<n>.json             wire: version n of the record <id> (records.ts), published no-clobber
 //   state/suspects.json                  wire: the suspect files, written by the sweeper
 //   state/checks/<hash>.json             wire: the last results of the checks on one file (the last run wins)
