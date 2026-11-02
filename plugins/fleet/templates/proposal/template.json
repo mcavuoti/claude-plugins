@@ -3,6 +3,6 @@
   "description": "research and convergence on a proposal: a chief, a requirements owner, researchers, a lead proof of concept with its specialists, testers, a verifier, a janitor, an integrator who owns the proposal and a business-plan owner",
   "folders": ["req", "findings", "board", "poc", "proposal", "plan", "brief", "notes", "journals", "ideas", "inputs", "inputs/intake"],
   "next": [
-    "Next: /fleet up --dry-run (the plan, the lints and the cost), then /fleet up Chief and answer its interview with /fleet as its questions come. It drafts the charter, the roster and the shared files as changes for you to apply (/fleet <n> apply); then /fleet up --wave 1, and later --wave 2 and 3."
+    "Next: /fleet up --dry-run (the plan, the lints and the cost), then /fleet up Chief and answer its interview with /fleet as its questions come. It drafts the charter, the roster and the shared files as changes for you to apply (/fleet <n> apply); then /fleet up --wave 1, and later --wave 2 and 3. The roster gives the instances auto mode (\"settings\" at its top), so they work with nobody at them: /fleet up --dry-run says each one's mode, and marks one that would ask. The chief drafts outbound.json too (your own hosts, the dev machine, remotes and addresses: sends there need no draft); later, /fleet <n> send --allow adds one as it goes. In a git repository, /fleet up --dry-run marks the instances a background session would move into a worktree copy (the README's Worktrees section)."
   ]
 }

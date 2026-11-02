@@ -5,7 +5,8 @@ and holds no credentials: whatever saves the mail files (a mail client's rule, f
 
     python3 mail-folder.py <folder of .eml files> <project folder> [source]
 
-Run it every few minutes from launchd, cron or a systemd timer, for example (crontab):
+Run it every few minutes from a scheduler: on macOS a launchd agent (cron there can't read protected folders, such as
+Mail's, without Full Disk Access), on Linux a systemd timer or cron, for example (crontab):
 
     */5 * * * * /usr/bin/python3 /path/to/project/.claude/fleet/pollers/mail-folder.py /path/to/saved-mail /path/to/project mail
 

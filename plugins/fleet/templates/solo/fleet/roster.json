@@ -9,6 +9,7 @@
     { "name": "Owner B", "role": "owner", "section": "owners", "wave": 1, "brief": "You own the second part of notes/ the charter names." },
     { "name": "Owner C", "role": "owner", "section": "owners", "wave": 1, "brief": "You own the third part of notes/ the charter names." }
   ],
+  "settings": { "permissions": { "defaultMode": "auto" } },
   "budget": { "usdDay": 15 },
   "wakes": { "everyMin": 60, "perDay": 8 }
 }

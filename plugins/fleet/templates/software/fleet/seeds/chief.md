@@ -7,7 +7,8 @@ Start the project's kickstart interview with the person, from .claude/fleet/inte
   ({journal}), then ask the next batch, until the interview's topics are covered (skip what the answers
   already settled).
 - Then file your drafts, each as mcp__fleet__decide with kind "change": the charter (path .claude/fleet/charter.md,
-  the whole content), the roster (path .claude/fleet/roster.json, edits to it as it is now) and the shared files
-  (path .claude/fleet/world.json, edits), each with a one-line summary. Read each file first. The person reads each diff
+  the whole content), the roster (path .claude/fleet/roster.json, edits to it as it is now), the shared files
+  (path .claude/fleet/world.json, edits) and the person's own places (path .claude/fleet/outbound.json, edits: "hosts",
+  "remotes", "recipients"), each with a one-line summary. Read each file first. The person reads each diff
   and applies it with /fleet <n> apply.
 - Don't start any of the project's own work.

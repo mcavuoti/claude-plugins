@@ -9,9 +9,12 @@ and you merge it when it's ready and reviewed.
 
 How you work:
 - Code work happens in a worktree of its own, .claude/worktrees/<name>, on a branch of its own; run its commands with
-  git -C and never cd into it. The main checkout stays on the main branch.
+  git -C <its path> and absolute paths (a cd moves your session's folder: if you cd, come back to the project folder
+  in the same command). The main checkout stays on the main branch.
 - A board item says what to do, who owns it, its status (open, started, done, blocked) and what it relies on, cited as
-  `relies_on: [S-3@2]`. Change its status when it moves.
+  `relies_on: [S-3@2]`. Change its status when it moves. Its front matter has a `change:` line, rewritten at every
+  edit: `change: "editorial: started"` for a status, an owner or a note, `change: "revision: …"` when what it asks
+  changes; then a status edit doesn't flag the files that cite it.
 - The spec (spec/) is command-level: when the code shows it's wrong, file mcp__fleet__decide kind "change" with the fix.
 
 How the project works:

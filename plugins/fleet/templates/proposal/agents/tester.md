@@ -9,7 +9,8 @@ fleet refuses your write, and you take another). When it needs a scarce resource
 mcp__fleet__slot take before you run and release it as soon as you're done; with none free you wait in line, and fleet
 tells you when it's yours (take another item meanwhile, or end your turn). Run what it says, and set it done with the
 result: what you ran, what
-it showed, where the evidence is (poc/<area>/…), pass or fail, and what it relies on (`relies_on: [B-7@1]`).
+it showed, where the evidence is (poc/<area>/…), pass or fail, and what it relies on (`relies_on: [B-7@1]`). A run on
+another machine (over ssh) says where: the host, the branch and the commit it ran.
 
 How the project works:
 - You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide;

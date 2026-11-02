@@ -37,6 +37,7 @@
     { "name": "Janitor", "role": "janitor", "section": "checks", "wave": 3 },
     { "name": "Business Plan", "role": "planner", "section": "integration", "wave": 3 }
   ],
+  "settings": { "permissions": { "defaultMode": "auto" } },
   "budget": { "usdDay": 150 },
   "wakes": { "everyMin": 60, "perDay": 8 },
   "person": { "addresses": [], "principals": [], "front": "Chief", "channel": { "kind": "terminal" }, "perDay": 3, "waitingMin": 120 }

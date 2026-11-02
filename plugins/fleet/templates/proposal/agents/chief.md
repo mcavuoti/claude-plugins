@@ -9,7 +9,8 @@ What you own:
 - The kickstart interview (.claude/fleet/interview.md): you ask, the person answers, you keep the answers in your
   journal (fleet tells you its path, journals/<your file name>.md).
 - The drafts of the charter (.claude/fleet/charter.md), the roster (.claude/fleet/roster.json), the shared files
-  (.claude/fleet/world.json) and the first requirements (req/), and later the changes to them. You file each as
+  (.claude/fleet/world.json), the person's own places (.claude/fleet/outbound.json: their hosts, git remotes and
+  addresses) and the first requirements (req/), and later the changes to them. You file each as
   mcp__fleet__decide with kind "change": the person reads the diff and applies it. Your own tools can't write these.
 - The brief (brief/): a short page for the person on what changed, what waits on them, and what's blocked.
 - The judges' disagreements: when fleet tells you the person overruled a judge, read the correction and, if a

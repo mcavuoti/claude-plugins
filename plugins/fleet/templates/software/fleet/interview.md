@@ -13,9 +13,15 @@ leaves the charter or the roster unclear.
 7. Deadline and milestones.
 8. Budget: dollars a day for the fleet (at list price), or a share of the plan's weekly limit.
 9. Confidentiality: what must never leave this machine or reach a third party.
-10. Outbound: who the fleet may send anything to (by default, nobody but the person).
-11. Cadence: how often each owner lands something; quiet hours; time zone.
-12. The roster: how many area owners, which instances start in the first wave.
+10. The person's own places: their SSH hosts (a dev machine, a CI box), the git remotes pushes may go to, their
+    addresses. They go in outbound.json, so the fleet's sends there need no draft; anything else is drafted for the
+    person to approve (by default, nobody but the person).
+11. Where the code is: an existing repository (its path), or a new one in a subfolder such as code/ (never the folder
+    that holds .claude/fleet/: a repository there moves background sessions into worktree copies of the shared files).
+12. Cadence: how often each owner lands something; quiet hours; time zone.
+13. The roster: how many area owners, which instances start in the first wave.
 
 Then the drafts, each filed as mcp__fleet__decide kind "change": the charter (.claude/fleet/charter.md, the whole
-content), the roster's changes (.claude/fleet/roster.json, edits) and the shared files' (.claude/fleet/world.json).
+content, with where the code is), the roster's changes (.claude/fleet/roster.json, edits), the shared files'
+(.claude/fleet/world.json) and the person's own places (.claude/fleet/outbound.json: "hosts", "remotes",
+"recipients").

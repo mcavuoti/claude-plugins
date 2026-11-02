@@ -19,11 +19,14 @@ leaves the charter or the roster unclear.
 10. Principals: who besides the person may direct the work, and in what scope (a request for a change from a
    principal's address is drafted for the person to confirm; anyone else's is a proposal).
 11. Confidentiality: what must never leave this machine or reach a third party.
-12. Outbound: who the fleet may send anything to (by default, nobody but the person).
+12. The person's own places: their SSH hosts (a dev machine that holds the code and runs simulations), the git remotes
+    pushes may go to, their addresses. They go in outbound.json, so the fleet's sends there need no draft; anything
+    else is drafted for the person to approve (by default, nobody but the person).
 13. Cadence: how often each kind of owner lands something; quiet hours; time zone.
 14. The roster: which roles and how many of each, the areas of the proof of concept, the first wave.
 
 Then the drafts, each filed as mcp__fleet__decide kind "change": the charter (.claude/fleet/charter.md, the whole
 content), the roster's changes (.claude/fleet/roster.json, edits: subscriptions and the person's channel too), the
-shared files' (.claude/fleet/world.json: the tags too), the scarce resources (.claude/fleet/slots.json), and the first
-requirements (req/R-<n>.md, one per file, new files with their whole content).
+shared files' (.claude/fleet/world.json: the tags too), the scarce resources (.claude/fleet/slots.json), the person's
+own places (.claude/fleet/outbound.json: "hosts", "remotes", "recipients"), and the first requirements (req/R-<n>.md,
+one per file, new files with their whole content).

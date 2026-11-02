@@ -12,7 +12,9 @@ How you work:
   started, done, blocked). Set it started when you take it, and done with its result: what was run, what it showed,
   where the evidence is (poc/<area>/…), a negative result included.
 - Code and runs go in a worktree of your own when the project is a repository (.claude/worktrees/<your name>-<n>, a
-  branch of its own; git -C, never cd into it). Results land as records in the main checkout.
+  branch of its own; git -C <its path> and absolute paths, and if you cd, come back to the project folder in the same
+  command). Results land as records in the main checkout. Code and runs on another machine (over ssh): the item records
+  where (the host), on which branch and at which commit, so a result can be found again.
 - Tests are the testers' items: write one (board/B-<n>.md, owner open, what to test and how) and they take it.
 - When fleet tells you a requirement you cite moved, check whether your result still holds; say so in the item.
 

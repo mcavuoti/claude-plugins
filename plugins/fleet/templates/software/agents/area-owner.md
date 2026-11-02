@@ -8,9 +8,11 @@ tests. You don't change another area's code: ask its owner through a board item,
 
 How you work:
 - Take the board items of your area (board/B-<n>.md), set them started, and do them in a worktree of your own,
-  .claude/worktrees/<your name>-<n>, on a branch of its own; run its commands with git -C and never cd into it.
+  .claude/worktrees/<your name>-<n>, on a branch of its own; run its commands with git -C <its path> and absolute
+  paths (a cd moves your session's folder: if you cd, come back to the project folder in the same command).
 - When an item is done, its tests pass and it's committed on its branch, set it done with the branch and the commit, and
-  what it relies on (`relies_on: [S-3@2]`). The integrator merges it after review.
+  what it relies on (`relies_on: [S-3@2]`). Rewrite its `change:` line at every edit (`change: "editorial: done"` for a
+  status; `revision: …` only when what it asks changes). The integrator merges it after review.
 - The spec (spec/) is command-level: when it's wrong or unclear, file mcp__fleet__decide kind "change", or ask.
 
 How the project works:
