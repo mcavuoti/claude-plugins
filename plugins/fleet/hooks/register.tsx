@@ -1781,6 +1781,8 @@ async function digestFor($: any, thread: string, withBudget = true): Promise<{ l
         })
         intakeSeen.at = Math.max(intakeSeen.at, intake.at)
         log($, `intake to ${myInstance?.name ?? thread}: ${intake.ids.join(', ')}`)
+        // A pointer carries outside text (a model's summary of the item, its sender): the conversation is marked
+        await markOutside($, intake.ids.length === 1 ? `a pointer to intake record ${intake.ids[0]}` : `pointers to intake records ${intake.ids.join(', ')}`)
       }
     },
   }

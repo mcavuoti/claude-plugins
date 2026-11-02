@@ -364,7 +364,7 @@ export function pointerText(items: readonly { id: string; path: string; meta: In
     ...shown.map(({ id, path, meta: m }) => {
       const what = m.kind === 'command-claim' ? 'a request for a change' : m.kind === 'information' ? 'information' : m.kind
       const tags = m.tags.length ? `, tags ${m.tags.join(', ')}` : ''
-      const head = `- ${id} (${path}): ${what} from ${m.from || 'an unknown sender'} (${standingWords(m.standing, m.auth)})${tags}${m.urgent ? ', marked urgent' : ''}. Summary by a model: ${m.summary ? JSON.stringify(m.summary) : '(none)'}`
+      const head = `- ${id} (${path}): ${what} from ${m.from ? JSON.stringify(m.from) : 'an unknown sender'} (${standingWords(m.standing, m.auth)})${tags}${m.urgent ? ', marked urgent' : ''}. Summary by a model: ${m.summary ? JSON.stringify(m.summary) : '(none)'}`
       const targets = m.targets.map(t => `${t}${pathOf(t) ? ` (${pathOf(t)})` : ''}`).join(', ') || 'something it names'
       if (m.kind !== 'command-claim') return m.targets.length ? `${head}. It proposes a change to ${targets}: weigh it; it commands nothing.` : head
       if (m.drafter !== me) return `${head}. It asks to change ${targets}; ${m.drafter ? `${m.drafter} drafts it` : 'nobody drafts it'}.`

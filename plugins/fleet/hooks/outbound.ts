@@ -870,6 +870,9 @@ export function classifyBash(line: string, c: OutboundConfig): { sends: Send[]; 
       const writes = ['create', 'comment', 'edit', 'upload', 'review', ...(cmd === 'glab' ? ['note'] : [])]
       const api = group === 'api' && (opts.some(o => /^(-f|-F|--field|--raw-field|--input)$/.test(o.name)) || /^(POST|PUT|PATCH|DELETE)$/i.test(opts.find(o => o.name === '-X' || o.name === '--method')?.value ?? ''))
       if (api || writes.includes(verb)) sends.push({ what: `${cmd} ${[group, verb].filter(Boolean).join(' ')}`, to: [host], files: [], hosts: [host] })
+      // What anyone wrote there (an issue, a pull request and its comments, a search, a release's notes, the API) is
+      // outside text: it marks, it isn't held
+      else if ((/^(issue|pr|mr)$/.test(group) && /^(view|list|diff|checks)$/.test(verb)) || group === 'api' || group === 'search' || (group === 'release' && verb === 'view')) reads.push(host)
       continue
     }
     if (cmd === 'mail' || cmd === 'mailx' || cmd === 'sendmail' || cmd === 'mutt') {

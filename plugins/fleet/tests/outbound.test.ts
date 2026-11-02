@@ -30,6 +30,7 @@ import {
 
 const NONE = newOutbound()
 const MINE: OutboundConfig = { ...newOutbound(), hosts: ['devbox', '*.corp.example'], remotes: ['origin'], recipients: ['me@example.com'] }
+const MINE_GH: OutboundConfig = { ...newOutbound(), hosts: ['github.com'] }
 
 test('outbound.json: its lists, a newer one left alone, junk said', () => {
   expect(parseOutbound(JSON.stringify({ outboundFormat: 1, hosts: ['devbox', 3], keep: true }))).toEqual({
@@ -139,6 +140,14 @@ test('Bash: what sends content outside, and what passes', () => {
   expect(held('scp far.invalid:/tmp/x notes/')).toEqual([])
   expect(held('curl -s https://example.invalid/page')).toEqual([])
   expect(classifyBash('curl -s https://example.invalid/page', NONE).reads).toEqual(['example.invalid'])
+  // gh's reads of what anyone wrote there mark (they hold nothing), unless outbound.json has the host
+  for (const line of ['gh issue view 12 --comments', 'gh pr diff 3', 'gh pr checks 3', 'gh issue list', 'gh api repos/o/r/issues', 'gh search issues cache', 'gh release view v1']) {
+    expect(classifyBash(line, NONE)).toEqual({ sends: [], pushes: [], reads: ['github.com'] })
+  }
+  expect(classifyBash('glab mr view 4', NONE).reads).toEqual(['gitlab.com'])
+  expect(classifyBash('gh --hostname ghe.corp.example pr view 3', NONE).reads).toEqual(['ghe.corp.example'])
+  expect(classifyBash('gh pr view 3', MINE_GH).reads).toEqual([])
+  expect(classifyBash('gh auth status', NONE).reads).toEqual([])
   expect(held('grep -r curl notes/ && cat notes/x.md && git status && git push --dry-run')).toEqual([])
   expect(held('nc -l 9000')).toEqual([])
   // What ssh runs on the person's own machine goes through the same rules
