@@ -3,9 +3,11 @@
 
 A cheap check of the data, run by dev/fleet/ci.sh: the JSON files parse and carry their versions, every role of the
 roster has its role file with fleet's tools in it (without them they'd be hidden from the instance), every instance's
-role, section and parent exist, and every role has its seed. Sections are the person's across projects, so across the
-templates one id has one title and order, and two ids never share an order. /fleet up --dry-run lints a project's own
-roster fully.
+role, section and parent exist, and every role has its seed. Every template has its verify.md; world.json's code
+entries have a kind fleet knows and what it needs, its proofs lists are lists of strings, and a check's script under
+.claude/fleet/ ships with the template; a role verifies roles or instances of the roster, and a role's or an
+instance's code names world.json's. Sections are the person's across projects, so across the templates one id has one
+title and order, and two ids never share an order. /fleet up --dry-run lints a project's own roster fully.
 """
 import json
 import re
@@ -48,12 +50,46 @@ for t in templates:
     except (OSError, ValueError) as e:
         say(meta_path, e)
         continue
+    world = {}
     try:
         world = json.loads((t / 'fleet/world.json').read_text())
         if not isinstance(world.get('worldFormat'), int) or not isinstance(world.get('paths'), list):
             say(t / 'fleet/world.json', 'needs worldFormat and paths')
     except (OSError, ValueError) as e:
         say(t / 'fleet/world.json', e)
+    if not (t / 'fleet/verify.md').is_file():
+        say(t / 'fleet/verify.md', 'missing: how the project proves something works, which every role reads before it lands')
+    # The code fleet watches: each repository or depot by a name the roster's "code" uses
+    code = world.get('code', {}) if isinstance(world, dict) else {}
+    if not isinstance(code, dict):
+        say(t / 'fleet/world.json', 'code is an object: a repository or depot by its name')
+        code = {}
+    for name, spec in code.items():
+        where = f"{t / 'fleet/world.json'} (code {name})"
+        if not re.match(r'^[a-z0-9][a-z0-9-]*$', name):
+            say(where, 'a name of lowercase letters, digits and -')
+        if not isinstance(spec, dict) or spec.get('kind') not in ('git', 'p4', 'command'):
+            say(where, 'its kind is git, p4 or command')
+            continue
+        if spec['kind'] == 'p4' and not (isinstance(spec.get('depot'), str) and spec['depot'].strip()):
+            say(where, 'a p4 entry needs its depot (//depot/<project>/...)')
+        if spec['kind'] == 'command':
+            for key in ('changed', 'open'):
+                argv = spec.get(key)
+                if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+                    say(where, f'a command entry needs {key} as a command line (a list of strings)')
+    proofs = world.get('proofs', {}) if isinstance(world, dict) else {}
+    if not isinstance(proofs, dict):
+        say(t / 'fleet/world.json', 'proofs is an object')
+        proofs = {}
+    for key in ('paths', 'kinds', 'rerun'):
+        if key in proofs and (not isinstance(proofs[key], list) or not all(isinstance(x, str) for x in proofs[key])):
+            say(t / 'fleet/world.json', f'proofs.{key} is a list of strings')
+    # A check's script the template ships (.claude/fleet/…) is there, or the check could never start
+    for check in world.get('checks', []) if isinstance(world, dict) else []:
+        for word in check.get('argv', []) if isinstance(check, dict) else []:
+            if isinstance(word, str) and word.startswith('.claude/fleet/') and not (t / 'fleet' / word[len('.claude/fleet/'):]).is_file():
+                say(t / 'fleet/world.json', f"the check {check.get('name', '')} runs {word}, which the template doesn't ship")
     outbound = t / 'fleet/outbound.json'
     if outbound.exists():
         try:
@@ -118,6 +154,19 @@ for t in templates:
         for kind in sub.get('kinds', []):
             if kind not in kinds:
                 say(t / 'fleet/roster.json', f'{who} subscribes to the kind {kind}, which intake has not')
+    # Whose work a verifier verifies, and which of world.json's repositories a role or an instance works in
+    for role, spec in roles.items():
+        for who in spec.get('verifies', []):
+            if who not in roles and who.lower() not in names:
+                say(t / 'fleet/roster.json', f'{role} verifies {who}, which is no role or instance')
+    for who, spec in [*roles.items(), *[(i.get('name'), i) for i in instances]]:
+        mine = spec.get('code', {})
+        if not isinstance(mine, dict):
+            say(t / 'fleet/roster.json', f'{who}: code is an object, by the names of world.json\'s code')
+            continue
+        for repo in mine:
+            if repo not in code:
+                say(t / 'fleet/roster.json', f"{who} works in the code {repo}, which world.json's code doesn't name")
     for kind, spec in (world.get('derived') or {}).items():
         owner = spec.get('owner', '')
         if owner not in roles and owner.lower() not in names:
