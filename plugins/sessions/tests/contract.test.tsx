@@ -87,6 +87,14 @@ test("agent: the transcript's first row says which agent the session runs as", W
   await startSession($, w)
   expect((await call($, 'current')).agent).toBe('scout')
   expect((w.store.get(`state:${SID}`) as any)?.agent).toBe('scout')
+  // After /clear the new conversation's transcript doesn't name it, but the process still runs as it
+  const NEW = 'dddddddd-0000-0000-0000-000000000000'
+  w.transcript.value = `{"type":"custom-title","customTitle":"one"}\n{"type":"user","message":{}}`
+  await $.session.end({ reason: 'clear', sessionId: SID } as any)
+  w.id.value = NEW
+  await w.clock.advance(16000)
+  expect(await call($, 'current')).toMatchObject({ sessionId: NEW, agent: 'scout' })
+  expect((w.store.get(`state:${NEW}`) as any)?.agent).toBe('scout')
 })
 
 test('sections: defined and assigned before the start, from a session whose folder is gone, through sections.json', WITH_PROBE, async ($, on) => {

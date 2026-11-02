@@ -33,6 +33,8 @@ export type World = {
   usage: { value: any }
   // What Claude (and the mods beneath this one) draw in the band above the prompt: nothing, or a line
   band: { value: string }
+  // The start of the session's transcript (WorldOptions.transcript), which a test can change
+  transcript: { value: string | undefined }
 }
 
 export type WorldOptions = {
@@ -59,6 +61,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const panes: any[] = []
   const usage = { value: { context: { percent: 10 }, rateLimits: [] } as any }
   const band = { value: '' }
+  const transcript = { value: options.transcript }
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
@@ -150,7 +153,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     if (argv[0] === '/bin/claude' && argv[1] === 'plugin') return ok('[]')
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok('Darwin|')
     // The transcript's first row (readAgent)
-    if (argv[0] === '/bin/sh' && String(argv[2]).includes('.jsonl')) return options.transcript === undefined ? failed() : ok(options.transcript)
+    if (argv[0] === '/bin/sh' && String(argv[2]).includes('.jsonl')) return transcript.value === undefined ? failed() : ok(transcript.value)
     return ok()
   })
   on('command.register', (_, e) => {
@@ -177,7 +180,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: undefined }
   })
   on('ui.log', () => ({ value: undefined }))
-  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band }
+  return { files, opens, registered, clock, id, panes, store, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

@@ -580,13 +580,12 @@ test('refs: the official short id, or sid:<sessionId> for a regular session (it 
   expect(refOf({ id: '', sessionId: 'cccccccc-0000' })).toBe('sid:cccccccc-0000')
 })
 
-test('agent: an agent-setting row among the ones that open the transcript, before any message', () => {
-  expect(agentFromTranscript('{"type":"agent-setting","agentSetting":"scout"}\n{"type":"user"}')).toBe('scout')
-  // A session started with a name: its title rows come first
-  const named = ['{"type":"custom-title","customTitle":"TEST one"}', '{"type":"agent-name","agentName":"TEST one"}', '{"type":"agent-setting","agentSetting":"scout"}', '{"type":"mode","mode":"normal"}']
-  expect(agentFromTranscript(named.join('\n'))).toBe('scout')
-  // After the first message it's not the session's own (a message's text can say anything)
-  expect(agentFromTranscript('{"type":"custom-title"}\n{"type":"user","message":{}}\n{"type":"agent-setting","agentSetting":"x"}')).toBe(null)
+test("agent: the transcript's last agent-setting row, and only a row that is one", () => {
+  expect(agentFromTranscript('{"type":"agent-setting","agentSetting":"scout","sessionId":"x"}\n')).toBe('scout')
+  // Written again when the session is resumed or restarted: the last one says
+  expect(agentFromTranscript('{"type":"agent-setting","agentSetting":"scout"}\n{"type":"agent-setting","agentSetting":"judge"}')).toBe('judge')
+  // A message that mentions one isn't one
+  expect(agentFromTranscript('{"parentUuid":null,"type":"user","message":{"content":"{\\"type\\":\\"agent-setting\\",\\"agentSetting\\":\\"x\\"}"}}')).toBe(null)
   expect(agentFromTranscript('{"type":"agent-setting"')).toBe(null)
   expect(agentFromTranscript('')).toBe(null)
 })

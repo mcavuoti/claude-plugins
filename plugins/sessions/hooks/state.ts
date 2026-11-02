@@ -605,21 +605,21 @@ export function refOf(s: { id?: unknown; sessionId: string }): string {
   return typeof s.id === 'string' && s.id ? s.id : `sid:${s.sessionId}`
 }
 
-// The agent a session runs as (`claude --agent <name>`): Claude writes it among the rows that open the session's
-// transcript, before any message ({"type":"agent-setting","agentSetting":"<name>"}, after custom-title and agent-name
-// when the session was started with a name). null when those rows have none
-export function agentFromTranscript(head: string): string | null {
-  for (const line of head.split('\n')) {
-    let row: any
+// The agent a session runs as (`claude --agent <name>`): Claude writes a {"type":"agent-setting","agentSetting":"<name>"}
+// row in the session's transcript when it starts (after custom-title and agent-name when it has a name) and again when
+// it's resumed or restarted (after the messages). rows: the transcript's lines that start that way (a message that
+// quotes one has it escaped, so it never starts a line); the last one says. null when there's none
+export const AGENT_ROW = '{"type":"agent-setting"'
+export function agentFromTranscript(rows: string): string | null {
+  let agent: string | null = null
+  for (const line of rows.split('\n')) {
+    if (!line.startsWith(AGENT_ROW)) continue
     try {
-      row = JSON.parse(line)
-    } catch {
-      return null
-    }
-    if (row?.type === 'agent-setting') return typeof row.agentSetting === 'string' && row.agentSetting ? row.agentSetting : null
-    if (row?.type === 'user' || row?.type === 'assistant' || row?.message) return null
+      const row = JSON.parse(line)
+      agent = typeof row?.agentSetting === 'string' && row.agentSetting ? row.agentSetting : null
+    } catch {}
   }
-  return null
+  return agent
 }
 
 // Sections: <data>/sections.json, the person's data (what they chose, kept for good), so it has its own version,

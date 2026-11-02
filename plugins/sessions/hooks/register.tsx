@@ -19,6 +19,7 @@ import type {
 
 import {
   abbreviate,
+  AGENT_ROW,
   agentFromTranscript,
   assignChange,
   formatUsd,
@@ -1562,13 +1563,14 @@ function truncate(text: string, width: number): string {
   return chars.length <= width ? text : `${chars.slice(0, Math.max(1, width - 1)).join('')}…`
 }
 
-// The agent this session runs as: the first row of its transcript (agentFromTranscript), which lives in
-// ~/.claude/projects/<folder>/<sessionId>.jsonl. Only its start is read. Once per session id (again after /clear); until
-// the transcript exists, on every beat
+// The agent this session runs as: its transcript's agent-setting rows (agentFromTranscript), from
+// ~/.claude/projects/<folder>/<sessionId>.jsonl, with grep (no model, no tokens). Once per session id (until the
+// transcript exists, on every beat). After /clear the new transcript doesn't name the agent: rebind carries a known one
+// over
 async function readAgent($: any) {
   if (!myId || !home || agentFor === myId) return
-  const script = 'for f in "$1"/*/"$2".jsonl; do if [ -f "$f" ]; then head -c 4096 "$f"; exit 0; fi; done; exit 1'
-  const r = await runSafe($, ['/bin/sh', '-c', script, 'sh', `${home}/.claude/projects`, myId])
+  const script = 'for f in "$1"/*/"$2".jsonl; do if [ -f "$f" ]; then grep -e "^$3" "$f" | tail -n 3; exit 0; fi; done; exit 1'
+  const r = await runSafe($, ['/bin/sh', '-c', script, 'sh', `${home}/.claude/projects`, myId, AGENT_ROW])
   if (r.exitCode !== 0) return
   agentFor = myId
   myAgent = agentFromTranscript(r.stdout)
@@ -1688,11 +1690,14 @@ async function rebind($: any) {
   const old = myId
   myId = id
   debugLine($, `rebind: ${old} → ${id}`)
-  // The short id stays what the official list says (myShortId): the refresh below sets it
+  // The short id stays what the official list says (myShortId): the refresh below sets it. The process runs as the same
+  // agent, but the new conversation's transcript doesn't say so (no agent-setting row after /clear): a known agent
+  // carries over; with none, the new transcript is read
+  if (agentFor === old && myAgent) agentFor = id
   const previous = await readState($, old)
   const existing = await readState($, id)
   const now = await $.clock.now()
-  await storeSet($, `state:${id}`, existing ?? { created: previous?.created ?? now, model: previous?.model, context: undefined, version: previous?.version })
+  await storeSet($, `state:${id}`, existing ?? { created: previous?.created ?? now, model: previous?.model, context: undefined, version: previous?.version, agent: previous?.agent, root: previous?.root })
   const seen = await storeGet($, `seen:${old}`)
   if (seen && !(await storeGet($, `seen:${id}`))) await storeSet($, `seen:${id}`, seen)
   for (const k of ['state', 'seen', 'title', 'waiting', 'restarted']) await storeDelete($, `${k}:${old}`)
