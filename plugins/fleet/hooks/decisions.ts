@@ -428,7 +428,7 @@ export type Command =
   | { kind: 'status' }
   | { kind: 'init'; template: string; commitRegister: boolean }
   | { kind: 'world'; action: 'list' | 'add' | 'remove'; glob: string }
-  | { kind: 'accept'; path: string }
+  | { kind: 'accept'; paths: string[] }
   | { kind: 'up'; dryRun: boolean; wave: number | null; names: string[] }
   | { kind: 'down'; names: string[] }
   | { kind: 'remove'; names: string[]; yes: boolean }
@@ -570,7 +570,8 @@ export function parseCommand(args: string): Command {
       return { kind: 'world', action: a as 'add' | 'remove', glob }
     }
     case 'accept':
-      return { kind: 'accept', path: tail.replace(/^["']|["']$/g, '') }
+      // Several paths at once (/fleet accept charter.md roster.json), a path with spaces in quotes
+      return { kind: 'accept', paths: (tail.match(/"[^"]*"|“[^”]*”|'[^']*'|\S+/g) ?? []).map(w => w.replace(/^["“']|["”']$/g, '')).filter(Boolean) }
   }
   const items = parseAnswers(line)
   return typeof items === 'string' ? { kind: 'bad', reason: items } : { kind: 'answer', items }
@@ -618,7 +619,7 @@ export const HELP = [
   '/fleet drop <n> [why]  drop the decision of question n without answering it',
   '/fleet status          what fleet does in this session, the shared files, what changed and who is behind',
   '/fleet world           the shared files (world.json); /fleet world add <glob>, /fleet world remove <glob>',
-  '/fleet accept [path]   stamp a change made outside fleet (your editor, a script) as yours; alone, lists them',
+  '/fleet accept [path…]  stamp changes made outside fleet (your editor, a script) as yours, one path or several; alone, lists them',
   '/fleet accept checks   let fleet run the check scripts world.json lists, as they are now',
   '/fleet accept channel  let fleet run your command channel (roster.json person.channel), as it is now',
   '/fleet 4 apply         apply the change of item 4 as drafted (also 4 reject, and 4 edit to change the draft first)',

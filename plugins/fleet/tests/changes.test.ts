@@ -61,8 +61,9 @@ test('/fleet world add and remove keep the other fields; a folder written with /
   expect(parseCommand('world')).toEqual({ kind: 'world', action: 'list', glob: '' })
   expect(parseCommand('world add docs/**')).toEqual({ kind: 'world', action: 'add', glob: 'docs/**' })
   expect(parseCommand('world drop docs').kind).toBe('bad')
-  expect(parseCommand('accept notes/plan.md')).toEqual({ kind: 'accept', path: 'notes/plan.md' })
-  expect(parseCommand('accept')).toEqual({ kind: 'accept', path: '' })
+  expect(parseCommand('accept notes/plan.md')).toEqual({ kind: 'accept', paths: ['notes/plan.md'] })
+  expect(parseCommand('accept')).toEqual({ kind: 'accept', paths: [] })
+  expect(parseCommand('accept charter.md roster.json "notes/a b.md"')).toEqual({ kind: 'accept', paths: ['charter.md', 'roster.json', 'notes/a b.md'] })
 })
 
 test('globs: ** any folders, * within a name, {a,b}; case ignored where the volume ignores it; fleet’s folder never', () => {

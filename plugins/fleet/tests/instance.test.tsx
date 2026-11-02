@@ -110,8 +110,14 @@ test('the person’s own session writes the charter (his edit is his; /fleet acc
   const r: any = await $.tool.call({ tool: 'Write', file_path: `${FLEET}/charter.md`, content: '# Charter, by hand\n' } as any)
   expect(r.deny).toBe(undefined)
   expect(await fleet($, 'accept')).toContain('  .claude/fleet/charter.md: changed outside fleet (not through a change you applied) · /fleet accept .claude/fleet/charter.md')
-  expect(await fleet($, 'up --dry-run')).toContain('Changed outside fleet (not through a change you applied): .claude/fleet/charter.md.')
-  expect(await fleet($, 'accept charter.md')).toBe('.claude/fleet/charter.md: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).')
+  w.touch(`${ROOT}/.claude/agents/owner.md`, '---\nname: owner\ntools: Read, mcp__fleet__*\n---\nYou own the notes.\n')
+  expect(await fleet($, 'up --dry-run')).toContain(
+    "Your edits since /fleet init or your last /fleet accept: .claude/fleet/charter.md, .claude/agents/owner.md. If they're yours, /fleet accept charter.md .claude/agents/owner.md stamps them (till then fleet flags them as changed outside fleet; one you didn't make, read first).",
+  )
+  // Several at once, as the dry run says
+  expect(await fleet($, 'accept charter.md .claude/agents/owner.md')).toBe(
+    '.claude/fleet/charter.md: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).\n.claude/agents/owner.md: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).',
+  )
   expect(await fleet($, 'accept')).toBe('No change made outside fleet waits to be stamped.')
 })
 

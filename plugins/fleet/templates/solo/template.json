@@ -3,6 +3,6 @@
   "description": "three owners sharing notes/, no chief: you talk to each owner directly",
   "folders": ["notes", "journals"],
   "next": [
-    "Next: write the charter (.claude/fleet/charter.md) and change each owner's brief in roster.json to its part, then /fleet up --dry-run (the plan, the lints and the cost) and /fleet up to start the three owners. The roster gives the instances auto mode (\"settings\" at its top), so they work with nobody at them: /fleet up --dry-run says each one's mode, and marks one that would ask."
+    "Next: write the charter (.claude/fleet/charter.md) and change each owner's brief in roster.json to its part, then /fleet up --dry-run (the plan, the lints and the cost) and /fleet up to start the three owners. The roster gives the instances auto mode (\"settings\" at its top), so they work with nobody at them: /fleet up --dry-run says each one's mode, and marks one that would ask. Before /fleet up, /fleet accept charter.md roster.json stamps your edits as yours (else fleet flags them as changed outside fleet)."
   ]
 }

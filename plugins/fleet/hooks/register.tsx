@@ -4294,6 +4294,12 @@ async function unstamped($: any): Promise<string[]> {
   return out
 }
 
+/** How /fleet accept names a config file: fleet's own by its name (charter.md), a role file by its path */
+function acceptName(rel: string): string {
+  const name = rel.startsWith('.claude/fleet/') ? rel.slice('.claude/fleet/'.length) : rel
+  return /\s/.test(name) ? JSON.stringify(name) : name
+}
+
 /** Whether a config file is as fleet wrote it or the person stamped it (with no stamps yet, what's there is) */
 async function stampedNow($: any, rel: string): Promise<boolean> {
   const s = await readWire<Stamps>($, stateDir('stamps.json'))
@@ -5350,7 +5356,8 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (lint.errors.length) out.push('Errors (fix roster.json or the role files):', ...lint.errors.map(x => `  ✗ ${x}`))
   if (lint.warnings.length) out.push('Warnings:', ...lint.warnings.map(x => `  ! ${x}`))
   const loose = await unstamped($)
-  if (loose.length) out.push(`Changed outside fleet (not through a change you applied): ${loose.join(', ')}. /fleet accept <path> stamps your own edit as yours.`)
+  // The config files edited since fleet wrote them (/fleet init) or the person last stamped them: his own edits, mostly
+  if (loose.length) out.push(`Your edits since /fleet init or your last /fleet accept: ${loose.join(', ')}. If they're yours, /fleet accept ${loose.map(acceptName).join(' ')} stamps them (till then fleet flags them as changed outside fleet; one you didn't make, read first).`)
   if (c.dryRun) return [...out, 'Nothing was started (--dry-run).'].join('\n')
   if (lint.errors.length) return [...out, 'Nothing was started: fix the errors, then /fleet up again.'].join('\n')
   await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
@@ -6893,7 +6900,12 @@ async function fleetCommand($: any, e: any): Promise<string> {
   if (c.kind === 'overrule') return origin === 'composer' ? overruleCommand($, c, origin) : onlyPerson('overrules a judge', origin)
   // The world, accept and the roster's commands are the person's own too, like answers (below): typed at a terminal
   if (c.kind === 'world') return worldCommand($, c.action, c.glob, origin)
-  if (c.kind === 'accept') return acceptCommand($, c.path, origin)
+  if (c.kind === 'accept') {
+    if (c.paths.length < 2) return acceptCommand($, c.paths[0] ?? '', origin)
+    const out: string[] = []
+    for (const p of c.paths) out.push(await acceptCommand($, p, origin))
+    return out.join('\n')
+  }
   if (c.kind === 'up') return upCommand($, c, origin)
   if (c.kind === 'down') return downCommand($, c.names, origin)
   if (c.kind === 'remove') return removeCommand($, c.names, c.yes, origin)
