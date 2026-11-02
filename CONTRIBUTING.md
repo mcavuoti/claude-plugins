@@ -44,6 +44,7 @@ A rule that should apply only to some files goes there, with `paths:` in its fro
 ## Git
 
 - Once per clone: `git config core.hooksPath .githooks` and `git config user.email <id>+<user>@users.noreply.github.com` (the address GitHub shows under Settings → Emails). The `commit-msg` hook in `.githooks/` refuses a commit with any other email and drops `Claude-Session:` lines, so nothing personal reaches the public history.
+- Once per machine, optionally: list in `~/.config/claude-plugins/private-words.txt` (or the file `CLAUDE_PLUGINS_PRIVATE_WORDS` names) the words that must never be published, such as your real project, client and session names, one per line. The `pre-commit` hook then refuses a commit whose added lines or file paths contain one, ignoring case. The list stays outside the repository; with no list the hook does nothing.
 - `git pull --rebase` before you start, keep commits small, push when done.
 - A release: bump `version` in the plugin's `.claude-plugin/plugin.json`, commit, push. Each machine that uses the plugins then runs `claude plugin marketplace update mcavuoti && claude plugin update <plugin>@mcavuoti` (or has auto-update on).
 - After a release, run `/coherence` (`.claude/skills/coherence/`): it checks that `CLAUDE.md`, the rules, this file, each plugin's README and the session's memory still match the code and each other, and proposes the fixes.

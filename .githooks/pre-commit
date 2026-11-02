@@ -1,0 +1,41 @@
+#!/bin/sh
+# Active once a clone runs `git config core.hooksPath .githooks` (see CONTRIBUTING.md). This repository is public:
+# refuses a commit whose staged changes (the lines added, or a file's path) contain a word or phrase from the owner's
+# private list, kept outside the repository: $CLAUDE_PLUGINS_PRIVATE_WORDS, or ~/.config/claude-plugins/private-words.txt.
+# One entry per line, matched as text and ignoring case; empty lines and lines starting with # are skipped.
+# With no list (the GitHub check, another clone) it does nothing.
+list="${CLAUDE_PLUGINS_PRIVATE_WORDS:-$HOME/.config/claude-plugins/private-words.txt}"
+[ -f "$list" ] || exit 0
+{
+  git diff --cached --name-only --no-color | sed 's/^/+++ path: /'
+  git diff --cached -U0 --no-color --no-ext-diff
+} | awk -v words="$list" '
+  BEGIN {
+    while ((getline w < words) > 0) {
+      gsub(/^[ \t]+|[ \t\r]+$/, "", w)
+      if (w != "" && substr(w, 1, 1) != "#") list[++n] = tolower(w)
+    }
+  }
+  /^\+\+\+ path: / { check(substr($0, 11), "its path"); next }
+  /^\+\+\+ / { file = substr($0, 7); next }
+  /^\+/ { check(substr($0, 2), file) }
+  function check(text, where,    t, i) {
+    t = tolower(text)
+    for (i = 1; i <= n; i++) {
+      if (index(t, list[i])) {
+        print "  " where ": " substr(text, 1, 120)
+        found = 1
+        return
+      }
+    }
+  }
+  END { exit found ? 1 : 0 }
+' > "${TMPDIR:-/tmp}/private-words-$$" 2>&1
+status=$?
+if [ "$status" -ne 0 ]; then
+  echo "pre-commit: the staged changes contain an entry of $list:" >&2
+  cat "${TMPDIR:-/tmp}/private-words-$$" >&2
+  echo "Replace it with a placeholder (CLAUDE.md: /Users/x, aaaaaaaa, made-up names), or take it off the list." >&2
+fi
+rm -f "${TMPDIR:-/tmp}/private-words-$$"
+exit "$status"
