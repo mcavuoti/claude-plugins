@@ -45,7 +45,11 @@ export type Records = {
   strict: 'all' | RegExp[] | null
   checks: Check[]
   commitEveryMin: number | null
+  /** world.json's proofs: the records that must carry a proof, by path or by their kind: line */
+  proofs: Proofs | null
 }
+/** Which records must carry a proof: those under these globs, and those whose kind: line names one of these kinds */
+export type Proofs = { globs: string[]; res: RegExp[]; kinds: string[] }
 
 /** One version of a record: <project>/.claude/fleet/state/revs/<id>/<rev>.json, written once */
 export type Rev = {
@@ -110,7 +114,24 @@ export function recordsOf(w: WorldConfig, insensitive: boolean): { records: Reco
   }
   const every = (w.commit && typeof w.commit === 'object' ? (w.commit as Record<string, unknown>).everyMin : undefined) as unknown
   const commitEveryMin = typeof every === 'number' && every > 0 ? num(every, 1, 24 * 60, 60) : null
-  return { records: { id, pin, changeKey, strict, checks, commitEveryMin } }
+  const p = proofsOf(w, insensitive)
+  if ('problem' in p) return p
+  return { records: { id, pin, changeKey, strict, checks, commitEveryMin, proofs: p.proofs } }
+}
+
+function proofsOf(w: WorldConfig, insensitive: boolean): { proofs: Proofs | null } | { problem: string } {
+  if (w.proofs === undefined || w.proofs === null) return { proofs: null }
+  if (typeof w.proofs !== 'object' || Array.isArray(w.proofs)) return { problem: 'world.json: proofs is an object: { "paths": [globs], "kinds": ["finding", "result"] }' }
+  const raw = w.proofs as Record<string, unknown>
+  const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && !!x.trim()).map(x => x.trim()) : [])
+  const globs = list(raw.paths)
+  for (const g of globs) {
+    const bad = checkGlob(g)
+    if (bad) return { problem: `world.json: proofs path "${g}" ${bad}` }
+  }
+  const kinds = [...new Set(list(raw.kinds).map(k => k.toLowerCase()))]
+  if (kinds.some(k => !/^[a-z][a-z0-9-]{0,39}$/.test(k))) return { problem: "world.json: proofs kinds are words (finding, result), as a record's kind: line names them" }
+  return { proofs: globs.length || kinds.length ? { globs, res: globs.map(g => globRegex(g, insensitive)), kinds } : null }
 }
 
 function parseCheck(raw: any, i: number, insensitive: boolean): { check: Check } | { problem: string } {
@@ -192,6 +213,74 @@ export function changeOf(text: string, key: string): { kind: ChangeKind | null; 
   }
   return null
 }
+
+// ---- Proofs: a finding carries source: and quote:, a result run: and sha: ----
+
+/** A proof's sha: the sha256 of the run's output, or its first 12 hex digits at least (sha256: before it is fine) */
+const SHA = /^(?:sha256:)?[0-9a-f]{12,64}$/i
+/** A quote shorter than this proves nothing */
+export const MIN_QUOTE = 10
+const PROOF_KEYS = new Set(['kind', 'run', 'sha', 'source', 'quote'])
+
+/** A record's kind: and proof lines, in order, from its front matter when it has one, else its first 30 lines (a value
+ * in matching quotes without them) */
+export function proofLines(text: string): [string, string][] {
+  const lines = text.replace(/^﻿/, '').split(/\r?\n/)
+  let scope = lines.slice(0, 30)
+  if (lines[0]?.trim() === '---') {
+    const end = lines.slice(1).findIndex(l => l.trim() === '---')
+    scope = end >= 0 ? lines.slice(1, end + 1) : scope
+  }
+  const out: [string, string][] = []
+  for (const line of scope) {
+    const m = /^\s*([a-z]+)\s*:\s*(.*)$/.exec(line)
+    if (!m || !PROOF_KEYS.has(m[1] as string)) continue
+    const v = (m[2] as string).trim()
+    out.push([m[1] as string, v.length > 1 && /^(["']).*\1$/s.test(v) ? v.slice(1, -1) : v])
+  }
+  return out
+}
+
+/** Why a world file that must carry a proof doesn't seem to (null: it does, or it needn't). It must when world.json's
+ * proofs name its path, or its kind: line names one of their kinds; a proof is a run: then a sha: (12 to 64 hex
+ * digits), or a source: then a quote: (MIN_QUOTE characters at least). Valid-looking only: the proofs check script
+ * re-runs what the person lets it and compares */
+export function proofProblem(text: string | null, rel: string, records: Records): string | null {
+  const p = records.proofs
+  if (!p || text === null) return null
+  const keys = proofLines(text)
+  const kind = keys.find(k => k[0] === 'kind')?.[1].trim().toLowerCase() || null
+  const byKind = !!kind && p.kinds.includes(kind)
+  if (!byKind && !p.res.some(r => r.test(rel))) return null
+  let run: string | null = null
+  let source: string | null = null
+  let bad: string | null = null
+  for (const [k, v] of keys) {
+    if (k === 'run') run = v.trim() || null
+    else if (k === 'source') source = v.trim() || null
+    else if (k === 'sha' && run !== null) {
+      if (SHA.test(v.trim())) return null
+      bad = "its sha: isn't the sha256 of the run's output (12 to 64 hex digits)"
+      run = null
+    } else if (k === 'quote' && source !== null) {
+      if (Array.from(v.trim()).length >= MIN_QUOTE) return null
+      bad = `its quote: is too short to prove anything (${MIN_QUOTE} characters at least)`
+      source = null
+    }
+  }
+  const what = byKind ? `a ${kind}` : 'a record that must carry a proof'
+  if (bad) return `${what}, but ${bad}`
+  if (run !== null) return `${what}, with run: but no sha: after it (the sha256 of its output)`
+  if (source !== null) return `${what}, with source: but no quote: after it (the exact text it rests on)`
+  return `${what} with no proof: run: and sha: (the command, and the sha256 of its output), or source: and quote: (where, and the exact text)`
+}
+
+/** How to prove one, in a few words (the gate's line, the digest's) */
+export const PROOF_HOW =
+  'a finding carries kind: finding, source: and quote: (where, and the exact text it rests on); a result carries kind: result, run: and sha: (the command, and the sha256 of its output); .claude/fleet/verify.md says what counts as proof here'
+
+/** A world file the sweeper finds unproven: why, the version it found so, who wrote it last */
+export type Unproven = { path: string; id: string | null; owner: Who | null; why: string; v: string | null }
 
 /** What a landing counts as. A new file is an addition, a removed one a retraction; otherwise the change line's kind,
  * and a revision when there is none, it names no kind, or it was left as it was (the convention: rewrite it each time) */
@@ -340,7 +429,7 @@ export type Reason = {
 }
 export type Suspect = { path: string; id: string | null; owner: Who | null; reasons: Reason[]; via?: string[] }
 /** derived: the derived documents among the suspects a revised record made stale (derived.ts), for their owners */
-export type SuspectsFile = { format: number; at: number; by: string; suspects: Suspect[]; derived?: DerivedStale[] }
+export type SuspectsFile = { format: number; at: number; by: string; suspects: Suspect[]; derived?: DerivedStale[]; unproven?: Unproven[] }
 /** One world file as the sweeper sees it: its pins, and its last landing (a record's newest version, or the last event) */
 export type Facts = { path: string; id: string | null; pins: readonly string[]; owner: Who | null; blind?: readonly string[]; confirmed?: readonly string[] }
 
@@ -474,7 +563,7 @@ export function checkOutcome(paths: readonly string[], r: { exitCode: number; st
  * included (check.py, ./tools/lint.sh, an absolute path inside one of the project's roots), and the file an
  * indirection reads (make: the Makefile; npm, yarn or pnpm run: package.json). The ones that exist are stamped with
  * the checks and command-level (fleet runs them as the person, with no prompt) */
-export function scriptsOf(checks: readonly Check[], roots: readonly string[] = []): string[] {
+export function scriptsOf(checks: readonly Pick<Check, 'argv'>[], roots: readonly string[] = []): string[] {
   const out = new Set<string>()
   for (const c of checks) {
     const words = c.argv.filter(a => !a.startsWith('-'))
@@ -496,9 +585,10 @@ export function scriptsOf(checks: readonly Check[], roots: readonly string[] = [
   return [...out].sort()
 }
 
-/** The stamp of a set of checks: their definitions and their scripts' versions */
-export function checksKey(checks: readonly Check[], scripts: ReadonlyMap<string, string | null>): string {
-  return hashText(JSON.stringify({ checks: checks.map(c => [c.name, c.glob, c.argv, c.when]), scripts: [...scripts].sort() }))
+/** The stamp of a set of checks: their definitions and their scripts' versions; and the code watch's commands, which the
+ * same stamp lets run (code.ts) */
+export function checksKey(checks: readonly Check[], scripts: ReadonlyMap<string, string | null>, commands: readonly string[][] = []): string {
+  return hashText(JSON.stringify({ checks: checks.map(c => [c.name, c.glob, c.argv, c.when]), scripts: [...scripts].sort(), ...(commands.length ? { commands } : {}) }))
 }
 
 // ---- The sweeper's lease: <project>/.claude/fleet/state/sweeper.json, replaced with mv by whoever holds or takes it ----

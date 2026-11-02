@@ -19,6 +19,8 @@ import {
   pinState,
   pinsOf,
   pinsText,
+  proofLines,
+  proofProblem,
   porcelainPaths,
   problemKeys,
   recordsOf,
@@ -220,4 +222,40 @@ test('the lease, the commit message, git status -z, worktree folders and copies'
   expect(copyOf('/Users/x/proj-wt/other/plan.md', linked, 'sub', false)).toEqual({ tree: '/Users/x/proj-wt', rel: '' })
   expect(copyOf('/Users/x/proj/notes/plan.md', linked, '', false)).toBe(null)
   expect(copyOf('/Users/x/PROJ-WT/notes/plan.md', linked, '', true)).toEqual({ tree: '/Users/x/proj-wt', rel: 'notes/plan.md' })
+})
+
+test("proofs: which records must carry one (world.json's paths, or their kind: line), and what a valid-looking one is", () => {
+  const r = recs({ paths: ['findings/**', 'req/**'], proofs: { paths: ['findings/**'], kinds: ['Finding', 'result'] } })
+  expect(r.proofs?.kinds).toEqual(['finding', 'result'])
+  const F = (lines: string) => `---\n${lines}\n---\nF-3: the claim\n`
+  // Under the proofs' paths, whatever its kind; elsewhere, by its kind: line
+  expect(proofProblem('F-3: a claim, no front matter\n', 'findings/F-3.md', r)).toBe('a record that must carry a proof with no proof: run: and sha: (the command, and the sha256 of its output), or source: and quote: (where, and the exact text)')
+  expect(proofProblem(F('kind: note'), 'req/R-1.md', r)).toBeNull()
+  expect(proofProblem(F('kind: result'), 'req/R-1.md', r)).toBe('a result with no proof: run: and sha: (the command, and the sha256 of its output), or source: and quote: (where, and the exact text)')
+  expect(proofProblem(F(`kind: result\nrun: printf 'x'\nsha: 2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881`), 'req/R-1.md', r)).toBeNull()
+  expect(proofProblem(F('kind: result\nrun: make sim\nsha: sha256:2D711642B726'), 'req/R-1.md', r)).toBeNull()
+  expect(proofProblem(F('kind: result\nrun: make sim\nsha: pending'), 'req/R-1.md', r)).toBe("a result, but its sha: isn't the sha256 of the run's output (12 to 64 hex digits)")
+  expect(proofProblem(F('kind: result\nrun: make sim'), 'req/R-1.md', r)).toBe('a result, with run: but no sha: after it (the sha256 of its output)')
+  expect(proofProblem(F('kind: finding\nsource: https://example.invalid/paper\nquote: "the FIFO must hold 64 entries"'), 'findings/F-3.md', r)).toBeNull()
+  expect(proofProblem(F('kind: finding\nsource: docs/spec.md\nquote: yes'), 'findings/F-3.md', r)).toBe('a finding, but its quote: is too short to prove anything (10 characters at least)')
+  expect(proofProblem(F('kind: finding\nsource: docs/spec.md'), 'findings/F-3.md', r)).toBe('a finding, with source: but no quote: after it (the exact text it rests on)')
+  // A second pair after a bad first one proves it; past 4 MiB (no text) it isn't looked at; no proofs, nothing
+  expect(proofProblem(F('kind: finding\nsource: a\nquote: no\nsource: docs/spec.md\nquote: "the exact text it rests on"'), 'findings/F-3.md', r)).toBeNull()
+  expect(proofProblem(null, 'findings/F-3.md', r)).toBeNull()
+  expect(proofProblem(F('kind: result'), 'req/R-1.md', recs())).toBeNull()
+  // Quotes come off only when the same one opens and closes the value
+  expect(proofLines("---\nrun: printf 'x'\nquote: 'a: b'\n---\n")).toEqual([
+    ['run', "printf 'x'"],
+    ['quote', 'a: b'],
+  ])
+  expect(recordsOf({ worldFormat: 1, paths: [], proofs: { paths: ['/abs/**'] } }, false)).toEqual({ problem: 'world.json: proofs path "/abs/**" must be relative to the project folder' })
+  expect(recordsOf({ worldFormat: 1, paths: [], proofs: { kinds: ['two words'] } }, false)).toEqual({ problem: "world.json: proofs kinds are words (finding, result), as a record's kind: line names them" })
+  expect(recordsOf({ worldFormat: 1, paths: [], proofs: [] }, false)).toEqual({ problem: 'world.json: proofs is an object: { "paths": [globs], "kinds": ["finding", "result"] }' })
+})
+
+test("the checks' stamp covers the code watch's commands too; with none, it is as before", () => {
+  const c = recs({ checks: [{ glob: 'board/**', argv: ['python3', 'checks/board.py'] }] })
+  const scripts = new Map([['checks/board.py', 'h1']])
+  expect(checksKey(c.checks, scripts, [])).toBe(checksKey(c.checks, scripts))
+  expect(checksKey(c.checks, scripts, [['bash', 'tools/up.sh', '{marker}']])).not.toBe(checksKey(c.checks, scripts))
 })
