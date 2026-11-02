@@ -5,6 +5,10 @@
  * (a hot reload loses the copy that waited on the submit) */
 export type FleetInflight = { at: number; epoch: string }
 
+/** Notes the person added to answers already on their way to this session's model (closeNow found them newer than
+ * the delivery's read): delivered once, on their own; sent: their submit, while its turn hasn't started */
+export type FleetLate = { notes: { q: number; question: string; text: string }[]; at: number; sent?: FleetInflight }
+
 /** A world file as one thread last read it (or wrote it): the version, when, and the newest version it was told of;
  * for a record, the version number fleet gave what it read */
 export type FleetRead = { v: string; at: number; told?: string; rev?: number }
@@ -80,6 +84,8 @@ declare module 'claude-code' {
       slotWait: string[]
       /** The person's overrules of a judge's answer to this session, submitted and whose turn hasn't started */
       overruling: Record<string, FleetInflight>
+      /** The person's notes that came after this session's answers were on their way: decision id → them */
+      lateNotes: Record<string, FleetLate>
     }
   }
 }

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { FleetInflight, FleetMark, FleetRead } from '../types'
+import type { FleetInflight, FleetLate, FleetMark, FleetRead } from '../types'
 import { OUTSIDE_TOOLS, checkResource, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, markWords, preAnswer, resourceDelivery, resourceTicket, type OutsideMark, type ResourceSpec } from './authority'
 import { CHIEF_PROMPT, SHOWN as BRIEF_SHOWN, briefText, chiefLines, closedLine, type BriefFacts, type BriefNeed } from './brief'
 import {
@@ -108,6 +108,7 @@ import {
   idNumber,
   isDecisionId,
   knownKind,
+  lateNoteText,
   letter,
   monthBefore,
   monthOf,
@@ -371,6 +372,8 @@ const intakeTold = atom({ plugin: 'fleet', key: 'intakeTold' } as const, {} as R
 const slotTold = atom({ plugin: 'fleet', key: 'slotTold' } as const, {} as Record<string, number>)
 const slotWait = atom({ plugin: 'fleet', key: 'slotWait' } as const, [] as string[])
 const overruling = atom({ plugin: 'fleet', key: 'overruling' } as const, {} as Record<string, FleetInflight>)
+// The person's notes that came once this session's answers were on their way: delivered on their own (deliverLate)
+const lateNotes = atom({ plugin: 'fleet', key: 'lateNotes' } as const, {} as Record<string, FleetLate>)
 // A fresh period's hand-off, from the /clear until a turn carrying it starts
 const handoff = atom({ plugin: 'fleet', key: 'handoff' } as const, null as { text: string; at: number } | null)
 // What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing)
@@ -705,7 +708,7 @@ function timers($: any) {
   $.clock.after(0, () => bg((async () => (sweep.bornAt = sweep.bornAt || (await $.clock.now())))()))
   if (jobRef) {
     $.clock.after(0, () => bg(rebuild($)))
-    $.clock.every(2000, () => bg(deliver($).then(() => deliverOverrules($))))
+    $.clock.every(2000, () => bg(deliver($).then(() => deliverOverrules($)).then(() => deliverLate($))))
     // An instance of the roster: its binding, heartbeat and spend; its seed, and its nudges
     $.clock.after(1500, () => bg(instanceTick($)))
     $.clock.every(30000, () => bg(instanceTick($)))
@@ -855,7 +858,9 @@ async function askerNow($: any): Promise<Asker> {
 
 // Closes a decision: its register record first (written once), then its queue and answer files. A crash between the
 // steps leaves the register, and whoever finds the leftovers removes them
-type CloseHow = { state: 'delivered' | 'abandoned'; turnId?: string; why?: string; how?: 'submit' | 'result'; sentAt?: number }
+// readAt: when the delivery read the answers (its inflight entry's at): a note newer than that went with nothing,
+// and an overrule newer than that came after the judge's answer had left
+type CloseHow = { state: 'delivered' | 'abandoned'; turnId?: string; why?: string; how?: 'submit' | 'result'; readAt?: number }
 
 async function close($: any, id: string, how: CloseHow) {
   // One close at a time per decision in this module (the turn's start and the submit's answer come together)
@@ -869,6 +874,7 @@ async function close($: any, id: string, how: CloseHow) {
 }
 
 async function closeNow($: any, id: string, how: CloseHow) {
+  const readAt = how.readAt ?? (await read($, inflight))[id]?.at
   const rec = await readQueue($, id)
   if (rec && !('otherFormat' in rec)) {
     const present = await answerNames($)
@@ -877,12 +883,25 @@ async function closeNow($: any, id: string, how: CloseHow) {
     const delivered = how.state === 'delivered'
     // The person's answer replaced the judge's after this session had read it to deliver (/fleet overrule, just then):
     // its model got the judge's, so it hears the overrule as any other
-    const sentAt = how.sentAt ?? (await read($, inflight))[id]?.at
-    const late = delivered && sentAt !== undefined && rec.asker.ref === jobRef ? outcomes.map(o => (o?.replacedJudge && (o.at ?? 0) >= sentAt ? o : null)) : []
+    const late = delivered && readAt !== undefined && rec.asker.ref === jobRef ? outcomes.map(o => (o?.replacedJudge && (o.at ?? 0) >= readAt ? o : null)) : []
     if (late.some(Boolean)) {
       const notice: OverruleNotice = { format: FORMAT, id, at: now, asker: rec.asker, questions: rec.questions.map(q => ({ question: q.question, options: q.options })), judged: late.map(o => o?.replacedJudge?.label ?? o?.replacedJudge?.text ?? null), answers: late.map(o => (o ? { ...(o.label !== undefined ? { label: o.label } : { text: o.text ?? '' }), origin: o.origin, session: o.session, at: o.at } : null)), ...(rec.area ? { area: rec.area } : {}) }
       await publish($, dec(`overrules/${id}.json`), json(notice))
       log($, `${id}: the person's overrule came as the judge's answer was on its way: told as an overrule`)
+    }
+    // A note the person wrote after the delivery read the answers went with nothing: it's told on its own (the register
+    // keeps it with its answer all the same)
+    if (delivered && readAt) {
+      const late: FleetLate['notes'] = []
+      for (let q = 1; q <= slots(rec); q++) {
+        if (!present.has(noteName(id, q))) continue
+        const p = parseWire<NoteFile>((await readText($, dec(`answers/${noteName(id, q)}`))) ?? '')
+        if (p && 'value' in p && p.value.at > readAt) late.push({ q, question: rec.questions[q - 1]?.question ?? `your ${rec.kind ?? 'question'}`, text: p.value.text })
+      }
+      if (late.length) {
+        await update($, lateNotes, m => ({ ...m, [id]: { notes: late, at: now } }))
+        log($, `${id}: a note came after its answers left; it goes on its own`)
+      }
     }
     const why = drop?.why || how.why
     // What the judge proposed, and whether the person agreed: the case law and the stats read it there
@@ -1075,12 +1094,19 @@ async function turnStarted($: any, text: string, turnId: string) {
   // The person's overrules of a judge's answers, delivered in this turn
   const over = await read($, overruling)
   for (const id of ids) if (over[id] && text.includes(`[${id}] The person overruled`)) await overruleDelivered($, id, turnId)
+  // His notes that came late, told in this turn
+  const late = await read($, lateNotes)
+  const told = ids.filter(id => late[id] && text.includes(`[${id}] The person added a note`))
+  if (told.length) {
+    await update($, lateNotes, m => omit(m, told))
+    log($, `the late notes of ${told.join(', ')} were delivered (turn ${turnId})`)
+  }
   const mine = await read($, open)
   const pending = await read($, inflight)
   const closing = ids.filter(id => mine[id] !== undefined || pending[id])
   if (!closing.length) return
   await update($, inflight, m => omit(m, closing))
-  for (const id of closing) await close($, id, { state: 'delivered', turnId, ...(pending[id] ? { sentAt: pending[id].at } : {}) })
+  for (const id of closing) await close($, id, { state: 'delivered', turnId, ...(pending[id] ? { readAt: pending[id].at } : {}) })
 }
 
 /** What the person typed that these decisions carry to their asker: his text answers (origin composer), his notes and
@@ -1104,6 +1130,7 @@ async function personWords($: any, ids: readonly string[]): Promise<string> {
       for (const a of n.answers) if (a?.text) out.push(a.text)
       if (n.why) out.push(n.why)
     }
+    for (const x of (await read($, lateNotes))[id]?.notes ?? []) out.push(x.text)
   }
   return out.join('\n')
 }
@@ -6427,6 +6454,56 @@ async function deliverOverrules($: any) {
   )
 }
 
+/** Every 2 s in a background session, after the answers themselves: the person's notes that came once their answers
+ * were on their way, as a prompt of fleet's own ("[D-<n>] The person added a note"), once */
+async function deliverLate($: any) {
+  if (!jobRef || delivering) return
+  const late = await read($, lateNotes)
+  const ids = Object.keys(late)
+  if (!ids.length) return
+  const now = await $.clock.now()
+  // One an older copy of the module waited on: its turn shows in the transcript, or it's sent again
+  const orphans = ids.filter(id => late[id]?.sent && late[id]?.sent?.epoch !== EPOCH)
+  if (orphans.length && !(await read($, busy)) && now - (await read($, idleSince)) >= ORPHAN_IDLE_MS) {
+    let said = ''
+    try {
+      const messages = await $.session.messages()
+      if (Array.isArray(messages)) said = messages.slice(-200).filter((m: any) => m?.role === 'user' && typeof m.text === 'string').map((m: any) => m.text).join('\n')
+    } catch {}
+    for (const id of orphans) await update($, lateNotes, m => (said.includes(`[${id}] The person added a note`) ? omit(m, [id]) : m[id] ? { ...m, [id]: { notes: m[id].notes, at: m[id].at } } : m))
+  }
+  if ((await read($, busy)) || (await read($, stopped)) || now < (await read($, retryAt)) || Object.keys(await read($, inflight)).length) return
+  const waiting = await read($, lateNotes)
+  const ready = Object.keys(waiting).filter(id => !waiting[id]?.sent)
+  if (!ready.length) return
+  await update($, lateNotes, m => ({ ...m, ...Object.fromEntries(ready.filter(id => m[id]).map(id => [id, { ...(m[id] as FleetLate), sent: { at: now, epoch: EPOCH } }])) }))
+  log($, `delivering the late notes of ${ready.join(', ')}`)
+  const unsend = (m: Record<string, FleetLate>) => Object.fromEntries(Object.entries(m).map(([id, x]) => [id, ready.includes(id) ? { notes: x.notes, at: x.at } : x]))
+  $.prompt.submit({ text: ready.map(id => lateNoteText(id, (waiting[id] as FleetLate).notes)).join('\n\n') }).then(
+    (r: any) =>
+      bg(
+        (async () => {
+          if (r && typeof r.drop === 'string') {
+            await update($, lateNotes, unsend)
+            if (/stopped|nobody has sent input/i.test(r.drop)) await update($, stopped, () => true)
+            return
+          }
+          // { text }: its turn has started (turnStarted removed them); a second later this removes any it didn't
+          await $.clock.sleep(1000)
+          await update($, lateNotes, m => omit(m, ready))
+        })(),
+      ),
+    (err: unknown) =>
+      bg(
+        (async () => {
+          await update($, lateNotes, unsend)
+          await update($, retryAt, () => now + 30000)
+          log($, `the late notes of ${ready.join(', ')} failed (${String(err).slice(0, 200)}); trying again in 30 s`)
+        })(),
+      ),
+  )
+}
+
 async function overruleDelivered($: any, id: string, turnId?: string) {
   await remove($, [dec(`overrules/${id}.json`)])
   await update($, overruling, m => omit(m, [id]))
@@ -6656,9 +6733,17 @@ async function noteCommand($: any, n: number, text: string, origin: string): Pro
   const rec = await readQueue($, item.id)
   if (!rec) return closedText($, item.id)
   if ('otherFormat' in rec) return `${item.id} was asked by a fleet with another format: restart that session (u)`
+  const complete = knownKind(rec) && progress(item.id, slots(rec), await answerNames($)).answered.every(Boolean)
   const note: NoteFile = { format: FORMAT, id: item.id, q: item.q, text, origin, at: await $.clock.now() }
-  if (!(await replace($, dec(`answers/${noteName(item.id, item.q)}`), json(note)))) return "couldn't save the note"
-  return `Note on ${n} saved: it goes with the answer`
+  const path = dec(`answers/${noteName(item.id, item.q)}`)
+  if (!(await replace($, path, json(note)))) return "couldn't save the note"
+  // Closed while it was written: its asker took the answers already, and won't look for it
+  if (await gone($, dec(`queue/${queueName(item.id)}`))) {
+    await remove($, [path])
+    return `${await closedText($, item.id)}: the note didn't reach it; tell that session yourself`
+  }
+  // Every question answered: the answers may be on their way, and a note that misses them goes on its own
+  return complete ? `Note on ${n} saved: it goes with the answer, or right after it as a note of its own if the answer is on its way already` : `Note on ${n} saved: it goes with the answer`
 }
 
 async function dropCommand($: any, target: string, why: string, origin: string): Promise<string> {
@@ -6671,6 +6756,11 @@ async function dropCommand($: any, target: string, why: string, origin: string):
   const rec = await readQueue($, id)
   if (!rec) return closedText($, id)
   if ('otherFormat' in rec) return `${id} was asked by a fleet with another format: restart that session (u)`
+  // Every question answered: it goes as answered (a drop now would come ahead of the answers, or after answers already
+  // on their way, and the register would say dropped)
+  if (knownKind(rec) && progress(id, slots(rec), await answerNames($)).answered.every(Boolean)) {
+    return `${id} is answered already: it goes to ${(await askerViews($, [rec]))(rec).name} as answered, not dropped (/fleet note <n> "…" adds a note to it)`
+  }
   const file: DropFile = { format: FORMAT, id, ...(why ? { why } : {}), origin, session: await sessionName($), at: await $.clock.now() }
   const r = await publish($, dec(`answers/${dropName(id)}`), json(file))
   if (r === 'exists') return `${id} was dropped already`

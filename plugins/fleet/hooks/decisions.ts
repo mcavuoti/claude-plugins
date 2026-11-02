@@ -413,6 +413,12 @@ export function deliveryText(parts: readonly Delivery[], own: (p: Delivery) => s
   return blocks.join('\n\n') + (answered ? `\n\nGo on with what depended on it.${judged ? " If the person overrules the judge, you'll hear it as a message from the fleet plugin that starts with the same id: then undo what you built on its answer." : ''}` : '')
 }
 
+/** A note the person added once the answers it goes with were on their way (or delivered): told on its own, with the
+ * decision's id first, so the asker knows what it adds to */
+export function lateNoteText(id: string, notes: readonly { q: number; question: string; text: string }[]): string {
+  return `[${id}] The person added a note to the answer you were given:\n${notes.map(n => `${n.q}) ${n.question} → note: ${n.text}`).join('\n')}\n\nTake it into account in what you built on that answer.`
+}
+
 /** The ids a turn's text carries in brackets (the turn that delivers them) */
 export function bracketedIds(textIn: string): string[] {
   return [...new Set([...textIn.matchAll(/\[(D-\d+)\]/g)].map(m => m[1] as string))]

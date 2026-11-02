@@ -197,6 +197,44 @@ test('a note goes with the answer, free text is kept as typed, and a drop tells 
   expect(json(w, `${DEC}/register/2026-11/D-2.json`)).toMatchObject({ state: 'dropped', why: 'not needed any more' })
 })
 
+test('once every question is answered a drop is refused, and a note that comes after the answers left is told on its own', WITH_SESSIONS, async ($, on) => {
+  const w = world(on)
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
+  await startSession($, w)
+  await decide($, { questions: [TWO_QUESTIONS.questions[0]] })
+  await fleet($, '')
+  // Held on its way: the engine starts the submitted prompt's turn later
+  let release: (v: unknown) => void = () => {}
+  w.answerSubmit.value = () => new Promise(res => (release = res))
+  await fleet($, '1a')
+  expect(await fleet($, 'drop 1 not needed')).toBe('D-1 is answered already: it goes to TEST A as answered, not dropped (/fleet note <n> "…" adds a note to it)')
+  expect(under(w, `${DEC}/answers`)).toEqual(['D-1.1.json'])
+  await tick(w)
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]).toContain('[D-1] The person answered:')
+  // The person adds a note while the answer is on its way: it missed it, so it goes on its own once the session is idle
+  expect(await fleet($, 'note 1 only for the tests')).toBe('Note on 1 saved: it goes with the answer, or right after it as a note of its own if the answer is on its way already')
+  await $.turn.start({ text: `The fleet plugin sent a message:\n${w.submits[0]}`, turnId: 't-1' })
+  await w.clock.settle()
+  release({ text: w.submits[0] })
+  await w.clock.settle()
+  expect(json(w, `${DEC}/register/2026-11/D-1.json`)).toMatchObject({ state: 'delivered' })
+  expect(json(w, `${DEC}/register/2026-11/D-1.json`).answers[0]).toMatchObject({ label: 'SQLite', note: 'only for the tests' })
+  await tick(w)
+  expect(w.submits.length).toBe(1)
+  w.answerSubmit.value = text => ({ text })
+  await $.turn.complete({ answer: 'ok', durationMs: 5, isAborted: false, turnId: 't-1', reason: 'answer' } as any)
+  await tick(w)
+  expect(w.submits.length).toBe(2)
+  expect(w.submits[1]).toBe('[D-1] The person added a note to the answer you were given:\n1) Which database for the cache? → note: only for the tests\n\nTake it into account in what you built on that answer.')
+  await $.turn.start({ text: `The fleet plugin sent a message:\n${w.submits[1]}`, turnId: 't-2' })
+  await $.turn.complete({ answer: 'ok', durationMs: 5, isAborted: false, turnId: 't-2', reason: 'answer' } as any)
+  await tick(w, 12000)
+  expect(w.submits.length).toBe(2)
+  // Once it's closed, a note says so
+  expect(await fleet($, 'note 1 and one more thing')).toMatch(/^D-1 is closed \(delivered \d+s ago\)$/)
+})
+
 test('the asking session sits in the "Asking you" section while it waits, and leaves it once answered', WITH_SESSIONS, async ($, on) => {
   const w = world(on)
   sessionsSay(w, { rows: { [REF]: row(REF, 'TEST A', 'idle') } })
@@ -407,6 +445,8 @@ test('/fleet init says when the template turns world commits on', WITH_SESSIONS,
   await startSession($, w)
   expect(await fleet($, 'init hourly')).toContain('World commits are on: every 60 min the sweeper commits the shared files that changed, only them, and never pushes')
   expect(await fleet($, 'init')).toContain('World commits are on')
+})
+
 test('a read of the queue that fails for a while (too many open files) drops nothing: the decision stays and is delivered once it reads', WITH_SESSIONS, async ($, on) => {
   const w = world(on)
   const QUEUE = `${DEC}/queue/D-6.json`
