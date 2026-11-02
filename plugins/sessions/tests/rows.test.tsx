@@ -239,6 +239,37 @@ test('c folds the selected session\'s section into one line, Enter on it unfolds
   await ui.unmount()
 })
 
+function four(): any[] {
+  return [...list(), { id: 'dddddddd', sessionId: 'dddddddd-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4245, name: 'delta' }]
+}
+
+test('c folds and unfolds with the other rows where they were: the pending sort waits until you leave the panel', async ($, on) => {
+  const sessionsList = four()
+  const w = world(on, { list: sessionsList })
+  w.files.set(SECTIONS, DESK({ bbbbbbbb: { section: 'probe:desk', by: 'probe' }, cccccccc: { section: 'probe:desk', by: 'probe' } }))
+  await startSession($, w)
+  const words = ['alpha', 'delta', 'bravo', 'charlie', '▸ Desk']
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'delta', 'bravo', 'charlie'])
+  setFocused(w, true)
+  // delta now waits for you: it would go first, but nothing moves while you're in the panel
+  sessionsList[3].status = 'waiting'
+  await w.clock.advance(7000)
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'delta', 'bravo', 'charlie'])
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  await focusOn($, 's:bbbbbbbb-0000-0000-0000-000000000000')
+  await ui.press({ key: 'fold' })
+  await ui.unmount()
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'delta', '▸ Desk'])
+  const again = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  await again.press({ key: 'h:probe:desk' })
+  await again.unmount()
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'delta', 'bravo', 'charlie'])
+  // Leaving the panel applies the sort
+  setFocused(w, false)
+  await w.clock.advance(3000)
+  expect(await drawnOrder($, words)).toEqual(['delta', 'alpha', 'bravo', 'charlie'])
+})
+
 test('folds made in another session apply here once the panel doesn\'t have the keyboard', async ($, on) => {
   const w = world(on, { list: list() })
   w.files.set(SECTIONS, DESK({ cccccccc: { section: 'probe:desk', by: 'probe' } }))

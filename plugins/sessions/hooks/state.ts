@@ -1080,6 +1080,16 @@ export function drawPlan<T extends { section: string; sectionTitle: string; colo
   return out
 }
 
+// Where the focus goes back to after what the arrows go through changed under it (ringKeys before and after): Claude
+// keeps the focus's position, so when the focused row or fold line moved (one above it left) it's focused again, and
+// when it left, the one next to it. undefined: nothing to do (it's where it was, or it isn't one of them)
+export function refocusTarget(before: readonly string[], after: readonly string[], current: string | undefined): string | undefined {
+  if (!current) return undefined
+  const at = before.indexOf(current)
+  if (at < 0 || after.indexOf(current) === at) return undefined
+  return after.includes(current) ? current : remainingNeighbor([...before], current, [...after])
+}
+
 // What the arrows go through, in order: the rows (s:<sessionId>) and the folded sections' lines (h:<section>)
 export function ringKeys(rows: readonly { sessionId: string; section: string; sectionTitle: string; color: Color; folded?: boolean }[]): string[] {
   return drawPlan(rows).flatMap(it => (it.kind === 'row' ? [`s:${it.row.sessionId}`] : it.kind === 'fold' ? [`h:${it.section}`] : []))

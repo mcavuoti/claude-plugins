@@ -56,6 +56,7 @@ import {
   foldRows,
   drawPlan,
   ringKeys,
+  refocusTarget,
   assignChange,
   sectionHeaders,
   keepPlaces,
@@ -795,6 +796,19 @@ test('folds: a folded section draws one line with its count and who waits, the a
   // With the f filter on nothing folds; nor does a section with no header (the only group)
   expect(foldRows(rows, new Set(['me:renders']), true).some(r => r.folded)).toBe(false)
   expect(foldRows(rows.filter(r => r.section === 'me:renders'), new Set(['me:renders']), false).some(r => r.folded)).toBe(false)
+})
+
+test('focus by position: a row or fold line that shifted, or left, gets the focus put back on it, or on the one next to it', () => {
+  const before = ['s:a', 's:d', 'h:probe:desk', 's:e']
+  // d, above the fold line, left: the line moved up one, so it's focused again
+  expect(refocusTarget(before, ['s:a', 'h:probe:desk', 's:e'], 'h:probe:desk')).toBe('h:probe:desk')
+  // The folded section's last members left, and its line with them: the one after it
+  expect(refocusTarget(before, ['s:a', 's:d', 's:e'], 'h:probe:desk')).toBe('s:e')
+  expect(refocusTarget(before, ['s:a', 's:d', 's:e'], 's:e')).toBe('s:e')
+  // Nothing moved under the focus (a row below it left), or the focus isn't on the list: nothing to do
+  expect(refocusTarget(before, ['s:a', 's:d', 'h:probe:desk'], 's:d')).toBe(undefined)
+  expect(refocusTarget(before, ['s:a'], 'name')).toBe(undefined)
+  expect(refocusTarget(before, ['s:a'], undefined)).toBe(undefined)
 })
 
 test('assignSection with a parent: kept with the member, cleared without one, refused for itself; the person moving it drops it', () => {

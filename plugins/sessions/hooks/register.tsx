@@ -40,6 +40,7 @@ import {
   drawPlan,
   foldRows,
   ringKeys,
+  refocusTarget,
   sectionsFileText,
   sectionsView,
   setMember,
@@ -1253,15 +1254,20 @@ async function refresh($: any) {
 // the panel's focus by position, not by session: if rows move while you're in the panel, the highlight would jump to
 // another session. So with the keyboard in the panel nothing moves, sections, their members, parents, folds and the
 // filter's included (keepPlaces: new rows go at the end); on leaving, the layout is applied. reflow: the person asked
-// for a new layout right now (f, c). If a row left the list, the focus goes back to its session (or the one next to it)
-async function layout($: any, focused: boolean, reflow = false) {
+// for something right now: 'filter' (f) lays the panel out anew; 'fold' (c) folds or unfolds a section with every row
+// kept where it was (the pending sort waits until they leave the panel). The caller of a reflow puts the focus where
+// it goes. Otherwise, if what the arrows go through moved (a row or a fold line left the list, or shifted), the focus
+// goes back to its element (or the one next to it), since Claude keeps the position, not the element
+async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' = '') {
   const shownBefore = await read($, rows)
-  const frozen = focused && !reflow
+  const frozen = focused && reflow !== 'filter'
   waitingSnapshot = waitingMembers(projectRows, waitingSnapshot, waitingOnly, frozen)
   const members = waitingSnapshot
   // Filtered first: a child whose parent isn't shown is drawn as any row
   const grouped = groupRows(members ? projectRows.filter(f => members.has(f.sessionId)) : projectRows, sectionsNow)
-  const shown = keepPlaces(foldRows(grouped, collapsed, !!members), shownBefore, frozen)
+  const kept = keepPlaces(foldRows(grouped, collapsed, !!members), shownBefore, frozen)
+  // A fold the person made: the rows stay put, and only the folds are taken anew, over the sections as they're drawn
+  const shown = reflow === 'fold' ? foldRows(kept, collapsed, !!members) : kept
   await update($, rows, () => shown)
   const spends = projectRows.filter(f => f.usd !== null)
   const others = projectRows.filter(f => !f.current)
@@ -1273,12 +1279,9 @@ async function layout($: any, focused: boolean, reflow = false) {
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
   if (JSON.stringify(next) !== JSON.stringify(await read($, summary))) await update($, summary, () => next)
-  const before = shownBefore.filter(f => !f.folded).map(f => f.sessionId)
-  const after = shown.filter(f => !f.folded).map(f => f.sessionId)
-  if (focused && currentFocus?.startsWith('s:') && before.some(id => !after.includes(id))) {
-    const id = currentFocus.slice(2)
-    bg(focusSession($, after.includes(id) ? id : remainingNeighbor(before, id, after)))
-  }
+  if (!focused || reflow) return
+  const target = refocusTarget(ringKeys(shownBefore), ringKeys(shown), currentFocus)
+  if (target) bg(focusElement($, target))
 }
 
 // The panel stays closed once you close it yourself (its close mark or key, or /sessions): what you chose wins over
@@ -1893,7 +1896,7 @@ async function toggleWaiting($: any) {
   waitingOnly = !waitingOnly
   waitingSnapshot = null
   await storeSet($, 'waitingOnly', waitingOnly)
-  await layout($, true, true)
+  await layout($, true, 'filter')
   const list = await read($, rows)
   const keep = list.find(f => `s:${f.sessionId}` === selectedRow) ?? list.find(f => !f.current) ?? list[0]
   if (keep) bg(focusSession($, keep.sessionId))
@@ -1910,7 +1913,7 @@ async function setFolded($: any, section: string, folded: boolean) {
   if (folded) collapsed.add(section)
   else collapsed.delete(section)
   await storeSet($, 'collapsed', [...collapsed])
-  await layout($, true, true)
+  await layout($, true, 'fold')
 }
 
 // The c key: folds the selected session's section into one line (a button: Enter unfolds it), or unfolds the folded
