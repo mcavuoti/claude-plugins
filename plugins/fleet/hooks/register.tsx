@@ -420,11 +420,13 @@ const seedSent = atom({ plugin: 'fleet', key: 'seedSent' } as const, '')
 const budgetTold = atom({ plugin: 'fleet', key: 'budgetTold' } as const, '')
 const nudgeAt = atom({ plugin: 'fleet', key: 'nudgeAt' } as const, 0)
 const outside = atom({ plugin: 'fleet', key: 'outside' } as const, null as FleetMark | null)
-const personTurn = atom({ plugin: 'fleet', key: 'personTurn' } as const, null as { turnId: string; quoted: string; text?: string } | null)
+// The person's turn: his words (a prompt typed into it adds to them), when he last typed, and how (composer at a terminal,
+// bridge over Remote Control: his answers count from both, a change filed is applied as filed only from a terminal)
+const personTurn = atom({ plugin: 'fleet', key: 'personTurn' } as const, null as { turnId: string; quoted: string; text?: string; at?: number; origin?: string } | null)
 // A turn fleet's own prompt started to deliver the person's answers: the words of his it carries (text answers, notes,
 // reject reasons, why he dropped a decision or overruled a judge), which a taste recorded in it may quote
 const fleetTurn = atom({ plugin: 'fleet', key: 'fleetTurn' } as const, null as { turnId: string; words: string } | null)
-const pendingPerson = atom({ plugin: 'fleet', key: 'pendingPerson' } as const, null as { text: string; at: number } | null)
+const pendingPerson = atom({ plugin: 'fleet', key: 'pendingPerson' } as const, null as { text: string; at: number; origin?: string } | null)
 const turns = atom({ plugin: 'fleet', key: 'turns' } as const, 0)
 const conversationAt = atom({ plugin: 'fleet', key: 'conversationAt' } as const, 0)
 const landedAt = atom({ plugin: 'fleet', key: 'landedAt' } as const, 0)
@@ -1233,7 +1235,7 @@ async function beat($: any) {
   if (!root) return
   const { records } = await queueRecords($)
   const present = await answerNames($)
-  const n = heldCount(records, present)
+  const n = heldCount(records, present, alikeQuestion)
   if ((await read($, held)) !== n) await update($, held, () => n)
   await loadRoster($)
   // Over budget and running: one that's stopped spends nothing more today. Running as sessions sees it (as /fleet
@@ -5313,7 +5315,7 @@ function circularOfChange(rel: string, cur: string | null, result: string, summa
 }
 
 /** The lines a prompt the person typed here (starting a turn) carries when this session's own questions still wait in
- * their queue: which, and how an answer typed here takes one off it */
+ * their queue: which, numbered when a decision has several, and how an answer typed here takes one off it */
 async function openHereLines($: any, e: any): Promise<string[]> {
   if (e.command || e.turnId || !jobRef || !offered || !root) return []
   const pp = await read($, pendingPerson)
@@ -5322,19 +5324,25 @@ async function openHereLines($: any, e: any): Promise<string[]> {
   if (!ids.length) return []
   const present = await answerNames($)
   const waiting: string[] = []
+  let several = false
   for (const id of ids.sort((a, b) => idNumber(a) - idNumber(b))) {
     const rec = await readQueue($, id)
-    if (!rec || 'otherFormat' in rec || rec.kind !== undefined || progress(id, slots(rec), present).complete) continue
-    waiting.push(`${id} ("${cut(rec.questions.map(q => q.question).join(' / '), 160)}")`)
+    if (!rec || 'otherFormat' in rec || rec.kind !== undefined) continue
+    const p = progress(id, slots(rec), present)
+    if (p.complete) continue
+    const qs = rec.questions.map((q, i) => ({ q: i + 1, text: q.question })).filter(x => !p.answered[x.q - 1])
+    if (qs.length > 1) several = true
+    waiting.push(qs.length === 1 ? `${id} ("${cut((qs[0] as { text: string }).text, 160)}")` : `${id} (${qs.map(x => `q ${x.q}: "${cut(x.text, 100)}"`).join(', ')})`)
   }
   if (!waiting.length) return []
-  return [`fleet: your question${waiting.length === 1 ? '' : 's'} ${waiting.join(', ')} still wait${waiting.length === 1 ? 's' : ''} in the person's queue. If what they just typed answers ${waiting.length === 1 ? 'it' : 'one'}, call mcp__fleet__decide with kind "answered" and its id: fleet records their words as its answer and takes it off their queue. If it doesn't, leave it.`]
+  return [`fleet: your question${waiting.length === 1 ? '' : 's'} ${waiting.join(', ')} still wait${waiting.length === 1 ? 's' : ''} in the person's queue. If what they just typed answers ${waiting.length === 1 ? 'it' : 'one'}, call mcp__fleet__decide with kind "answered" and its id${several ? ', and q (the number of the question their words answer; once per question)' : ''}: fleet records their words as its answer and takes it off their queue. If it doesn't, leave it.`]
 }
 
-/** decide with kind answered: the person answered one of this session's own open questions by typing here, so it
- * leaves their queue. The answer is their words as fleet saw them typed this turn (never the model's account of
- * them), for each open question; it's closed as delivered in this call's result. Only a choice: a change, a resource
- * or an outbound does something when answered, and goes through /fleet */
+/** decide with kind answered: the person answered one of this session's own open questions by typing here. The answer
+ * is their words as fleet saw them typed this turn (never the model's account of them), for the question q names (or
+ * the only one open); the others stay in their queue. Once every question is answered it's closed as delivered, and
+ * this call's result carries every answer and note as a delivery would. Only a choice asked before they typed: a
+ * change, a resource or an outbound does something when answered, and goes through /fleet */
 async function answeredHere($: any, e: any) {
   const id = String(e.id ?? '').trim().toUpperCase()
   if (!isDecisionId(id)) return { deny: 'id: the decision the person just answered here, as D-<n>. Nothing was changed.' }
@@ -5346,23 +5354,32 @@ async function answeredHere($: any, e: any) {
   const me = String(await $.session.id())
   if (rec.asker.sessionId !== me && (!jobRef || rec.asker.ref !== jobRef)) return { deny: `${id} was asked by another session (${rec.asker.name || rec.asker.ref || 'not this one'}): only its asker closes it. Nothing was changed.` }
   if (rec.kind !== undefined) return { deny: `${id} is a ${rec.kind}: its answer does something (apply, send, done), so the person answers it with /fleet ${id} …. Nothing was changed.` }
+  // Words typed before the question existed don't answer it
+  if (turn.at !== undefined && rec.at >= turn.at) return { deny: `${id} was asked after the person last typed here: their words can't be its answer. Leave it open; it reaches them in their queue. Nothing was changed.` }
   const present = await answerNames($)
   const p = progress(id, slots(rec), present)
   if (p.complete) return { result: `${id} is answered already: the answer reaches you as usual.` }
+  const openQs = rec.questions.map((_, i) => i + 1).filter(q => !p.answered[q - 1])
+  const asked = e.q === undefined || e.q === null || e.q === '' ? null : Number(e.q)
+  if (asked === null && openQs.length > 1) return { deny: `${id} has questions ${openQs.join(' and ')} open: call again with q, the number of the one their words answer (once per question they answer). Nothing was changed.` }
+  const q = asked ?? (openQs[0] as number)
+  if (!Number.isInteger(q) || q < 1 || q > rec.questions.length) return { deny: `q: a question of ${id}, 1 to ${rec.questions.length}. Nothing was changed.` }
+  if (p.answered[q - 1]) return { result: `${id} question ${q} is answered already: the answer reaches you as usual.` }
   const now = await $.clock.now()
   const here = await sessionName($)
   const words = cut((turn.text ?? turn.quoted).trim(), 2000)
-  let saved = 0
-  for (let q = 1; q <= rec.questions.length; q++) {
-    if (p.answered[q - 1]) continue
-    const file: AnswerFile = { format: FORMAT, id, q, text: words, origin: 'composer', session: here, at: now, pre: true, quoted: turn.quoted }
-    if ((await publish($, dec(`answers/${answerName(id, q)}`), json(file))) === 'ok') saved++
-  }
-  if (!saved) return { result: `${id} was answered meanwhile: the answer reaches you as usual.` }
-  await close($, id, { state: 'delivered', how: 'result' })
-  log($, `${id} answered in its asker's session: the person typed it this turn`)
+  const file: AnswerFile = { format: FORMAT, id, q, text: words, origin: turn.origin === 'bridge' ? 'bridge' : 'composer', session: here, at: now, pre: true, quoted: turn.quoted }
+  if ((await publish($, dec(`answers/${answerName(id, q)}`), json(file))) !== 'ok') return { result: `${id} question ${q} was answered meanwhile: the answer reaches you as usual.` }
+  const after = await answerNames($)
+  const left = progress(id, slots(rec), after).answered.map((a, i) => (a ? 0 : i + 1)).filter(Boolean)
+  log($, `${id} question ${q} answered in its asker's session: the person typed it this turn`)
   bg(beat($))
-  return { result: `${id} is off the person's queue: what they typed this turn is its answer, in the register. Go on with it.` }
+  if (left.length) return { result: `${id} question ${q}: what they typed this turn is its answer, in the register when ${id} closes. Question${left.length === 1 ? '' : 's'} ${left.join(' and ')} still wait${left.length === 1 ? 's' : ''} in their queue. Go on with what depended on question ${q}.` }
+  // Every question answered now: it closes here, and what the others were answered (with /fleet, or a judge) and any
+  // note come in this result, as a delivery would bring them
+  const { outcomes, drop } = await outcomesOf($, rec, after)
+  await close($, id, { state: 'delivered', how: 'result' })
+  return { result: `${id} is off the person's queue: what they typed this turn is the answer to question ${q}, in the register.\n\n${deliveryText([{ record: rec, outcomes, drop }])}` }
 }
 
 async function fileChange($: any, e: any) {
@@ -5404,7 +5421,8 @@ async function fileChange($: any, e: any) {
   // Who asked for it: the person, typing this turn, in a conversation that read nothing from outside (then it's applied
   // as it's filed: his direct command costs him no tap), or not (it waits for /fleet <n> apply)
   const mark = await read($, outside)
-  const turn = await read($, personTurn)
+  const anyTurn = await read($, personTurn)
+  const turn = anyTurn && anyTurn.origin !== 'bridge' ? anyTurn : null
   // A change to outbound.json (what may leave without asking) always waits for his apply, which shows him the diff
   const verdict = circular ? { ok: false as const, why: 'circular' as const } : rel === OUTBOUND_JSON ? { ok: false as const, why: 'allowlist' as const } : preAnswer({ personTurn: !!turn, mark, mainThread: e.agentId === undefined })
   const record = await allocate($, id => ({
@@ -7182,7 +7200,8 @@ async function tasteCall($: any, e: any) {
   await ensureWorld($)
   const area = areaOf(c.area, worldTags)
   // His only when what it says is in his own words: his prompt of this turn, or what fleet delivered of his in it
-  const turn = await read($, personTurn)
+  const anyTurn = await read($, personTurn)
+  const turn = anyTurn && anyTurn.origin !== 'bridge' ? anyTurn : null
   const delivered = await read($, fleetTurn)
   const typed = !!turn && heardIn(c.said, turn.text ?? turn.quoted)
   const fromAnswer = !typed && !!delivered && heardIn(c.said, delivered.words)
@@ -7670,17 +7689,40 @@ async function itemsOf($: any, n: number): Promise<{ id: string; q: number }[]> 
   return key ? listedMembers(key) : []
 }
 
-/** A decision named by its id (D-3): a change, resource or outbound itself, or a choice's only open question. why: what
- * to say when it names none */
-async function itemsOfId($: any, id: string): Promise<{ items: { id: string; q: number }[]; why?: string }> {
+/** A decision named by its id (D-3): a change, resource or outbound itself, or a choice's only open question, with the
+ * same question other sessions asked (one answer goes to each, as by its number). For a note: the choice's first open
+ * question, or its first once all are answered (it goes with the answer). why: what to say when it names none */
+async function itemsOfId($: any, id: string, forNote = false): Promise<{ items: { id: string; q: number }[]; why?: string }> {
   const rec = await readQueue($, id)
   if (!rec) return { items: [], why: await closedText($, id) }
   if ('otherFormat' in rec || !knownKind(rec) || rec.kind !== undefined) return { items: [{ id, q: 1 }] }
-  const p = progress(id, slots(rec), await answerNames($))
+  const present = await answerNames($)
+  const p = progress(id, slots(rec), present)
+  if (p.dropped) return { items: [], why: `${id} was dropped` }
   const open = rec.questions.map((_, i) => i + 1).filter(q => !p.answered[q - 1])
-  if (open.length === 1) return { items: [{ id, q: open[0] as number }] }
-  if (!open.length) return { items: [], why: p.dropped ? `${id} was dropped` : `${id} is answered already` }
-  return { items: [], why: `${id} has ${open.length} questions open: answer them by their numbers in /fleet` }
+  if (forNote) return { items: [{ id, q: (open[0] as number | undefined) ?? 1 }] }
+  if (!open.length) return { items: [], why: `${id} is answered already` }
+  if (open.length > 1) return { items: [], why: `${id} has ${open.length} questions open: answer them by their numbers in /fleet` }
+  const q = open[0] as number
+  const { records } = await queueRecords($)
+  const group = listedItems(records, present, alikeQuestion).find(l => l.members.some(m => m.id === id && m.q === q))
+  // The one named first: it's the one the reply speaks of
+  return { items: group ? [{ id, q }, ...group.members.filter(m => m.id !== id)] : [{ id, q }] }
+}
+
+/** A choice's answer to question q as the register keeps it, once the decision closed (this month's or last month's) */
+async function registerAnswer($: any, id: string, q: number): Promise<Outcome | null> {
+  const now = await $.clock.now()
+  for (const m of [monthOf(now), monthBefore(monthOf(now))]) {
+    const t = await readText($, registerPath(id, m))
+    if (t === null) continue
+    try {
+      return ((JSON.parse(t) as RegisterRecord).answers[q - 1] as Outcome | null | undefined) ?? null
+    } catch {
+      return null
+    }
+  }
+  return null
 }
 
 // What became of a decision that's no longer open, from the register (this month's or last month's)
@@ -7706,11 +7748,17 @@ async function closedText($: any, id: string, q?: number): Promise<string> {
 let pointerWarned = ''
 
 async function answerCommand($: any, items: AnswerItem[], origin: string): Promise<string> {
+  // What this session's list showed before this command: an outbound goes only as it was shown here
+  let seen = await read($, listing)
   // No list shown in this session yet: with one thing waiting, 1 is it; otherwise the list, to answer by its numbers
-  if (items.some(it => typeof it.n === 'number') && !(await read($, listing)).length) {
+  if (items.some(it => typeof it.n === 'number') && !seen.length) {
     const list = await listCommand($)
     const keys = await read($, listing)
     if (keys.length !== 1 || items.some(it => it.n !== 1)) return keys.length ? `Nothing was answered: these are the numbers to answer by.\n\n${list}` : list
+    // The one thing waiting is an outbound to send: it goes only once the list has shown it whole, so here it is
+    const only = await readQueue($, (listedMembers(keys[0] as string)[0] as { id: string }).id)
+    if (only && !('otherFormat' in only) && only.kind === 'outbound' && items.some(it => it.verb === 'send')) return `Nothing was sent: an outbound goes only as /fleet shows it. Here it is; /fleet 1 send sends it.\n\n${list}`
+    seen = keys
   }
   const now = await $.clock.now()
   const here = await sessionName($)
@@ -7731,6 +7779,20 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
         lines.push(`${it.n}: not in the last list (/fleet shows it again)`)
         continue
       }
+    }
+    // A question several asked: the members closed meanwhile (answered in their own session, dropped) are said, and
+    // the answer goes to the ones still open
+    if (members.length > 1) {
+      const still: { id: string; q: number }[] = []
+      const shut: string[] = []
+      for (const m of members) {
+        const r = await readQueue($, m.id)
+        const done = !r || (!('otherFormat' in r) && ((await exists($, dec(`answers/${dropName(m.id)}`))) || (await exists($, dec(`answers/${answerName(m.id, m.q)}`)))))
+        if (done) shut.push(`${m.id}: ${r ? 'answered or dropped already' : await closedText($, m.id, m.q)}`)
+        else still.push(m)
+      }
+      if (shut.length && still.length) lines.push(`${it.n}: ${shut.join('; ')}`)
+      if (still.length) members = still
     }
     const item = members[0] as { id: string; q: number }
     const rec = await readQueue($, item.id)
@@ -7759,8 +7821,11 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
       continue
     }
     if (rec.kind === 'outbound') {
-      // What leaves the project is the one hard line: its draft is answered where it was read whole, at a terminal
-      lines.push(origin === 'bridge' ? `${it.n}: ${rec.id} is an outbound draft: answer it at a terminal session of the project, where /fleet shows exactly what would go out` : await answerOutbound($, it, rec, origin, here, now))
+      // What leaves the project is the one hard line: its draft is answered where it was read whole, at a terminal, and
+      // sent only once this session's list showed it (by its id too)
+      if (origin === 'bridge') lines.push(`${it.n}: ${rec.id} is an outbound draft: answer it at a terminal session of the project, where /fleet shows exactly what would go out`)
+      else if (it.verb === 'send' && !seen.includes(`${rec.id}.1`)) lines.push(`${it.n}: nothing was sent: ${rec.id} goes out only as /fleet shows it in this session. /fleet lists it whole; then /fleet <its number> send`)
+      else lines.push(await answerOutbound($, it, rec, origin, here, now))
       continue
     }
     if (it.verb) {
@@ -7786,7 +7851,9 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
       if (k !== null && k !== it.n && k <= (await read($, listing)).length && pointerWarned !== key) {
         pointerWarned = key
         const said = await itemAnswerWords($, k)
-        lines.push(`${it.n}: your answer points at item ${k} of this list ("${chosen.text}"), and ${(await askerViews($, [rec]))(rec).name} never sees this list: write the answer itself${said ? ` (item ${k} was answered ${said}: /fleet ${it.n} ${said} sends that)` : ''}. Typed again as it is, it goes as it is.`)
+        const i = said?.label !== undefined ? question.options.findIndex(o => o.label === said.label) : -1
+        const fix = said ? (i >= 0 ? `/fleet ${it.n}${letter(i)}` : `/fleet ${it.n} "${said.words.replace(/"/g, "'")}"`) : ''
+        lines.push(`${it.n}: your answer points at item ${k} of this list ("${chosen.text}"), and ${(await askerViews($, [rec]))(rec).name} never sees this list: write the answer itself${said ? ` (item ${k} was answered "${said.words}": ${fix} sends that)` : ''}. Typed again as it is, it goes as it is.`)
         continue
       }
     }
@@ -7840,20 +7907,21 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
   return lines.join('\n')
 }
 
-/** What the list's item k was answered, in the words /fleet takes ("Mountains"), when it was: a pointer's fix */
-async function itemAnswerWords($: any, k: number): Promise<string> {
+/** What the list's item k was answered ("Mountains", and its label when it picked an option), when it was: a pointer's
+ * fix. Its answer file, or the register once its asker had it */
+async function itemAnswerWords($: any, k: number): Promise<{ words: string; label?: string } | null> {
   const m = (await itemsOf($, k))[0]
-  if (!m) return ''
+  if (!m) return null
   const p = parseWire<AnswerFile>((await readText($, dec(`answers/${answerName(m.id, m.q)}`))) ?? '')
-  const a = p && 'value' in p ? p.value : null
+  const a: { label?: string; text?: string } | null = p && 'value' in p ? p.value : await registerAnswer($, m.id, m.q)
   const words = a ? (a.label ?? a.text ?? '') : ''
-  return words ? `"${words.replace(/"/g, "'")}"` : ''
+  return words ? { words, ...(a?.label !== undefined ? { label: a.label } : {}) } : null
 }
 
 async function noteCommand($: any, n: number | string, text: string, origin: string): Promise<string> {
   let members: { id: string; q: number }[]
   if (typeof n === 'string') {
-    const r = await itemsOfId($, n)
+    const r = await itemsOfId($, n, true)
     if (!r.items.length) return `${n}: ${r.why}`
     members = r.items
   } else {
@@ -8226,7 +8294,7 @@ async function statusCommand($: any): Promise<string> {
     const { records, other } = await queueRecords($)
     const present = await answerNames($)
     const waiting = records.filter(r => knownKind(r) && progress(r.id, slots(r), present).complete).length
-    lines.push(`project: ${heldCount(records, present)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
+    lines.push(`project: ${heldCount(records, present, alikeQuestion)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
     lines.push((await sweeperState($)).line)
     await ensureWorld($)
     const spent = await judgeLedger($, await $.clock.now())
@@ -8414,16 +8482,25 @@ async function personPrompt($: any, e: any) {
     launch = isLaunchPrompt({ background: true, turnsBefore: 0, text, intent: typeof s?.intent === 'string' ? s.intent : null })
     if (launch) person = false
   }
-  log($, `prompt from ${kind || 'unknown'}${e.origin?.name ? ` ${e.origin.name}` : ''}${launch ? ', the launch prompt (not the person)' : ''}${e.turnId ? `, into turn ${e.turnId}` : ''}${person ? ': the person' : ''}`)
-  if (!person) {
+  // Over Remote Control it's his too: his answers count from there; a change he files is applied as filed only from a
+  // terminal (the turn keeps how he typed)
+  const bridge = kind === 'bridge'
+  log($, `prompt from ${kind || 'unknown'}${e.origin?.name ? ` ${e.origin.name}` : ''}${launch ? ', the launch prompt (not the person)' : ''}${e.turnId ? `, into turn ${e.turnId}` : ''}${person || bridge ? ': the person' : ''}`)
+  if (!person && !bridge) {
     if (!e.turnId) await update($, pendingPerson, () => null)
     return
   }
+  const origin = person ? 'composer' : 'bridge'
   const now = await $.clock.now()
-  // Typed into a running turn: that turn is his; and the next, if the prompt waits for it (every other prompt that
-  // starts a turn comes through here first and clears this)
-  if (e.turnId) await update($, personTurn, t => (t && t.turnId === e.turnId ? t : { turnId: e.turnId, quoted: cut(text, 300), text: cut(text, 4000) }))
-  await update($, pendingPerson, () => ({ text, at: now }))
+  // Typed into a running turn: that turn is his, and what he typed adds to his words; and the next, if the prompt waits
+  // for it (every other prompt that starts a turn comes through here first and clears this)
+  if (e.turnId)
+    await update($, personTurn, t =>
+      t && t.turnId === e.turnId
+        ? { ...t, text: cut(`${t.text ?? t.quoted}\n${text}`, 4000), at: now, origin: t.origin === 'bridge' && origin === 'bridge' ? 'bridge' : 'composer' }
+        : { turnId: e.turnId, quoted: cut(text, 300), text: cut(text, 4000), at: now, origin },
+    )
+  await update($, pendingPerson, () => ({ text, at: now, origin }))
 }
 
 // ---- AskUserQuestion: what the person answered in a dialog goes to the register too ----
@@ -8573,7 +8650,7 @@ export const register: Register = on => {
       const now = await $.clock.now()
       const his = !!p && now - p.at < 60000 && !!p.text.trim() && String(e.text ?? '').includes(p.text.trim().slice(0, 200))
       if (his || (p && now - p.at >= 60000)) await update($, pendingPerson, () => null)
-      await update($, personTurn, () => (his && p ? { turnId: e.turnId, quoted: cut(p.text, 300), text: cut(p.text, 4000) } : null))
+      await update($, personTurn, () => (his && p ? { turnId: e.turnId, quoted: cut(p.text, 300), text: cut(p.text, 4000), at: p.at, origin: p.origin ?? 'composer' } : null))
       await update($, fleetTurn, () => null)
       await update($, turns, n => n + 1)
       // Busy whatever the timers are: a hot reload mid-turn resets them (module state) while busy lives on in $.state,

@@ -226,11 +226,12 @@ export function sameQuestion(a: string, b: string): boolean {
   return shared >= 2 && shared / union >= 0.5
 }
 
-/** Two questions /fleet lists as one: alike in words (sameQuestion) and with the same option labels in the same order,
- * so one letter picks the same option for each asker */
+/** Two questions /fleet lists as one: the same words once normalised (case, accents, punctuation), and the same option
+ * labels in the same order, so one letter picks the same option for each asker. Never words merely alike: "delete
+ * notes/old.md?" and "keep notes/old.md?" share most of their words and mean the opposite */
 export function alikeQuestion(a: { question: string; options: readonly { label: string }[] }, b: { question: string; options: readonly { label: string }[] }): boolean {
   if (a.options.length !== b.options.length || !a.options.every((o, i) => norm(o.label) === norm(b.options[i]?.label ?? ''))) return false
-  return sameQuestion(a.question, b.question)
+  return norm(a.question) !== '' && norm(a.question) === norm(b.question)
 }
 
 /** The words that set an option apart: four letters or more, off the stop list, in its label or description and in no
