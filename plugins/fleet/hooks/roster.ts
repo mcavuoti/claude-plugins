@@ -353,6 +353,9 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
     const f = parseRoleFile(text)
     if (f.name !== null && f.name !== agent) errors.push(`.claude/agents/${agent}.md is named "${f.name}" in its front matter: --agent ${agent} finds a role by that name`)
     if (!seesFleet(f.tools)) errors.push(`.claude/agents/${agent}.md: its tools don't list mcp__fleet__*, so fleet's tools would be hidden from it (and its start would hold 8 s)`)
+    // A dialog in a session nobody is at waits for nobody: a mark, the role's to fix
+    else if (f.tools === null || f.tools.includes('AskUserQuestion') || f.tools.includes('*'))
+      warnings.push(`.claude/agents/${agent}.md: ${f.tools === null ? 'with no tools line it has every tool, AskUserQuestion included' : 'its tools include AskUserQuestion'}: a question it asks that way waits for nobody (an instance asks with mcp__fleet__decide); list its tools without it`)
   }
   for (const i of instances) {
     if (i.model !== null && !familyOf(i.model)) warnings.push(`"${i.name}": no price known for the model "${i.model}": the forecast leaves it out`)
