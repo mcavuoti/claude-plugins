@@ -227,6 +227,16 @@ export function letter(i: number): string {
   return LETTERS[i] ?? '?'
 }
 
+/** A label reads well up to this many characters; a longer one is kept whole and the asker is told */
+export const LABEL_READS = 60
+/** The longest label fleet keeps */
+export const LABEL_MAX = 200
+
+/** A text shortened for a one-line display, with an ellipsis when it was longer (the text itself is kept whole) */
+export function shown(s: string, max: number): string {
+  return Array.from(s).length > max ? `${Array.from(s).slice(0, max - 1).join('').trimEnd()}…` : s
+}
+
 /** At most max UTF-16 units of a text, never ending on half of a character: a lone high surrogate at the end (an emoji
  * cut in two, here or by an earlier slice) is dropped, since the API refuses a request that carries one. Every text fleet
  * cuts on its way to a model goes through this */
@@ -270,7 +280,7 @@ export const DECIDE_SCHEMA = {
               type: 'object',
               required: ['label'],
               properties: {
-                label: { type: 'string', maxLength: 60 },
+                label: { type: 'string', description: 'A few words, up to about 60 characters; the detail goes in description' },
                 description: { type: 'string', maxLength: 200, description: 'Optional: what choosing it means' },
               },
             },
@@ -312,10 +322,12 @@ export const DECIDE_DESCRIPTION =
 /** The asker's own word on a choice, which only the judges' gates read (a flag that isn't a boolean says nothing) */
 export type DecideFlags = { area?: unknown; reversible?: boolean; touchesMoney?: boolean; outsideWorld?: boolean }
 
-export function checkDecide(input: any): ({ ok: true; questions: Question[]; blocks?: string } & DecideFlags) | { ok: false; reason: string } {
+/** notes: what the asker should hear about its input (a long label, kept whole) */
+export function checkDecide(input: any): ({ ok: true; questions: Question[]; blocks?: string; notes: string[] } & DecideFlags) | { ok: false; reason: string } {
   const list = input?.questions
   if (!Array.isArray(list) || list.length < 1 || list.length > 4) return { ok: false, reason: 'questions: give 1 to 4 questions' }
   const questions: Question[] = []
+  const notes: string[] = []
   for (const [i, raw] of list.entries()) {
     const n = i + 1
     const question = text(raw?.question, 400)
@@ -324,14 +336,15 @@ export function checkDecide(input: any): ({ ok: true; questions: Question[]; blo
     if (!Array.isArray(opts) || opts.length < 2 || opts.length > 4) return { ok: false, reason: `question ${n}: give 2 to 4 options` }
     const options: Option[] = []
     for (const o of opts) {
-      const label = text(typeof o === 'string' ? o : o?.label, 60)
+      const label = text(typeof o === 'string' ? o : o?.label, LABEL_MAX)
       if (!label) return { ok: false, reason: `question ${n}: every option needs a label` }
+      if (Array.from(label).length > LABEL_READS) notes.push(`question ${n}, option ${letter(options.length)}: its label is ${Array.from(label).length} characters, kept whole, but a label of a few words with the detail in its description reads better`)
       if (options.some(x => x.label.toLowerCase() === label.toLowerCase())) return { ok: false, reason: `question ${n}: two options are both "${label}"` }
       const description = text(o?.description, 200)
       options.push(description ? { label, description } : { label })
     }
     // The recommendation: an option's label, or its letter (a-d)
-    const said = text(raw?.recommended, 60)
+    const said = text(raw?.recommended, LABEL_MAX)
     const k = options.findIndex(o => o.label.toLowerCase() === said.toLowerCase())
     const byLetter = /^[a-d]\)?$/i.test(said) ? LETTERS.indexOf(said[0]!.toLowerCase()) : -1
     const pick = k >= 0 ? k : byLetter < options.length ? byLetter : -1
@@ -345,7 +358,7 @@ export function checkDecide(input: any): ({ ok: true; questions: Question[]; blo
   const flags: DecideFlags = {}
   for (const k of ['reversible', 'touchesMoney', 'outsideWorld'] as const) if (typeof input?.[k] === 'boolean') flags[k] = input[k]
   if (input?.area !== undefined) flags.area = input.area
-  return { ok: true, questions, ...(blocks ? { blocks } : {}), ...flags }
+  return { ok: true, questions, notes, ...(blocks ? { blocks } : {}), ...flags }
 }
 
 export function ticketText(id: string): string {

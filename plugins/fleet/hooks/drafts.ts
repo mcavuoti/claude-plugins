@@ -8,6 +8,7 @@
 // deny it); the person's own editor always may (/fleet accept stamps it as his).
 
 import { hashText } from './changes'
+import { cut } from './decisions'
 
 /** The change a queue record carries: the file (relative to the project), what it does, the versions it's bound to,
  * where the draft and its diff are (relative to the project's .claude/fleet/) and how many lines it adds and removes */
@@ -30,6 +31,11 @@ export type Edit = { old_string: string; new_string: string; replace_all?: boole
 /** What the person answered to a change: fleet applied it, he rejected it, or it couldn't be applied (the file moved) */
 export type ChangeOutcome = 'applied' | 'rejected' | 'stale'
 
+/** A summary reads well in the brief up to this many characters; a longer one is kept whole (/fleet shows it all) */
+export const SUMMARY_READS = 200
+/** The longest summary fleet keeps */
+export const SUMMARY_MAX = 1000
+
 /** The biggest draft fleet keeps */
 export const MAX_DRAFT = 1024 * 1024
 /** How many diff lines /fleet shows inline */
@@ -39,12 +45,12 @@ export const DIFF_SHOWN = 12
 export function checkChange(input: any): { ok: true; path: string; summary: string; edits?: Edit[]; content?: string; blocks?: string } | { ok: false; reason: string } {
   const path = typeof input?.path === 'string' ? input.path.trim() : ''
   if (!path) return { ok: false, reason: 'path: name the file to change, relative to the project folder' }
-  const summary = typeof input?.summary === 'string' ? input.summary.trim().replace(/\s+/g, ' ').slice(0, 200) : ''
+  const summary = typeof input?.summary === 'string' ? cut(input.summary.trim().replace(/\s+/g, ' '), SUMMARY_MAX) : ''
   if (!summary) return { ok: false, reason: 'summary: say in one line what the change does and why' }
   const hasEdits = Array.isArray(input?.edits) && input.edits.length > 0
   const hasContent = typeof input?.content === 'string'
   if (hasEdits === hasContent) return { ok: false, reason: 'give either edits (old_string → new_string, as with Edit) or content (the whole new text), not both' }
-  const blocks = typeof input?.blocks === 'string' ? input.blocks.trim().slice(0, 200) : ''
+  const blocks = typeof input?.blocks === 'string' ? cut(input.blocks.trim(), 200) : ''
   const more = blocks ? { blocks } : {}
   if (hasContent) {
     if (input.content.length > MAX_DRAFT) return { ok: false, reason: `content: at most ${MAX_DRAFT} characters` }
@@ -198,7 +204,8 @@ export function applyVerdict(spec: ChangeSpec, current: string | null, draft: st
 
 export function changeTicket(id: string, spec: ChangeSpec): string {
   const what = spec.base === null ? 'a new file' : `+${spec.added} −${spec.removed} lines`
-  return `Queued as ${id} for the person: a change to ${spec.path} (${what}). Nothing changes until the person applies it; then fleet writes your draft itself, as long as ${spec.path} is still as it is now. Don't write it another way meanwhile. The answer arrives later as a message from the fleet plugin that starts with [${id}].`
+  const long = Array.from(spec.summary).length > SUMMARY_READS ? ` Its summary is ${Array.from(spec.summary).length} characters: /fleet shows it whole, the brief only its start, so keep the next one to a line.` : ''
+  return `Queued as ${id} for the person: a change to ${spec.path} (${what}). Nothing changes until the person applies it; then fleet writes your draft itself, as long as ${spec.path} is still as it is now. Don't write it another way meanwhile. The answer arrives later as a message from the fleet plugin that starts with [${id}].${long}`
 }
 
 /** What the asker reads when its change was answered. It stands on its own (after a /clear too) */

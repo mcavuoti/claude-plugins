@@ -423,7 +423,8 @@ In a background session (`claude --bg`, or one started from the panel or `ccc`) 
 - 1 to 4 questions, each with 2 to 4 options, the option it recommends and one line on why, and optionally what waits on the answer (`blocks`);
 - it answers at once: `Queued as D-3 for the person … The answer arrives later as a message from the fleet plugin that starts with [D-3]`, and the model goes on with what doesn't depend on it, or ends its turn;
 - with `kind: "change"` it files a change to a command-level file instead ([above](#changes-to-command-level-files)), and with `kind: "resource"` a request for something only you can get ([above](#resources));
-- a subagent can't use it ("put the question in your report to the main thread"), and a bad call (an option recommended that isn't one of the options, no reason) is refused with what to fix.
+- a subagent can't use it ("put the question in your report to the main thread"), and a bad call (an option recommended that isn't one of the options, no reason) is refused with what to fix;
+- what it writes is kept whole: an option's label past 60 characters, or a change's summary past 200, is kept as written (`/fleet` shows it all; the brief only a summary's start), and the ticket tells the model that a short one reads better.
 
 It gets **`mcp__fleet__send`** too: the draft of anything that would send the project's content outside, for you to approve ([above](#what-leaves-goes-through-you-outbound)); and **`mcp__fleet__slot`**, to take and release the project's scarce resources ([above](#slots-scarce-resources)).
 

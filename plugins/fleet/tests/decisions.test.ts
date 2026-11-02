@@ -15,6 +15,7 @@ import {
   parseConfig,
   parseWire,
   progress,
+  shown,
   type QueueRecord,
 } from '../hooks/decisions'
 
@@ -110,7 +111,15 @@ test('a change waits for one answer and counts for the band; a kind this fleet d
 
 test("decide's input: counts, labels, the recommendation by label or letter, and a reason", () => {
   const ok = checkDecide({ questions: [{ question: ' Which? ', options: ['A', { label: 'B', description: 'bee' }], recommended: 'b', why: 'cheaper' }] })
-  expect(ok).toEqual({ ok: true, questions: [{ question: 'Which?', options: [{ label: 'A' }, { label: 'B', description: 'bee' }], recommended: 'B', why: 'cheaper' }] })
+  expect(ok).toEqual({ ok: true, notes: [], questions: [{ question: 'Which?', options: [{ label: 'A' }, { label: 'B', description: 'bee' }], recommended: 'B', why: 'cheaper' }] })
+  // A long label is kept whole (and recommended by it), and the asker hears that a short one reads better
+  const long = 'A named colleague may request changes to requirements and the proof of concept'
+  const kept = checkDecide({ questions: [{ question: 'Who?', options: ['Only me', long], recommended: long, why: 'w' }] })
+  expect(kept.ok && kept.questions[0]!.options[1]!.label).toBe(long)
+  expect(kept.ok && kept.questions[0]!.recommended).toBe(long)
+  expect(kept.ok && kept.notes).toEqual([`question 1, option b: its label is ${long.length} characters, kept whole, but a label of a few words with the detail in its description reads better`])
+  expect(shown('abcdef', 4)).toBe('abc…')
+  expect(shown('abc', 4)).toBe('abc')
   const bad = (input: unknown) => {
     const r = checkDecide(input)
     return r.ok ? '' : r.reason

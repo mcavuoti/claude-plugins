@@ -91,6 +91,7 @@ import {
   ago,
   answerName,
   checkDecide,
+  shown,
   cut,
   classifyDialog,
   configText,
@@ -6391,7 +6392,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     const who = view(r).name
     const what =
       r.kind === 'change' && r.change
-        ? `${r.change.path}, "${r.change.summary}"`
+        ? `${r.change.path}, "${shown(r.change.summary, 120)}"`
         : r.kind === 'resource' && r.resource
           ? r.resource.what
           : r.kind === 'outbound' && r.outbound
@@ -6984,7 +6985,7 @@ export const register: Register = on => {
     bg(beat($))
     // The judge: one call of its own, after the ticket (from a timer: the tool's answer doesn't wait for it)
     $.clock.after(0, () => bg(judgeDecision($, record)))
-    return { result: `${ticketText(record.id)}${area.note ? ` (${area.note}.)` : ''}` }
+    return { result: `${ticketText(record.id)}${area.note ? ` (${area.note}.)` : ''}${checked.notes.length ? ` Note: ${checked.notes.join('; ')}.` : ''}` }
   }).catch(() => ({ result: "fleet couldn't queue this question: ask the person in plain text" }))
 
   // An outbound draft for the person (outbound.ts): what a held call would have sent, kept exactly, until he answers

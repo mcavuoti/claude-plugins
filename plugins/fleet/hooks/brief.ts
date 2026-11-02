@@ -5,7 +5,7 @@
 
 import type { Level } from './authority'
 import { changeLine, clock, type ChangeEvent, type Me } from './changes'
-import { ago } from './decisions'
+import { ago, shown } from './decisions'
 import { hoursText, usd, usdOf } from './roster'
 
 /** judge: what the judge proposed on a choice, in a few words ("a) SQLite, citing D-3") */
@@ -166,7 +166,7 @@ export function closedLine(r: { id: string; kind?: string; change?: { path: stri
   if (!a) return null
   if (r.kind === 'change' && r.change && a.label === 'applied') {
     const how = a.pre ? `as filed: the person typed it to ${asker}${a.session ? ` in ${a.session}` : ''}` : `by the person's apply${a.session ? ` in ${a.session}` : ''}`
-    return `${r.change.path}: ${r.id} applied ${how} ("${r.change.summary}")`
+    return `${r.change.path}: ${r.id} applied ${how} ("${shown(r.change.summary, 120)}")`
   }
   if (r.kind === 'outbound' && r.outbound && (a.label === 'sent' || a.label === 'done')) {
     return `went out: ${r.outbound.what} to ${r.outbound.to}, ${r.id} ${a.label === 'sent' ? `sent by fleet as the person approved (${a.text ?? 'done'})` : 'sent by the person himself'}`

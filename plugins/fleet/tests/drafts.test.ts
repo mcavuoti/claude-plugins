@@ -70,6 +70,12 @@ test('applying: the draft as filed (or the one the person confirmed), on the ver
 test("the words: the asker's ticket and what it hears when the person answers; the draft's name", () => {
   expect(changeTicket('D-4', SPEC)).toContain('Queued as D-4 for the person: a change to req/R-1.md (+1 −1 lines)')
   expect(changeTicket('D-4', SPEC)).toContain('[D-4]')
+  expect(changeTicket('D-4', SPEC)).not.toContain('Its summary is')
+  // A long summary is kept whole (it was cut at 200 before), and the asker hears the brief shows only its start
+  const summary = `${'the charter changes too: '.repeat(14)}the deadline`
+  const c = checkChange({ path: 'a.md', summary, content: 'x' })
+  expect(c.ok && c.summary).toBe(summary)
+  expect(changeTicket('D-4', { ...SPEC, summary })).toContain(`Its summary is ${summary.length} characters: /fleet shows it whole, the brief only its start`)
   expect(changeDelivery('D-4', SPEC, { label: 'applied' }, null)).toBe('[D-4] The person applied your change to req/R-1.md ("the target goes down"): fleet wrote it as you drafted it.')
   expect(changeDelivery('D-4', SPEC, { label: 'applied', text: 'edited', note: 'keep it short' }, null)).toContain('with edits of their own to the draft: read it before you rely on it (note: keep it short)')
   expect(changeDelivery('D-4', SPEC, { label: 'rejected' }, null)).toContain("[D-4] The person rejected your change to req/R-1.md")
