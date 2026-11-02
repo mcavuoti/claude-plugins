@@ -63,6 +63,10 @@ import {
   pruneMembers,
   slugOf,
   type SectionsView,
+  spendOf,
+  publishedSpend,
+  formatUsd,
+  limitsText,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -657,4 +661,33 @@ test("sections: the person's own are made by title and go when the last session 
   // Members of sessions that are gone go, and so do the person's sections they leave empty
   const pruned = pruneMembers(b.file, ref => ref === 'zzzzzzzz')
   expect(sectionsView(pruned)).toEqual({ sections: [], members: {} })
+})
+
+test('spend: read per session, a subscription by its windows, an API account by its cost', () => {
+  // A subscription: whichever windows the account reports (the weekly one alone is fine), the cost is ignored
+  expect(spendOf({ usd: 4, limits: [{ kind: 'seven_day', percent: 43 }] })).toEqual({ mode: 'subscription', limits: [{ kind: 'seven_day', percent: 43 }] })
+  // No windows and a cost: an API account
+  expect(spendOf({ usd: 1.2, limits: [] })).toEqual({ mode: 'api', usd: 1.2 })
+  // Before the first response (no window, nothing spent) or nothing published: not known yet
+  expect(spendOf({ usd: 0, limits: [] })).toEqual({ mode: 'unknown' })
+  expect(spendOf(null)).toEqual({ mode: 'unknown' })
+  expect(spendOf({ limits: [{ kind: 'seven_day' }] })).toEqual({ mode: 'unknown' })
+  // What a session publishes from $.session.usage(): its cost to the cent, each window once
+  expect(
+    publishedSpend({
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: 12.5 },
+        { kind: 'seven_day', percentUsed: 43, resetsAt: 'x' },
+        { kind: 'seven_day', percentUsed: 44 },
+      ],
+      cost: { usd: 1.23456 },
+    }),
+  ).toEqual({ usd: 1.23, limits: [{ kind: 'five_hour', percent: 12.5 }, { kind: 'seven_day', percent: 43 }] })
+  expect(publishedSpend({ rateLimits: [] })).toEqual({ usd: undefined, limits: [] })
+  expect(publishedSpend(undefined)).toEqual({ usd: undefined, limits: [] })
+  expect(limitsText([{ kind: 'five_hour', percent: 12.5 }, { kind: 'seven_day', percent: 43.4 }, { kind: 'spend_limit', percent: 101 }])).toBe('5h 13% · 7d 43% · limit 101%')
+  expect(limitsText([])).toBe('')
+  expect([0.04, 1.2, 20.04, 123.4, 1234].map(formatUsd)).toEqual(['$0.04', '$1.20', '$20.04', '$123', '$1.2k'])
+  // The spend column widens the panel as much as it needs
+  expect(paneWidth(['Refactor the payment retry handling'], 89, 7)).toBe(67)
 })

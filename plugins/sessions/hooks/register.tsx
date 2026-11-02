@@ -4,6 +4,7 @@ import type { Register } from 'claude-code'
 import type {
   Color,
   PaneNote,
+  RateLimit,
   Renaming,
   Row,
   Sessions,
@@ -19,6 +20,10 @@ import {
   abbreviate,
   agentFromTranscript,
   assignChange,
+  formatUsd,
+  limitsText,
+  publishedSpend,
+  spendOf,
   emptySectionsFile,
   groupRows,
   keepPlaces,
@@ -95,6 +100,8 @@ import { choosePlatform, macos, type Me, type Platform, type Run } from './platf
 const PANE = 'sessions'
 
 const DOT: Record<Color, string> = { red: '🔴', blue: '🔵', yellow: '🟡', green: '🟢', gray: '⚫' }
+// The spend column's width, a space included ("$20.04")
+const SPEND_COLUMN = 7
 // The colors for each state, from Claude's theme (they adapt to light, dark and colorblind modes)
 const TINT: Record<Color, string> = { red: 'error', blue: 'suggestion', yellow: 'warning', green: 'success', gray: 'inactive' }
 
@@ -108,6 +115,9 @@ const usageView = atom({ plugin: 'sessions', key: 'usageView' } as const, { peri
 const shortId = atom({ plugin: 'sessions', key: 'shortId' } as const, '')
 // Why the panel isn't shown, for the line above the prompt (see paneState)
 const paneNote = atom({ plugin: 'sessions', key: 'paneNote' } as const, '' as PaneNote)
+// The account's rate-limit windows, as this session's last response reported them (empty off a subscription), for the
+// line above the prompt
+const limits = atom({ plugin: 'sessions', key: 'limits' } as const, [] as RateLimit[])
 
 let claude = 'claude'
 let myId = ''
@@ -775,6 +785,7 @@ async function refresh($: any) {
     }
     const current = s.sessionId === myId
     const hb = heartbeatStatus(beats[s.sessionId] ?? null, s.pid, now)
+    const spend = spendOf(e)
     fresh.push({
       sessionId: s.sessionId,
       id: s.id ?? null,
@@ -793,6 +804,8 @@ async function refresh($: any) {
       ref: refOf(s),
       section: '',
       sectionTitle: '',
+      // What it spent so far, from what it published itself: only for a running session on an API account
+      usd: color !== 'gray' && spend.mode === 'api' ? spend.usd : null,
     })
   }
   installedVersion = newest
@@ -878,7 +891,8 @@ async function adjustWidth($: any) {
     for (let i = 0; i < 10 && defaultWindowWidth === before; i++) await $.clock.sleep(100)
   }
   if (defaultWidth === 0) return
-  const width = paneWidth((await read($, rows)).map(f => f.title), defaultWidth)
+  const shown = await read($, rows)
+  const width = paneWidth(shown.map(f => f.title), defaultWidth, shown.some(f => f.usd !== null) ? SPEND_COLUMN : 0)
   if (width === requestedWidth) return
   requestedWidth = width
   await $.ui.open({ id: PANE, title: 'Sessions', columns: width })
@@ -1512,24 +1526,37 @@ async function readAgent($: any) {
   myAgent = agentFromTranscript(r.stdout)
 }
 
-// Each session publishes its model and the % of context used (the same as the status line), the agent it runs as and
-// its project root, only if they changed
+// Each session publishes its model and the % of context used (the same as the status line), the agent it runs as, its
+// project root and what it spends (its cost and the account's windows, as the status line has them), only if they
+// changed
 async function publishUsage($: any) {
   let model = ''
   let context: number | undefined
   let version = ''
+  let spend: ReturnType<typeof publishedSpend> = { limits: [] }
   try {
     model = shortModelName(String(await $.session.model()))
-    context = (await $.session.usage())?.context?.percent
+    const u = await $.session.usage()
+    context = u?.context?.percent
+    spend = publishedSpend(u)
     version = String((await $.session.version())?.version ?? '')
   } catch {
     return
   }
+  if (JSON.stringify(spend.limits) !== JSON.stringify(await read($, limits))) await update($, limits, () => spend.limits)
   const agent = agentFor === myId ? myAgent : undefined
   const root = myCwd
   const previous = (await readState($, myId)) ?? {}
-  if (previous.model === model && previous.context === context && previous.version === version && previous.agent === agent && previous.root === root) return
-  await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? (await $.clock.now()), model, context, version, agent, root })
+  const same =
+    previous.model === model &&
+    previous.context === context &&
+    previous.version === version &&
+    previous.agent === agent &&
+    previous.root === root &&
+    previous.usd === spend.usd &&
+    JSON.stringify(previous.limits ?? []) === JSON.stringify(spend.limits)
+  if (same) return
+  await storeSet($, `state:${myId}`, { ...previous, created: previous.created ?? (await $.clock.now()), model, context, version, agent, root, usd: spend.usd, limits: spend.limits })
 }
 
 // After restarting with u from its own panel, the notice is shown when the window reconnects: at startup nobody is
@@ -2205,6 +2232,8 @@ export const register: Register = (on, options) => {
     const id = await read($, shortId)
     const note = await read($, paneNote)
     const why = note === 'closed' ? 'panel closed · /sessions to open' : note === 'narrow' ? 'panel hidden: window too narrow · /sessions to show' : ''
+    // On a subscription, each of the account's windows once ("7d 43%"); off one (an API key) the panel shows the cost
+    const account = limitsText(await read($, limits))
     const counts = (
       <Text dimColor>
         {reds > 0 && <Text color={TINT.red}>● </Text>}
@@ -2218,7 +2247,8 @@ export const register: Register = (on, options) => {
       return (
         <Text dimColor>
           {counts}
-          {why && `${why}  `}⟨{id}⟩
+          {why && `${why}  `}
+          {account && `${account}  `}⟨{id}⟩
         </Text>
       )
     }
@@ -2226,7 +2256,7 @@ export const register: Register = (on, options) => {
       <Box flexDirection="row">
         {counts}
         <Button key="show-panel" plain dimColor label={why} onPress={() => { bg(openByYou($)) }} />
-        <Text dimColor>{`  ⟨${id}⟩`}</Text>
+        <Text dimColor>{`  ${account ? `${account}  ` : ''}⟨${id}⟩`}</Text>
       </Box>
     )
   })
@@ -2255,6 +2285,9 @@ export const register: Register = (on, options) => {
       }
     }
     const marks = list.some(f => f.noPanel || f.otherFormat)
+    // On an API account each row says what its session cost so far, and a line the project's total (list price)
+    const spends = list.some(f => f.usd !== null)
+    const spent = list.reduce((sum, f) => sum + (f.usd ?? 0), 0)
     // A section's title above its first row, when two or more groups have rows: plain Text, which the focus ring skips
     const headers = sectionHeaders(list)
     const lines = list.length + headers.filter(h => h !== null).length
@@ -2269,18 +2302,20 @@ export const register: Register = (on, options) => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + 5 <= room
+      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + 5 <= room
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
-    // Columns: [▌][● ][name…][↑][◆][ model  ctx  time]; in narrow panels the model is left out
+    // Columns: [▌][● ][name…][↑][◆][ model  ctx  time][ spend]; in narrow panels the model is left out
     // Rows use only the width they need: in the box above the prompt (small windows or not fullscreen) the panel takes
     // the whole screen, and without this the model and time would end up far away from the name
-    const total = Math.min(e.props.bodyColumns ?? 48, paneWidth(list.map(f => f.title), e.props.bodyColumns ?? 48)) - 1
+    const spendWidth = spends ? SPEND_COLUMN : 0
+    const total = Math.min(e.props.bodyColumns ?? 48, paneWidth(list.map(f => f.title), e.props.bodyColumns ?? 48, spendWidth)) - 1
     const showModel = total >= 44
-    const infoWidth = showModel ? 20 : 10
+    const infoWidth = (showModel ? 20 : 10) + spendWidth
     const nameWidth = Math.max(8, total - 4 - infoWidth)
     const padRight = (t: string, w: number) => t + ' '.repeat(Math.max(0, w - displayWidth(t)))
     const padLeft = (t: string, w: number) => ' '.repeat(Math.max(0, w - displayWidth(t))) + t
-    const info = (f: Row) => `${showModel ? `  ${padRight(f.model, 9)}` : ''} ${padLeft(f.context, 4)} ${padLeft(f.time, 4)}`
+    const info = (f: Row) =>
+      `${showModel ? `  ${padRight(f.model, 9)}` : ''} ${padLeft(f.context, 4)} ${padLeft(f.time, 4)}${spends ? ` ${padLeft(f.usd === null ? '' : formatUsd(f.usd), SPEND_COLUMN - 1)}` : ''}`
     const name = (f: Row) => padRight(truncate(f.title, nameWidth), nameWidth)
     // ↑: runs an older Claude version than the installed one; !: its panel isn't running there, or runs another version
     // (u restarts it). Both take the first space after the name
@@ -2393,6 +2428,7 @@ export const register: Register = (on, options) => {
           </Text>
         )}
         {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (auto with Remote Control)</Text>}
+        {spends && <Text dimColor>{truncate(`${formatUsd(spent)} est. spent here so far (list price)`, total)}</Text>}
         {/* Tokens spent: period (d, w, m) and scope (p: all of Claude or this project); bars per hour or per day */}
         {showUsage && <Box flexGrow={1} minHeight={1} />}
         {showUsage && (

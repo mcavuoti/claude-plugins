@@ -1,9 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
-import { COMMAND, DATA, ROOT, SID, startSession, world } from './world'
+import { BAND, COMMAND, DATA, ROOT, SID, startSession, world } from './world'
 
-// Sections in the panel: the person's /sessions section, the headers, the freeze while the panel has the keyboard, and
-// sections.json kept tidy (members of gone sessions, a regular session's /clear)
+// What the panel's rows show beyond each session: sections (the person's /sessions section, the headers, the freeze
+// while the panel has the keyboard, sections.json kept tidy) and what the sessions spend
 
 const SECTIONS = `${DATA}/sections.json`
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
@@ -96,4 +96,39 @@ test("/clear in a regular session: its section follows its new session id", asyn
   w.id.value = NEW
   await w.clock.advance(1000)
   expect(JSON.parse(w.files.get(SECTIONS) ?? '{}').members).toEqual({ [`sid:${NEW}`]: { section: 'me:renders', by: 'person' } })
+})
+
+test('spend on a subscription: the account windows it has, once, above the prompt, and no dollars in the rows', async ($, on) => {
+  const w = world(on, { list: list() })
+  w.usage.value = { context: { percent: 10 }, rateLimits: [{ kind: 'seven_day', percentUsed: 43.4, resetsAt: '2026-11-08T00:00:00Z' }], cost: { usd: 3.5 } }
+  await startSession($, w)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await band.drawn())).toContain('7d 43%')
+  await band.unmount()
+  await w.clock.advance(3000)
+  const ui = await $.ui.mount(PANEL)
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).not.toContain('$3.50')
+  expect(drawn).not.toContain('est.')
+  await ui.unmount()
+})
+
+test('spend on an API account: each row its cost so far, and the project total, as estimates at list price', async ($, on) => {
+  const w = world(on, { list: list() })
+  w.usage.value = { context: { percent: 10 }, rateLimits: [], cost: { usd: 1.2 } }
+  // Another session published its own: still on a subscription (no dollars) or on an API key
+  w.store.set('state:bbbbbbbb-0000-0000-0000-000000000000', { usd: 20.04, limits: [] })
+  w.store.set('state:cccccccc-0000-0000-0000-000000000000', { usd: 9, limits: [{ kind: 'seven_day', percent: 40 }] })
+  await startSession($, w)
+  await w.clock.advance(3000)
+  const ui = await $.ui.mount(PANEL)
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).toContain('$1.20')
+  expect(drawn).toContain('$20.04')
+  expect(drawn).not.toContain('$9.00')
+  expect(drawn).toContain('$21.24 est. spent here so far (list price)')
+  await ui.unmount()
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await band.drawn())).not.toContain('7d')
+  await band.unmount()
 })

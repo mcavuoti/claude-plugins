@@ -1,4 +1,4 @@
-import type { Color, Period, SessionsMember, SessionsResult, SessionsSection, UsageSummary } from '../types'
+import type { Color, Period, RateLimit, SessionsMember, SessionsResult, SessionsSection, UsageSummary } from '../types'
 
 // The format of everything the mod shares outside one session: the files in its data folder (heartbeats, the panel
 // order, inbox requests, the launcher's window files, the mirrored settings) and the notices between sessions. Each one
@@ -15,7 +15,9 @@ export const HEARTBEAT_VERSION = '0.10.0'
 // created: when the session's mod first started; turnStarted: when the current turn started; finished: when the last
 // turn finished; reason: why it finished; answer: last line of the answer; question: whether that line ends in "?";
 // model: short model name; context: % of the context used; version: the Claude version the session runs; agent: the
-// agent it runs as (`claude --agent`), null for none; root: the project root its panel uses
+// agent it runs as (`claude --agent`), null for none; root: the project root its panel uses; usd: what it has cost so
+// far at list price (as /cost says); limits: the account's rate-limit windows its last response reported (empty off a
+// subscription)
 export type SessionState = {
   created?: number
   turnStarted?: number
@@ -28,6 +30,43 @@ export type SessionState = {
   version?: string
   agent?: string | null
   root?: string
+  usd?: number
+  limits?: RateLimit[]
+}
+
+// What a session spends, read per session and never assumed: on a subscription its responses report rate-limit windows
+// (five_hour, seven_day, …; any can be missing); off one (an API key) there are none, and the cost at list price is what
+// says how much. Before its first response a session reports no window and costs nothing: nothing is known yet
+export type Spend = { mode: 'subscription'; limits: RateLimit[] } | { mode: 'api'; usd: number } | { mode: 'unknown' }
+export function spendOf(e: { usd?: unknown; limits?: unknown } | null): Spend {
+  const limits = Array.isArray(e?.limits) ? e.limits.filter((l: any) => typeof l?.kind === 'string' && Number.isFinite(l?.percent)) : []
+  if (limits.length) return { mode: 'subscription', limits }
+  const usd = Number(e?.usd)
+  return Number.isFinite(usd) && usd > 0 ? { mode: 'api', usd } : { mode: 'unknown' }
+}
+
+// What $.session.usage() says, as a session publishes it: the cost rounded to the cent, and each window once
+export function publishedSpend(u: { rateLimits?: unknown; cost?: { usd?: unknown } } | null | undefined): { usd?: number; limits: RateLimit[] } {
+  const limits: RateLimit[] = []
+  for (const l of Array.isArray(u?.rateLimits) ? u.rateLimits : []) {
+    const percent = Number(l?.percentUsed)
+    if (typeof l?.kind === 'string' && Number.isFinite(percent) && !limits.some(x => x.kind === l.kind)) limits.push({ kind: l.kind, percent })
+  }
+  const usd = Number(u?.cost?.usd)
+  return { usd: Number.isFinite(usd) ? Math.round(usd * 100) / 100 : undefined, limits }
+}
+
+// $0.04, $1.20, $20.04, $123, $1.2k
+export function formatUsd(usd: number): string {
+  if (usd < 100) return `$${usd.toFixed(2)}`
+  if (usd < 1000) return `$${Math.round(usd)}`
+  return `$${abbreviate(usd)}`
+}
+
+// The account's windows, as the line above the prompt shows them: "5h 12% · 7d 43%"
+export function limitsText(limits: readonly RateLimit[]): string {
+  const label = (kind: string) => (kind === 'five_hour' ? '5h' : kind === 'seven_day' ? '7d' : kind === 'spend_limit' ? 'limit' : kind.replace(/_/g, ' '))
+  return limits.map(l => `${label(l.kind)} ${Math.round(l.percent)}%`).join(' · ')
 }
 
 // Short time for the right-hand column: now, 3m, 2h, 1d
@@ -72,10 +111,11 @@ export function displayWidth(text: string): number {
 
 // Panel width (body columns): what the widest row needs ([▌● ] + name + [↑◆] + model, % and time), never less than the
 // legend (50). The cap is the width Claude gives the panel on its own (measured); if it hasn't been measured yet, 89
-// (the one for a 229-column window). Never less than 20.
-export function paneWidth(names: string[], cap: number): number {
+// (the one for a 229-column window). Never less than 20. extra: the columns another column takes (the spend, on an API
+// account)
+export function paneWidth(names: string[], cap: number, extra = 0): number {
   const longestName = Math.max(8, ...names.map(displayWidth))
-  const needed = Math.max(50, longestName + 25)
+  const needed = Math.max(50, longestName + 25 + extra)
   return Math.max(20, Math.min(cap > 0 ? cap : 89, needed))
 }
 

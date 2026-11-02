@@ -25,7 +25,12 @@ export type Row = {
   // The section it's drawn in ('' for none) and that section's title
   section: string
   sectionTitle: string
+  // What it has cost so far in US dollars at list price, on an API account (null on a subscription, or not known yet)
+  usd: number | null
 }
+
+// One rate-limit window of the account, as a session's last response reported it (five_hour, seven_day, …)
+export type RateLimit = { kind: string; percent: number }
 
 // The usage block. usage.py builds the summary: totals per day and per hour, split by the session's folder; each total
 // is [input, output, cache read, cache written, thinking] (thinking is part of the output)
@@ -137,6 +142,7 @@ declare module 'claude-code' {
       usageView: UsageView
       paneNote: PaneNote
       shortId: string
+      limits: RateLimit[]
     }
   }
 }
