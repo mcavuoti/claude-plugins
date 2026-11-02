@@ -1,7 +1,7 @@
 {
   "name": "fleet",
-  "version": "0.2.0",
-  "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost; a write of a shared file that changed since the session read it is refused once with who changed it, and the session hears of such changes at its next step",
+  "version": "0.2.1",
+  "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost; a write of a shared file that changed since the session read it is refused once with who changed it, and the session hears of such changes at its next step; records cited by version (R-12@4) make their citers suspect when revised, a write citing a stale version is refused once, and the project's check scripts run as its linters",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
   "types": "./types/index.d.ts",
