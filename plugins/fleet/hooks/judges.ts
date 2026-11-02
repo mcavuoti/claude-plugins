@@ -9,11 +9,14 @@
 // precedents or statute lines it rests on), send-back (the question is malformed, or the files answer it), hold (it
 // needs the person). Code does the rest: the gates before any model (never money, the outside world, what can't be
 // undone, a question asked after reading outside content, a kind other than a choice), the exact repeats (no model),
-// every citation checked, the agreement once the person answers, the stats per area. In shadow it only proposes.
+// every citation checked, the agreement once the person answers, the stats per area. In shadow it only proposes; in an
+// area the person turned live (0.7.0), it answers what the record settles, labelled as the judge's, sends back what's
+// malformed, and the person can overrule it: his correction is case law the judges read next time, and counts against
+// the area, which goes back to shadow once its agreement falls below the threshold.
 
 import type { OutsideMark } from './authority'
 import { hashText, type WorldConfig } from './changes'
-import { letter, type Option, type Outcome, type Question } from './decisions'
+import { letter, type Asker, type Option, type Outcome, type Question } from './decisions'
 
 /** What world.json's "judges" says, with the defaults. They're on in every project unless it says "judges": false */
 export type JudgeConfig = {
@@ -33,6 +36,8 @@ export type JudgeConfig = {
   /** Live answers a day in the project, and dollars a day of judge calls (at list price) */
   perDay: number
   usdDay: number
+  /** An instance (by name) or a role told of each overrule, to propose a principle (a change to principles.md) */
+  reviewer: string | null
 }
 
 export const DEFAULT_STATUTE = ['CLAUDE.md', '.claude/rules/*.md']
@@ -93,6 +98,7 @@ export function judgesOf(w: WorldConfig | null): { judges: JudgeConfig; problems
       promote: { proposals: Math.round(num(promote.proposals, 30, 1, 100000)), agreement: num(promote.agreement, 0.9, 0, 1) },
       perDay: Math.round(num(o.perDay, 20, 0, 100000)),
       usdDay: num(o.usdDay, 1, 0, 100000),
+      reviewer: typeof o.reviewer === 'string' && o.reviewer.trim() ? o.reviewer.trim() : null,
     },
     problems,
   }
@@ -124,6 +130,15 @@ export function gateOf(f: GateFacts, c: JudgeConfig): string | null {
   if (p) return `it matches world.json's judges.hold "${p.source}"`
   const who = [f.asker.name, f.asker.role].filter((x): x is string => !!x).map(x => x.toLowerCase())
   if (c.skip.some(s => who.includes(s.toLowerCase()))) return "its asker is in world.json's judges.skip"
+  return null
+}
+
+/** What a live answer needs besides the gates: the asker's own word that it's reversible, touches no money and stays
+ * inside the project (a flag left out says nothing, so it doesn't pass: v1's decision 11a). Null when it has it */
+export function liveGate(f: { reversible?: boolean; touchesMoney?: boolean; outsideWorld?: boolean }): string | null {
+  if (f.reversible !== true) return "its asker didn't say it's reversible"
+  if (f.touchesMoney !== false) return "its asker didn't say it touches no money"
+  if (f.outsideWorld !== false) return "its asker didn't say it stays inside the project"
   return null
 }
 
@@ -491,11 +506,14 @@ export type JudgeFile = {
   verdicts: Verdict[]
   /** The call couldn't be made, or had no answer */
   problem?: string
+  /** Its area was live when it judged (0.7.0); liveWhy: why it didn't answer all the same (a flag, the cap) */
+  live?: true
+  liveWhy?: string
 }
 
-/** What the register keeps of it once the decision closes: the verdicts, and per question whether the person agreed
- * (null: not a decided verdict, or no answer of his) */
-export type JudgeEntry = Omit<JudgeFile, 'format'> & { agreed: (boolean | null)[] }
+/** What the register keeps of it once the decision closes: the verdicts, per question whether the person agreed (null:
+ * not a decided verdict, or no answer of his), the questions the judge answered itself, and whether it sent it back */
+export type JudgeEntry = Omit<JudgeFile, 'format'> & { agreed: (boolean | null)[]; answered?: number[]; sentBack?: true }
 
 /** Whether the person's answer agrees with a decided verdict; null when there's nothing to compare */
 export function agreementOf(v: Verdict | undefined, o: Outcome | null): boolean | null {
@@ -504,10 +522,16 @@ export function agreementOf(v: Verdict | undefined, o: Outcome | null): boolean 
   return o.text ? false : null
 }
 
-export function judgeEntryOf(f: JudgeFile, outcomes: readonly (Outcome | null)[]): JudgeEntry {
+export function judgeEntryOf(f: JudgeFile, outcomes: readonly (Outcome | null)[], drop: { origin?: string } | null = null): JudgeEntry {
   const { format: _format, ...rest } = f
   const n = Math.max(outcomes.length, ...f.verdicts.map(v => v.q))
-  return { ...rest, agreed: Array.from({ length: n }, (_, i) => agreementOf(f.verdicts.find(v => v.q === i + 1), outcomes[i] ?? null)) }
+  const answered = outcomes.flatMap((o, i) => (o?.origin === 'judge' ? [i + 1] : []))
+  return {
+    ...rest,
+    agreed: Array.from({ length: n }, (_, i) => agreementOf(f.verdicts.find(v => v.q === i + 1), outcomes[i] ?? null)),
+    ...(answered.length ? { answered } : {}),
+    ...(drop?.origin === 'judge' ? { sentBack: true as const } : {}),
+  }
 }
 
 /** An option as /fleet shows it: "a) SQLite" */
@@ -552,7 +576,7 @@ export type AreaStats = {
 
 /** One closed decision as the stats read it: its area, the register's judge, and the questions it answered and the
  * person overruled (0.7.0) */
-export type StatsInput = { area: string | null; judge: Omit<JudgeEntry, 'id' | 'at'> & { answered?: number[]; sentBack?: true }; overruled?: number[] }
+export type StatsInput = { area: string | null; judge: Omit<JudgeEntry, 'id' | 'at'>; overruled?: number[] }
 
 export const NO_AREA = '(no area)'
 
@@ -701,3 +725,103 @@ export function tasteResult(id: string, t: TasteSpec): string {
   return `Recorded as ${id} in the register, marked as not heard from the person directly (${why}): the judges don't read it until the person promotes it into .claude/fleet/principles.md.`
 }
 
+// ---- Live areas (0.7.0): state/judges.json, written by the person's /fleet judges and by an overrule that drops an
+// area's agreement below the threshold ----
+
+/** Which areas are live (since when, forced past the threshold, why) and which went back to shadow by themselves */
+export type JudgesState = {
+  format: number
+  live: Record<string, { at: number; forced?: true; why?: string; by?: string }>
+  back: Record<string, { at: number; why: string }>
+}
+
+export function newJudgesState(format: number): JudgesState {
+  return { format, live: {}, back: {} }
+}
+
+/** Whether an area's agreement fell below the threshold (only what the judge decided counts; how many proposals it
+ * has doesn't: an area the person forced live goes back once the judge is wrong too often, not for being young) */
+export function belowAgreement(s: AreaStats | undefined, c: JudgeConfig): boolean {
+  const r = s ? agreementRate(s) : null
+  return r !== null && r < c.promote.agreement
+}
+
+/** The words for an area going live, or the refusal: it hasn't earned it, and --force wasn't given */
+export function liveWords(area: string, check: { ok: boolean; why: string }, force: boolean, c: JudgeConfig): { ok: boolean; text: string } {
+  if (!check.ok && !force) return { ok: false, text: `Not turned live: ${area} ${check.why}. /fleet stats ${area} shows it; /fleet judges live ${area} --force "why" turns it on anyway, recorded as forced.` }
+  return {
+    ok: true,
+    text: [
+      `Area ${area} is live${check.ok ? ` (${check.why})` : ` (forced: ${check.why}; recorded)`}.`,
+      `In it, a question that passes every gate, and whose asker says it's reversible, touches no money and stays inside the project, is answered by the judge at once when the record settles it (an exact repeat, or a citation code checks), labelled as the judge's; at most ${c.perDay} a day in the project.`,
+      'One the judge finds malformed goes back to its asker with why; the rest wait for you as always.',
+      `/fleet overrule D-<n> <answer> ["why"] corrects one: the asker hears it, the judges read it next time, and ${area} goes back to shadow once its agreement falls below ${Math.round(c.promote.agreement * 100)}%. /fleet judges off ${area} stops it.`,
+    ].join('\n'),
+  }
+}
+
+// ---- Overrules (0.7.0): the person's correction of a judge, in the register beside the decision, and told to the asker
+
+/** decisions/register/<month>/D-<n>.overrule.json: per question, his answer instead of the judge's (null: left as it
+ * was); judged: what the judge had answered */
+export type OverruleRecord = {
+  registerFormat: number
+  id: string
+  overrules: string
+  at: number
+  origin: string
+  session: string
+  answers: (Outcome | null)[]
+  judged: (string | null)[]
+  why?: string
+  area?: string
+  asker?: Asker
+  /** The judge had sent the decision back (the person answered it after all) */
+  sentBack?: true
+}
+
+/** decisions/overrules/D-<n>.json (wire): what the asker's fleet tells it, once */
+export type OverruleNotice = {
+  format: number
+  id: string
+  at: number
+  asker: Asker
+  questions: { question: string; options: Option[] }[]
+  judged: (string | null)[]
+  answers: (Outcome | null)[]
+  why?: string
+  sentBack?: true
+  area?: string
+}
+
+function said(q: { options: Option[] } | undefined, o: Outcome | null | undefined): string {
+  if (!o) return 'no answer'
+  if (o.label !== undefined) return optionWords(q as Question | undefined, o.label)
+  return `in their words: "${o.text ?? ''}"`
+}
+
+/** What the asker reads: the correction, the judge's answer it replaces, and what to undo */
+export function overruleText(n: Pick<OverruleNotice, 'id' | 'questions' | 'judged' | 'answers' | 'why' | 'sentBack'>): string {
+  const lines = n.questions.flatMap((q, i) => {
+    const a = n.answers[i]
+    if (!a) return []
+    const before = n.judged[i]
+    return [`${i + 1}) ${q.question} → ${said(q, a)}${before && !n.sentBack ? `, not ${optionWords(q as Question, before)}` : ''}`]
+  })
+  const why = n.why ? `\nWhy: "${n.why}"` : ''
+  if (n.sentBack) return `[${n.id}] The person overruled the judge, who had sent ${n.id} back, and answered it:\n${lines.join('\n')}${why}\n\nGo on with what depended on it.`
+  return `[${n.id}] The person overruled the judge on ${n.id}:\n${lines.join('\n')}${why}\n\nUndo what you built on the judge's answer, and go on with theirs.`
+}
+
+/** What the reviewer reads of an overrule: what was corrected, and the one thing it may do about it */
+export function reviewText(n: Pick<OverruleNotice, 'id' | 'questions' | 'judged' | 'answers' | 'why' | 'area'>[]): string {
+  const items = n.map(x => {
+    const qs = x.questions.flatMap((q, i) => (x.answers[i] ? [`"${q.question}" → ${said(q, x.answers[i])}${x.judged[i] ? `, not ${optionWords(q as Question, x.judged[i] as string)}` : ''}`] : []))
+    return `- ${x.id}${x.area ? ` (area ${x.area})` : ''}: ${qs.join('; ')}${x.why ? ` (why: "${x.why}")` : ''}`
+  })
+  return [
+    `fleet: the person overruled the project's judge ${n.length === 1 ? 'once' : `${n.length} times`} (you review the judges' disagreements):`,
+    ...items,
+    'If a standing principle would have settled it, propose it: a change to .claude/fleet/principles.md with mcp__fleet__decide kind "change" (one short, general line; the person applies it, or not). If not, nothing to do.',
+  ].join('\n')
+}

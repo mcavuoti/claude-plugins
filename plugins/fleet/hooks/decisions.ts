@@ -98,11 +98,14 @@ export type QueueRecord = {
 /** origin: how the person typed it (composer: a terminal); session: the session it was typed in. pre: a change applied
  * as it was filed, because the person typed the turn that filed it (quoted: the start of what he typed); hash: the
  * version of an outbound the person approved */
-export type AnswerFile = { format: number; id: string; q: number; label?: string; text?: string; origin: string; session: string; at: number; pre?: true; quoted?: string; hash?: string }
+export type AnswerFile = { format: number; id: string; q: number; label?: string; text?: string; origin: string; session: string; at: number; pre?: true; quoted?: string; hash?: string; judge?: JudgeCite }
 export type NoteFile = { format: number; id: string; q: number; text: string; origin: string; at: number }
-export type DropFile = { format: number; id: string; why?: string; origin: string; session: string; at: number }
+/** A drop by the judge (origin judge, 0.7.0) sends the decision back to its asker, with why */
+export type DropFile = { format: number; id: string; why?: string; origin: string; session: string; at: number; sentBack?: true }
+/** What a judge's own answer rests on (origin judge): the precedents or statute lines it cites; repeat: an exact repeat */
+export type JudgeCite = { cites: string[]; repeat?: true }
 /** One question's outcome in the register: the option picked or the text typed, and any note */
-export type Outcome = { label?: string; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true }
+export type Outcome = { label?: string; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true; judge?: JudgeCite }
 export type RegisterState = 'delivered' | 'dropped' | 'abandoned' | 'answered' | 'not answered'
 export type RegisterRecord = {
   registerFormat: number
@@ -350,6 +353,7 @@ function outcomeText(q: Question, o: Outcome | null): string {
     const i = q.options.findIndex(x => x.label === o.label)
     s = i >= 0 ? `${letter(i)}) ${o.label}` : o.label
   } else s = `they wrote: "${o.text ?? ''}"`
+  if (o.origin === 'judge') s += ` (the judge's answer, citing ${o.judge?.cites.join(', ') || 'the record'}${o.judge?.repeat ? ': the same question, answered so before' : ''})`
   return o.note ? `${s} (note: ${o.note})` : s
 }
 
@@ -362,16 +366,21 @@ export function deliveryText(parts: readonly Delivery[], own: (p: Delivery) => s
     const special = own(p)
     if (special !== null) return special
     const { record, outcomes, drop } = p
+    const asked = record.questions.map((q, i) => `${i + 1}) ${q.question}`).join(' ')
+    if (drop && drop.origin === 'judge') {
+      return `[${record.id}] The judge sent this question back without asking the person: ${drop.why ?? 'it is malformed'}\nYou asked: ${asked}\nFix it (options that don't overlap, everything needed to answer it) and ask again with mcp__fleet__decide, or, if the project's files already answer it, go on with that and say so in your report.`
+    }
     if (drop) {
-      const asked = record.questions.map((q, i) => `${i + 1}) ${q.question}`).join(' ')
       const why = drop.why ? ` (${drop.why})` : ''
       return `[${record.id}] The person dropped this decision without answering it${why}: ${asked}\nDon't wait for it: go on as you think best, and say what you chose in your report.`
     }
     const lines = record.questions.map((q, i) => `${i + 1}) ${q.question} → ${outcomeText(q, outcomes[i] ?? null)}`)
-    return `[${record.id}] The person answered:\n${lines.join('\n')}`
+    const byJudge = outcomes.length > 0 && outcomes.every(o => o?.origin === 'judge')
+    return `[${record.id}] ${byJudge ? "The judge answered for the person, from what they decided before (they can overrule it):" : 'The person answered:'}\n${lines.join('\n')}`
   })
   const answered = parts.some(p => !p.drop && own(p) === null)
-  return blocks.join('\n\n') + (answered ? '\n\nGo on with what depended on it.' : '')
+  const judged = parts.some(p => !p.drop && own(p) === null && p.outcomes.some(o => o?.origin === 'judge'))
+  return blocks.join('\n\n') + (answered ? `\n\nGo on with what depended on it.${judged ? " If the person overrules the judge, you'll hear it as a message from the fleet plugin that starts with the same id: then undo what you built on its answer." : ''}` : '')
 }
 
 /** The ids a turn's text carries in brackets (the turn that delivers them) */
@@ -402,6 +411,8 @@ export type Command =
   | { kind: 'budget'; target: string; amount: string }
   | { kind: 'brief'; chief: boolean }
   | { kind: 'stats'; area: string }
+  | { kind: 'judges'; action: 'list' | 'live' | 'off'; area: string; force: boolean; why: string }
+  | { kind: 'overrule'; id: string; answers: { q: number; letter?: string; text?: string }[]; why: string }
   | { kind: 'help' }
   | { kind: 'bad'; reason: string }
 
@@ -452,6 +463,20 @@ export function parseCommand(args: string): Command {
       if (more.length > 1) return { kind: 'bad', reason: 'write /fleet stats, or /fleet stats <area> for one area' }
       return { kind: 'stats', area: (more[0] ?? '').toLowerCase() }
     }
+    case 'judges': {
+      const w = wordsOf(tail)
+      if (!w.length) return { kind: 'judges', action: 'list', area: '', force: false, why: '' }
+      const [action = '', area = '', ...rest] = w
+      const a = action.toLowerCase()
+      const force = rest.includes('--force')
+      const extra = rest.filter(x => x !== '--force')
+      if ((a !== 'live' && a !== 'off') || !area || area.startsWith('--') || (a === 'off' && rest.length) || extra.length > 1) {
+        return { kind: 'bad', reason: 'write /fleet judges, /fleet judges live <area> [--force "why"] or /fleet judges off <area>' }
+      }
+      return { kind: 'judges', action: a, area: area.toLowerCase(), force, why: (extra[0] ?? '').slice(0, 300) }
+    }
+    case 'overrule':
+      return parseOverrule(tail)
     case 'init': {
       const flags = more.filter(w => w.startsWith('--'))
       const names = more.filter(w => !w.startsWith('--'))
@@ -519,6 +544,41 @@ export function parseCommand(args: string): Command {
   return typeof items === 'string' ? { kind: 'bad', reason: items } : { kind: 'answer', items }
 }
 
+/** `/fleet overrule D-7 b "why"`: one question's letter (the first question by default), `1b 2a`, or the person's words
+ * in quotes (`1 "use both"`); a quoted text after an answer is why */
+export function parseOverrule(tail: string): Command {
+  const bad: Command = { kind: 'bad', reason: 'write /fleet overrule D-<n> <answer> ["why"]: a letter (b), one per question (1b 2a), or your words in quotes' }
+  const m = /^(D-\d+)\s+([\s\S]+)$/i.exec(tail.trim())
+  if (!m) return bad
+  const answers: { q: number; letter?: string; text?: string }[] = []
+  let why = ''
+  let rest = (m[2] as string).trim()
+  while (rest) {
+    const l = /^(?:(\d+)\s*[).:]?\s*)?([a-d])(?![A-Za-z0-9])\s*,?\s*/i.exec(rest)
+    if (l) {
+      const q = l[1] ? Number(l[1]) : 1
+      if (answers.some(a => a.q === q)) return { kind: 'bad', reason: `question ${q} is answered twice` }
+      answers.push({ q, letter: (l[2] as string).toLowerCase() })
+      rest = rest.slice(l[0].length)
+      continue
+    }
+    const t = /^(?:(\d+)\s*[).:]?\s*)?(?:"([^"]*)"|“([^”]*)”)\s*,?\s*/.exec(rest)
+    if (!t) return bad
+    const words = (t[2] ?? t[3] ?? '').trim()
+    rest = rest.slice(t[0].length)
+    if (!words) return { kind: 'bad', reason: 'the quotes are empty' }
+    if (!t[1] && answers.length) {
+      if (why) return bad
+      why = words.slice(0, 300)
+      continue
+    }
+    const q = t[1] ? Number(t[1]) : 1
+    if (answers.some(a => a.q === q)) return { kind: 'bad', reason: `question ${q} is answered twice` }
+    answers.push({ q, text: words.slice(0, 2000) })
+  }
+  return answers.length ? { kind: 'overrule', id: (m[1] as string).toUpperCase(), answers, why } : bad
+}
+
 export const HELP = [
   '/fleet                 the questions waiting for you in this project, numbered',
   '/fleet 1a 2b           answer them (also 1) a 2) b, or 3 "your words")',
@@ -533,6 +593,8 @@ export const HELP = [
   '/fleet 6 send          send the outbound of item 6 exactly as shown (also 6 reject, 6 edit, and 6 done if you sent it yourself)',
   '/fleet brief [--chief] what needs you, what changed and who changed it, what’s blocked, the spend, the inputs and ideas',
   '/fleet stats [area]    what the judges proposed per area, how often you agreed, what they cost',
+  '/fleet judges          the live areas, the areas back in shadow, your taste; /fleet judges live <area> [--force "why"], /fleet judges off <area>',
+  '/fleet overrule D-7 b ["why"]  correct the judge\'s answer to D-7: its asker hears it, and the judges read it next time',
   '/fleet init [template] set fleet up in this project (.claude/fleet/): blank, solo, software or proposal',
   '/fleet up [--dry-run] [--wave n] [name…]  start the roster\'s instances that aren\'t running (--dry-run: the plan, the lints, the cost)',
   '/fleet down [name…]    take instances down: no wakes or nudges, /fleet up skips them (s in the panel stops one)',
@@ -568,8 +630,8 @@ export function heldText(n: number, record: QueueRecord, q: number, asker: Asker
 }
 
 /** What the person is told about a decision that's answered but not delivered yet, by its asker's state */
-export function waitingText(record: QueueRecord, asker: AskerView, dropped: boolean): string {
-  const what = dropped ? 'dropped' : 'answered'
+export function waitingText(record: QueueRecord, asker: AskerView, dropped: boolean, byJudge = false): string {
+  const what = byJudge ? (dropped ? 'sent back by the judge' : 'answered by the judge') : dropped ? 'dropped' : 'answered'
   const how =
     asker.state === 'idle'
       ? 'delivering'

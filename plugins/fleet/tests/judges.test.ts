@@ -1,8 +1,13 @@
 import { expect, test } from 'claude-code/testing'
 
-import type { Question } from '../hooks/decisions'
+import { deliveryText, parseCommand, type Question, type QueueRecord } from '../hooks/decisions'
 import {
   JUDGE_SYSTEM,
+  belowAgreement,
+  liveGate,
+  liveWords,
+  overruleText,
+  reviewText,
   areaOf,
   agreementOf,
   caseLawText,
@@ -211,4 +216,63 @@ test('taste: its input, its number, and what the session is told by its provenan
   expect(areaOf('db', ['storage', 'ui'])).toEqual({ area: null, note: 'area "db" isn\'t one of the project\'s tags (storage, ui), so it was kept without one' })
   expect(areaOf('Front End!', [])).toEqual({ area: 'front-end', note: null })
   expect(areaOf(undefined, ['ui'])).toEqual({ area: null, note: null })
+})
+
+// ---- Live (0.7.0) ----
+
+test('live: the asker’s own word is needed (a flag left out says nothing); the words for turning an area on; going back', () => {
+  expect(liveGate({ reversible: true, touchesMoney: false, outsideWorld: false })).toBe(null)
+  expect(liveGate({ touchesMoney: false, outsideWorld: false })).toBe("its asker didn't say it's reversible")
+  expect(liveGate({ reversible: true, outsideWorld: false })).toBe("its asker didn't say it touches no money")
+  expect(liveGate({ reversible: true, touchesMoney: false })).toBe("its asker didn't say it stays inside the project")
+  const c = judgesOf(null).judges
+  expect(liveWords('storage', { ok: false, why: 'it has 3 proposals (…)' }, false, c).ok).toBe(false)
+  const forced = liveWords('storage', { ok: false, why: 'it has 3 proposals (…)' }, true, c)
+  expect(forced.ok).toBe(true)
+  expect(forced.text).toContain('Area storage is live (forced: it has 3 proposals (…); recorded).')
+  expect(forced.text).toContain('at most 20 a day in the project')
+  const s = statsOf([{ area: 'storage', judge: { area: 'storage', verdicts: [{ q: 1, outcome: 'decided', option: 'SQLite', cites: ['D-1'], why: '' }], agreed: [null], answered: [1] }, overruled: [1] }]).get('storage')!
+  expect([s.decided, s.live, s.overruled, s.agreed, s.disagreed]).toEqual([1, 1, 1, 0, 1])
+  expect(belowAgreement(s, c)).toBe(true)
+  const fine = statsOf([{ area: 'storage', judge: { area: 'storage', verdicts: [{ q: 1, outcome: 'decided', option: 'SQLite', cites: ['D-1'], why: '' }], agreed: [null], answered: [1] } }]).get('storage')!
+  expect([fine.live, fine.agreed, belowAgreement(fine, c)]).toEqual([1, 1, false])
+  // A decision the judge sent back that the person answered anyway counts against it
+  const back = statsOf([{ area: 'ui', judge: { area: 'ui', verdicts: [{ q: 1, outcome: 'send-back', cites: [], why: 'x' }], agreed: [null], sentBack: true }, overruled: [1] }]).get('ui')!
+  expect([back.sentBack, back.overruled, back.disagreed]).toEqual([1, 1, 1])
+})
+
+test('/fleet judges and /fleet overrule: the grammar', () => {
+  expect(parseCommand('judges')).toEqual({ kind: 'judges', action: 'list', area: '', force: false, why: '' })
+  expect(parseCommand('judges live Storage --force "trying it"')).toEqual({ kind: 'judges', action: 'live', area: 'storage', force: true, why: 'trying it' })
+  expect(parseCommand('judges off ui')).toEqual({ kind: 'judges', action: 'off', area: 'ui', force: false, why: '' })
+  expect(parseCommand('judges live').kind).toBe('bad')
+  expect(parseCommand('judges off ui --force').kind).toBe('bad')
+  expect(parseCommand('overrule D-7 b')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 1, letter: 'b' }], why: '' })
+  expect(parseCommand('overrule d-7 1b 2a "too slow"')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 1, letter: 'b' }, { q: 2, letter: 'a' }], why: 'too slow' })
+  expect(parseCommand('overrule D-7 "use both" "they differ"')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 1, text: 'use both' }], why: 'they differ' })
+  expect(parseCommand('overrule D-7 2 “keep it”')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 2, text: 'keep it' }], why: '' })
+  expect(parseCommand('overrule D-7').kind).toBe('bad')
+  expect(parseCommand('overrule D-7 1b 1a')).toEqual({ kind: 'bad', reason: 'question 1 is answered twice' })
+  expect(parseCommand('overrule 7 b').kind).toBe('bad')
+})
+
+test('what the asker reads: the judge’s answer, labelled; a question sent back; the overrule; and the reviewer’s lines', () => {
+  const record = { format: 1, fleet: '0.7.0', id: 'D-7', at: AT, asker: { ref: 'aaaaaaaa', sessionId: 's', name: 'TEST A', root: '/Users/x/proj' }, questions: [DB] } as QueueRecord
+  const judged = deliveryText([{ record, outcomes: [{ label: 'SQLite', origin: 'judge', judge: { cites: ['D-1'], repeat: true } }], drop: null }])
+  expect(judged).toBe(
+    "[D-7] The judge answered for the person, from what they decided before (they can overrule it):\n1) Which database for the cache? → a) SQLite (the judge's answer, citing D-1: the same question, answered so before)\n\nGo on with what depended on it. If the person overrules the judge, you'll hear it as a message from the fleet plugin that starts with the same id: then undo what you built on its answer.",
+  )
+  const two = { ...record, questions: [DB, COLOR] } as QueueRecord
+  const mixed = deliveryText([{ record: two, outcomes: [{ label: 'SQLite', origin: 'judge', judge: { cites: ['principles.md:3'] } }, { label: 'Amber', origin: 'composer' }], drop: null }])
+  expect(mixed).toContain("[D-7] The person answered:\n1) Which database for the cache? → a) SQLite (the judge's answer, citing principles.md:3)\n2) Which color for the warning band? → a) Amber")
+  const back = deliveryText([{ record, outcomes: [null], drop: { format: 1, id: 'D-7', why: 'the options overlap', origin: 'judge', session: 'the judge', at: AT, sentBack: true } }])
+  expect(back).toBe(
+    "[D-7] The judge sent this question back without asking the person: the options overlap\nYou asked: 1) Which database for the cache?\nFix it (options that don't overlap, everything needed to answer it) and ask again with mcp__fleet__decide, or, if the project's files already answer it, go on with that and say so in your report.",
+  )
+  const o = { id: 'D-7', questions: [DB, COLOR], judged: ['SQLite', 'Amber'], answers: [{ label: 'Redis' }, null], why: 'the queue runs it' }
+  expect(overruleText(o)).toBe('[D-7] The person overruled the judge on D-7:\n1) Which database for the cache? → b) Redis, not a) SQLite\nWhy: "the queue runs it"\n\nUndo what you built on the judge\'s answer, and go on with theirs.')
+  expect(overruleText({ ...o, judged: [null, null], answers: [{ text: 'both, one per tier' }, null], sentBack: true })).toBe(
+    '[D-7] The person overruled the judge, who had sent D-7 back, and answered it:\n1) Which database for the cache? → in their words: "both, one per tier"\nWhy: "the queue runs it"\n\nGo on with what depended on it.',
+  )
+  expect(reviewText([{ ...o, area: 'storage' }])).toContain('- D-7 (area storage): "Which database for the cache?" → b) Redis, not a) SQLite (why: "the queue runs it")')
 })
