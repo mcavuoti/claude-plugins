@@ -10,9 +10,9 @@ const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requ
 
 function list(): any[] {
   return [
-    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
-    { id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'two' },
-    { id: 'cccccccc', sessionId: 'cccccccc-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4244, name: 'three' },
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'alpha' },
+    { id: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'bravo' },
+    { id: 'cccccccc', sessionId: 'cccccccc-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4244, name: 'charlie' },
   ]
 }
 
@@ -37,37 +37,37 @@ function setFocused(w: any, focused: boolean) {
 test("the person's sections: /sessions section puts this session in one, with a header only when two groups have rows", async ($, on) => {
   const w = world(on, { list: list() })
   await startSession($, w)
-  const words = ['one', 'two', 'three', 'Renders']
-  expect(await drawnOrder($, words)).toEqual(['one', 'three', 'two'])
+  const words = ['alpha', 'bravo', 'charlie', 'Renders']
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'bravo', 'charlie'])
   expect(await sessions($, 'section Renders')).toBe('This session is in “Renders” now')
   await w.clock.advance(3000)
   // In no section first, with no header; then the section's title above its rows
-  expect(await drawnOrder($, words)).toEqual(['three', 'two', 'Renders', 'one'])
+  expect(await drawnOrder($, words)).toEqual(['bravo', 'charlie', 'Renders', 'alpha'])
+  // The order file ccc reads keeps the usual order, whatever the sections
+  expect((w.files.get(`${DATA}/order/_Users_x_myapp`) ?? '').split('\n').filter(l => l.startsWith('row=')).map(l => l.split('\t')[2])).toEqual(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
   expect(await sessions($, 'section')).toContain('This session is in “Renders”')
   expect(await sessions($, 'sections')).toContain('Renders · 1 session')
   expect(JSON.parse(w.files.get(SECTIONS) ?? '{}').members).toEqual({ aaaaaaaa: { section: 'me:renders', by: 'person' } })
   // Out of it: the section goes (nobody's in it), and so does the header
   expect(await sessions($, 'section -')).toBe('This session is in no section now')
   await w.clock.advance(3000)
-  expect(await drawnOrder($, words)).toEqual(['one', 'three', 'two'])
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'bravo', 'charlie'])
   expect(JSON.parse(w.files.get(SECTIONS) ?? '{}').sections).toEqual([])
-  // The order file ccc reads stays the usual order, whatever the sections
-  expect((w.files.get(`${DATA}/order/_Users_x_myapp`) ?? '').split('\n').filter(l => l.startsWith('row=')).map(l => l.split('\t')[2])).toEqual(['aaaaaaaa', 'cccccccc', 'bbbbbbbb'])
 })
 
 test('while the panel has the keyboard, sections and their members stay put; they apply when it leaves', async ($, on) => {
   const w = world(on, { list: list() })
   w.files.set(SECTIONS, JSON.stringify({ sectionsFormat: 1, sections: [{ id: 'probe:desk', title: 'Desk', order: 10, owner: 'probe' }], members: {} }))
   await startSession($, w)
-  const words = ['one', 'two', 'three', 'Desk']
-  expect(await drawnOrder($, words)).toEqual(['one', 'three', 'two'])
+  const words = ['alpha', 'bravo', 'charlie', 'Desk']
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'bravo', 'charlie'])
   setFocused(w, true)
   w.files.set(SECTIONS, JSON.stringify({ sectionsFormat: 1, sections: [{ id: 'probe:desk', title: 'Desk', order: 10, owner: 'probe' }], members: { bbbbbbbb: { section: 'probe:desk', by: 'probe' } } }))
   await w.clock.advance(6000)
-  expect(await drawnOrder($, words)).toEqual(['one', 'three', 'two'])
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'bravo', 'charlie'])
   setFocused(w, false)
   await w.clock.advance(3000)
-  expect(await drawnOrder($, words)).toEqual(['one', 'three', 'Desk', 'two'])
+  expect(await drawnOrder($, words)).toEqual(['alpha', 'charlie', 'Desk', 'bravo'])
 })
 
 test('members of sessions gone from the list are dropped with the rest of their data', async ($, on) => {
@@ -96,6 +96,35 @@ test("/clear in a regular session: its section follows its new session id", asyn
   w.id.value = NEW
   await w.clock.advance(1000)
   expect(JSON.parse(w.files.get(SECTIONS) ?? '{}').members).toEqual({ [`sid:${NEW}`]: { section: 'me:renders', by: 'person' } })
+})
+
+test('f: only the sessions waiting for you, kept while the panel has the keyboard, for every session until f again', async ($, on) => {
+  const sessionsList = list()
+  sessionsList[2].status = 'waiting'
+  const w = world(on, { list: sessionsList })
+  await startSession($, w)
+  setFocused(w, true)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  const shown = async () => {
+    const text = JSON.stringify(await ui.drawn())
+    return ['alpha', 'bravo', 'charlie', 'Waiting for you · 1 of 3', 'Nobody is waiting'].filter(x => text.includes(x))
+  }
+  expect(await shown()).toEqual(['alpha', 'bravo', 'charlie'])
+  await ui.press({ key: 'waiting' })
+  expect(await shown()).toEqual(['charlie', 'Waiting for you · 1 of 3'])
+  expect(w.store.get('waitingOnly')).toBe(true)
+  // Answered while you're in the panel: it stays until you leave
+  sessionsList[2].status = 'idle'
+  await w.clock.advance(4000)
+  expect(await shown()).toEqual(['charlie', 'Waiting for you · 1 of 3'])
+  setFocused(w, false)
+  await w.clock.advance(4000)
+  expect(await shown()).toEqual(['Nobody is waiting'])
+  setFocused(w, true)
+  await ui.press({ key: 'waiting' })
+  expect(await shown()).toEqual(['alpha', 'bravo', 'charlie'])
+  expect(w.store.get('waitingOnly')).toBe(false)
+  await ui.unmount()
 })
 
 test('spend on a subscription: the account windows it has, once, above the prompt, and no dollars in the rows', async ($, on) => {

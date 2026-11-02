@@ -4,6 +4,7 @@ import type { Register } from 'claude-code'
 import type {
   Color,
   PaneNote,
+  PanelSummary,
   RateLimit,
   Renaming,
   Row,
@@ -38,6 +39,7 @@ import {
   setMember,
   checkSectionSpec,
   upsertSection,
+  waitingMembers,
   type SectionsFile,
   type SectionsView,
   type Action,
@@ -118,6 +120,8 @@ const paneNote = atom({ plugin: 'sessions', key: 'paneNote' } as const, '' as Pa
 // The account's rate-limit windows, as this session's last response reported them (empty off a subscription), for the
 // line above the prompt
 const limits = atom({ plugin: 'sessions', key: 'limits' } as const, [] as RateLimit[])
+// About all the project's rows, whatever is shown: the f filter, how many there are, what they spent
+const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, spent: null } as PanelSummary)
 
 let claude = 'claude'
 let myId = ''
@@ -146,6 +150,10 @@ let sectionsProblem = ''
 // The agent this session runs as (`claude --agent`), read once per session id from its transcript (agentFor)
 let myAgent: string | null = null
 let agentFor = ''
+// The f filter: on (the person's choice, shared by every session through the store key waitingOnly) and who's in it
+// (waitingMembers: a snapshot, kept while the panel has the keyboard)
+let waitingOnly = false
+let waitingSnapshot: Set<string> | null = null
 // The row selected with the arrows (the session button's key, "s:<sessionId>") and the element that has the focus now
 let selectedRow: string | undefined
 let currentFocus: string | undefined
@@ -246,7 +254,7 @@ function debugLine($: any, text: string) {
 // installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
 // autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
-// session's mod updated itself with /reload-plugins: from, to, at).
+// session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it
 async function storeGet($: any, key: string): Promise<any> {
   try {
@@ -822,22 +830,33 @@ async function refresh($: any) {
   const sections = await readSectionsFile($)
   sectionsNow = 'problem' in sections ? NO_SECTIONS : sectionsView(sections.file)
   sectionsProblem = 'problem' in sections ? sections.problem : ''
-  await layout($, !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused)
+  const focused = !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
+  // The filter turned on or off in another session applies here too, once the panel doesn't have the keyboard
+  if (!focused) waitingOnly = (await storeGet($, 'waitingOnly')) === true
+  await layout($, focused)
   await update($, notice, () => sectionsProblem)
   await paneState($)
   await adjustWidth($)
   await prune($)
 }
 
-// The rows as the panel shows them: grouped in sections (groupRows). Claude tracks the panel's focus by position, not by
-// session: if rows move while you're in the panel, the highlight would jump to another session. So with the keyboard in
-// the panel nothing moves, sections and their members included (keepPlaces: new rows go at the end); on leaving, the
-// layout is applied. reflow: the person asked for a new layout right now. If a row left the list, the focus goes back to
-// its session (or the one next to it)
+// The rows as the panel shows them: grouped in sections (groupRows), and only the ones waiting for you with the f filter
+// on. Claude tracks the panel's focus by position, not by session: if rows move while you're in the panel, the
+// highlight would jump to another session. So with the keyboard in the panel nothing moves, sections, their members and
+// the filter's included (keepPlaces: new rows go at the end); on leaving, the layout is applied. reflow: the person
+// asked for a new layout right now (f). If a row left the list, the focus goes back to its session (or the one next to
+// it)
 async function layout($: any, focused: boolean, reflow = false) {
   const shownBefore = await read($, rows)
-  const shown = keepPlaces(groupRows(projectRows, sectionsNow), shownBefore, focused && !reflow)
+  const frozen = focused && !reflow
+  waitingSnapshot = waitingMembers(projectRows, waitingSnapshot, waitingOnly, frozen)
+  const members = waitingSnapshot
+  const grouped = groupRows(projectRows, sectionsNow)
+  const shown = keepPlaces(members ? grouped.filter(f => members.has(f.sessionId)) : grouped, shownBefore, frozen)
   await update($, rows, () => shown)
+  const spends = projectRows.filter(f => f.usd !== null)
+  const next: PanelSummary = { waitingOnly, sessions: projectRows.length, spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null }
+  if (JSON.stringify(next) !== JSON.stringify(await read($, summary))) await update($, summary, () => next)
   const before = shownBefore.map(f => f.sessionId)
   const after = shown.map(f => f.sessionId)
   if (focused && currentFocus?.startsWith('s:') && before.some(id => !after.includes(id))) {
@@ -1418,6 +1437,20 @@ async function toggleNew($: any) {
   }
 }
 
+// The f key: only the sessions waiting for you, or all of them again. It's the person's choice, so it's remembered for
+// every session (you can hop through the waiting ones with Enter) and it lays the panel out again right away, sections
+// included: f twice takes a fresh snapshot of who's waiting without leaving the panel. The focus stays on the selected
+// session if it's still shown, else on the first one
+async function toggleWaiting($: any) {
+  waitingOnly = !waitingOnly
+  waitingSnapshot = null
+  await storeSet($, 'waitingOnly', waitingOnly)
+  await layout($, true, true)
+  const list = await read($, rows)
+  const keep = list.find(f => `s:${f.sessionId}` === selectedRow) ?? list.find(f => !f.current) ?? list[0]
+  if (keep) bg(focusSession($, keep.sessionId))
+}
+
 // With Enter in the field, the session is renamed with its own /rename, the official one: it changes the name in every
 // session's list, in claude agents and on the phone. This one, directly; another one, by asking its mod with a notice
 // (it runs it when it finishes what it's doing)
@@ -1951,6 +1984,7 @@ async function start($: any) {
     }
     // A New or Rename field left open before a reload or a restart would come back stuck in the pane: start closed
     await closeFields($)
+    waitingOnly = (await storeGet($, 'waitingOnly')) === true
     const view = await storeGet($, 'usageView')
     if (view && ['day', 'week', 'month'].includes(view.period) && ['all', 'project'].includes(view.scope)) {
       await update($, usageView, () => ({ period: view.period, scope: view.scope }))
@@ -2285,12 +2319,13 @@ export const register: Register = (on, options) => {
       }
     }
     const marks = list.some(f => f.noPanel || f.otherFormat)
+    const about = await read($, summary)
     // On an API account each row says what its session cost so far, and a line the project's total (list price)
-    const spends = list.some(f => f.usd !== null)
-    const spent = list.reduce((sum, f) => sum + (f.usd ?? 0), 0)
-    // A section's title above its first row, when two or more groups have rows: plain Text, which the focus ring skips
+    const spends = about.spent !== null
+    // A section's title above its first row, when two or more groups have rows: plain Text, which the focus ring skips.
+    // The f filter's line ("Waiting for you · 3 of 17") goes above the rows, as Text too
     const headers = sectionHeaders(list)
-    const lines = list.length + headers.filter(h => h !== null).length
+    const lines = list.length + headers.filter(h => h !== null).length + (about.waitingOnly ? 1 : 0)
     const overflows = lines + 6 + (note !== '' ? 1 : 0) > height
     // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
@@ -2338,12 +2373,16 @@ export const register: Register = (on, options) => {
             <Button key="new" plain dimColor hotkey="n" label="New" onPress={() => toggleNew($)} />
             <Text dimColor> · </Text>
             <Button key="agents" plain dimColor hotkey="a" label="Agents" onPress={() => { bg(openAgentsView($)) }} />
+            <Text dimColor> · </Text>
+            {/* f: only the sessions waiting for you (drawn bright while it's on) */}
+            <Button key="waiting" plain dimColor={about.waitingOnly ? undefined : true} hotkey="f" label="Waiting" onPress={() => { bg(toggleWaiting($)) }} />
             <Text dimColor>{` · ${help}`}</Text>
           </Box>
         )}
         <Text> </Text>
         {note !== '' && <Text color="warning">{note}</Text>}
-        {list.length === 0 && <Text dimColor>No other sessions in this folder.</Text>}
+        {about.waitingOnly && <Text dimColor>{truncate(`Waiting for you · ${list.length} of ${about.sessions}${inTerminal ? ' · f: all' : ''}`, total)}</Text>}
+        {list.length === 0 && <Text dimColor>{about.waitingOnly ? 'Nobody is waiting for you.' : 'No other sessions in this folder.'}</Text>}
         {list.flatMap((f, i) => {
           const header = headers[i]
           const title = header ? [<Text key={`h:${f.section}`} dimColor>{` ${truncate(header, total - 1)}`}</Text>] : []
@@ -2428,7 +2467,7 @@ export const register: Register = (on, options) => {
           </Text>
         )}
         {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (auto with Remote Control)</Text>}
-        {spends && <Text dimColor>{truncate(`${formatUsd(spent)} est. spent here so far (list price)`, total)}</Text>}
+        {about.spent !== null && <Text dimColor>{truncate(`${formatUsd(about.spent)} est. spent here so far (list price)`, total)}</Text>}
         {/* Tokens spent: period (d, w, m) and scope (p: all of Claude or this project); bars per hour or per day */}
         {showUsage && <Box flexGrow={1} minHeight={1} />}
         {showUsage && (

@@ -67,6 +67,7 @@ import {
   publishedSpend,
   formatUsd,
   limitsText,
+  waitingMembers,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -176,6 +177,7 @@ test('terminal: the panel renders and "New" opens the name field', async $ => {
   expect(await ui.find({ key: 'new' })).toBeDefined()
   expect(await ui.find({ key: 'restart' })).toBeDefined()
   expect(await ui.find({ key: 'rename' })).toBeDefined()
+  expect(await ui.find({ key: 'waiting' })).toBeDefined()
   expect(await ui.find({ key: 'name' })).toBe(undefined)
   await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface })
   expect(await ui.find({ key: 'name' })).toBeDefined()
@@ -189,6 +191,7 @@ for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
     expect(await ui.find({ key: 'agents' })).toBe(undefined)
     expect(await ui.find({ key: 'restart' })).toBe(undefined)
     expect(await ui.find({ key: 'rename' })).toBe(undefined)
+    expect(await ui.find({ key: 'waiting' })).toBe(undefined)
   })
 }
 
@@ -690,4 +693,17 @@ test('spend: read per session, a subscription by its windows, an API account by 
   expect([0.04, 1.2, 20.04, 123.4, 1234].map(formatUsd)).toEqual(['$0.04', '$1.20', '$20.04', '$123', '$1.2k'])
   // The spend column widens the panel as much as it needs
   expect(paneWidth(['Refactor the payment retry handling'], 89, 7)).toBe(67)
+})
+
+test('the f filter: a snapshot of who waits for you, taken at the toggle and whenever the panel lacks the keyboard', () => {
+  const rows = [row('aaaaaaaa', 'red', 'one'), row('bbbbbbbb', 'green', 'two'), row('cccccccc', 'red', 'three')]
+  expect(waitingMembers(rows, null, false, false)).toBe(null)
+  // Turned on (no snapshot yet), focused or not: the red ones now
+  expect([...(waitingMembers(rows, null, true, true) ?? [])]).toEqual(['aaaaaaaa-0000', 'cccccccc-0000'])
+  // While focused it's kept, whatever changed: a row answered stays, a new red one doesn't come in
+  const later = [row('aaaaaaaa', 'green', 'one'), row('bbbbbbbb', 'red', 'two'), row('cccccccc', 'red', 'three')]
+  const kept = waitingMembers(later, new Set(['aaaaaaaa-0000', 'cccccccc-0000']), true, true)
+  expect([...(kept ?? [])]).toEqual(['aaaaaaaa-0000', 'cccccccc-0000'])
+  // Without the keyboard: taken again
+  expect([...(waitingMembers(later, kept, true, false) ?? [])]).toEqual(['bbbbbbbb-0000', 'cccccccc-0000'])
 })

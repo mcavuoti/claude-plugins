@@ -805,6 +805,15 @@ export function sectionHeaders(rows: readonly { section: string; sectionTitle: s
   return rows.map((r, i) => (many && r.section !== '' && (i === 0 || rows[i - 1]?.section !== r.section) ? r.sectionTitle : null))
 }
 
+// The f filter shows only the sessions waiting for you (red). Who's in it is a snapshot: taken when it's turned on and
+// whenever the pane doesn't have the keyboard, and kept while it has it (a row you answered stays, in its new color,
+// until you leave), so nothing moves under the focus. null: the filter is off
+export function waitingMembers(rows: readonly { sessionId: string; color: Color }[], previous: ReadonlySet<string> | null, on: boolean, frozen: boolean): Set<string> | null {
+  if (!on) return null
+  if (previous && frozen) return new Set(previous)
+  return new Set(rows.filter(r => r.color === 'red').map(r => r.sessionId))
+}
+
 // While the pane has the keyboard nothing moves (Claude follows the focus by position): the rows that were shown keep
 // their places and their sections, and new ones go at the end. Otherwise (or on a reflow the person asked for), the
 // layout as computed
