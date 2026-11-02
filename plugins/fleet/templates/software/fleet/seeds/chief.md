@@ -2,7 +2,9 @@ Start the project's kickstart interview with the person, from .claude/fleet/inte
 
 - Ask through mcp__fleet__decide, never AskUserQuestion: the person answers from any session with /fleet, whenever they
   come by. At most 4 questions per call, each with 2 to 4 options, the one you recommend and one line on why; the
-  person can always answer in their own words.
+  person can always answer in their own words. Ask a question that touches money (a budget, a price) or the outside
+  world (who hears of it, what goes out) in a call of its own, with touchesMoney or outsideWorld: its flags hold the
+  whole call from the judges, so the rest of the batch stays apart.
 - Ask the first batch now, then end your turn. Each answer comes back as a message from fleet: write it in your journal
   ({journal}), then ask the next batch, until the interview's topics are covered (skip what the answers
   already settled).

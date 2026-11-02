@@ -1,4 +1,5 @@
 {
   "worldFormat": 1,
-  "paths": ["notes/**", "docs/**"]
+  "paths": ["notes/**", "docs/**"],
+  "judges": { "hold": ["\\b(spend\\w*|spent|costs?|budget\\w*|pric\\w*|pay|paid|payment\\w*|invoice\\w*|dollars?|euros?)\\b|[$€£]"] }
 }

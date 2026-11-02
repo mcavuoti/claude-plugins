@@ -1,5 +1,6 @@
 {
   "worldFormat": 1,
   "paths": ["notes/**", "journals/**"],
-  "tags": ["scope", "layout", "schedule", "cost", "process"]
+  "tags": ["scope", "layout", "schedule", "cost", "process"],
+  "judges": { "hold": ["\\b(spend\\w*|spent|costs?|budget\\w*|pric\\w*|pay|paid|payment\\w*|invoice\\w*|dollars?|euros?)\\b|[$€£]"] }
 }

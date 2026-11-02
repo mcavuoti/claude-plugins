@@ -4,5 +4,5 @@
   "command": ["spec/**"],
   "proposal": ["ideas/**"],
   "tags": ["spec", "code", "tests", "process"],
-  "judges": { "model": "haiku", "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
+  "judges": { "model": "haiku", "hold": ["\\b(spend\\w*|spent|costs?|budget\\w*|pric\\w*|pay|paid|payment\\w*|invoice\\w*|dollars?|euros?)\\b|[$€£]"], "statute": ["CLAUDE.md", ".claude/rules/*.md"], "reviewer": "Chief" }
 }

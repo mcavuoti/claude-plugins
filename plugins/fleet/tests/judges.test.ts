@@ -84,6 +84,14 @@ test('the gates, before any model: money, the outside world, what can’t be und
   expect(gateOf({ ...f, kind: 'change' }, c)).toBe("a change is the person's alone")
   expect(gateOf({ ...f, text: 'Pay the Invoice now?' }, c)).toBe('it matches world.json\'s judges.hold "invoice"')
   expect(gateOf({ ...f, asker: { name: 'Janitor', role: 'janitor' } }, c)).toBe("its asker is in world.json's judges.skip")
+  // The money pattern the templates ship: a question about spending holds even when its asker said touchesMoney false
+  const money = judgesOf({ worldFormat: 1, paths: [], judges: { hold: ['\\b(spend\\w*|spent|costs?|budget\\w*|pric\\w*|pay|paid|payment\\w*|invoice\\w*|dollars?|euros?)\\b|[$€£]'] } }).judges
+  const asked = (question: string) => gateOf({ ...f, touchesMoney: false, text: decisionText({ questions: [{ ...DB, question }] }) }, money)
+  expect(asked('What is the most you want to spend on the first year?')).toContain("it matches world.json's judges.hold")
+  expect(asked('Renew the hosting plan at €40 a month?')).toContain('judges.hold')
+  expect(asked('Which pricing page goes first?')).toContain('judges.hold')
+  expect(asked('Which database for the cache?')).toBe(null)
+  expect(asked('Keep the payload small?')).toBe(null)
 })
 
 test('the case law: only the person’s answers (never a judge’s own), dialogs, corrections, and taste he typed', () => {
