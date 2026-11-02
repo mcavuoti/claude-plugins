@@ -15,7 +15,7 @@
     {
       "name": "fleet",
       "source": "./plugins/fleet",
-      "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost. Needs sessions",
+      "description": "Per project: background sessions ask you without stopping, and you answer from any session of the project with /fleet, at no token cost; shared files a session read and someone changed since are flagged to it, and its stale write is refused once. Needs sessions",
       "category": "productivity",
       "tags": ["agents", "decisions", "background", "coordination"]
     }

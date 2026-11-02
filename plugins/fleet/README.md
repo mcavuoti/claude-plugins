@@ -1,6 +1,9 @@
 # fleet
 
-A Claude Code mod, turned on per project, for running several sessions on one project at once. In 0.1.0 it does one thing: a background session that needs your decision asks it without stopping, keeps working on what doesn't depend on it, and gets your answer later; you answer from any session of the project, with a slash command that spends no tokens.
+A Claude Code mod, turned on per project, for running several sessions on one project at once. In 0.2.0 it does two things:
+
+- a background session that needs your decision asks it without stopping, keeps working on what doesn't depend on it, and gets your answer later; you answer from any session of the project, with a slash command that spends no tokens;
+- the files the sessions share (the world: notes, plans, specs) behave like code with a compiler: a session's write of a shared file that changed since it read it is refused once, with who changed it and when, and a session hears at its next step that something it read has changed. No session has to remember to read a log ([below](#shared-files-changed-since-you-read-it)).
 
 It builds on [`sessions`](../sessions/README.md) (0.11.0 or newer): the names and states of the asking sessions come from its panel, through its API for other plugins.
 
@@ -57,13 +60,15 @@ Whatever the install says about versions, `fleet` asks `sessions` at run time wh
 
 ## Setting a project up: `/fleet init`
 
-`/fleet init` (or `/fleet init blank`, the only template in 0.1.0) creates `<project>/.claude/fleet/` in the session's folder:
+`/fleet init` (or `/fleet init blank`, the only template so far) creates `<project>/.claude/fleet/` in the session's folder:
 
 - `config.json`: the template and whether the register is committed (`"commitRegister": false`);
+- `world.json`: the shared files, as globs relative to the project (to start with, everything under `<project>/notes/` and `<project>/docs/`; [below](#shared-files-changed-since-you-read-it));
 - `<project>/.claude/fleet/decisions/`: the open decisions, the answers and the register;
-- `.gitignore`: keeps `<project>/.claude/fleet/decisions/` out of git. `/fleet init --commit-register` sets `commitRegister` and commits the register (`<project>/.claude/fleet/decisions/register/`) with the project, the rest of `<project>/.claude/fleet/decisions/` still ignored.
+- `<project>/.claude/fleet/events/` and `<project>/.claude/fleet/reads/`: the landings on shared files, and what each session read of them;
+- `.gitignore`: keeps `<project>/.claude/fleet/decisions/`, `<project>/.claude/fleet/events/` and `<project>/.claude/fleet/reads/` out of git. `/fleet init --commit-register` sets `commitRegister` and commits the register (`<project>/.claude/fleet/decisions/register/`) with the project, the rest of `<project>/.claude/fleet/decisions/` still ignored. `config.json` and `world.json` are the project's: commit them if you like.
 
-Running it again only brings `.gitignore` in line with `config.json`. A session in a subfolder of the project uses the nearest `<project>/.claude/fleet/` above it; your home folder is never a project. Sessions that were already running join within a minute.
+Running it again only brings `.gitignore` in line with `config.json`, and writes `world.json` if it isn't there. A session in a subfolder of the project uses the nearest `<project>/.claude/fleet/` above it; your home folder is never a project. Sessions that were already running join within a minute.
 
 ## What a background session gets: `mcp__fleet__decide`
 
@@ -86,7 +91,9 @@ In any session of the project, typed by you (`fleet` takes answers only from you
 | `/fleet 3 "your words"` | answers in your own words |
 | `/fleet note 1 <text>` | adds a note for whoever asked question 1, delivered with the answer |
 | `/fleet drop 1 [why]` | drops the decision of question 1 without answering it (also `/fleet drop D-3`): the asker is told to go on as it thinks best |
-| `/fleet status` | what `fleet` does in this session: the project, whether `decide` is offered here and why not, `sessions`' API, the counts |
+| `/fleet status` | what `fleet` does in this session: the project, whether `decide` is offered here and why not, `sessions`' API, the counts; the shared files, the last changes to them, and which session read a version that has changed since |
+| `/fleet world` | the shared files (`world.json`); `/fleet world add <glob>` and `/fleet world remove <glob>` change them ([below](#shared-files-changed-since-you-read-it)) |
+| `/fleet accept <path>` | stamps a change to a shared file made outside fleet (your editor, a script) as yours; `/fleet accept` alone lists those changes |
 | `/fleet init` | sets the project up (above) |
 
 - The numbers are those of the last `/fleet` list shown in that session, so a question asked meanwhile doesn't shift them.
@@ -114,6 +121,42 @@ Go on with what depended on it.
 - **After a restart** (`u`, `claude respawn`) the session's open decisions come back from the files, by its short id, which stays across restarts and `/clear`.
 - **After a `/clear`** the answer arrives as the first turn of the new conversation. It quotes the questions, so it stands on its own, but the cleared model doesn't remember what it was doing.
 
+## Shared files: changed since you read it
+
+Sessions of a project that work on the same notes, plans or specs coordinate through those files. In code a stale assumption fails loudly (the compiler, the tests); in documents it doesn't, and Claude Code doesn't refuse a write of a file that changed since the model read it either (it writes, and at most adds a note). So `fleet` does the checking, for the files listed in `world.json`:
+
+```json
+{ "worldFormat": 1, "paths": ["notes/**", "docs/**"] }
+```
+
+Globs relative to the project folder: `**` any folders, `*` within a name, `{a,b}` either. `fleet`'s own folder is never part of it. `/fleet world add specs` (a folder means everything under it) and `/fleet world remove docs/**` change the list, typed by you; every session follows within 2 seconds.
+
+What happens, in every session of the project (background or not), for each thread (the session's main loop, and each of its helpers on its own):
+
+- **A read** of a shared file (Read, or a Bash `cat`, `head`, `tail`, `sed -n` of one file) is noted with the version read (a hash of the text).
+- **A write** (Write, Edit, NotebookEdit) of a shared file that changed since this thread read it, or that it never read, is refused once:
+
+  ```
+  fleet: notes/plan.md changed at 14:02 by TEST B (Edit), after you read it. Read it again, then redo this write
+  so it agrees with that change (this write was not made).
+  ```
+
+  After a new read it passes. The gate is soft: a second try at the same version passes too, the model having been told. A new file, and anything outside the world, is never held. A helper's read doesn't count for the main thread, nor the reverse: whoever writes has to have seen it.
+- **Every landing** (a write to a shared file by any session) is one small event: the file, who (session and helper), the tool, the versions, when. Never the content.
+- **At its next step**, a thread that read a file someone else changed hears it, with no content, at most ten lines:
+
+  ```
+  fleet: a shared file you read has changed since you read it. Read it again before you rely on it or write it:
+  - notes/plan.md: changed at 14:02 by TEST B (Edit)
+  ```
+
+  Mid-turn it rides the next tool result (Read, Write, Edit, NotebookEdit, Bash); otherwise it goes with the next prompt that starts a turn. Each change is told once, and nothing is added when nothing it read changed.
+- **A Bash command** that writes a shared file isn't stopped: `fleet` compares the shared files before and after the command and records what changed as that thread's landing, marked *landed blind*. When the command changed a file someone else had changed after this thread read it, the model is told to check that change is still there.
+- **Outside changes** (your editor, a script, a session without `fleet`) are found by a scan every 10 seconds and recorded once for the project as changed *outside fleet*. `/fleet accept notes/plan.md` stamps the current version as yours: the sessions that read an older version hear it as your change. `/fleet accept` alone lists the outside changes not stamped yet.
+- **`/fleet status`** shows the shared files, the last changes and, for every session of the project, the files it read whose version has changed since.
+
+This is coordination, not security: if `fleet` errs, or can't place a path, it lets the tool run. A `world.json` from a newer `fleet` is left untouched and nothing is held until the session restarts (`u`). Bash is never restricted. `claude -p` runs in a `fleet` project aren't followed (their writes show as outside changes).
+
 ## The register
 
 Every closed decision, and every AskUserQuestion of the model that you answered in a dialog (an option or text you typed; "Chat about this" and Esc record as not answered), is one JSON file in `<project>/.claude/fleet/decisions/register/<YYYY-MM>/`: the questions, the options, who asked, your answers and notes, where you typed them, and when it was delivered. Another plugin's dialog isn't recorded. It's out of git unless you chose `--commit-register`.
@@ -126,10 +169,11 @@ Once a day the first session to get there closes the decisions of sessions gone 
 plugins/fleet/
 ├── .claude-plugin/plugin.json   name, version, the sessions dependency, where the state types are
 ├── hooks/hooks.json             which module Claude loads
-├── hooks/register.tsx           the mod: decide, /fleet, delivery, the recorder, the band, the section, the prune
+├── hooks/register.tsx           the mod: decide, /fleet, delivery, the recorder, the band, the section, the prune; the gate, the reads, the events, the scans, the digest
 ├── hooks/decisions.ts           pure logic: records and their files, decide's input, the /fleet grammar, the texts (tested)
+├── hooks/changes.ts             pure logic of the shared files: world.json, globs, placing a path, versions, events, the gate's and the digest's words (tested)
 ├── types/index.d.ts             fleet's state ($.state)
-└── tests/                       decisions.test (pure), fleet.test (the mod, with a stand-in for sessions typed by its contract), world.tsx
+└── tests/                       decisions.test and changes.test (pure), fleet.test and gate.test (the mod, with a stand-in for sessions typed by its contract and for the engine's file tools), world.tsx
 ```
 
 What it writes, all in the project's `<project>/.claude/fleet/` (`fleet` keeps no store and nothing in your home folder):
@@ -137,12 +181,16 @@ What it writes, all in the project's `<project>/.claude/fleet/` (`fleet` keeps n
 | Path | What | Version |
 |---|---|---|
 | `config.json` | the template, `commitRegister` | `configFormat` (person data: only gains fields) |
+| `world.json` | the shared files' globs | `worldFormat` (person data) |
 | `<project>/.claude/fleet/decisions/queue/D-<n>.json` | an open decision, written once by the session that asked | `format` |
 | `<project>/.claude/fleet/decisions/answers/D-<n>.<q>.json`, `….note.json`, `D-<n>.drop.json` | answers (no-clobber: the first wins), notes, drops | `format` |
 | `<project>/.claude/fleet/decisions/register/<YYYY-MM>/<id>.json` | closed decisions and recorded dialogs | `registerFormat` (person data) |
 | `<project>/.claude/fleet/decisions/last`, `<project>/.claude/fleet/decisions/prune/<day>`, `<project>/.claude/fleet/decisions/tmp/` | the last number handed out, the daily prune's marker, files about to be put in place | `format` |
+| `<project>/.claude/fleet/events/<YYYY-MM-DD>/<HH>/<ms>-<session>-<n>.json` | one landing on a shared file (UTC hours), written once by the session that saw it; removed after 7 days | `format` |
+| `<project>/.claude/fleet/events/latest`, `<project>/.claude/fleet/events/claims/` | the last event's name, which every session watches; outside changes claimed no-clobber, so one session records each | `format` |
+| `<project>/.claude/fleet/reads/<session id>.json` | what that session's threads read of the shared files, written only by it (for `/fleet status` elsewhere and after a restart) | `format` |
 
-A session whose `fleet` meets another `format` (a session still on an older or newer version) acts on nothing and says to restart (`u`); a `config.json` from a newer `fleet` is left untouched. The rules: [`.claude/rules/fleet-wire-format.md`](../../.claude/rules/fleet-wire-format.md).
+A session whose `fleet` meets another `format` (a session still on an older or newer version) acts on nothing and says to restart (`u`); a `config.json` or `world.json` from a newer `fleet` is left untouched. The rules: [`.claude/rules/fleet-wire-format.md`](../../.claude/rules/fleet-wire-format.md).
 
 ## Turning it off
 
@@ -154,6 +202,7 @@ In a project: `claude plugin disable fleet@mcavuoti --scope local` (or remove th
   ```sh
   claude --bg --model claude-haiku-5-5 --settings '{"env":{"CLAUDE_CODE_PLUGIN_DIRS":"/path/to/claude-plugins/plugins/sessions:/path/to/claude-plugins/plugins/fleet","SESSIONS_DATA_DIR":"/tmp/t/data","SESSIONS_JOBS_DIR":"/tmp/t/jobs","SESSIONS_DAEMON_LOG":"/tmp/t/daemon.log"},"enabledPlugins":{"sessions@inline":true,"fleet@inline":true,"sessions@mcavuoti":false}}' -n "TEST A" "<a prompt that calls mcp__fleet__decide>"
   ```
-  Attach another test session in `dev/sessions/hidden-terminal.py` to type `/fleet` there, and clean up with `dev/sessions/clean-test-sessions.sh <folder>`. With `--debug-file`, every step shows in Claude's debug log as `fleet: …` (`D-3 queued`, `delivering D-3`, `D-3 closed: delivered (turn …)`).
+  Attach another test session in `dev/sessions/hidden-terminal.py` to type `/fleet` there, and clean up with `dev/sessions/clean-test-sessions.sh <folder>`. With `--debug-file`, every step shows in Claude's debug log as `fleet: …` (`D-3 queued`, `delivering D-3`, `D-3 closed: delivered (turn …)`; for the shared files `notes/plan.md: tool (Edit)`, `refused once: Edit of notes/plan.md by main (stale)`, `digest to main: notes/plan.md`, `notes/plan.md: bash (Bash), landed blind`).
+- A test folder under `~/.claude` makes every Write and Edit there a "sensitive file": `claude -p` refuses them whatever the allow rules, and a session asks (auto mode lets them through). Headless probes of the gate run from a folder outside it.
 - After every change: `claude plugin validate plugins/fleet` and `claude plugin test plugins/fleet`; `dev/fleet/ci.sh` checks that `fleet` only calls `sessions` and runs every command from a folder that exists.
 - The tests load a stand-in for `sessions` typed by its contract (`EngineInterface['sessions']`), with the same golden list of methods as `sessions`' own contract test. Type-check with `npx -p typescript@5.6.3 tsc --noEmit -p tsconfig.json` in this folder once a session has loaded it (Claude lays the types, `sessions`' contract included, in `.claude-plugin/types/`).
