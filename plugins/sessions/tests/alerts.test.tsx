@@ -4,7 +4,8 @@ import { dueWaits, inQuietHours, parseQuietHours, waitText } from '../hooks/stat
 import { COMMAND, ROOT, SID, startSession, world, type World } from './world'
 
 // Telling the person: a push when a session of the project waits too long (once per wait, one session for the
-// project, quiet hours and a cap a day). Nothing here ever stops a session or reaches the model
+// project, quiet hours and a cap a day), and the ⧗ on rows working or unseen for long. Nothing here ever stops a
+// session or reaches the model
 
 const BRAVO = 'bbbbbbbb-0000-0000-0000-000000000000'
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
@@ -149,4 +150,29 @@ test('waitPushMinutes 0: no pushes', { options: { waitPushMinutes: 0 } }, async 
   await startSession($, w)
   await w.clock.advance(30 * MIN)
   expect(w.pushes).toEqual([])
+})
+
+test('⧗ on a row working, or done and unseen in the background, for staleMinutes; nothing moves', async ($, on) => {
+  const now = 1_000_000_000
+  const sessions = [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
+    { id: 'bbbbbbbb', sessionId: BRAVO, cwd: ROOT, kind: 'background', status: 'busy', pid: 4243, name: 'bravo' },
+    { id: 'cccccccc', sessionId: 'cccccccc-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4244, name: 'charlie' },
+    { sessionId: 'dddddddd-0000-0000-0000-000000000000', cwd: ROOT, kind: 'interactive', status: 'idle', pid: 4245, name: 'delta' },
+  ]
+  const w = world(on, {
+    list: sessions,
+    store: {
+      [`state:${BRAVO}`]: { turnStarted: now - 2 * HOUR },
+      'state:cccccccc-0000-0000-0000-000000000000': { finished: now - 3 * HOUR },
+      'state:dddddddd-0000-0000-0000-000000000000': { finished: now - 3 * HOUR },
+    },
+  })
+  await startSession($, w)
+  const text = await drawn($)
+  expect(text).toContain('⧗2h')
+  expect(text).toContain('⧗3h')
+  // A regular session's unseen answer is in its own window: no ⧗
+  expect(text.match(/⧗3h/g)).toHaveLength(1)
+  expect(text).toContain('⧗ Working, or done and unseen, for 60 min or more')
 })

@@ -1099,3 +1099,11 @@ export function waitText(waits: readonly Wait[], now: number): string {
   if (others === 0) return `${name} has been waiting for you for ${howLong(now - oldest.since)}`
   return `${name} and ${others === 1 ? '1 other session' : `${others} other sessions`} are waiting for you, the longest for ${howLong(now - oldest.since)}`
 }
+
+// A session working (blue) for the threshold or longer, or a background one done and unseen (yellow) that long: the
+// time on its row gets a dim ⧗. Nothing moves for it
+export function isStale(r: { color: Color; background: boolean }, since: number | undefined, now: number, threshold: number): boolean {
+  if (!(threshold > 0) || !since) return false
+  if (r.color !== 'blue' && !(r.color === 'yellow' && r.background)) return false
+  return now - since >= threshold
+}

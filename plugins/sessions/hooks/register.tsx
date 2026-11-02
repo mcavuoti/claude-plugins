@@ -117,6 +117,7 @@ import {
   dueWaits,
   howLong,
   inQuietHours,
+  isStale,
   parseQuietHours,
   sentToday,
   waitText,
@@ -231,11 +232,13 @@ let lastBeat = 0
 // plugin options
 let debugLogs = false
 // The plugin's options for telling the person (see "Telling the person" in state.ts): a push once a session has waited
-// waitPushMinutes (0: never), none in quietHours, and at most notificationsPerDay notifications of any kind a day
+// waitPushMinutes (0: never), none in quietHours, at most notificationsPerDay notifications of any kind a day, and the ⧗
+// on rows working, or done and unseen, for staleMinutes (0: never)
 let waitPushMs = 600000
 let quietHours: QuietHours | null = null
 let quietHoursText = ''
 let notificationsPerDay = 5
+let staleMs = 3600000
 // The installed version this session's mod already tried to update itself to (once per version)
 let reloadTriedFor = ''
 const startProblems: string[] = []
@@ -1074,6 +1077,7 @@ async function refresh($: any) {
       depth: 0,
       folded: false,
       helpers,
+      stale: isStale({ color, background: s.kind === 'background' }, since, now, staleMs),
     })
   }
   waitsNow = waits
@@ -2251,6 +2255,7 @@ async function notificationsText($: any, now: number): Promise<string> {
       ? ` · last, ${howLong(now - Number(last.at))} ago from ${String(last.from)}: “${String(last.text)}” (phone: ${String(last.phone)}${last.notification ? `; notification: ${String(last.notification)}` : ''})`
       : ''
   const lines = [`Notifications: ${when}${quiet}, ${count}${lastText}`]
+  lines.push(staleMs > 0 ? `⧗ on rows working, or done and unseen, for ${howLong(staleMs)}` : 'No ⧗ on rows (staleMinutes 0)')
   return lines.join('\n')
 }
 
@@ -2605,6 +2610,7 @@ export const register: Register = (on, options) => {
   debugLogs = options?.debugLogs === true
   const minutes = (value: unknown, fallback: number) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value * 60000 : fallback)
   waitPushMs = minutes(options?.waitPushMinutes, 600000)
+  staleMs = minutes(options?.staleMinutes, 3600000)
   quietHoursText = typeof options?.quietHours === 'string' ? options.quietHours.trim() : ''
   quietHours = parseQuietHours(quietHoursText)
   notificationsPerDay = typeof options?.notificationsPerDay === 'number' && Number.isFinite(options.notificationsPerDay) ? Math.max(0, Math.floor(options.notificationsPerDay)) : 5
@@ -2918,7 +2924,7 @@ export const register: Register = (on, options) => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + 5 <= room
+      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
     // Columns: [▌][● ][name…][↑][◆][ model  ctx  time][ spend]; in narrow panels the model is left out
     // Rows use only the width they need: in the box above the prompt (small windows or not fullscreen) the panel takes
@@ -2934,8 +2940,9 @@ export const register: Register = (on, options) => {
     const helperWidth = helperColumn(list)
     const padRight = (t: string, w: number) => t + ' '.repeat(Math.max(0, w - displayWidth(t)))
     const padLeft = (t: string, w: number) => ' '.repeat(Math.max(0, w - displayWidth(t))) + t
+    // ⧗ before the time: working, or done and unseen, for staleMinutes or longer (it takes a column the time leaves free)
     const info = (f: Row) =>
-      `${showModel ? `  ${padRight(f.model, 9)}` : ''} ${padLeft(f.context, 4)} ${padLeft(f.time, 4)}${spends ? ` ${padLeft(f.usd === null ? '' : formatUsd(f.usd), SPEND_COLUMN - 1)}` : ''}`
+      `${showModel ? `  ${padRight(f.model, 9)}` : ''} ${padLeft(f.context, 4)} ${padLeft(`${f.stale ? '⧗' : ''}${f.time}`, 4)}${spends ? ` ${padLeft(f.usd === null ? '' : formatUsd(f.usd), SPEND_COLUMN - 1)}` : ''}`
     // A child's name starts INDENT columns in; the others take those columns
     const name = (f: Row) => {
       const width = nameWidth + (f.depth > 0 ? 0 : indentWidth)
@@ -3065,6 +3072,7 @@ export const register: Register = (on, options) => {
         )}
         {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (auto with Remote Control)</Text>}
         {helperWidth > 0 && <Text dimColor>⚙ Running in the background: subagents, shells</Text>}
+        {list.some(f => f.stale) && <Text dimColor>{truncate(`⧗ Working, or done and unseen, for ${howLong(staleMs)} or more`, total)}</Text>}
         {about.spent !== null && <Text dimColor>{truncate(`${formatUsd(about.spent)} est. spent here so far (list price)`, total)}</Text>}
         {/* Tokens spent: period (d, w, m) and scope (p: all of Claude or this project); bars per hour or per day */}
         {showUsage && <Box flexGrow={1} minHeight={1} />}

@@ -29,6 +29,12 @@
       "title": "Notifications a day, at most",
       "description": "For all of the panel's notifications together. 0: none",
       "default": 5
+    },
+    "staleMinutes": {
+      "type": "number",
+      "title": "⧗ after this many minutes",
+      "description": "A session working this long, or a background session done and unseen this long, gets a dim ⧗ before its time. 0: never",
+      "default": 60
     }
   }
 }

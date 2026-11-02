@@ -39,6 +39,8 @@ export type Row = {
   folded: boolean
   // A running background session's subagents and background tasks (⚙n), as the background service counts them
   helpers: number
+  // Working, or done and unseen in the background, for the staleMinutes option or longer: a dim ⧗ before its time
+  stale: boolean
 }
 
 // One rate-limit window of the account, as a session's last response reported it (five_hour, seven_day, …)
