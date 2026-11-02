@@ -91,11 +91,14 @@ export function personOf(r: Roster | null): { person: Person; problem: string | 
   return terminal(`roster.json: person.channel.kind "${String(c.kind)}" isn't push, mcp, command or terminal`)
 }
 
-/** The script a command channel runs (the last argument that looks like a path): stamped, and command-level */
+/** The script a command channel runs, when it's the project's (relative): the interpreter's first argument (bash x.sh,
+ * python3 x.py), else the command itself. It's stamped, and command-level */
 export function channelScript(c: Channel): string | null {
   if (c.kind !== 'command') return null
-  const s = [...c.argv].reverse().find(a => /[/.]/.test(a) && !a.startsWith('-'))
-  return s && !s.startsWith('/') && !s.includes('..') ? s.replace(/^\.\//, '') : null
+  const first = c.argv[0] as string
+  const name = first.slice(first.lastIndexOf('/') + 1)
+  const s = /^(?:ba|z|da|k)?sh$|^python3?$|^node$|^perl$|^ruby$/.test(name) ? c.argv.slice(1).find(a => !a.startsWith('-')) : first
+  return s && /[/.]/.test(s) && !s.startsWith('/') && !s.includes('..') ? s.replace(/^\.\//, '') : null
 }
 
 /** What the person's stamp of a command channel covers: the command, and its script's version */

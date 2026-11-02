@@ -28,9 +28,11 @@ test('the MCP send: the roster’s arguments, the person’s address, the text',
 })
 
 test('the command channel: its script is command-level, and its stamp covers the command and the script', () => {
-  const c = { kind: 'command' as const, argv: ['bash', './scripts/alert.sh', '--quiet'] }
+  const c = { kind: 'command' as const, argv: ['bash', './scripts/alert.sh', '--quiet', '/tmp/x/alerts.txt'] }
   expect(channelScript(c)).toBe('scripts/alert.sh')
-  expect(channelScript({ kind: 'command', argv: ['/usr/local/bin/notify'] })).toBe(null)
+  expect(channelScript({ kind: 'command', argv: ['/bin/bash', '-e', '.claude/fleet/channels/append.sh', 'log.txt'] })).toBe('.claude/fleet/channels/append.sh')
+  expect(channelScript({ kind: 'command', argv: ['scripts/notify'] })).toBe('scripts/notify')
+  expect(channelScript({ kind: 'command', argv: ['/usr/local/bin/notify', 'x.txt'] })).toBe(null)
   expect(channelKey(c, 'h1')).not.toBe(channelKey(c, 'h2'))
   expect(channelKey({ kind: 'push' }, null)).toBe('')
 })

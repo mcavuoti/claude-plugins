@@ -161,6 +161,7 @@ test('formats: wire files of another format are recognised, config.json from a n
   expect('problem' in parseConfig('{"configFormat":2}')).toBe(true)
   expect('problem' in parseConfig('{')).toBe(true)
   expect(gitignoreText(false)).toContain('\ndecisions/\n')
+  expect(gitignoreText(false)).toContain('\ninbox/\nintake/\n')
   expect(gitignoreText(true)).toContain('decisions/*\n!decisions/register/\n')
 })
 
