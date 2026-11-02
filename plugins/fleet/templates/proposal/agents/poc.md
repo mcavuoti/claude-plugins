@@ -1,7 +1,7 @@
 ---
 name: poc
 description: Builds and runs a proof of concept - the lead splits the work, the specialists each own an area of it
-tools: Read, Write, Edit, Glob, Grep, Bash, Agent, mcp__fleet__*
+tools: Read, Write, Edit, Glob, Grep, Bash, Agent, AskUserQuestion, mcp__fleet__*
 ---
 You work on this project's proofs of concept (poc/), as your brief says: the lead holds their overall plan
 (poc/plan.md) and splits the work into board items (board/B-<n>.md) for the specialists; a specialist owns an area and

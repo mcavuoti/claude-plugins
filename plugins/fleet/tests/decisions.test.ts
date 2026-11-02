@@ -7,6 +7,9 @@ import {
   deliveryText,
   gitignoreText,
   heldCount,
+  listedItems,
+  listedKey,
+  listedMembers,
   monthBefore,
   monthOf,
   parseAnswerName,
@@ -14,10 +17,12 @@ import {
   parseCommand,
   parseConfig,
   parseWire,
+  pointsAtItem,
   progress,
   shown,
   type QueueRecord,
 } from '../hooks/decisions'
+import { alikeQuestion } from '../hooks/judges'
 
 const record = (id: string, n: number): QueueRecord => ({
   format: 1,
@@ -199,4 +204,34 @@ test('register months', () => {
   expect(monthOf(Date.UTC(2026, 10, 2))).toBe('2026-11')
   expect(monthBefore('2026-11')).toBe('2026-10')
   expect(monthBefore('2027-01')).toBe('2026-12')
+})
+
+test('answers by the decision id: D-3 b, D-3 apply, a note on D-3', () => {
+  expect(parseAnswers('D-3 b')).toEqual([{ n: 'D-3', letter: 'b' }])
+  expect(parseAnswers('d-3b 1a')).toEqual([{ n: 'D-3', letter: 'b' }, { n: 1, letter: 'a' }])
+  expect(parseAnswers('D-2 reject D-3 apply')).toEqual([{ n: 'D-2', verb: 'reject' }, { n: 'D-3', verb: 'apply' }])
+  expect(parseAnswers('D-4 "my words"')).toEqual([{ n: 'D-4', text: 'my words' }])
+  expect(parseCommand('note D-4 keep it short')).toEqual({ kind: 'note', n: 'D-4', text: 'keep it short' })
+  expect(parseCommand('note 2 keep it short')).toEqual({ kind: 'note', n: 2, text: 'keep it short' })
+})
+
+test('an answer that points at another list item, and one that only says a number in passing', () => {
+  for (const t of ['the same as question 2', 'same as 2', 'igual que la 2', 'like #2', 'lo mismo que la 2', 'la 2', 'question 2']) expect(pointsAtItem(t)).toBe(2)
+  for (const t of ['Docs, 2 pages', 'Leave it to Owner A', 'after 2 days', 'version 2.0 of the plan']) expect(pointsAtItem(t)).toBe(null)
+})
+
+test('the list: one item per open question, the same question from several askers joined, a change alone', () => {
+  const q = (question: string, labels: string[]) => ({ question, options: labels.map(label => ({ label })), recommended: labels[0] as string, why: 'w' })
+  const a = { ...record('D-1', 0), questions: [q('Which part of the site is yours?', ['Docs', 'Tests'])] }
+  const other = { ref: 'bbbbbbbb', sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', name: 'TEST B', root: '/Users/x/proj' }
+  const b = { ...record('D-2', 0), asker: other, questions: [q('Which part of the site is mine?', ['Docs', 'Tests']), q('Which release day?', ['Monday', 'Friday'])] }
+  const c = { ...record('D-3', 0), questions: [q('Which part of the site is yours?', ['Tests', 'Docs'])] }
+  const change = { ...record('D-4', 0), kind: 'change' as const }
+  const items = listedItems([a, b, c, change], new Set(['D-2.2.json']), alikeQuestion)
+  expect(items.map(listedKey)).toEqual(['D-1.1+D-2.1', 'D-3.1', 'D-4.1'])
+  // The same asker asking the same again: listed apart, each answered
+  const again = { ...record('D-5', 0), questions: [q('Which part of the site is yours?', ['Docs', 'Tests'])] }
+  expect(listedItems([a, again], new Set(), alikeQuestion).map(listedKey)).toEqual(['D-1.1', 'D-5.1'])
+  expect(listedMembers('D-1.1+D-2.1')).toEqual([{ id: 'D-1', q: 1 }, { id: 'D-2', q: 1 }])
+  expect(listedMembers('nonsense')).toEqual([])
 })

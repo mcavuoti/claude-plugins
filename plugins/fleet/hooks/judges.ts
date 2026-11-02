@@ -16,7 +16,7 @@
 // read next time, and counts against the area, which goes back to shadow once he overrules 2 of the last 10 live
 // answers he reviewed.
 
-import type { OutsideMark } from './authority'
+import { isAnswerOrigin, type OutsideMark } from './authority'
 import { hashText, type WorldConfig } from './changes'
 import { cut, letter, type Asker, type Option, type Outcome, type Question } from './decisions'
 
@@ -226,6 +226,13 @@ export function sameQuestion(a: string, b: string): boolean {
   return shared >= 2 && shared / union >= 0.5
 }
 
+/** Two questions /fleet lists as one: alike in words (sameQuestion) and with the same option labels in the same order,
+ * so one letter picks the same option for each asker */
+export function alikeQuestion(a: { question: string; options: readonly { label: string }[] }, b: { question: string; options: readonly { label: string }[] }): boolean {
+  if (a.options.length !== b.options.length || !a.options.every((o, i) => norm(o.label) === norm(b.options[i]?.label ?? ''))) return false
+  return sameQuestion(a.question, b.question)
+}
+
 /** The words that set an option apart: four letters or more, off the stop list, in its label or description and in no
  * other option's */
 export function distinguishing(option: Option, options: readonly Option[]): string[] {
@@ -297,7 +304,7 @@ export function precedentsOf(records: readonly RegisterLike[], corrections: read
     if (r.source === 'decide' && (r.kind === 'change' || r.kind === 'outbound')) {
       const a = r.answers?.[0]
       const what = r.kind === 'change' ? `the change to ${r.change?.path ?? '?'} ("${r.change?.summary ?? ''}")` : `the outbound ${r.outbound?.what ?? '?'} to ${r.outbound?.to ?? '?'}`
-      if (a && a.label === 'rejected' && a.origin === 'composer' && a.note?.trim()) out.push({ id: r.id, at: r.closedAt ?? r.at, area: r.area ?? null, kind: 'rejection', questions: [], taste: { said: line(a.note, 300), about: line(what, 300), principle: '' } })
+      if (a && a.label === 'rejected' && isAnswerOrigin(a.origin) && a.note?.trim()) out.push({ id: r.id, at: r.closedAt ?? r.at, area: r.area ?? null, kind: 'rejection', questions: [], taste: { said: line(a.note, 300), about: line(what, 300), principle: '' } })
       continue
     }
     if ((r.source !== 'decide' && r.source !== 'dialog') || r.kind !== undefined || !Array.isArray(r.questions)) continue

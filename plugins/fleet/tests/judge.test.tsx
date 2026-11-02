@@ -166,7 +166,7 @@ test('taste: the person’s "no", recorded in the register with its provenance; 
   const asked = model(on, () => '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}')
   const w = project(on)
   // The person is at this background session's viewer: what he types there is his
-  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, firstTerminalAt: '2026-11-02T11:00:00Z' }))
+  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: '2026-11-02T11:00:00Z' }))
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
   await startSession($, w)
   // Not a turn the person typed: kept, but the judges don't read it

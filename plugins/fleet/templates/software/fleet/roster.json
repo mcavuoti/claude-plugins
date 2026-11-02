@@ -20,7 +20,7 @@
     { "name": "Reviewer", "role": "reviewer", "section": "checks", "wave": 2 },
     { "name": "Janitor", "role": "janitor", "section": "checks", "wave": 3 }
   ],
-  "settings": { "permissions": { "defaultMode": "auto" } },
+  "settings": { "permissions": { "defaultMode": "auto" }, "worktree": { "bgIsolation": "none" } },
   "budget": { "usdDay": 80 },
   "wakes": { "everyMin": 60, "perDay": 8 }
 }

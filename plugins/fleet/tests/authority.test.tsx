@@ -388,7 +388,7 @@ test('an outbound MCP call, approved: fleet makes it with the server’s own con
 test('outside content marks the conversation: a change filed then waits for the person, even in his own turn; /clear ends it', async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
   // The person attached to this background session (a viewer): his typing is his
-  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, firstTerminalAt: '2026-11-02T11:00:00Z' }))
+  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: '2026-11-02T11:00:00Z' }))
   on('tool.call', { tool: 'WebFetch' }, () => ({ result: { bytes: 10, code: 200 }, text: 'a page' }) as any)
   await startSession($, w)
   await $.prompt.submit({ text: 'Look at that page, then put its idea in the charter', origin: { kind: 'composer' }, wait: false } as any)
@@ -413,8 +413,10 @@ test('outside content marks the conversation: a change filed then waits for the 
 
 test('the person types, in a clean conversation, and the change it files is applied as it’s filed; a launch prompt isn’t his', async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
+  // Started as claude --bg "Set the goal in the charter": the job's intent is its launch prompt
+  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: 'Set the goal in the charter', firstTerminalAt: null }))
   await startSession($, w)
-  // The first prompt of a background session nobody attached to: its launch prompt (composer too), not the person
+  // The first prompt of the background session, the job's intent: its launch prompt (composer too), not the person
   await $.prompt.submit({ text: 'Set the goal in the charter', origin: { kind: 'composer' }, wait: false } as any)
   await $.turn.start({ text: 'Set the goal in the charter', turnId: 't-1' })
   const first = await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal', content: '# Charter\n\nGoal A.\n' })
@@ -447,6 +449,18 @@ test('the person types, in a clean conversation, and the change it files is appl
   expect((await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal is D', content: '# Charter\n\nGoal D.\n' })).result).toContain('Applied at once as D-5')
   // The ones that weren't his wait for /fleet n apply
   expect(await fleet($, '')).toContain('3 changes for you')
+})
+
+test('a session opened with ccc has no launch prompt: its first prompt is the person’s, though the job shows no attach', async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
+  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: null }))
+  await startSession($, w)
+  await $.prompt.submit({ text: 'Set the goal in the charter', origin: { kind: 'composer' }, wait: false } as any)
+  await $.turn.start({ text: 'Set the goal in the charter', turnId: 't-1' })
+  const r = await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal', content: '# Charter\n\nGoal A.\n' })
+  expect(r.result).toContain('Applied at once as D-1')
+  expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n\nGoal A.\n')
+  expect(w.logs.some(l => l.includes('prompt from composer: the person'))).toBe(true)
 })
 
 test('a resource: asked apart from the questions, answered done or no with a note, delivered', async ($, on) => {

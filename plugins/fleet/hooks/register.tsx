@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { FleetBg, FleetInflight, FleetLate, FleetMark, FleetRead } from '../types'
-import { OUTSIDE_TOOLS, checkResource, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, markWords, preAnswer, resourceDelivery, resourceTicket, type OutsideMark, type ResourceSpec } from './authority'
+import { OUTSIDE_TOOLS, checkResource, isAnswerOrigin, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, markWords, preAnswer, resourceDelivery, resourceTicket, type OutsideMark, type ResourceSpec } from './authority'
 import { CHIEF_PROMPT, SHOWN as BRIEF_SHOWN, briefText, chiefLines, closedLine, type BriefFacts, type BriefNeed } from './brief'
 import {
   DESCRIBE_BATCH,
@@ -155,6 +155,9 @@ import {
   knownKind,
   lateNoteText,
   letter,
+  listedItems,
+  listedKey,
+  listedMembers,
   monthBefore,
   monthOf,
   noteName,
@@ -162,6 +165,7 @@ import {
   parseCommand,
   parseConfig,
   parseWire,
+  pointsAtItem,
   progress,
   queueName,
   slots,
@@ -193,6 +197,7 @@ import {
   TASTE_DESCRIPTION,
   TASTE_SCHEMA,
   agreementOf,
+  alikeQuestion,
   areaOf,
   areaStateLine,
   demoteCheck,
@@ -1196,9 +1201,9 @@ async function turnStarted($: any, text: string, turnId: string) {
   for (const id of closing) await close($, id, { state: 'delivered', turnId, ...(pending[id] ? { readAt: pending[id].at } : {}) })
 }
 
-/** What the person typed that these decisions carry to their asker: his text answers (origin composer), his notes and
- * reject reasons (a note is only ever his: /fleet note and a verb's note are typed at a terminal), why he dropped one,
- * and his overrule of a judge (its words and why) */
+/** What the person typed that these decisions carry to their asker: his text answers (typed at a terminal or over
+ * Remote Control), his notes and reject reasons (a note is only ever his), why he dropped one, and his overrule of a
+ * judge (its words and why) */
 async function personWords($: any, ids: readonly string[]): Promise<string> {
   const out: string[] = []
   const present = await answerNames($)
@@ -1208,9 +1213,9 @@ async function personWords($: any, ids: readonly string[]): Promise<string> {
       const { outcomes, drop } = await outcomesOf($, rec, present)
       for (const o of outcomes) {
         if (o?.note) out.push(o.note)
-        if (o && o.origin === 'composer' && o.label === undefined && o.text) out.push(o.text)
+        if (o && isAnswerOrigin(o.origin) && o.label === undefined && o.text) out.push(o.text)
       }
-      if (drop?.origin === 'composer' && drop.why) out.push(drop.why)
+      if (drop && isAnswerOrigin(drop.origin) && drop.why) out.push(drop.why)
     }
     const n = await readWire<OverruleNotice>($, dec(`overrules/${id}.json`))
     if (n) {
@@ -1231,7 +1236,16 @@ async function beat($: any) {
   const n = heldCount(records, present)
   if ((await read($, held)) !== n) await update($, held, () => n)
   await loadRoster($)
-  const o = roster ? (await budgets($)).filter(b => b.state === 'over').length : 0
+  // Over budget and running (its fleet beat in the last 3 min): one that's stopped spends nothing more today
+  let o = 0
+  if (roster) {
+    const now = await $.clock.now()
+    for (const b of await budgets($)) {
+      if (b.state !== 'over') continue
+      const hb = await heartbeatOf($, b.inst.slug)
+      if (hb && now - hb.at < HEARTBEAT_STALE_MS) o++
+    }
+  }
   if ((await read($, overBudget)) !== o) await update($, overBudget, () => o)
   if (jobRef) await keepSection($, records, present)
   await refreshName($)
@@ -4399,7 +4413,7 @@ async function worldCommand($: any, action: 'list' | 'add' | 'remove', glob: str
       '/fleet world add <glob> and /fleet world remove <glob> change it (globs relative to the project: ** any folders, * within a name).',
     ].join('\n')
   }
-  if (origin !== 'composer') return `Only the person changes the world, typing /fleet world at a terminal (this came from ${origin || 'somewhere else'})`
+  if (origin !== 'composer') return `Only the person changes the world, typing /fleet world at a terminal (${originWords(origin)})`
   let w = p ? p.world : { ...newWorld(), paths: [] }
   let g = glob
   if (action === 'add' && !/[*?{]/.test(g)) {
@@ -4429,7 +4443,7 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
   if (path === 'checks') return stampChecks($, origin)
   const cfg = /^(charter\.md|principles\.md|verify\.md|roster\.json|world\.json|outbound\.json|slots\.json)$/.test(path) ? `.claude/fleet/${path}` : path.startsWith(`${root}/`) ? path.slice((root as string).length + 1) : path
   if (path && (await configFiles($)).includes(cfg)) {
-    if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (this came from ${origin || 'somewhere else'})`
+    if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (${originWords(origin)})`
     await writeStamps($, [cfg])
     if (cfg === '.claude/fleet/roster.json') roster = null
     return `${cfg}: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).`
@@ -4445,7 +4459,7 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
     for (const rel of await unstamped($)) out.push(`  ${rel}: changed outside fleet (not through a change you applied) · /fleet accept ${rel}`)
     return out.length ? ['Changes made outside fleet, not stamped as yours yet:', ...out].join('\n') : 'No change made outside fleet waits to be stamped.'
   }
-  if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (this came from ${origin || 'somewhere else'})`
+  if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (${originWords(origin)})`
   const w = await worldFile($, path.startsWith('/') ? path : `${realRoot}/${path}`)
   if (!w) return `${path} isn't a shared file of this project (the world: ${globList(world?.globs ?? [])})`
   const cur = await versionOf($, w.abs)
@@ -4480,7 +4494,7 @@ async function stampChecks($: any, origin: string): Promise<string> {
     ...commands.map(r => `the code watch ${r.name} (${r.kind === 'command' ? `${r.changed.join(' ')}; ${r.open.join(' ')}` : ''}, every ${r.everyMin} min)`),
   ]
   if (st.ok) return `The checks are stamped as they are: ${list.join('; ')}`
-  if (origin !== 'composer') return `Only the person stamps the checks, typing /fleet accept checks at a terminal (this came from ${origin || 'somewhere else'})`
+  if (origin !== 'composer') return `Only the person stamps the checks, typing /fleet accept checks at a terminal (${originWords(origin)})`
   if (!(await replace($, stateDir('checks-stamp.json'), json({ format: FORMAT, key: st.key, at: await $.clock.now() })))) {
     await run($, ['mkdir', '-p', stateDir()])
     if (!(await replace($, stateDir('checks-stamp.json'), json({ format: FORMAT, key: st.key, at: await $.clock.now() })))) return `couldn't stamp them (${stateDir()})`
@@ -4516,7 +4530,7 @@ async function worldStatus($: any): Promise<string[]> {
     return versions.get(rel)
   }
   const sessionId = String(await $.session.id())
-  const sessions: { name: string; threads: Record<string, Record<string, FleetRead>> }[] = [{ name: 'this session', threads: await read($, reads) }]
+  const sessions: { name: string; ref?: string | null; threads: Record<string, Record<string, FleetRead>> }[] = [{ name: 'this session', threads: await read($, reads) }]
   let other = 0
   const now = await $.clock.now()
   for (const name of await names($, `${fleetDir()}/reads`)) {
@@ -4528,10 +4542,13 @@ async function worldStatus($: any): Promise<string[]> {
       continue
     }
     if (now - p.at > 24 * HOUR) continue
-    sessions.push({ name: p.name || p.ref || p.sessionId.slice(0, 8), threads: p.threads })
+    sessions.push({ name: p.name || p.ref || p.sessionId.slice(0, 8), ref: p.ref, threads: p.threads })
   }
+  // A session that's stopped or gone is behind nobody: what it read stays in its file until it runs again
+  const notRunning = await notRunningRefs($, sessions.map(s => s.ref ?? null))
   const behind: string[] = []
   for (const s of sessions) {
+    if (s.ref && notRunning.has(s.ref)) continue
     for (const rel of new Set(Object.values(s.threads).flatMap(t => Object.keys(t)))) await current(rel)
     const stale = staleOf(s.threads, rel => versions.get(rel))
     for (const x of stale) {
@@ -5287,6 +5304,59 @@ function circularOfChange(rel: string, cur: string | null, result: string, summa
   return circularOf({ targetId, summary, newPins, addedText: added, derivedPaths: derivedFiles, derivedIds, inputsOf: p => (known.get(p)?.pins ?? []).map(x => parsePin(x)?.id ?? '').filter(Boolean) })
 }
 
+/** The lines a prompt the person typed here (starting a turn) carries when this session's own questions still wait in
+ * their queue: which, and how an answer typed here takes one off it */
+async function openHereLines($: any, e: any): Promise<string[]> {
+  if (e.command || e.turnId || !jobRef || !offered || !root) return []
+  const pp = await read($, pendingPerson)
+  if (!pp || pp.text !== String(e.text ?? '')) return []
+  const ids = Object.keys(await read($, open))
+  if (!ids.length) return []
+  const present = await answerNames($)
+  const waiting: string[] = []
+  for (const id of ids.sort((a, b) => idNumber(a) - idNumber(b))) {
+    const rec = await readQueue($, id)
+    if (!rec || 'otherFormat' in rec || rec.kind !== undefined || progress(id, slots(rec), present).complete) continue
+    waiting.push(`${id} ("${cut(rec.questions.map(q => q.question).join(' / '), 160)}")`)
+  }
+  if (!waiting.length) return []
+  return [`fleet: your question${waiting.length === 1 ? '' : 's'} ${waiting.join(', ')} still wait${waiting.length === 1 ? 's' : ''} in the person's queue. If what they just typed answers ${waiting.length === 1 ? 'it' : 'one'}, call mcp__fleet__decide with kind "answered" and its id: fleet records their words as its answer and takes it off their queue. If it doesn't, leave it.`]
+}
+
+/** decide with kind answered: the person answered one of this session's own open questions by typing here, so it
+ * leaves their queue. The answer is their words as fleet saw them typed this turn (never the model's account of
+ * them), for each open question; it's closed as delivered in this call's result. Only a choice: a change, a resource
+ * or an outbound does something when answered, and goes through /fleet */
+async function answeredHere($: any, e: any) {
+  const id = String(e.id ?? '').trim().toUpperCase()
+  if (!isDecisionId(id)) return { deny: 'id: the decision the person just answered here, as D-<n>. Nothing was changed.' }
+  const turn = await read($, personTurn)
+  if (!turn) return { deny: `kind answered closes ${id} only in a turn the person started by typing in this session: their words are the answer. Leave it open; it reaches you when they answer with /fleet. Nothing was changed.` }
+  const rec = await readQueue($, id)
+  if (!rec) return { result: `${id} is closed already: nothing to do.` }
+  if ('otherFormat' in rec || !knownKind(rec)) return { deny: `${id} was asked by a fleet of another version: leave it. Nothing was changed.` }
+  const me = String(await $.session.id())
+  if (rec.asker.sessionId !== me && (!jobRef || rec.asker.ref !== jobRef)) return { deny: `${id} was asked by another session (${rec.asker.name || rec.asker.ref || 'not this one'}): only its asker closes it. Nothing was changed.` }
+  if (rec.kind !== undefined) return { deny: `${id} is a ${rec.kind}: its answer does something (apply, send, done), so the person answers it with /fleet ${id} …. Nothing was changed.` }
+  const present = await answerNames($)
+  const p = progress(id, slots(rec), present)
+  if (p.complete) return { result: `${id} is answered already: the answer reaches you as usual.` }
+  const now = await $.clock.now()
+  const here = await sessionName($)
+  const words = cut((turn.text ?? turn.quoted).trim(), 2000)
+  let saved = 0
+  for (let q = 1; q <= rec.questions.length; q++) {
+    if (p.answered[q - 1]) continue
+    const file: AnswerFile = { format: FORMAT, id, q, text: words, origin: 'composer', session: here, at: now, pre: true, quoted: turn.quoted }
+    if ((await publish($, dec(`answers/${answerName(id, q)}`), json(file))) === 'ok') saved++
+  }
+  if (!saved) return { result: `${id} was answered meanwhile: the answer reaches you as usual.` }
+  await close($, id, { state: 'delivered', how: 'result' })
+  log($, `${id} answered in its asker's session: the person typed it this turn`)
+  bg(beat($))
+  return { result: `${id} is off the person's queue: what they typed this turn is its answer, in the register. Go on with it.` }
+}
+
 async function fileChange($: any, e: any) {
   const c = checkChange(e)
   if (!c.ok) return { deny: `${c.reason}. Nothing was queued: call mcp__fleet__decide again with that fixed.` }
@@ -5300,7 +5370,11 @@ async function fileChange($: any, e: any) {
   }
   if (rel.split('/').some(s => s === '..' || s === '.' || s === '')) return { deny: 'path: write it relative to the project folder, without . or .. in it. Nothing was queued.' }
   if (/^\.claude\/fleet\/instances(\/|$)/.test(rel)) return { deny: `${rel} is generated by /fleet up from roster.json: change roster.json instead. Nothing was queued.` }
-  if (!isCommandLevel(rel, await commandLevelNow($), insensitive)) return { deny: `${rel} isn't a command-level file of this project: write it with your own tools (fleet checks a shared file's landing). Nothing was queued.` }
+  if (!isCommandLevel(rel, await commandLevelNow($), insensitive)) {
+    // Claude's own settings and the like: no change of fleet's reaches them, and a session's tools may not either
+    if (/^\.claude\//.test(rel) && !/^\.claude\/fleet\//.test(rel)) return { deny: `${rel} is Claude's own (its settings, say), not a command-level file of fleet's: a change can't name it. If the person should change it, ask them with kind choice (what to set and why), or say it in your journal. Nothing was queued.` }
+    return { deny: `${rel} isn't a command-level file of this project: write it with your own tools (fleet checks a shared file's landing). Nothing was queued.` }
+  }
   const abs = `${root}/${rel}`
   const cur = await readText($, abs)
   if (c.edits && cur === null) return { deny: `${rel} doesn't exist yet: give its whole content instead of edits. Nothing was queued.` }
@@ -5798,7 +5872,7 @@ async function allowHint($: any, note: string): Promise<string> {
 }
 
 /** /fleet lists a change: its file, summary and size, the first lines of its diff, where the draft is, who asked */
-async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, now: number): Promise<string> {
+async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, now: number, moved = false): Promise<string> {
   const spec = r.change as ChangeSpec
   const diff = (await readText($, `${fleetDir()}/${spec.diff}`)) ?? ''
   const { shown, more } = diffHead(diff)
@@ -5806,7 +5880,9 @@ async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, n
   const lines = [`${n}. Change ${spec.path}: "${spec.summary}" (${what})`]
   if (shown.length) lines.push('```diff', ...shown, '```')
   if (more) lines.push(`   and ${more} more lines in ${fleetDir()}/${spec.diff}`)
-  lines.push(`   draft ${fleetDir()}/${spec.draft} (${shortHash(spec.result)}) · /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit to change the draft first`)
+  // Its file moved since it was drafted (another change applied, or an edit): apply would refuse it as stale
+  if (moved) lines.push(`   ⚠ stale: ${spec.path} changed since this was drafted, so it can't apply as it is: /fleet ${n} reject (its asker can draft it again on the file as it is)`)
+  else lines.push(`   draft ${fleetDir()}/${spec.draft} (${shortHash(spec.result)}) · /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit to change the draft first`)
   if (spec.circular?.length) lines.push(`   ⚠ ${circularWords(spec.circular)}.`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
   lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin)}): read the diff before you apply it` : ''}`)
@@ -5881,7 +5957,12 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   await saveNote($, rec.id, it.note, origin)
   await say('applied', v.edited ? 'edited' : undefined)
   log($, `${rec.id} applied: ${spec.path}`)
-  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effectOf(spec.path)}. ${who} hears it.`, done: true, applied: true }
+  // The other changes waiting on the same file were drafted on the version it just left: none can apply now
+  const { records } = await queueRecords($)
+  const present = await answerNames($)
+  const rivals = records.filter(r => r.id !== rec.id && r.kind === 'change' && r.change?.path === spec.path && !progress(r.id, slots(r), present).complete).map(r => r.id)
+  const stale = rivals.length ? ` ${rivals.join(', ')} ${rivals.length === 1 ? 'changes' : 'change'} ${spec.path} too, drafted on the version it just left, so ${rivals.length === 1 ? "it can't" : "they can't"} apply: /fleet ${rivals.map(id => `${id} reject`).join(' ')}` : ''
+  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effectOf(spec.path)}. ${who} hears it.${stale}`, done: true, applied: true }
 }
 
 // What follows fleet's write of a command-level file the person answered for (an applied change, the outbound.json of
@@ -6115,7 +6196,13 @@ async function setFleetMarks($: any, given: Record<string, RowMark>, now: number
 // anyone's ----
 
 function onlyPerson(what: string, origin: string): string {
-  return `Only the person ${what}, typing it at a terminal (this came from ${origin || 'somewhere else'})`
+  return `Only the person ${what}, typing it at a terminal (${originWords(origin)})`
+}
+
+/** Where a refused command came from, in the refusal: Remote Control takes answers, and nothing that changes the
+ * project */
+function originWords(origin: string): string {
+  return origin === 'bridge' ? 'this came over Remote Control, which takes your answers only' : `this came from ${origin || 'somewhere else'}`
 }
 
 async function freshRoster($: any): Promise<string | null> {
@@ -6210,6 +6297,53 @@ async function dropLocalSessions($: any, dir: string): Promise<string> {
   if (!(await replace($, path, next))) return `Couldn't rewrite .claude/settings.local.json to take ${keys.join(', ')} out: take it out by hand (your user settings enable it).`
   log($, `plan B: ${keys.join(', ')} taken out of ${path}`)
   return `Took ${keys.join(', ')} out of .claude/settings.local.json (backed up as settings.local.json.bak-antes-fleet): your user settings enable it, and that key would make Claude install a copy pinned to this project that \`claude plugin update\` doesn't reach. Restart the sessions running here (u) to load it from your user settings.`
+}
+
+/** /fleet init in a git repository: the roster it just wrote keeps its instances in the main checkout (top-level
+ * "worktree": { "bgIsolation": "none" }), where their shared files are the world's; by default a background session
+ * moves into a worktree copy before its first edit, and Claude then refuses its edits of the main checkout (W1, tried
+ * 02/11: with the setting a --bg session stays). Code work goes in explicit worktrees, as the role files say. A roster
+ * that sets it already (the templates do) is left as it is */
+function plainObject(v: unknown): v is Record<string, any> {
+  return !!v && typeof v === 'object' && !Array.isArray(v)
+}
+
+async function keepInMainCheckout($: any, here: string, path: string): Promise<string> {
+  if (!(await gitOf($, here))) return ''
+  const text = await readText($, path)
+  if (text === null) return ''
+  let r: any
+  try {
+    r = JSON.parse(text)
+  } catch {
+    return ''
+  }
+  if (!plainObject(r)) return ''
+  const settings: Record<string, any> = plainObject(r.settings) ? r.settings : {}
+  const w: Record<string, any> = plainObject(settings.worktree) ? settings.worktree : {}
+  if (typeof w.bgIsolation === 'string' && w.bgIsolation) return ''
+  r.settings = { ...settings, worktree: { ...w, bgIsolation: 'none' } }
+  if (!(await replace($, path, `${JSON.stringify(r, null, 2)}\n`))) return ''
+  return 'This project is in a git repository: roster.json keeps the instances in the main checkout ("worktree": { "bgIsolation": "none" }), so their shared files are the ones everyone reads; code work goes in a worktree of its own (the README\'s Worktrees section).'
+}
+
+/** /fleet init: a copy of sessions installed for this project alone (the first session here made it, before init took
+ * the key out) is uninstalled, run in the project as Claude's own command needs (its warning that fleet requires it is
+ * expected: fleet goes on with the user-scope sessions). Lines saying what was done, and to restart (u) */
+async function uninstallLocalSessions($: any, dir: string): Promise<string[]> {
+  const bin = await claudeCommand($)
+  if (!bin) return []
+  const list = await run($, [bin, 'plugin', 'list', '--json'], { timeoutMs: 15000 })
+  if (list.exitCode !== 0) return []
+  const out: string[] = []
+  for (const r of localSessionsRecords(list.stdout, dir)) {
+    const u = await run($, [bin, 'plugin', 'uninstall', r.id, '--scope', 'local'], { cwd: dir, timeoutMs: 30000 })
+    if (u.exitCode === 0) {
+      log($, `plan B: the local record of ${r.id} ${r.version} uninstalled in ${dir}`)
+      out.push(`Uninstalled ${r.id} ${r.version}, which was installed for this project alone (a local record that \`claude plugin update\` never reaches): fleet uses your user-scope ${r.id.split('@')[0]}. Restart the sessions running here (u) to load it.`)
+    } else out.push(`${localRecordLine(r)} (fleet tried: ${(u.stderr || u.stdout).trim().split('\n').pop()?.slice(0, 200) || `exit ${u.exitCode}`})`)
+  }
+  return out
 }
 
 /** The record of the instances of the waves before n (roster.ts waveRecordText), from the project's files: the landings
@@ -7417,6 +7551,16 @@ async function askerViews($: any, records: QueueRecord[]): Promise<(r: QueueReco
   }
 }
 
+/** The short ids among these that sessions says are stopped or gone (none when sessions can't say) */
+async function notRunningRefs($: any, refsIn: readonly (string | null)[]): Promise<Set<string>> {
+  const refs = [...new Set(refsIn.filter((x): x is string => !!x))]
+  const out = new Set<string>()
+  if (!refs.length || !(await has($, 'status'))) return out
+  const st = await race<Status>($, () => $.sessions.status({ refs }))
+  for (const row of st?.ready ? st.rows : []) if (row.state === 'stopped' || row.state === 'gone') out.add(row.ref)
+  return out
+}
+
 async function listCommand($: any): Promise<string> {
   const { records, other } = await queueRecords($)
   const present = await answerNames($)
@@ -7425,38 +7569,48 @@ async function listCommand($: any): Promise<string> {
   const keys: string[] = []
   const shown: string[] = []
   const waiting: string[] = []
+  const stale: string[] = []
   const count = { change: 0, resource: 0, outbound: 0 }
   let unknown = 0
+  let firstAsked: number | null = null
   for (const r of records) {
     if (!knownKind(r)) {
       unknown++
       continue
     }
     const p = progress(r.id, slots(r), present)
-    if (p.complete) {
-      // Answered (or sent back) by the judge in a live area: said so, so the person knows what to overrule
-      let byJudge = false
-      if (r.kind === undefined) {
-        const f = p.dropped ? dec(`answers/${dropName(r.id)}`) : dec(`answers/${answerName(r.id, 1)}`)
-        byJudge = (await readWire<{ origin?: string }>($, f))?.origin === 'judge'
-      }
-      waiting.push(waitingText(r, view(r), p.dropped, byJudge))
-      continue
+    if (!p.complete) continue
+    // Answered (or sent back) by the judge in a live area: said so, so the person knows what to overrule
+    let byJudge = false
+    if (r.kind === undefined) {
+      const f = p.dropped ? dec(`answers/${dropName(r.id)}`) : dec(`answers/${answerName(r.id, 1)}`)
+      byJudge = (await readWire<{ origin?: string }>($, f))?.origin === 'judge'
     }
+    waiting.push(waitingText(r, view(r), p.dropped, byJudge))
+  }
+  const byId = new Map(records.map(r => [r.id, r]))
+  for (const item of listedItems(records, present, alikeQuestion)) {
+    const first = item.members[0] as { id: string; q: number }
+    const r = byId.get(first.id) as QueueRecord
+    keys.push(listedKey(item))
+    const n = keys.length
     if (r.kind !== undefined) {
-      keys.push(`${r.id}.1`)
-      const n = keys.length
-      shown.push(r.kind === 'change' ? await changeHeld($, n, r, view(r), now) : r.kind === 'resource' ? resourceHeld(n, r, view(r), now) : await outboundHeld($, n, r, view(r), now))
+      if (r.kind === 'change') {
+        const moved = await changeMoved($, r.change as ChangeSpec)
+        if (moved) stale.push(`${n} reject`)
+        shown.push(await changeHeld($, n, r, view(r), now, moved))
+      } else shown.push(r.kind === 'resource' ? resourceHeld(n, r, view(r), now) : await outboundHeld($, n, r, view(r), now))
       count[r.kind]++
       continue
     }
+    if (firstAsked === null) firstAsked = n
     // What the judge proposed on it (shadow: the person answers as always)
     const jf = await readJudge($, r.id)
-    for (let q = 1; q <= r.questions.length; q++) {
-      if (p.answered[q - 1]) continue
-      keys.push(`${r.id}.${q}`)
-      shown.push(heldText(keys.length, r, q, view(r), now, proposalLine(jf, r.questions[q - 1], q)))
-    }
+    const also = item.members.slice(1).map(m => {
+      const o = byId.get(m.id) as QueueRecord
+      return { name: view(o).name, id: o.id, q: m.q, of: o.questions.length }
+    })
+    shown.push(heldText(n, r, first.q, view(r), now, proposalLine(jf, r.questions[first.q - 1], first.q), also))
   }
   // The person's overrules of a judge, on their way to their askers
   for (const n of (await names($, dec('overrules'))).filter(x => /^D-\d+\.json$/.test(x)).sort()) {
@@ -7470,8 +7624,10 @@ async function listCommand($: any): Promise<string> {
     const plural = (k: number, one: string, many: string) => (k ? `${k} ${k === 1 ? one : many}` : '')
     const parts = [plural(asked, 'question', 'questions'), plural(count.change, 'change', 'changes'), plural(count.resource, 'resource', 'resources'), plural(count.outbound, 'outbound draft', 'outbound drafts')].filter(Boolean)
     const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : (parts[0] as string)
-    const how = asked ? `answer with /fleet 1a${keys.length > 1 ? ' 2b' : ''}` : count.change ? 'answer with /fleet 1 apply' : count.resource ? 'answer with /fleet 1 done' : 'answer with /fleet 1 send'
+    // The example names no option: a letter in it would read as a suggestion
+    const how = asked ? `answer with /fleet ${firstAsked}<letter>, or ${firstAsked} "your words"` : count.change ? 'answer with /fleet 1 apply' : count.resource ? 'answer with /fleet 1 done' : 'answer with /fleet 1 send'
     out.push(`${what} for you · ${how} · /fleet help`, '', shown.join('\n\n'))
+    if (stale.length > 1) out.push('', `${stale.length} changes can't apply any more (their files moved since they were drafted): /fleet ${stale.join(' ')} rejects them all`)
   } else out.push('Nothing is waiting for you in this project.')
   if (waiting.length) out.push('', 'Answered, not delivered yet:', ...waiting)
   if (other) out.push('', `${other} decision${other === 1 ? ' was' : 's were'} asked by a fleet with another format: restart the sessions (u)`)
@@ -7480,12 +7636,29 @@ async function listCommand($: any): Promise<string> {
   return out.join('\n')
 }
 
-// The number in the last listing shown here, as its decision and question
-async function itemOf($: any, n: number): Promise<{ id: string; q: number } | null> {
+/** Whether a change's file moved since it was drafted: applying it would find it stale */
+async function changeMoved($: any, spec: ChangeSpec): Promise<boolean> {
+  const cur = await readText($, `${root}/${spec.path}`)
+  return (cur === null ? null : hashText(cur)) !== spec.base
+}
+
+// The number in the last listing shown here: its decision and question, or each one of a question several asked
+async function itemsOf($: any, n: number): Promise<{ id: string; q: number }[]> {
   const key = (await read($, listing))[n - 1]
-  if (!key) return null
-  const [id = '', q = '0'] = key.split('.')
-  return { id, q: Number(q) }
+  return key ? listedMembers(key) : []
+}
+
+/** A decision named by its id (D-3): a change, resource or outbound itself, or a choice's only open question. why: what
+ * to say when it names none */
+async function itemsOfId($: any, id: string): Promise<{ items: { id: string; q: number }[]; why?: string }> {
+  const rec = await readQueue($, id)
+  if (!rec) return { items: [], why: await closedText($, id) }
+  if ('otherFormat' in rec || !knownKind(rec) || rec.kind !== undefined) return { items: [{ id, q: 1 }] }
+  const p = progress(id, slots(rec), await answerNames($))
+  const open = rec.questions.map((_, i) => i + 1).filter(q => !p.answered[q - 1])
+  if (open.length === 1) return { items: [{ id, q: open[0] as number }] }
+  if (!open.length) return { items: [], why: p.dropped ? `${id} was dropped` : `${id} is answered already` }
+  return { items: [], why: `${id} has ${open.length} questions open: answer them by their numbers in /fleet` }
 }
 
 // What became of a decision that's no longer open, from the register (this month's or last month's)
@@ -7507,18 +7680,37 @@ async function closedText($: any, id: string, q?: number): Promise<string> {
   return `${id} is closed already`
 }
 
+// An answer whose words point at another item of the list ("the same as 2"), warned once: typed again as it is, it goes
+let pointerWarned = ''
+
 async function answerCommand($: any, items: AnswerItem[], origin: string): Promise<string> {
-  if (!(await read($, listing)).length) return 'Run /fleet first: the numbers are the ones its list shows.'
+  // No list shown in this session yet: with one thing waiting, 1 is it; otherwise the list, to answer by its numbers
+  if (items.some(it => typeof it.n === 'number') && !(await read($, listing)).length) {
+    const list = await listCommand($)
+    const keys = await read($, listing)
+    if (keys.length !== 1 || items.some(it => it.n !== 1)) return keys.length ? `Nothing was answered: these are the numbers to answer by.\n\n${list}` : list
+  }
   const now = await $.clock.now()
   const here = await sessionName($)
   const lines: string[] = []
   const touched = new Map<string, QueueRecord>()
   for (const it of items) {
-    const item = await itemOf($, it.n)
-    if (!item) {
-      lines.push(`${it.n}: not in the last list (/fleet shows it again)`)
-      continue
+    let members: { id: string; q: number }[]
+    if (typeof it.n === 'string') {
+      const r = await itemsOfId($, it.n)
+      if (!r.items.length) {
+        lines.push(`${it.n}: ${r.why}`)
+        continue
+      }
+      members = r.items
+    } else {
+      members = await itemsOf($, it.n)
+      if (!members.length) {
+        lines.push(`${it.n}: not in the last list (/fleet shows it again)`)
+        continue
+      }
     }
+    const item = members[0] as { id: string; q: number }
     const rec = await readQueue($, item.id)
     if (!rec) {
       lines.push(`${it.n}: ${await closedText($, item.id, item.q)}`)
@@ -7545,7 +7737,8 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
       continue
     }
     if (rec.kind === 'outbound') {
-      lines.push(await answerOutbound($, it, rec, origin, here, now))
+      // What leaves the project is the one hard line: its draft is answered where it was read whole, at a terminal
+      lines.push(origin === 'bridge' ? `${it.n}: ${rec.id} is an outbound draft: answer it at a terminal session of the project, where /fleet shows exactly what would go out` : await answerOutbound($, it, rec, origin, here, now))
       continue
     }
     if (it.verb) {
@@ -7554,36 +7747,65 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
     }
     const question = rec.questions[item.q - 1]
     if (!question) continue
-    let chosen: { label: string } | { text: string }
+    let chosen: { label: string; i: number } | { text: string }
     if (it.letter !== undefined) {
-      const o = question.options['abcd'.indexOf(it.letter)]
+      const i = 'abcd'.indexOf(it.letter)
+      const o = question.options[i]
       if (!o) {
         lines.push(`${it.n}: "${question.question}" has no option ${it.letter}`)
         continue
       }
-      chosen = { label: o.label }
-    } else chosen = { text: it.text ?? '' }
-    const file: AnswerFile = { format: FORMAT, id: item.id, q: item.q, ...chosen, origin, session: here, at: now }
-    const path = dec(`answers/${answerName(item.id, item.q)}`)
-    const r = await publish($, path, json(file))
-    if (r === 'exists') {
-      const before = parseWire<AnswerFile>((await readText($, path)) ?? '')
-      const b = before && 'value' in before ? before.value : null
-      const what = b ? (b.label !== undefined ? `${letter(question.options.findIndex(o => o.label === b.label))}) ${b.label}` : `"${b.text}"`) : 'by another fleet'
-      lines.push(`${it.n}: already answered${b ? ` ${ago(now - b.at)} ago in ${b.session}` : ''}: ${what}`)
-      continue
+      chosen = { label: o.label, i }
+    } else {
+      chosen = { text: it.text ?? '' }
+      // Words that point at another item of this list reach the asker meaning nothing: warned once
+      const k = pointsAtItem(chosen.text)
+      const key = `${it.n}|${chosen.text}`
+      if (k !== null && k !== it.n && k <= (await read($, listing)).length && pointerWarned !== key) {
+        pointerWarned = key
+        const said = await itemAnswerWords($, k)
+        lines.push(`${it.n}: your answer points at item ${k} of this list ("${chosen.text}"), and ${(await askerViews($, [rec]))(rec).name} never sees this list: write the answer itself${said ? ` (item ${k} was answered ${said}: /fleet ${it.n} ${said} sends that)` : ''}. Typed again as it is, it goes as it is.`)
+        continue
+      }
     }
-    if (r === 'failed') {
-      lines.push(`${it.n}: couldn't save the answer (${path})`)
-      continue
+    // The same question asked by several: each asker gets the answer (the labels are the same, in the same order)
+    const saved: string[] = []
+    let first: { line: string } | null = null
+    for (const m of members) {
+      const r = m.id === rec.id ? rec : await readQueue($, m.id)
+      if (!r || 'otherFormat' in r || !knownKind(r) || r.kind !== undefined) continue
+      const qm = r.questions[m.q - 1]
+      if (!qm) continue
+      const pick = 'label' in chosen ? { label: (qm.options[chosen.i] ?? { label: chosen.label }).label } : { text: chosen.text }
+      const file: AnswerFile = { format: FORMAT, id: m.id, q: m.q, ...pick, origin, session: here, at: now }
+      const path = dec(`answers/${answerName(m.id, m.q)}`)
+      const res = await publish($, path, json(file))
+      if (res === 'exists') {
+        if (m === item) {
+          const before = parseWire<AnswerFile>((await readText($, path)) ?? '')
+          const b = before && 'value' in before ? before.value : null
+          const what = b ? (b.label !== undefined ? `${letter(question.options.findIndex(o => o.label === b.label))}) ${b.label}` : `"${b.text}"`) : 'by another fleet'
+          first = { line: `${it.n}: already answered${b ? ` ${ago(now - b.at)} ago in ${b.session}` : ''}: ${what}` }
+        }
+        continue
+      }
+      if (res === 'failed') {
+        if (m === item) first = { line: `${it.n}: couldn't save the answer (${path})` }
+        continue
+      }
+      touched.set(m.id, r)
+      if (m !== item) saved.push(m.id)
+      else {
+        const said = 'label' in chosen ? `${it.letter}) ${chosen.label}` : `"${chosen.text}"`
+        // Whether he agreed with what the judge proposed (the register keeps it when the decision closes)
+        const v = (await readJudge($, item.id))?.verdicts.find(x => x.q === item.q)
+        const agreed = agreementOf(v, { ...pick, origin })
+        const judged = agreed === null ? '' : agreed ? ` (the judge proposed ${optionWords(question, v?.option)}: agreed)` : ` (the judge proposed ${optionWords(question, v?.option)}: /fleet stats counts the difference)`
+        first = { line: `${it.n}: ${question.question} → ${said}${judged}` }
+      }
     }
-    const said = 'label' in chosen ? `${it.letter}) ${chosen.label}` : `"${chosen.text}"`
-    // Whether he agreed with what the judge proposed (the register keeps it when the decision closes)
-    const v = (await readJudge($, item.id))?.verdicts.find(x => x.q === item.q)
-    const agreed = agreementOf(v, { ...chosen, origin })
-    const judged = agreed === null ? '' : agreed ? ` (the judge proposed ${optionWords(question, v?.option)}: agreed)` : ` (the judge proposed ${optionWords(question, v?.option)}: /fleet stats counts the difference)`
-    lines.push(`${it.n}: ${question.question} → ${said}${judged}`)
-    touched.set(item.id, rec)
+    if (first) lines.push(`${first.line}${saved.length ? ` (the same answer to ${saved.join(', ')})` : ''}`)
+    else if (saved.length) lines.push(`${it.n}: answered for ${saved.join(', ')}`)
   }
   const present = await answerNames($)
   const view = await askerViews($, [...touched.values()])
@@ -7596,32 +7818,70 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
   return lines.join('\n')
 }
 
-async function noteCommand($: any, n: number, text: string, origin: string): Promise<string> {
-  const item = await itemOf($, n)
-  if (!item) return `${n} isn't in the last list: /fleet shows it again`
-  const rec = await readQueue($, item.id)
-  if (!rec) return closedText($, item.id)
-  if ('otherFormat' in rec) return `${item.id} was asked by a fleet with another format: restart that session (u)`
-  const complete = knownKind(rec) && progress(item.id, slots(rec), await answerNames($)).answered.every(Boolean)
-  const note: NoteFile = { format: FORMAT, id: item.id, q: item.q, text, origin, at: await $.clock.now() }
-  const path = dec(`answers/${noteName(item.id, item.q)}`)
-  if (!(await replace($, path, json(note)))) return "couldn't save the note"
-  // Closed while it was written: its asker took the answers already, and won't look for it
-  if (await gone($, dec(`queue/${queueName(item.id)}`))) {
-    await remove($, [path])
-    return `${await closedText($, item.id)}: the note didn't reach it; tell that session yourself`
+/** What the list's item k was answered, in the words /fleet takes ("Mountains"), when it was: a pointer's fix */
+async function itemAnswerWords($: any, k: number): Promise<string> {
+  const m = (await itemsOf($, k))[0]
+  if (!m) return ''
+  const p = parseWire<AnswerFile>((await readText($, dec(`answers/${answerName(m.id, m.q)}`))) ?? '')
+  const a = p && 'value' in p ? p.value : null
+  const words = a ? (a.label ?? a.text ?? '') : ''
+  return words ? `"${words.replace(/"/g, "'")}"` : ''
+}
+
+async function noteCommand($: any, n: number | string, text: string, origin: string): Promise<string> {
+  let members: { id: string; q: number }[]
+  if (typeof n === 'string') {
+    const r = await itemsOfId($, n)
+    if (!r.items.length) return `${n}: ${r.why}`
+    members = r.items
+  } else {
+    members = await itemsOf($, n)
+    if (!members.length) return `${n} isn't in the last list: /fleet shows it again`
   }
-  // Every question answered: the answers may be on their way, and a note that misses them goes on its own
-  return complete ? `Note on ${n} saved: it goes with the answer, or right after it as a note of its own if the answer is on its way already` : `Note on ${n} saved: it goes with the answer`
+  const out: string[] = []
+  for (const item of members) {
+    const rec = await readQueue($, item.id)
+    if (!rec) {
+      out.push(await closedText($, item.id))
+      continue
+    }
+    if ('otherFormat' in rec) {
+      out.push(`${item.id} was asked by a fleet with another format: restart that session (u)`)
+      continue
+    }
+    const complete = knownKind(rec) && progress(item.id, slots(rec), await answerNames($)).answered.every(Boolean)
+    const note: NoteFile = { format: FORMAT, id: item.id, q: item.q, text, origin, at: await $.clock.now() }
+    const path = dec(`answers/${noteName(item.id, item.q)}`)
+    if (!(await replace($, path, json(note)))) {
+      out.push(`couldn't save the note on ${item.id}`)
+      continue
+    }
+    // Closed while it was written: its asker took the answers already, and won't look for it
+    if (await gone($, dec(`queue/${queueName(item.id)}`))) {
+      await remove($, [path])
+      out.push(`${await closedText($, item.id)}: the note didn't reach it; tell that session yourself`)
+      continue
+    }
+    // Every question answered: the answers may be on their way, and a note that misses them goes on its own
+    const on = members.length > 1 ? `${n} (${item.id})` : `${n}`
+    out.push(complete ? `Note on ${on} saved: it goes with the answer, or right after it as a note of its own if the answer is on its way already` : `Note on ${on} saved: it goes with the answer`)
+  }
+  return out.join('\n')
 }
 
 async function dropCommand($: any, target: string, why: string, origin: string): Promise<string> {
-  let id = target
-  if (!isDecisionId(id)) {
-    const item = await itemOf($, Number(target))
-    if (!item) return `${target} isn't in the last list: /fleet shows it again`
-    id = item.id
+  let ids: string[] = [target]
+  if (!isDecisionId(target)) {
+    const members = await itemsOf($, Number(target))
+    if (!members.length) return `${target} isn't in the last list: /fleet shows it again`
+    ids = [...new Set(members.map(m => m.id))]
   }
+  const out: string[] = []
+  for (const id of ids) out.push(await dropOne($, id, why, origin))
+  return out.join('\n')
+}
+
+async function dropOne($: any, id: string, why: string, origin: string): Promise<string> {
   const rec = await readQueue($, id)
   if (!rec) return closedText($, id)
   if ('otherFormat' in rec) return `${id} was asked by a fleet with another format: restart that session (u)`
@@ -8038,9 +8298,12 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   configProblem = ''
   if (fresh) worldReady = null
   roster = null
+  // In git, the roster it wrote keeps its instances in the main checkout (stamped with the rest below)
+  const isolation = written.includes('.claude/fleet/roster.json') ? await keepInMainCheckout($, here, `${dir}/roster.json`) : ''
   await writeStamps($, await configFiles($))
   // Plan B: sessions from the person's user settings, never a copy pinned here
   const dropped = await dropLocalSessions($, here)
+  const uninstalled = await uninstallLocalSessions($, here)
   const planB = await planBLines($, here)
   timers($)
   if (!offered && (jobRef || !tasteOffered)) await offer($).catch(() => {})
@@ -8060,8 +8323,10 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
       ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git.'
       : 'decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
     ...next,
+    isolation,
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
     dropped,
+    ...uninstalled,
     ...planB,
   ]
     .filter(Boolean)
@@ -8102,15 +8367,9 @@ async function fleetCommand($: any, e: any): Promise<string> {
   if (c.kind === 'remove') return removeCommand($, c.names, c.yes, origin)
   if (c.kind === 'budget') return budgetCommand($, c.target, c.amount, origin)
   if (c.kind === 'worktrees') return worktreesCommand($, c.prune, c.yes, origin)
-  // Answers, notes and drops are the person's own: typed at a terminal (the model can't run a plugin's command, and
-  // another plugin's $.command.run reads as plugin).
-  // TODO(G7): accept 'bridge' (Remote Control from the phone) once it's checked that a command typed there runs here
-  // and reads origin bridge
-  if (origin !== 'composer') {
-    return origin === 'bridge'
-      ? "Answers typed over Remote Control aren't taken yet (not tried): answer from a terminal session of the project"
-      : `Only the person answers, typing /fleet at a terminal (this came from ${origin || 'somewhere else'})`
-  }
+  // Answers, notes and drops are the person's own: typed at a terminal, or over Remote Control from the phone (the
+  // model can't run a plugin's command, and another plugin's $.command.run reads as plugin)
+  if (!isAnswerOrigin(origin)) return `Only the person answers, typing /fleet at a terminal or over Remote Control (${originWords(origin)})`
   if (c.kind === 'answer') return answerCommand($, c.items, origin)
   if (c.kind === 'note') return noteCommand($, c.n, c.text, origin)
   return dropCommand($, c.target, c.why, origin)
@@ -8130,7 +8389,7 @@ async function personPrompt($: any, e: any) {
     try {
       s = JSON.parse((await readText($, `${jobDir}/state.json`)) ?? 'null')
     } catch {}
-    launch = isLaunchPrompt({ background: true, turnsBefore: 0, text, intent: typeof s?.intent === 'string' ? s.intent : null, attached: !!s?.firstTerminalAt })
+    launch = isLaunchPrompt({ background: true, turnsBefore: 0, text, intent: typeof s?.intent === 'string' ? s.intent : null })
     if (launch) person = false
   }
   log($, `prompt from ${kind || 'unknown'}${e.origin?.name ? ` ${e.origin.name}` : ''}${launch ? ', the launch prompt (not the person)' : ''}${e.turnId ? `, into turn ${e.turnId}` : ''}${person ? ': the person' : ''}`)
@@ -8347,11 +8606,17 @@ export const register: Register = on => {
     try {
       await personPrompt($, e)
     } catch {}
-    if (e.command || (!worldOn() && !myInstance)) return next(e)
+    // The person typing here while this session's own questions wait in their queue: the turn hears which, so an
+    // answer typed here can take one off it (decide, kind answered)
+    let asked: string[] = []
+    try {
+      asked = await openHereLines($, e)
+    } catch {}
+    if (e.command || (!worldOn() && !myInstance)) return asked.length ? next({ ...e, context: [...(e.context ?? []), ...asked] }) : next(e)
     const d = await digestFor($, 'main')
-    if (!d.lines.length) return next(e)
-    const r = await next({ ...e, context: [...(e.context ?? []), ...d.lines] })
-    if (r && r.drop === undefined) bg(d.told())
+    if (!d.lines.length && !asked.length) return next(e)
+    const r = await next({ ...e, context: [...(e.context ?? []), ...asked, ...d.lines] })
+    if (r && r.drop === undefined && d.lines.length) bg(d.told())
     return r
   }).catch(($, e, next) => next(e))
 
@@ -8362,7 +8627,8 @@ export const register: Register = on => {
     const kind = (e as any).kind
     if (kind === 'change') return fileChange($, e)
     if (kind === 'resource') return fileResource($, e)
-    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions), "change" (a change to a command-level file) or "resource" (something only the person can get). Nothing was queued.' }
+    if (kind === 'answered') return answeredHere($, e)
+    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions), "change" (a change to a command-level file), "resource" (something only the person can get) or "answered" (one of your own questions the person just answered here, with its id). Nothing was queued.' }
     const checked = checkDecide(e)
     if (!checked.ok) return { deny: `${checked.reason}. Nothing was queued: call mcp__fleet__decide again with that fixed.` }
     const asker = await askerNow($)
@@ -8464,10 +8730,17 @@ export const register: Register = on => {
     return { deny: refusal }
   }).catch(($, e, next) => next(e))
 
-  // The model's own AskUserQuestion only: another plugin's $.ui.ask goes by untouched. It only watches: the dialog is
-  // the usual one, and what it returns goes back unchanged
+  // The model's own AskUserQuestion only: another plugin's $.ui.ask goes by untouched (sessions asks its Stop and
+  // Restart there, and the tool has to be in the session for that). In a background session of the project the
+  // model's own is refused: a dialog waits for whoever comes by, and decide asks without stopping. Elsewhere it only
+  // watches: the dialog is the usual one, and what it returns goes back unchanged
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
     if (next.origin.plugin !== 'engine') return next(e)
+    await locate($)
+    if (root && jobRef && offered) {
+      log($, "refused: the model's AskUserQuestion in a background session (it asks with decide)")
+      return { deny: 'fleet: this is a background session, where a dialog waits for whoever comes by. Ask with mcp__fleet__decide instead: the same questions and options, plus the one you recommend and why; it answers at once with a ticket and the answer reaches you later. Nothing was asked.' }
+    }
     let askedAt = 0
     try {
       askedAt = await $.clock.now()

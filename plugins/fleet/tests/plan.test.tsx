@@ -111,7 +111,7 @@ test('inputs that keep moving: the owner is told anyway 8 × debounceMin after t
 test('no circular authority: a change to a requirement resting only on the plan that cites it is flagged, never applied as filed', WITH_SESSIONS, async ($, on) => {
   const w = await planner($, on)
   // The person is attached and types this turn: a change filed in it would be applied as filed, but for the circle
-  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, firstTerminalAt: '2026-11-02T11:00:00Z' }))
+  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: '2026-11-02T11:00:00Z' }))
   for (let i = 0; i < 10; i++) await tick(w)
   await $.prompt.submit({ text: 'Lower R-1 so the plan works', origin: { kind: 'composer' }, wait: false } as any)
   await $.turn.start({ text: 'Lower R-1 so the plan works', turnId: 't-1' })

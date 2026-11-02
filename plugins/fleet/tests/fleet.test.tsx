@@ -112,7 +112,6 @@ test('the whole loop: listed, answered once from a terminal, delivered exactly o
   expect(list).toContain('2. Should entries expire?')
   // Only the person's own typing answers
   expect(await fleet($, '1a 2b', { kind: 'plugin', name: 'other' })).toContain('Only the person answers')
-  expect(await fleet($, '1a 2b', { kind: 'bridge' })).toContain("Remote Control aren't taken yet")
   expect(w.submits).toEqual([])
   const said = await fleet($, '1a 2b')
   expect(said).toContain('1: Which database for the cache? → a) SQLite')
@@ -378,6 +377,24 @@ test("another plugin's dialog isn't recorded", { plugins: [FAKE_SESSIONS, ASKER]
   expect(under(w, `${DEC}/register`)).toEqual([])
 })
 
+test("in a background session the model's own AskUserQuestion is refused toward decide; another plugin's dialog (sessions' Stop) passes", { plugins: [FAKE_SESSIONS, ASKER], timeoutMs: 30000 }, async ($, on) => {
+  const w = world(on)
+  let asked = 0
+  on('tool.call', { tool: 'AskUserQuestion' }, () => {
+    asked++
+    return { result: { answers: { 'Plugin?': 'A' } } }
+  })
+  await startSession($, w)
+  const questions = [{ question: 'Which color?', header: 'Color', options: [{ label: 'Red', description: '' }, { label: 'Blue', description: '' }], multiSelect: false }]
+  const r: any = await $.tool.call({ tool: 'AskUserQuestion', questions } as any)
+  expect(r.deny).toContain('Ask with mcp__fleet__decide instead')
+  expect(asked).toBe(0)
+  await $.turn.start({ text: 'ask through the plugin', turnId: 't-1' })
+  await w.clock.settle()
+  expect(w.files.get('/fake/asker-error')).toBe(undefined)
+  expect(asked).toBe(1)
+})
+
 test('a failed submit is tried again 30 s later; a { text } with no turn.start seen still closes the record', WITH_SESSIONS, async ($, on) => {
   const w = world(on)
   await startSession($, w)
@@ -421,22 +438,46 @@ test('plan B: /fleet init takes the sessions key out of settings.local.json, bac
     { id: 'sessions@m', version: '0.13.1', scope: 'user', enabled: true },
     { id: 'sessions@m', version: '0.13.0', scope: 'local', enabled: true, projectPath: ROOT },
   ])
-  w.exec.value = argv => (argv[0] === '/opt/x/claude' && argv.slice(1).join(' ') === 'plugin list --json' ? { exitCode: 0, stdout: listed } : undefined)
+  // The local record goes when init uninstalls it, run in the project; the first time the uninstall fails
+  let record = true
+  let fail = true
+  const uninstalls: string[] = []
+  w.exec.value = (argv, cwd) => {
+    if (argv[0] !== '/opt/x/claude') return undefined
+    const line = argv.slice(1).join(' ')
+    if (line === 'plugin list --json') return { exitCode: 0, stdout: record ? listed : JSON.stringify([{ id: 'sessions@m', version: '0.13.1', scope: 'user', enabled: true }]) }
+    if (line === 'plugin uninstall sessions@m --scope local') {
+      uninstalls.push(cwd)
+      if (fail) return { exitCode: 1, stderr: 'Error: something went wrong' }
+      record = false
+      return { exitCode: 0, stdout: 'Warning: fleet@m requires sessions\nUninstalled sessions@m' }
+    }
+    return undefined
+  }
   await startSession($, w)
   const said = await fleet($, 'init')
   expect(said).toContain('Took sessions@m out of .claude/settings.local.json (backed up as settings.local.json.bak-antes-fleet)')
   expect(json(w, LOCAL)).toEqual({ enabledPlugins: { 'fleet@m': true } })
   expect(w.files.get(`${LOCAL}.bak-antes-fleet`)).toBe(before)
+  expect(uninstalls).toEqual([ROOT])
   expect(said).toContain('sessions@m 0.13.0 is installed for this project alone (a local record)')
   expect(said).toContain('`claude plugin uninstall sessions@m --scope local`')
-  // Once the key is gone only the record is said; a second init keeps the first backup
+  expect(said).toContain('(fleet tried: Error: something went wrong)')
+  // Once the key is gone only the record is said; a second init keeps the first backup and uninstalls the record
   w.files.set(LOCAL, JSON.stringify({ enabledPlugins: { 'fleet@m': true, 'sessions@m': true } }))
   expect(await fleet($, 'status')).toContain('plan B: .claude/settings.local.json enables sessions@m for this project too')
-  await fleet($, 'init')
-  expect(w.files.get(`${LOCAL}.bak-antes-fleet`)).toBe(before)
   const status = await fleet($, 'status')
   expect(status).toContain('plan B: sessions@m 0.13.0 is installed for this project alone')
-  expect(status).not.toContain('enables sessions@m for this project too')
+  fail = false
+  const again = await fleet($, 'init')
+  expect(w.files.get(`${LOCAL}.bak-antes-fleet`)).toBe(before)
+  expect(again).toContain('Uninstalled sessions@m 0.13.0, which was installed for this project alone')
+  expect(again).toContain('Restart the sessions running here (u)')
+  expect(again).not.toContain('is installed for this project alone (a local record), and')
+  expect(uninstalls).toEqual([ROOT, ROOT])
+  const after = await fleet($, 'status')
+  expect(after).not.toContain('installed for this project alone')
+  expect(after).not.toContain('enables sessions@m for this project too')
 })
 
 test('/fleet init says when the template turns world commits on', WITH_SESSIONS, async ($, on) => {

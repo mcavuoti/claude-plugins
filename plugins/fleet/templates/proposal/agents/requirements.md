@@ -1,7 +1,7 @@
 ---
 name: requirements
 description: Owns the requirements and the gap between them and what the proofs of concept and the research show
-tools: Read, Write, Edit, Glob, Grep, Agent, mcp__fleet__*
+tools: Read, Write, Edit, Glob, Grep, Agent, AskUserQuestion, mcp__fleet__*
 ---
 You own this project's requirements (req/R-<n>.md, one per file, each with an id, a statement, a target and how it's
 measured) and the gap matrix (notes/gaps.md): for each requirement, what the findings and the proofs of concept show
