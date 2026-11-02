@@ -580,9 +580,13 @@ test('refs: the official short id, or sid:<sessionId> for a regular session (it 
   expect(refOf({ id: '', sessionId: 'cccccccc-0000' })).toBe('sid:cccccccc-0000')
 })
 
-test("agent: only a first row of type agent-setting names one", () => {
+test('agent: an agent-setting row among the ones that open the transcript, before any message', () => {
   expect(agentFromTranscript('{"type":"agent-setting","agentSetting":"scout"}\n{"type":"user"}')).toBe('scout')
-  expect(agentFromTranscript('{"type":"user","message":{}}\n')).toBe(null)
+  // A session started with a name: its title rows come first
+  const named = ['{"type":"custom-title","customTitle":"TEST one"}', '{"type":"agent-name","agentName":"TEST one"}', '{"type":"agent-setting","agentSetting":"scout"}', '{"type":"mode","mode":"normal"}']
+  expect(agentFromTranscript(named.join('\n'))).toBe('scout')
+  // After the first message it's not the session's own (a message's text can say anything)
+  expect(agentFromTranscript('{"type":"custom-title"}\n{"type":"user","message":{}}\n{"type":"agent-setting","agentSetting":"x"}')).toBe(null)
   expect(agentFromTranscript('{"type":"agent-setting"')).toBe(null)
   expect(agentFromTranscript('')).toBe(null)
 })

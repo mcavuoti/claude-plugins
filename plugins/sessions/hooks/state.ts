@@ -605,16 +605,21 @@ export function refOf(s: { id?: unknown; sessionId: string }): string {
   return typeof s.id === 'string' && s.id ? s.id : `sid:${s.sessionId}`
 }
 
-// The agent a session runs as (`claude --agent <name>`): Claude writes it as the first row of the session's transcript,
-// {"type":"agent-setting","agentSetting":"<name>"}. null when the first row is anything else
+// The agent a session runs as (`claude --agent <name>`): Claude writes it among the rows that open the session's
+// transcript, before any message ({"type":"agent-setting","agentSetting":"<name>"}, after custom-title and agent-name
+// when the session was started with a name). null when those rows have none
 export function agentFromTranscript(head: string): string | null {
-  const first = head.split('\n')[0] ?? ''
-  try {
-    const row = JSON.parse(first)
-    return row?.type === 'agent-setting' && typeof row.agentSetting === 'string' && row.agentSetting ? row.agentSetting : null
-  } catch {
-    return null
+  for (const line of head.split('\n')) {
+    let row: any
+    try {
+      row = JSON.parse(line)
+    } catch {
+      return null
+    }
+    if (row?.type === 'agent-setting') return typeof row.agentSetting === 'string' && row.agentSetting ? row.agentSetting : null
+    if (row?.type === 'user' || row?.type === 'assistant' || row?.message) return null
   }
+  return null
 }
 
 // Sections: <data>/sections.json, the person's data (what they chose, kept for good), so it has its own version,
