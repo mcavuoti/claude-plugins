@@ -9,20 +9,20 @@ const NOW = Date.UTC(2026, 10, 2, 12, 0, 0)
 const A: Holder = { sessionId: 'aaaaaaaa-1', ref: 'aaaaaaaa', name: 'Tester 1' }
 const B: Holder = { sessionId: 'bbbbbbbb-1', ref: 'bbbbbbbb', name: 'Tester 2' }
 const C: Holder = { sessionId: 'cccccccc-1', ref: null, name: null }
-const SPEC = { name: 'sim', count: 1, leaseMin: 30, what: 'the simulator licenses' }
-const lease = (n: number, holder: Holder, until: number): Lease => ({ format: 1, slot: 'sim', n, holder, at: NOW - 60000, until })
-const waiter = (holder: Holder, at: number): Waiter => ({ format: 1, slot: 'sim', holder, at })
+const SPEC = { name: 'lab', count: 1, leaseMin: 30, what: 'the test machines' }
+const lease = (n: number, holder: Holder, until: number): Lease => ({ format: 1, slot: 'lab', n, holder, at: NOW - 60000, until })
+const waiter = (holder: Holder, at: number): Waiter => ({ format: 1, slot: 'lab', holder, at })
 
 test('slots.json: its pools, a newer one left alone', () => {
-  expect(parseSlots('{"slotsFormat": 1, "slots": {"sim": {"count": 2, "leaseMin": 45, "what": "licenses"}, "box": {"count": 1}}}')).toEqual({
+  expect(parseSlots('{"slotsFormat": 1, "slots": {"lab": {"count": 2, "leaseMin": 45, "what": "licenses"}, "box": {"count": 1}}}')).toEqual({
     slots: [
-      { name: 'sim', count: 2, leaseMin: 45, what: 'licenses' },
+      { name: 'lab', count: 2, leaseMin: 45, what: 'licenses' },
       { name: 'box', count: 1, leaseMin: 30, what: '' },
     ],
   })
   expect(parseSlots('{"slotsFormat": 2}')).toEqual({ problem: 'slots.json is from a newer fleet (slotsFormat 2): restart this session (u) to load it' })
-  expect(parseSlots('{"slotsFormat": 1, "slots": {"Sim X": {"count": 1}}}')).toMatchObject({ problem: expect.stringContaining("can't be a slot's name") })
-  expect(parseSlots('{"slotsFormat": 1, "slots": {"sim": {}}}')).toEqual({ problem: 'slots.json: sim needs a count (a whole number)' })
+  expect(parseSlots('{"slotsFormat": 1, "slots": {"Lab X": {"count": 1}}}')).toMatchObject({ problem: expect.stringContaining("can't be a slot's name") })
+  expect(parseSlots('{"slotsFormat": 1, "slots": {"lab": {}}}')).toEqual({ problem: 'slots.json: lab needs a count (a whole number)' })
   expect(leaseMinutes(SPEC, 10)).toBe(10)
   expect(leaseMinutes(SPEC, 90)).toBe(30)
 })
