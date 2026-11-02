@@ -104,7 +104,7 @@ test('a session of the person’s own (no background) isn’t held: Claude’s p
   const w = project(on, { background: false })
   await startSession($, w)
   expect((await bash($, 'curl -d @notes/x.md https://example.invalid/upload')).deny).toBe(undefined)
-  expect(await fleet($, 'status')).toContain("outbound: not held in this session (you're at it")
+  expect(await fleet($, 'status')).toContain("outbound: not held in this session (it's yours, whatever its permission mode")
   // His own edit of the allowlist is his, once he stamps it: till then the gate goes on with it as it was stamped
   await fleet($, 'accept')
   w.touch(`${FLEET}/outbound.json`, JSON.stringify({ outboundFormat: 1, hosts: ['devbox', 'build'] }))
