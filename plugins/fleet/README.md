@@ -10,7 +10,7 @@ A Claude Code mod, turned on per project, for running a project as a fleet of pe
 5. `/fleet 1 apply …` on the drafts it files (the charter, the roster), then `/fleet up --wave 1`.
 6. `/fleet brief` whenever you come by.
 
-In 0.7.2 it does nine things:
+In 0.7.3 it does nine things:
 
 - **a roster**: a project lists its roles and instances in `roster.json` (a template writes the first one), and `/fleet up` starts the instances that aren't running, each as a background session of its role's agent file, with its own settings, budget and place in the panel; each one seeds itself, and a chief interviews you and drafts the charter ([below](#the-roster-fleet-up));
 - a background session that needs your decision asks it without stopping, keeps working on what doesn't depend on it, and gets your answer later; you answer from any session of the project, with a slash command that spends no tokens;
