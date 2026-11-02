@@ -24,8 +24,9 @@ export type WorldConfig = { worldFormat: number; paths: string[]; [key: string]:
 /** Who landed a change: a session (and its helper, agentId), or the person (/fleet accept); null for outside fleet */
 export type Who = { sessionId: string | null; agentId: string | null; ref: string | null; name: string | null; person?: true }
 /** tool: the model's Write, Edit or NotebookEdit, through the gate; bash: found after a Bash command; outside: found by a
- * session's scan (an editor, a script, a session without fleet); accept: the person stamped the current version as his */
-export type Via = 'tool' | 'bash' | 'outside' | 'accept'
+ * session's scan (an editor, a script, a session without fleet); accept: the person stamped the current version as his;
+ * answer: fleet wrote a command-level record, applying a change the person approved (drafts.ts) */
+export type Via = 'tool' | 'bash' | 'outside' | 'accept' | 'answer'
 export type ChangeEvent = {
   format: number
   /** When it changed (for an outside change, the file's modification time) */
@@ -271,6 +272,7 @@ export function whoText(e: ChangeEvent, me: Me): string {
   if (e.via === 'outside' || !e.by) return 'nobody fleet knows'
   const who = sessionWords(e.by, me)
   if (e.via === 'accept') return 'the person'
+  if (e.via === 'answer') return 'the person (a change applied by fleet)'
   if (e.via === 'bash') return `${who} (a Bash command, landed blind)`
   return e.tool ? `${who} (${e.tool})` : who
 }

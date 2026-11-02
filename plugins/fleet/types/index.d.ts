@@ -38,6 +38,14 @@ declare module 'claude-code' {
       flags: number
       /** What this session's model was told about the files it owns (suspects, failed checks): key → when */
       ownTold: Record<string, number>
+      /** The band's count of the roster's instances over their budget today */
+      overBudget: number
+      /** The short id this session's seed was submitted for (an instance is seeded once per session) */
+      seedSent: string
+      /** The budget state this instance's model was told of: "<day>|<warn|over>" */
+      budgetTold: string
+      /** When this instance's fleet submitted a nudge whose turn hasn't started yet (0: none) */
+      nudgeAt: number
     }
   }
 }

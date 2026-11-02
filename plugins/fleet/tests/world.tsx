@@ -18,11 +18,18 @@ export const BAND = { plugin: 'fleet', component: 'AbovePrompt', requestId: 'ban
 export const COMPOSER = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
 
 // The golden list of what sessions api 1 serves (plugins/sessions/tests/contract.test.tsx has the same one)
-export const GOLDEN = ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection']
+export const GOLDEN = ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks']
+// Where the tests' templates are (FLEET_TEMPLATES_DIR), and the blank one every test has
+export const TEMPLATES = '/fake/templates'
+export const BLANK = {
+  'template.json': JSON.stringify({ templateFormat: 1, description: 'nothing but fleet', folders: [] }),
+  'fleet/world.json': JSON.stringify({ worldFormat: 1, paths: ['notes/**', 'docs/**'] }),
+  'fleet/roster.json': JSON.stringify({ rosterFormat: 1, sections: [], roles: {}, instances: [] }),
+}
 
 /** A stand-in for sessions with the contract's own type (tsc checks it against plugins/sessions/types/index.d.ts).
- * It answers from FAKE ({ current, rows }) and appends each section call to FAKE_LOG. Inline plugins close over
- * nothing of the test file, so it spells its paths out */
+ * It answers from FAKE ({ current, rows, named }) and appends each call that changes something to FAKE_LOG. Inline
+ * plugins close over nothing of the test file, so it spells its paths out */
 export const FAKE_SESSIONS = {
   name: 'sessions',
   register(on: On) {
@@ -43,13 +50,26 @@ export const FAKE_SESSIONS = {
         await $.fs.write('/fake/sessions.log', `${before}${JSON.stringify(line)}\n`)
       }
       const api: EngineInterface['sessions'] = {
-        contract: async () => ({ api: 1, version: '0.11.0', format: 1, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection'] }),
+        contract: async () => ({ api: 1, version: '0.13.0', format: 2, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks'] }),
         current: async () => (await world()).current ?? { ready: false, ref: null, sessionId: '', name: '', root: '', background: false, agent: null },
         status: async input => {
           const w = await world()
           if (!w.rows) return { ready: false, rows: [] }
           const refs = input.refs ?? []
-          return { ready: true, rows: refs.map(ref => w.rows[ref] ?? { ref, sessionId: null, name: null, state: 'gone', panel: 'none', root: null, background: false, agent: null }) }
+          const byName = (input.names ?? []).flatMap((n: string) => Object.values(w.rows as Record<string, any>).filter(r => r.name === n))
+          return { ready: true, rows: [...refs.map(ref => w.rows[ref] ?? { ref, sessionId: null, name: null, state: 'gone', panel: 'none', root: null, background: false, agent: null }), ...byName] }
+        },
+        start: async input => {
+          await note({ start: input })
+          return { ok: true, queued: true }
+        },
+        wake: async input => {
+          await note({ wake: input })
+          return { ok: true, state: 'queued' }
+        },
+        setMarks: async input => {
+          await note({ setMarks: input })
+          return { ok: true }
         },
         sections: async () => ({ sections: [], members: {} }),
         defineSection: async input => {
@@ -107,6 +127,8 @@ export type WorldOptions = {
   links?: Record<string, string>
   env?: Record<string, string>
   files?: Record<string, string>
+  // Templates besides blank: name → path inside the template → text
+  templates?: Record<string, Record<string, string>>
 }
 
 function parentsOf(path: string): string[] {
@@ -137,6 +159,9 @@ export function world(on: On, options: WorldOptions = {}): World {
     for (const d of parentsOf(path)) dirs.add(d)
   }
   for (const [p, t] of files) addFile(p, t)
+  for (const [name, tree] of Object.entries({ blank: BLANK, ...options.templates })) {
+    for (const [p, t] of Object.entries(tree)) addFile(`${TEMPLATES}/${name}/${p}`, t)
+  }
   if (options.fleet !== false) {
     addFile(`${FLEET}/config.json`, '{ "configFormat": 1, "template": "blank", "commitRegister": false }\n')
     for (const d of ['queue', 'answers', 'register', 'tmp', 'prune']) dirs.add(`${DEC}/${d}`)
@@ -168,7 +193,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const logs: string[] = []
   const messages = { value: [] as unknown[] }
   const band = { value: '' }
-  const env: Record<string, string> = { HOME, ...(options.background !== false ? { CLAUDE_JOB_DIR: JOB } : {}), ...options.env }
+  const env: Record<string, string> = { HOME, FLEET_TEMPLATES_DIR: TEMPLATES, ...(options.background !== false ? { CLAUDE_JOB_DIR: JOB } : {}), ...options.env }
   mock.env(on, env)
   on('session.id', () => ({ value: id.value }))
   on('session.root', () => ({ value: root.value }))

@@ -35,8 +35,8 @@ test('the stand-in for sessions serves the golden list of api 1', WITH_SESSIONS,
   const w = world(on)
   await startSession($, w)
   // The stand-in's own list, as fleet reads it through /fleet status
-  expect(await fleet($, 'status')).toContain('sessions: api 1, version 0.11.0')
-  expect(GOLDEN).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection'])
+  expect(await fleet($, 'status')).toContain('sessions: api 1, version 0.13.0')
+  expect(GOLDEN).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks'])
 })
 
 test('/fleet init sets the project up: config, decisions folders, .gitignore; again it only updates', WITH_SESSIONS, async ($, on) => {
@@ -54,7 +54,7 @@ test('/fleet init sets the project up: config, decisions folders, .gitignore; ag
   expect(await fleet($, 'init --commit-register')).toContain('Up to date')
   expect(json(w, `${FLEET}/config.json`).commitRegister).toBe(true)
   expect(w.files.get(`${FLEET}/.gitignore`)).toContain('!decisions/register/')
-  expect(await fleet($, 'init solo')).toContain('one template, blank')
+  expect(await fleet($, 'init solo')).toContain('No template "solo": there are blank')
   expect(await fleet($, '')).toContain('Nothing is waiting for you')
 })
 

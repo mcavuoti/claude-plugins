@@ -44,7 +44,7 @@ test('answers: 1a 2b, 1) a 2) b, commas, free text in quotes; anything else is r
 test('/fleet words: list, status, init, note, drop, help; the rest are answers', () => {
   expect(parseCommand('')).toEqual({ kind: 'list' })
   expect(parseCommand(' status ')).toEqual({ kind: 'status' })
-  expect(parseCommand('init')).toEqual({ kind: 'init', template: 'blank', commitRegister: false })
+  expect(parseCommand('init')).toEqual({ kind: 'init', template: '', commitRegister: false })
   expect(parseCommand('init blank --commit-register')).toEqual({ kind: 'init', template: 'blank', commitRegister: true })
   expect(parseCommand('init --force').kind).toBe('bad')
   expect(parseCommand('note 2 keep it local')).toEqual({ kind: 'note', n: 2, text: 'keep it local' })
@@ -52,6 +52,44 @@ test('/fleet words: list, status, init, note, drop, help; the rest are answers',
   expect(parseCommand('drop 3 not needed')).toEqual({ kind: 'drop', target: '3', why: 'not needed' })
   expect(parseCommand('drop d-12')).toEqual({ kind: 'drop', target: 'D-12', why: '' })
   expect(parseCommand('1a 2b')).toEqual({ kind: 'answer', items: [{ n: 1, letter: 'a' }, { n: 2, letter: 'b' }] })
+})
+
+test('a change is answered with a verb: apply (with the edited draft’s version), reject, edit; mixed with letters', () => {
+  expect(parseAnswers('1 apply 2b 3 reject')).toEqual([{ n: 1, verb: 'apply' }, { n: 2, letter: 'b' }, { n: 3, verb: 'reject' }])
+  expect(parseAnswers('4 Apply h1A2b3c4d')).toEqual([{ n: 4, verb: 'apply', hash: 'h1a2b3c4d' }])
+  expect(parseAnswers('1 edit, 2 apply')).toEqual([{ n: 1, verb: 'edit' }, { n: 2, verb: 'apply' }])
+  expect(typeof parseAnswers('1 applied')).toBe('string')
+  expect(typeof parseAnswers('1 apply 1a')).toBe('string')
+})
+
+test("/fleet up, down, remove, budget, worktrees: their words and what's refused", () => {
+  expect(parseCommand('up')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [] })
+  expect(parseCommand('up --dry-run --wave 2')).toEqual({ kind: 'up', dryRun: true, wave: 2, names: [] })
+  expect(parseCommand('up "Area A" chief --wave=1')).toEqual({ kind: 'up', dryRun: false, wave: 1, names: ['Area A', 'chief'] })
+  expect(parseCommand('up --wave').kind).toBe('bad')
+  expect(parseCommand('up --wave 0').kind).toBe('bad')
+  expect(parseCommand('up --force').kind).toBe('bad')
+  expect(parseCommand('down')).toEqual({ kind: 'down', names: [] })
+  expect(parseCommand('down Lead "Area A"')).toEqual({ kind: 'down', names: ['Lead', 'Area A'] })
+  expect(parseCommand('remove "Area A" --yes')).toEqual({ kind: 'remove', names: ['Area A'], yes: true })
+  expect(parseCommand('remove').kind).toBe('bad')
+  expect(parseCommand('budget')).toEqual({ kind: 'budget', target: '', amount: '' })
+  expect(parseCommand('budget "Tester 2" +5')).toEqual({ kind: 'budget', target: 'Tester 2', amount: '+5' })
+  expect(parseCommand('budget project 40')).toEqual({ kind: 'budget', target: 'project', amount: '40' })
+  expect(parseCommand('budget Lead')).toEqual({ kind: 'budget', target: 'Lead', amount: '' })
+  expect(parseCommand('worktrees')).toEqual({ kind: 'worktrees', prune: false, yes: false })
+  expect(parseCommand('worktrees prune --yes')).toEqual({ kind: 'worktrees', prune: true, yes: true })
+  expect(parseCommand('worktrees all').kind).toBe('bad')
+})
+
+test('a change waits for one answer and counts for the band; a kind this fleet doesn’t know is never counted', () => {
+  const change: QueueRecord = { ...record('D-5', 0), kind: 'change' }
+  const other = { ...record('D-6', 0), kind: 'resource' } as unknown as QueueRecord
+  expect(heldCount([change, other, record('D-7', 2)], new Set())).toBe(3)
+  expect(heldCount([change], new Set(['D-5.1.json']))).toBe(0)
+  // The delivery: a change's own words, and "Go on with what depended on it." only after a choice
+  const text = deliveryText([{ record: change, outcomes: [{ label: 'applied' }], drop: null }], p => (p.record.kind === 'change' ? `[${p.record.id}] The person applied it.` : null))
+  expect(text).toBe('[D-5] The person applied it.')
 })
 
 test("decide's input: counts, labels, the recommendation by label or letter, and a reason", () => {

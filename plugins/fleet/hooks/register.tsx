@@ -10,6 +10,7 @@ import {
   ancestorsOf,
   bashReadTarget,
   caseProbe,
+  checkGlob,
   changeLine,
   changedPaths,
   clock,
@@ -69,6 +70,7 @@ import {
   heldText,
   idNumber,
   isDecisionId,
+  knownKind,
   letter,
   monthBefore,
   monthOf,
@@ -79,12 +81,14 @@ import {
   parseWire,
   progress,
   queueName,
+  slots,
   ticketText,
   waitingText,
   type AnswerFile,
   type AnswerItem,
   type Asker,
   type AskerView,
+  type Command,
   type Config,
   type Delivery,
   type DropFile,
@@ -93,6 +97,38 @@ import {
   type QueueRecord,
   type RegisterRecord,
 } from './decisions'
+import { applyEdits, applyVerdict, changeDelivery, changeTicket, checkChange, diffHead, draftName, lineDiff, shortHash, type ChangeSpec } from './drafts'
+import {
+  HEARTBEAT_STALE_MS,
+  ROSTER_FORMAT,
+  addSpend,
+  budgetState,
+  capFor,
+  commandLevel,
+  countWake,
+  denyRules,
+  forecastOf,
+  instancesOf,
+  isCommandLevel,
+  lintRoster,
+  localDay,
+  parseAmount,
+  parseRoster,
+  pickInstances,
+  projectCap,
+  settingsFor,
+  settingsText,
+  usd,
+  wakeUsd,
+  wakeVerdict,
+  wakesOf,
+  type BudgetState,
+  type Instance,
+  type LiftsFile,
+  type Roster,
+  type SpendFile,
+  type WakeCount,
+} from './roster'
 import {
   LEASE_MS,
   MAX_LINES,
@@ -164,6 +200,10 @@ const reads = atom({ plugin: 'fleet', key: 'reads' } as const, {} as Record<stri
 const warned = atom({ plugin: 'fleet', key: 'warned' } as const, {} as Record<string, Record<string, string>>)
 const flags = atom({ plugin: 'fleet', key: 'flags' } as const, 0)
 const ownTold = atom({ plugin: 'fleet', key: 'ownTold' } as const, {} as Record<string, number>)
+const overBudget = atom({ plugin: 'fleet', key: 'overBudget' } as const, 0)
+const seedSent = atom({ plugin: 'fleet', key: 'seedSent' } as const, '')
+const budgetTold = atom({ plugin: 'fleet', key: 'budgetTold' } as const, '')
+const nudgeAt = atom({ plugin: 'fleet', key: 'nudgeAt' } as const, 0)
 
 // This copy of the module: a hot reload makes a new one and drops the old one's timers and the submits it waited on
 const EPOCH = Math.random().toString(36).slice(2, 10)
@@ -183,6 +223,11 @@ let startedInTree = ''
 // A background session's official short id, from Claude's CLAUDE_JOB_DIR (~/.claude/jobs/<short id>); null otherwise.
 // It stays across /clear and restarts, so it names the asker of a decision
 let jobRef: string | null = null
+// An instance of the roster: the root and the name /fleet up put in its settings (FLEET_ROOT, FLEET_INSTANCE), and the
+// role it runs as (classic.SessionStart's agent_type, or sessions' current().agent)
+let envRoot = ''
+let envInstance = ''
+let agentType: string | null = null
 let offered = false
 let whyNot = "session.start never came in this session (an old pre-started process?): restart it (u)"
 let started = false
@@ -386,7 +431,10 @@ function locate($: any): Promise<void> {
         version = String(JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`))?.version ?? '')
       } catch {}
       jobRef = await backgroundRef($)
-      root = await findRoot($)
+      envRoot = ((await $.env.get('FLEET_ROOT')) ?? '').replace(/\/+$/, '')
+      envInstance = ((await $.env.get('FLEET_INSTANCE')) ?? '').trim()
+      // An instance's project is the one its settings name (a cd, or a worktree, doesn't move it)
+      root = envRoot && envRoot !== home && (await exists($, `${envRoot}/.claude/fleet/config.json`)) ? envRoot : await findRoot($)
       if (root) {
         const c = await readConfig($)
         configProblem = 'problem' in c ? c.problem : ''
@@ -424,7 +472,7 @@ async function start($: any) {
     .register({
       name: 'fleet',
       description: 'The questions background sessions of this project are waiting on: /fleet lists them, /fleet 1a 2b answers them. /fleet help for the rest',
-      argumentHint: '[1a 2b | note <n> <text> | drop <n> [why] | status | world | accept <path> | init | help]',
+      argumentHint: '[1a 2b | 3 apply | note <n> <text> | drop <n> [why] | status | up [--dry-run] | down | budget | world | accept <path> | init [template] | help]',
       immediate: true,
     })
     .catch(() => {})
@@ -455,6 +503,10 @@ function timers($: any) {
   if (jobRef) {
     $.clock.after(0, () => bg(rebuild($)))
     $.clock.every(2000, () => bg(deliver($)))
+    // An instance of the roster: its binding, heartbeat and spend; its seed, and its nudges
+    $.clock.after(1500, () => bg(instanceTick($)))
+    $.clock.every(30000, () => bg(instanceTick($)))
+    $.clock.every(5000, () => bg(nudgeTick($)))
   }
   $.clock.after(0, () => bg(startWorld($)))
   $.clock.every(2000, () => bg(worldTick($)))
@@ -496,13 +548,14 @@ async function answerNames($: any): Promise<Set<string>> {
 async function outcomesOf($: any, r: QueueRecord, present: ReadonlySet<string>) {
   const outcomes: (Outcome | null)[] = []
   let skew = false
-  for (let q = 1; q <= r.questions.length; q++) {
+  for (let q = 1; q <= slots(r); q++) {
     let o: Outcome | null = null
     if (present.has(answerName(r.id, q))) {
       const p = parseWire<AnswerFile>((await readText($, dec(`answers/${answerName(r.id, q)}`))) ?? '')
       if (p && 'value' in p) {
         const a = p.value
-        o = { ...(a.label !== undefined ? { label: a.label } : { text: a.text ?? '' }), origin: a.origin, session: a.session, at: a.at }
+        // A choice has a label or a text; a change's answer may have both (applied, and how; stale, and why)
+        o = { ...(a.label !== undefined ? { label: a.label } : { text: a.text ?? '' }), ...(a.label !== undefined && a.text !== undefined ? { text: a.text } : {}), origin: a.origin, session: a.session, at: a.at }
       } else skew = true
     }
     if (o && present.has(noteName(r.id, q))) {
@@ -522,6 +575,11 @@ async function outcomesOf($: any, r: QueueRecord, present: ReadonlySet<string>) 
 
 function answerFiles(id: string, present: ReadonlySet<string>): string[] {
   return [...present].filter(n => parseAnswerName(n)?.id === id).map(n => dec(`answers/${n}`))
+}
+
+// A change's draft, its diff and its claim: they go with the decision when it closes (the register keeps the rest)
+function changeFiles(id: string, spec: ChangeSpec): string[] {
+  return [`${fleetDir()}/${spec.draft}`, `${fleetDir()}/${spec.diff}`, dec(`applied/${id}.json`)]
 }
 
 function registerPath(id: string, month: string): string {
@@ -622,10 +680,11 @@ async function closeNow($: any, id: string, how: { state: 'delivered' | 'abandon
       ...(why ? { why } : {}),
       ...(delivered ? { delivered: { at: now, ...(how.turnId ? { turnId: how.turnId } : {}), how: 'submit' as const } } : {}),
       closedAt: now,
+      ...(rec.kind === 'change' && rec.change ? { kind: 'change' as const, change: rec.change } : {}),
     }
     const r = await publish($, registerPath(id, monthOf(rec.at)), json(entry))
     if (r === 'failed') log($, `${id}: couldn't write its register record; its files stay`)
-    else await remove($, [dec(`queue/${queueName(id)}`), ...answerFiles(id, present)])
+    else await remove($, [dec(`queue/${queueName(id)}`), ...answerFiles(id, present), ...(rec.change ? changeFiles(id, rec.change) : [])])
     log($, `${id} closed: ${entry.state}${how.turnId ? ` (turn ${how.turnId})` : ''}`)
   }
   await update($, open, m => omit(m, [id]))
@@ -640,12 +699,12 @@ async function rebuild($: any) {
   for (const name of await names($, dec('queue'))) {
     if (!/^D-\d+\.json$/.test(name)) continue
     const r = await readQueue($, name.slice(0, -5))
-    if (!r || 'otherFormat' in r || r.asker.ref !== jobRef) continue
+    if (!r || 'otherFormat' in r || r.asker.ref !== jobRef || !knownKind(r)) continue
     if (await inRegister($, r.id, r.at)) {
       await remove($, [dec(`queue/${name}`), ...answerFiles(r.id, await answerNames($))])
       continue
     }
-    back[r.id] = r.questions.length
+    back[r.id] = slots(r)
   }
   if (Object.keys(back).length) {
     await update($, open, m => ({ ...back, ...m }))
@@ -705,7 +764,7 @@ async function deliver($: any) {
     const sent = parts.map(p => p.record.id)
     await update($, inflight, m => ({ ...m, ...Object.fromEntries(sent.map(id => [id, { at: now, epoch: EPOCH }])) }))
     log($, `delivering ${sent.join(', ')}`)
-    $.prompt.submit({ text: deliveryText(parts) }).then(
+    $.prompt.submit({ text: deliveryText(parts, p => (p.record.kind === 'change' && p.record.change ? changeDelivery(p.record.id, p.record.change, p.outcomes[0] ?? null, p.drop) : null)) }).then(
       (r: any) => bg(submitted($, sent, r)),
       (err: unknown) => bg(failed($, sent, err)),
     )
@@ -738,7 +797,7 @@ async function failed($: any, ids: string[], err: unknown) {
 
 // The turn that carries a delivery: fleet's text starts each decision with "[D-<n>] The person …"
 function deliveredIds(text: string): string[] {
-  return [...new Set([...text.matchAll(/\[(D-\d+)\] The person (?:answered|dropped)/g)].map(m => m[1] as string))]
+  return [...new Set([...text.matchAll(/\[(D-\d+)\] The person (?:answered|dropped|applied|rejected|couldn't apply)/g)].map(m => m[1] as string))]
 }
 
 async function deliveredInTranscript($: any, ids: string[]): Promise<Set<string>> {
@@ -774,6 +833,9 @@ async function beat($: any) {
   const present = await answerNames($)
   const n = heldCount(records, present)
   if ((await read($, held)) !== n) await update($, held, () => n)
+  await loadRoster($)
+  const o = roster ? (await budgets($)).filter(b => b.state === 'over').length : 0
+  if ((await read($, overBudget)) !== o) await update($, overBudget, () => o)
   if (jobRef) await keepSection($, records, present)
   await refreshName($)
   await scanWorld($).catch(err => log($, `world scan: ${String(err).slice(0, 200)}`))
@@ -782,17 +844,23 @@ async function beat($: any) {
 
 // A background session that waits on the person sits in the panel's "Asking you" section (sessions' own, defined by
 // fleet), and leaves it once it has its answers. Never over the person's choice: sessions refuses that, and fleet lets it
+// An instance of the roster sits in its roster section (under its parent, when the roster gives one and the parent is
+// running) whenever it isn't asking
 async function keepSection($: any, records: QueueRecord[], present: ReadonlySet<string>) {
-  const waiting = records.some(r => r.asker.ref === jobRef && !progress(r.id, r.questions.length, present).complete)
-  const want = waiting ? ASKING_SECTION : 'none'
-  if ((await read($, section)) === want) return
+  const waiting = records.some(r => r.asker.ref === jobRef && knownKind(r) && !progress(r.id, slots(r), present).complete)
+  const placed = !waiting && myInstance?.section ? myInstance.section : null
+  const parent = placed && myInstance?.parent ? await refOfInstance($, myInstance.parent) : null
+  const want = waiting ? ASKING_SECTION : placed ? `fleet:${placed.id}` : 'none'
+  const key = parent ? `${want}|${parent}` : want
+  if ((await read($, section)) === key) return
   if (!(await has($, 'assignSection')) || !(await has($, 'defineSection'))) return
-  if (waiting) {
-    const d = await race<Result>($, () => $.sessions.defineSection({ source: 'fleet', spec: { id: ASKING_SECTION, title: 'Asking you' } }))
+  if (waiting || placed) {
+    const spec = waiting ? { id: ASKING_SECTION, title: 'Asking you' } : { id: want, title: (placed as { title: string }).title, order: (placed as { order: number }).order }
+    const d = await race<Result>($, () => $.sessions.defineSection({ source: 'fleet', spec }))
     if (!d?.ok) return
   }
-  const r = await race<Result>($, () => $.sessions.assignSection({ source: 'fleet', ref: jobRef as string, section: waiting ? ASKING_SECTION : null }))
-  if (r && (r.ok || r.reason === 'refused' || r.reason === 'invalid')) await update($, section, () => want)
+  const r = await race<Result>($, () => $.sessions.assignSection({ source: 'fleet', ref: jobRef as string, section: want === 'none' ? null : want, ...(parent ? { parent } : {}) }))
+  if (r && (r.ok || r.reason === 'refused' || r.reason === 'invalid')) await update($, section, () => key)
 }
 
 // Once a day, by whichever session publishes decisions/prune/<day> first: decisions whose asker is gone from the
@@ -1318,9 +1386,14 @@ async function clearReads($: any, oldSessionId: string) {
 
 /** The digest lines for one thread, and what marks them told (called once they're on their way): the world files it
  * read that changed since, and for the main thread the files this session wrote last that are flagged */
-async function digestFor($: any, thread: string): Promise<{ lines: string[]; told: () => Promise<void> }> {
+async function digestFor($: any, thread: string, withBudget = true): Promise<{ lines: string[]; told: () => Promise<void> }> {
   const none = { lines: [], told: async () => {} }
-  if (!worldOn()) return none
+  // An instance's budget, once per state and day, at its main thread's next step (it holds nothing)
+  const budget = withBudget && thread === 'main' ? await budgetLine($) : null
+  const sayBudget = async () => {
+    if (budget) await update($, budgetTold, () => budget.key)
+  }
+  if (!worldOn()) return budget ? { lines: [budget.line], told: sayBudget } : none
   await eventsTick($)
   const mine = (await read($, reads))[thread]
   const me = await meNow($)
@@ -1330,10 +1403,11 @@ async function digestFor($: any, thread: string): Promise<{ lines: string[]; tol
     await loadFlags($)
     own = await ownLines($)
   }
-  if (!items.length && !own.lines.length) return none
+  if (!items.length && !own.lines.length) return budget ? { lines: [budget.line], told: sayBudget } : none
   return {
-    lines: [...(items.length ? [digestText(items, me)] : []), ...own.lines],
+    lines: [...(items.length ? [digestText(items, me)] : []), ...own.lines, ...(budget ? [budget.line] : [])],
     told: async () => {
+      await sayBudget()
       if (items.length) {
         await update($, reads, m => {
           const t = { ...(m[thread] ?? {}) }
@@ -1496,6 +1570,12 @@ function resultOf(e: any, current: string | null): string | null {
 // didn't read as they are ----
 
 async function gate($: any, e: any, next: any) {
+  // An instance's own tools never write a command-level file (its settings deny it too): it files a change instead
+  const refusal = await commandRefusal($, e.file_path ?? e.notebook_path)
+  if (refusal) {
+    log($, `refused: ${e.tool} of a command-level file by ${threadOf(e)}`)
+    return { deny: refusal }
+  }
   const w = await worldFile($, e.file_path ?? e.notebook_path)
   if (!w) return next(e)
   const thread = threadOf(e)
@@ -1845,6 +1925,8 @@ async function releaseLease($: any) {
   sweep.holding = false
   const l = parseLease(await readText($, stateDir('sweeper.json')))
   if (l && l.sessionId === String(await $.session.id())) await remove($, [stateDir('sweeper.json')])
+  // Its marks on the instances' rows go with it (the next sweeper sets them again)
+  if (marksSet.key) await setFleetMarks($, {}, await $.clock.now())
 }
 
 // Every 2 s: a full sweep every 60 s, and the suspects again soon after a landing anywhere in the project
@@ -1860,6 +1942,7 @@ async function sweepTick($: any) {
       sweep.lastSweep = now
       await sweepChecks($)
       await maybeCommit($)
+      await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
     }
   } catch (err) {
     log($, `sweep: ${String(err).slice(0, 200)}`)
@@ -2174,6 +2257,8 @@ async function worldCommand($: any, action: 'list' | 'add' | 'remove', glob: str
   if ('problem' in changed) return changed.problem
   w = changed.world
   await $.fs.write(`${fleetDir()}/world.json`, worldText(w))
+  // His own change (typed here): stamped, so it isn't flagged as made outside fleet
+  await writeStamps($, ['.claude/fleet/world.json'])
   world = null
   await loadWorld($)
   return `${action === 'add' ? 'Added' : 'Removed'} ${globList(['added' in changed ? String(changed.added) : g])}. The world is now: ${w.paths.length ? globList(w.paths) : 'nothing'} (world.json). Every session of the project follows within 2 s.`
@@ -2183,6 +2268,14 @@ async function worldCommand($: any, action: 'list' | 'add' | 'remove', glob: str
 // hear it as his change. Alone, it lists the changes still unattributed
 async function acceptCommand($: any, path: string, origin: string): Promise<string> {
   await ensureWorld($)
+  // A command-level config file (the charter, roster.json, world.json, a role file): his own edit, stamped as his
+  const cfg = /^(charter\.md|roster\.json|world\.json)$/.test(path) ? `.claude/fleet/${path}` : path.startsWith(`${root}/`) ? path.slice((root as string).length + 1) : path
+  if (path && (await configFiles($)).includes(cfg)) {
+    if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (this came from ${origin || 'somewhere else'})`
+    await writeStamps($, [cfg])
+    if (cfg === '.claude/fleet/roster.json') roster = null
+    return `${cfg}: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).`
+  }
   if (!worldOn()) return worldProblem || 'This project has no world (world.json): /fleet world add <glob> starts one.'
   await pullEvents($)
   const me = await meNow($)
@@ -2192,6 +2285,7 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
     for (const e of [...latest.values()].filter(x => x.via === 'outside').sort((a, b) => b.at - a.at)) {
       if ((await versionOf($, `${realRoot}/${e.path}`)).v === e.to) out.push(`  ${e.path}: ${changeLine(e, me)} · /fleet accept ${e.path}`)
     }
+    for (const rel of await unstamped($)) out.push(`  ${rel}: changed outside fleet (not through a change you applied) · /fleet accept ${rel}`)
     return out.length ? ['Changes made outside fleet, not stamped as yours yet:', ...out].join('\n') : 'No change made outside fleet waits to be stamped.'
   }
   if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (this came from ${origin || 'somewhere else'})`
@@ -2342,6 +2436,994 @@ async function recordsStatus($: any, me: Me): Promise<string[]> {
   return lines
 }
 
+// ---- The roster (roster.ts): roster.json, this session as one of its instances, heartbeats, budgets, seeds, nudges;
+// the sweeper's marks and wakes; /fleet up, down, remove, budget, worktrees ----
+
+// roster.json, read again when its time moves (null: none, or one this fleet can't use: rosterProblem says why)
+let roster: { r: Roster; mtimeMs: number; instances: Instance[] } | null = null
+let rosterProblem = ''
+// This session as an instance of the roster (null: it isn't one); bound: it runs as the role file the roster gives it
+let myInstance: Instance | null = null
+let bound = false
+let bindWhy = 'not an instance of the roster'
+// Its settings file's version when it started: /fleet status says when /fleet up rewrote it since
+let settingsHash: string | null = null
+let instDirMade = ''
+type Heartbeat = { format: number; instance: string; slug: string; ref: string | null; sessionId: string; at: number; cwd: string; bound: boolean; why?: string; settingsHash: string | null; agentType: string | null; cost: number | null }
+type BudgetRow = { inst: Instance; usd: number; cap: number | null; own: BudgetState; state: BudgetState }
+type ProjectBudget = { usd: number; cap: number | null; state: BudgetState }
+type WakesFile = { format: number; day: string; instances: Record<string, WakeCount> }
+type Stamps = { format: number; files: Record<string, string | null> }
+const budgetCache = { at: 0, list: [] as BudgetRow[], project: { usd: 0, cap: null, state: 'ok' } as ProjectBudget }
+// The sweeper's view: since when a running instance shows no heartbeat (by ref), and the marks it set last
+const noFleetSince = new Map<string, number>()
+const marksSet = { key: '', at: 0 }
+const RUNNING = new Set(['working', 'waiting', 'idle'])
+const DEFAULT_SEED =
+  "Read the project's charter (.claude/fleet/charter.md) and the shared files your role works on. Then write down your plan for this first period where your role keeps its work, and start on what needs nobody's decision. Whenever you need the person's choice, ask with mcp__fleet__decide and keep going with the rest."
+
+function instDir(slug: string): string {
+  return `${fleetDir()}/instances/${slug}`
+}
+function settingsPath(slug: string): string {
+  return `${fleetDir()}/instances/${slug}.json`
+}
+function today(now: number): string {
+  return localDay(now, -new Date(now).getTimezoneOffset())
+}
+
+async function readWire<T>($: any, path: string): Promise<T | null> {
+  const t = await readText($, path)
+  if (t === null) return null
+  const p = parseWire<T>(t)
+  return p && 'value' in p ? p.value : null
+}
+
+async function loadRoster($: any) {
+  if (!root) return
+  const path = `${fleetDir()}/roster.json`
+  let st: any
+  try {
+    st = await $.fs.stat(path)
+  } catch {
+    roster = null
+    rosterProblem = ''
+    return
+  }
+  if (roster && roster.mtimeMs === Number(st.mtimeMs)) return
+  const t = await readText($, path)
+  const p = t === null ? { problem: "roster.json can't be read" } : parseRoster(t)
+  if ('problem' in p) {
+    if (rosterProblem !== p.problem) log($, p.problem)
+    roster = null
+    rosterProblem = p.problem
+    return
+  }
+  rosterProblem = ''
+  roster = { r: p.roster, mtimeMs: Number(st.mtimeMs), instances: instancesOf(p.roster) }
+}
+
+function instanceNamed(name: string): Instance | null {
+  const n = name.trim().toLowerCase()
+  return roster?.instances.find(i => i.name.toLowerCase() === n) ?? null
+}
+
+// Which instance this session is: the name its settings gave it (FLEET_INSTANCE), or, when that env isn't seen (E1),
+// its own session name; and whether it runs as the role file the roster gives that instance (agent_type)
+async function bind($: any) {
+  if (!root || !jobRef) return
+  await loadRoster($)
+  let name = envInstance
+  let current: Current | null = null
+  if (!name || agentType === null) current = (await has($, 'current')) ? await race<Current>($, () => $.sessions.current()) : null
+  if (!name && current?.ready) name = current.name
+  const inst = name ? instanceNamed(name) : null
+  if (!inst) {
+    if (myInstance) log($, 'not an instance of the roster any more')
+    myInstance = null
+    bound = false
+    bindWhy = !roster ? rosterProblem || 'the project has no roster.json' : envInstance ? `"${envInstance}" isn't in roster.json` : 'not an instance of the roster'
+    return
+  }
+  const type = agentType ?? current?.agent ?? null
+  const was = myInstance?.name
+  myInstance = inst
+  bound = !type || type === inst.agent
+  bindWhy = bound ? '' : `it runs as ${type}, and the roster gives ${inst.name} the role file ${inst.agent}`
+  if (settingsHash === null) {
+    const t = await readText($, settingsPath(inst.slug))
+    settingsHash = t === null ? '' : hashText(t)
+  }
+  if (was !== inst.name) log($, `instance ${inst.name} (${inst.role})${bound ? '' : `, unbound: ${bindWhy}`}`)
+}
+
+async function instanceTick($: any) {
+  await bind($)
+  if (!myInstance) return
+  await heartbeat($)
+  await maybeSeed($)
+}
+
+// <project>/.claude/fleet/instances/<slug>/state.json every 30 s (the sweeper reads "no fleet" from its absence), and the
+// session's cost turned into today's spend (spend.json)
+async function heartbeat($: any) {
+  const inst = myInstance
+  if (!inst || !root) return
+  const now = await $.clock.now()
+  const day = today(now)
+  const dir = instDir(inst.slug)
+  if (instDirMade !== dir) {
+    await run($, ['mkdir', '-p', dir])
+    instDirMade = dir
+  }
+  const sessionId = String(await $.session.id())
+  let cost: number | null = null
+  try {
+    const u = await $.session.usage()
+    cost = typeof u?.cost?.usd === 'number' ? u.cost.usd : null
+  } catch {}
+  if (cost !== null) {
+    const spend = await readWire<SpendFile>($, `${dir}/spend.json`)
+    const next = addSpend(spend, { format: FORMAT, slug: inst.slug, day, sessionId, cost, at: now })
+    if (!spend || next.usd !== spend.usd || next.day !== spend.day || next.last !== spend.last || next.sessionId !== spend.sessionId) await replace($, `${dir}/spend.json`, json(next))
+  }
+  budgetCache.at = 0
+  const b = (await budgets($)).find(x => x.inst.slug === inst.slug)
+  const beat: Heartbeat & Record<string, unknown> = {
+    format: FORMAT,
+    instance: inst.name,
+    slug: inst.slug,
+    role: inst.role,
+    agent: inst.agent,
+    agentType,
+    bound,
+    ...(bindWhy ? { why: bindWhy } : {}),
+    sessionId,
+    ref: jobRef,
+    fleet: version,
+    at: now,
+    cwd: String(await $.session.cwd()),
+    settingsHash,
+    cost,
+    budget: b ? { day, usd: b.usd, cap: b.cap, state: b.state } : null,
+  }
+  await replace($, `${dir}/state.json`, json(beat))
+}
+
+async function heartbeatOf($: any, slug: string): Promise<Heartbeat | null> {
+  return readWire<Heartbeat>($, `${instDir(slug)}/state.json`)
+}
+
+// Today's spend and cap of every instance (instances/<slug>/spend.json, state/lifts.json) and of the project; an
+// instance is over when its own budget or the project's is. A few seconds' cache: the band reads it every 10 s
+async function budgets($: any): Promise<BudgetRow[]> {
+  if (!roster) return []
+  const now = await $.clock.now()
+  if (now - budgetCache.at < 5000) return budgetCache.list
+  const day = today(now)
+  const lifts = await readWire<LiftsFile>($, stateDir('lifts.json'))
+  const rows: Omit<BudgetRow, 'state'>[] = []
+  let total = 0
+  for (const inst of roster.instances) {
+    const s = await readWire<SpendFile>($, `${instDir(inst.slug)}/spend.json`)
+    const spent = s && s.day === day ? s.usd : 0
+    total += spent
+    const cap = capFor(inst.usdDay, lifts, day, inst.slug)
+    rows.push({ inst, usd: spent, cap, own: budgetState(spent, cap) })
+  }
+  const pcap = capFor(projectCap(roster.r), lifts, day, null)
+  const project: ProjectBudget = { usd: total, cap: pcap, state: budgetState(total, pcap) }
+  const worst = (a: BudgetState, b: BudgetState): BudgetState => (a === 'over' || b === 'over' ? 'over' : a === 'warn' || b === 'warn' ? 'warn' : 'ok')
+  budgetCache.at = now
+  budgetCache.list = rows.map(r => ({ ...r, state: worst(r.own, project.state) }))
+  budgetCache.project = project
+  return budgetCache.list
+}
+
+function budgetWords(b: BudgetRow): string {
+  const p = budgetCache.project
+  return b.own === b.state || p.cap === null ? `this instance's budget (${usd(b.usd)} of ${usd(b.cap ?? 0)} today, estimated at list price)` : `the project's budget (${usd(p.usd)} of ${usd(p.cap)} today, estimated at list price)`
+}
+
+/** The line an instance's model reads once per day and state: at 80%, land what you have; at 100%, what fleet does */
+async function budgetLine($: any): Promise<{ line: string; key: string } | null> {
+  const inst = myInstance
+  if (!inst) return null
+  const b = (await budgets($)).find(x => x.inst.slug === inst.slug)
+  if (!b || b.state === 'ok') return null
+  const key = `${today(await $.clock.now())}|${b.state}`
+  if ((await read($, budgetTold)) === key) return null
+  if (b.state === 'warn') return { key, line: `fleet: ${budgetWords(b)} is past 80%: land what you have (a result, a negative result, or where you stopped) before it runs out.` }
+  return {
+    key,
+    line: `fleet: ${budgetWords(b)} is used up. Nothing is held, and your tools still work; but fleet won't wake or nudge this instance, and new helpers (Agent) are refused until the person lifts it (/fleet budget "${inst.name}" +<dollars>). Land what you have, then end your turn.`,
+  }
+}
+
+async function spawnRefusal($: any): Promise<string | null> {
+  const inst = myInstance
+  if (!inst) return null
+  const b = (await budgets($)).find(x => x.inst.slug === inst.slug)
+  if (b?.state !== 'over') return null
+  return `fleet: ${budgetWords(b)} is used up, so no new helper starts until the person lifts it (/fleet budget "${inst.name}" +<dollars>). Your other tools still work: finish what you can yourself, write down where you stopped, and end your turn.`
+}
+
+/** A running instance's short id, from its heartbeat: its parent in the panel */
+async function refOfInstance($: any, name: string): Promise<string | null> {
+  const inst = instanceNamed(name)
+  if (!inst) return null
+  const hb = await heartbeatOf($, inst.slug)
+  return hb?.ref && (await $.clock.now()) - hb.at < HEARTBEAT_STALE_MS ? hb.ref : null
+}
+
+// The seed: the instance's first prompt, from its role's seed file and its brief, submitted once per session (its short
+// id) by fleet itself, never on the launch line (a launch prompt reads as the person's). Retried every 5 s until sent
+async function maybeSeed($: any) {
+  const inst = myInstance
+  if (!inst || !bound || !jobRef || !root) return
+  if ((await read($, seedSent)) === jobRef) return
+  const ref = jobRef
+  const marker = `${instDir(inst.slug)}/seed-${ref}.json`
+  if (await exists($, marker)) {
+    await update($, seedSent, () => ref)
+    return
+  }
+  if ((await read($, busy)) || (await read($, stopped))) return
+  const text = await seedText($, inst)
+  await update($, seedSent, () => ref)
+  log($, `seed for ${inst.name}`)
+  $.prompt.submit({ text }).then(
+    (r: any) =>
+      bg(
+        (async () => {
+          if (r && typeof r.drop === 'string') {
+            await update($, seedSent, () => '')
+            log($, `the seed was dropped: ${r.drop}`)
+            return
+          }
+          await run($, ['mkdir', '-p', instDir(inst.slug)])
+          await publish($, marker, json({ format: FORMAT, ref, at: await $.clock.now() }))
+        })(),
+      ),
+    (err: unknown) =>
+      bg(
+        (async () => {
+          await update($, seedSent, () => '')
+          log($, `the seed failed: ${String(err).slice(0, 200)}`)
+        })(),
+      ),
+  )
+}
+
+async function seedText($: any, inst: Instance): Promise<string> {
+  const t = await readText($, `${fleetDir()}/${inst.seed}`)
+  const fill = (s: string) => s.replace(/\{name\}/g, inst.name).replace(/\{role\}/g, inst.role).replace(/\{root\}/g, root as string)
+  return [
+    `You are ${inst.name}, the ${inst.role} of this project's fleet (the project folder is ${root}; its roster is .claude/fleet/roster.json).`,
+    inst.brief ? `Your brief: ${fill(inst.brief)}` : '',
+    fill(t ?? DEFAULT_SEED).trim(),
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+// A nudge: an idle instance whose shared files changed (or that owns flagged files) is prompted by its own fleet, at
+// most once per wakes.everyMin and wakes.perDay a day with the sweeper's wakes; never while it's down or over budget
+async function nudgeTick($: any) {
+  const inst = myInstance
+  if (!inst || !jobRef || !root) return
+  await maybeSeed($)
+  if (!(await read($, seedSent))) return
+  const now = await $.clock.now()
+  if ((await read($, busy)) || (await read($, stopped)) || now - (await read($, idleSince)) < 30000) return
+  const pending = await read($, nudgeAt)
+  if (pending && now - pending < 10 * 60000) return
+  if (Object.keys(await read($, inflight)).length) return
+  if ((await downSet($)).has(inst.slug)) return
+  if ((await budgets($)).find(x => x.inst.slug === inst.slug)?.state === 'over') return
+  const d = await digestFor($, 'main', false)
+  if (!d.lines.length) return
+  const day = today(now)
+  const wakes = wakesOf(roster?.r ?? null)
+  const mine = await readWire<WakeCount>($, `${instDir(inst.slug)}/nudges.json`)
+  const swept = await readWire<WakesFile>($, stateDir('wakes.json'))
+  const others = swept && swept.day === day ? (swept.instances[inst.slug]?.count ?? 0) : 0
+  if (wakeVerdict(mine, others, now, day, wakes, false) !== 'ok') return
+  // Told now: the nudge carries them (fleet's own prompt.submit hook then finds nothing more to add)
+  await d.told()
+  await update($, nudgeAt, () => now)
+  await run($, ['mkdir', '-p', instDir(inst.slug)])
+  await replace($, `${instDir(inst.slug)}/nudges.json`, json({ format: FORMAT, ...countWake(mine, now, day) }))
+  log($, `nudge to ${inst.name}`)
+  const text = `${d.lines.join('\n\n')}\n\nThis is a nudge from fleet (at most one every ${wakes.everyMin} min, ${wakes.perDay} a day): check whether your work still holds against these changes and update what depends on them, or end your turn if nothing does.`
+  const done = () => bg(update($, nudgeAt, () => 0))
+  $.prompt.submit({ text }).then(done, done)
+}
+
+/** What an instance's model reads at the start of its conversation (classic.SessionStart, again after /clear and
+ * compaction): who it is, what it can't write, its budget. The same text every time, so it caches */
+async function instanceContext($: any, inst: Instance): Promise<string> {
+  const level = await commandLevelNow($)
+  const extra = level.globs.filter(g => g !== '.claude/agents/**')
+  return [
+    `fleet: this session is ${inst.name}, the ${inst.role} of this project's roster (${root}/.claude/fleet/roster.json).`,
+    `The command-level files are read-only for your own tools: .claude/fleet/charter.md, roster.json and world.json, the role files in .claude/agents/, the check scripts${extra.length ? `, and ${globList(extra)}` : ''}. To change one, call mcp__fleet__decide with kind "change" (path, a one-line summary, and edits or the whole content): the person reads the diff and applies it, and fleet writes it.`,
+    inst.usdDay !== null ? `Your budget is ${usd(inst.usdDay)} a day, estimated at list price: at 80% fleet asks you to land what you have, and once it's used up new helpers are refused.` : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+}
+
+// ---- Command-level files: what no instance's own tools write, and what a `change` changes ----
+
+async function commandLevelNow($: any): Promise<{ files: string[]; globs: string[] }> {
+  const w = await readWorldFile($)
+  return commandLevel(w && 'world' in w ? w.world : null, records ? scriptsOf(records.checks) : [])
+}
+
+// An instance's Write or Edit of a command-level file, or of fleet's instances/: refused every time (its settings deny
+// it as well, so this only gives the words for it)
+async function commandRefusal($: any, path: unknown): Promise<string | null> {
+  if (!myInstance || typeof path !== 'string' || !path) return null
+  await ensureWorld($)
+  if (!realRoot) return null
+  const abs = await place($, path.startsWith('/') ? path : `${String(await $.session.cwd()).replace(/\/+$/, '')}/${path}`)
+  const rel = abs ? relOf(abs, realRoot, insensitive) : null
+  if (rel === null) return null
+  if (/^\.claude\/fleet\/instances(\/|$)/i.test(rel)) return `fleet: ${rel} is fleet's own (an instance's settings and state): nothing writes it by hand (this write was not made).`
+  if (!isCommandLevel(rel, await commandLevelNow($), insensitive)) return null
+  return `fleet: ${rel} is a command-level file of this project, and your own tools don't write it (this write was not made). To change it, call mcp__fleet__decide with kind "change", path "${rel}", a one-line summary, and edits (old_string → new_string, as with Edit) or the whole content: the person reads the diff and applies it.`
+}
+
+// ---- Stamps: the command-level config files' versions, as fleet wrote them or the person stamped them; another
+// version means someone changed one another way (a flag, never a block) ----
+
+async function configFiles($: any): Promise<string[]> {
+  const list = ['.claude/fleet/charter.md', '.claude/fleet/roster.json', '.claude/fleet/world.json']
+  for (const n of (await names($, `${root}/.claude/agents`)).sort()) if (n.endsWith('.md')) list.push(`.claude/agents/${n}`)
+  return list
+}
+
+async function writeStamps($: any, rels: readonly string[]) {
+  const s = (await readWire<Stamps>($, stateDir('stamps.json'))) ?? { format: FORMAT, files: {} }
+  for (const rel of rels) {
+    const t = await readText($, `${root}/${rel}`)
+    s.files[rel] = t === null ? null : hashText(t)
+  }
+  if (!(await replace($, stateDir('stamps.json'), json(s)))) {
+    await run($, ['mkdir', '-p', stateDir()])
+    await replace($, stateDir('stamps.json'), json(s))
+  }
+}
+
+/** The config files changed since fleet wrote them or the person stamped them. With no stamps yet (a project set up
+ * before them), what's there now is the baseline */
+async function unstamped($: any): Promise<string[]> {
+  const files = await configFiles($)
+  const s = await readWire<Stamps>($, stateDir('stamps.json'))
+  if (!s) {
+    await writeStamps($, files)
+    return []
+  }
+  const out: string[] = []
+  for (const rel of files) {
+    const t = await readText($, `${root}/${rel}`)
+    const v = t === null ? null : hashText(t)
+    const had = s.files[rel]
+    if (had === undefined ? v !== null : had !== v) out.push(rel)
+  }
+  return out
+}
+
+/** A command-level config file's draft that fleet couldn't use: the reason, or null */
+function configProblemOf(rel: string, text: string): string | null {
+  if (rel === '.claude/fleet/roster.json') {
+    const p = parseRoster(text)
+    return 'problem' in p ? p.problem : null
+  }
+  if (rel === '.claude/fleet/world.json') {
+    const p = parseWorld(text)
+    return 'problem' in p ? p.problem : null
+  }
+  return null
+}
+
+// ---- The `change` decision (drafts.ts): filed by decide kind change, applied by fleet when the person says so ----
+
+async function fileChange($: any, e: any) {
+  const c = checkChange(e)
+  if (!c.ok) return { deny: `${c.reason}. Nothing was queued: call mcp__fleet__decide again with that fixed.` }
+  await ensureWorld($)
+  let rel = c.path.replace(/^\.\//, '')
+  if (rel.startsWith('/')) {
+    const abs = await place($, rel)
+    const r = abs ? relOf(abs, realRoot || (root as string), insensitive) : null
+    if (r === null) return { deny: `${c.path} isn't in this project (${root}). Nothing was queued.` }
+    rel = r
+  }
+  if (rel.split('/').some(s => s === '..' || s === '.' || s === '')) return { deny: 'path: write it relative to the project folder, without . or .. in it. Nothing was queued.' }
+  if (/^\.claude\/fleet\/instances(\/|$)/.test(rel)) return { deny: `${rel} is generated by /fleet up from roster.json: change roster.json instead. Nothing was queued.` }
+  if (!isCommandLevel(rel, await commandLevelNow($), insensitive)) return { deny: `${rel} isn't a command-level file of this project: write it with your own tools (fleet checks a shared file's landing). Nothing was queued.` }
+  const abs = `${root}/${rel}`
+  const cur = await readText($, abs)
+  if (c.edits && cur === null) return { deny: `${rel} doesn't exist yet: give its whole content instead of edits. Nothing was queued.` }
+  let result: string
+  if (c.content !== undefined) result = c.content
+  else {
+    const a = applyEdits(cur as string, c.edits ?? [])
+    if ('problem' in a) return { deny: `${a.problem}. Nothing was queued.` }
+    result = a.text
+  }
+  if (result === cur) return { deny: `that leaves ${rel} as it is: nothing to change. Nothing was queued.` }
+  const bad = configProblemOf(rel, result)
+  if (bad) return { deny: `the draft of ${rel} isn't usable: ${bad}. Nothing was queued.` }
+  const diff = lineDiff(cur, result, rel)
+  const asker = await askerNow($)
+  const now = await $.clock.now()
+  const record = await allocate($, id => ({
+    format: FORMAT,
+    fleet: version,
+    id,
+    at: now,
+    asker,
+    questions: [],
+    ...(c.blocks ? { blocks: c.blocks } : {}),
+    kind: 'change',
+    change: { path: rel, summary: c.summary, base: cur === null ? null : hashText(cur), result: hashText(result), draft: `decisions/drafts/${draftName(id, rel)}`, diff: `decisions/drafts/${id}.diff`, added: diff.added, removed: diff.removed },
+  }))
+  const spec = record.change as ChangeSpec
+  await run($, ['mkdir', '-p', dec('drafts')])
+  await $.fs.write(`${fleetDir()}/${spec.draft}`, result)
+  await $.fs.write(`${fleetDir()}/${spec.diff}`, diff.text)
+  await update($, open, m => ({ ...m, [record.id]: 1 }))
+  log($, `${record.id} queued: a change to ${rel}`)
+  bg(beat($))
+  return { result: changeTicket(record.id, spec) }
+}
+
+/** /fleet lists a change: its file, summary and size, the first lines of its diff, where the draft is, who asked */
+async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, now: number): Promise<string> {
+  const spec = r.change as ChangeSpec
+  const diff = (await readText($, `${fleetDir()}/${spec.diff}`)) ?? ''
+  const { shown, more } = diffHead(diff)
+  const what = spec.base === null ? `a new file, ${spec.added} lines` : `+${spec.added} −${spec.removed} lines`
+  const lines = [`${n}. Change ${spec.path}: "${spec.summary}" (${what})`]
+  if (shown.length) lines.push('```diff', ...shown, '```')
+  if (more) lines.push(`   and ${more} more lines in ${fleetDir()}/${spec.diff}`)
+  lines.push(`   draft ${fleetDir()}/${spec.draft} (${shortHash(spec.result)}) · /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit to change the draft first`)
+  const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
+  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}`)
+  return lines.join('\n')
+}
+
+function effectOf(path: string): string {
+  if (path === '.claude/fleet/roster.json') return '. It takes effect at the next /fleet up (a running instance takes new settings when restarted, u)'
+  if (path === '.claude/fleet/world.json') return '. Every session of the project follows it within 2 s'
+  if (path.startsWith('.claude/agents/')) return '. Running instances of that role take it when restarted (u)'
+  return ''
+}
+
+// The person answers a change (a person act: typed at a terminal). apply: claimed once (decisions/applied/), the file
+// still at the version it was drafted on, the draft still the one filed or the one he confirmed; then fleet writes it
+async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: string, here: string, now: number): Promise<{ line: string; done: boolean }> {
+  const spec = rec.change as ChangeSpec
+  const n = it.n
+  if (!it.verb) return { line: `${n}: ${rec.id} is a change to ${spec.path}: answer /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit`, done: false }
+  const answerPath = dec(`answers/${answerName(rec.id, 1)}`)
+  const before = parseWire<AnswerFile>((await readText($, answerPath)) ?? '')
+  if (before) return { line: `${n}: ${rec.id} was ${'value' in before ? (before.value.label ?? 'answered') : 'answered by a fleet with another format'} already`, done: false }
+  const draftAbs = `${fleetDir()}/${spec.draft}`
+  const draft = await readText($, draftAbs)
+  if (it.verb === 'edit') {
+    return {
+      line: draft === null ? `${n}: the draft of ${rec.id} is gone (${draftAbs}): /fleet ${n} reject` : `${n}: edit the draft in your editor: ${draftAbs} (now ${shortHash(hashText(draft))}). Then /fleet ${n} apply: fleet shows its new version for you to confirm.`,
+      done: false,
+    }
+  }
+  const say = (label: string, text?: string) => publish($, answerPath, json({ format: FORMAT, id: rec.id, q: 1, label, ...(text ? { text } : {}), origin, session: here, at: now }))
+  if (it.verb === 'reject') {
+    const r = await say('rejected')
+    return r === 'ok' ? { line: `${n}: rejected ${rec.id} (the change to ${spec.path})`, done: true } : { line: `${n}: ${r === 'exists' ? `${rec.id} was answered meanwhile` : "couldn't save the answer"}`, done: false }
+  }
+  const target = `${root}/${spec.path}`
+  const cur = await readText($, target)
+  const v = applyVerdict(spec, cur === null ? null : hashText(cur), draft, it.hash)
+  if (!v.ok && v.why === 'draft-gone') return { line: `${n}: the draft of ${rec.id} is gone (${draftAbs}): /fleet ${n} reject`, done: false }
+  if (!v.ok && v.why === 'draft-changed') {
+    const h = shortHash(v.hash ?? null)
+    return { line: `${n}: the draft of ${rec.id} isn't the one filed (it was ${shortHash(spec.result)}, it's ${h} now). If you edited it, apply your version with /fleet ${n} apply ${h}; if not, /fleet ${n} reject.`, done: false }
+  }
+  // Applied once: the first claim wins, so a replay (or the same answer from two sessions) finds it taken
+  const claimPath = dec(`applied/${rec.id}.json`)
+  const claim = await publish($, claimPath, json({ format: FORMAT, id: rec.id, at: now, session: here, origin }))
+  if (claim === 'exists') return { line: `${n}: ${rec.id} was applied already`, done: false }
+  if (claim === 'failed') return { line: `${n}: couldn't claim ${rec.id} (${claimPath})`, done: false }
+  const who = (await askerViews($, [rec]))(rec).name
+  if (!v.ok) {
+    if (worldOn()) await pullEvents($)
+    const last = latest.get(spec.path)
+    const why = last && cur !== null && last.to === hashText(cur) ? `${spec.path} ${changeLine(last, await meNow($))}, after ${rec.id} was drafted` : `${spec.path} ${cur === null ? 'was removed' : 'changed'} after ${rec.id} was drafted`
+    await say('stale', why)
+    log($, `${rec.id} not applied: ${spec.path} moved`)
+    return { line: `${n}: not applied: ${why}. ${who} hears it, and can draft it again.`, done: true }
+  }
+  const bad = configProblemOf(spec.path, draft as string)
+  if (bad) {
+    await remove($, [claimPath])
+    return { line: `${n}: not applied: the draft isn't usable (${bad}). /fleet ${n} edit to fix it, or /fleet ${n} reject.`, done: false }
+  }
+  try {
+    await run($, ['mkdir', '-p', target.slice(0, target.lastIndexOf('/'))])
+    await $.fs.write(target, draft)
+  } catch (err) {
+    await remove($, [claimPath])
+    return { line: `${n}: couldn't write ${spec.path}: ${String(err).slice(0, 200)}`, done: false }
+  }
+  await landApplied($, spec, cur)
+  await say('applied', v.edited ? 'edited' : undefined)
+  log($, `${rec.id} applied: ${spec.path}`)
+  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effectOf(spec.path)}. ${who} hears it.`, done: true }
+}
+
+// What follows fleet's write of an applied change: a shared file's landing (the person's, through an answer), the
+// stamp of a config file, world.json read again
+async function landApplied($: any, spec: ChangeSpec, before: string | null) {
+  try {
+    const w = await worldFile($, `${realRoot || root}/${spec.path}`)
+    if (w && !w.copy) {
+      const after = await versionOf($, w.abs)
+      const by: Who = { ...(await whoAmI($, 'main')), person: true }
+      await pullEvents($)
+      const fields = await landRecord($, w.rel, after, 'answer', by)
+      await writeEvent($, { path: w.rel, from: before === null ? null : hashText(before), to: after.v, via: 'answer', blind: false, by, ...fields })
+      setKnown(w.rel, { mtimeMs: after.mtimeMs, size: after.size, v: after.v, pins: fields.pins ?? [] })
+      unexplained.delete(w.rel)
+    }
+  } catch (err) {
+    log($, `after applying ${spec.path}: ${String(err).slice(0, 200)}`)
+  }
+  if (spec.path.startsWith('.claude/')) await writeStamps($, [spec.path])
+  if (spec.path === '.claude/fleet/world.json') {
+    world = null
+    await loadWorld($)
+  }
+  if (spec.path === '.claude/fleet/roster.json') roster = null
+}
+
+// ---- The sweeper's part: marks on the instances' rows, and wakes of retired ones (coalesced) ----
+
+async function downSet($: any): Promise<Set<string>> {
+  const d = await readWire<{ instances: Record<string, number> }>($, stateDir('down.json'))
+  return new Set(Object.keys(d?.instances ?? {}))
+}
+
+async function setDown($: any, slugs: readonly string[], down: boolean) {
+  const d = (await readWire<{ format: number; instances: Record<string, number> }>($, stateDir('down.json'))) ?? { format: FORMAT, instances: {} }
+  const now = await $.clock.now()
+  for (const s of slugs) {
+    if (down) d.instances[s] = d.instances[s] ?? now
+    else delete d.instances[s]
+  }
+  if (!(await replace($, stateDir('down.json'), json(d)))) {
+    await run($, ['mkdir', '-p', stateDir()])
+    await replace($, stateDir('down.json'), json(d))
+  }
+}
+
+function sameProject(rowRoot: string | null): boolean {
+  return !!rowRoot && (rowRoot === root || rowRoot === realRoot)
+}
+
+/** The rows of the panel that are this instance: in this project (sessions' names are per project), running first. A
+ * session whose mods never started publishes no root: the only one of that name with none counts as this one */
+function rowsOf(inst: Instance, rows: readonly any[]): { running: any | null; stopped: any | null } {
+  let mine = rows.filter(r => r.name === inst.name && sameProject(r.root))
+  if (!mine.length) {
+    const loose = rows.filter(r => r.name === inst.name && !r.root)
+    if (loose.length === 1) mine = loose
+  }
+  return { running: mine.find(r => RUNNING.has(r.state)) ?? null, stopped: mine.find(r => r.state === 'stopped') ?? null }
+}
+
+/** Whether a session read shared files that changed since (its reads file, its main thread) */
+async function isBehind($: any, sessionId: string): Promise<boolean> {
+  const p = parseReads((await readText($, readsPath(sessionId))) ?? '')
+  if (!p || !('threads' in p) || !p.threads.main) return false
+  return staleOf({ main: p.threads.main }, rel => known.get(rel)?.v ?? undefined).length > 0
+}
+
+// Every full sweep: each instance's row marked when its fleet isn't running (✗), it's over or near its budget ($), or
+// it's down (↓); a retired instance with answers waiting (at once) or shared files it read changed (coalesced) woken
+async function rosterTick($: any) {
+  await loadRoster($)
+  const now = await $.clock.now()
+  if (!roster || !roster.instances.length || !(await has($, 'status'))) return setFleetMarks($, {}, now)
+  const st = await race<Status>($, () => $.sessions.status({ names: (roster as { instances: Instance[] }).instances.map(i => i.name) }))
+  if (!st?.ready) return
+  const day = today(now)
+  const down = await downSet($)
+  budgetCache.at = 0
+  const list = await budgets($)
+  const { records } = await queueRecords($)
+  const present = await answerNames($)
+  const wakes = wakesOf(roster.r)
+  const had = await readWire<WakesFile>($, stateDir('wakes.json'))
+  const swept: WakesFile = had && had.day === day ? had : { format: FORMAT, day, instances: {} }
+  let woke = false
+  const marks: Record<string, Record<string, unknown>> = {}
+  for (const inst of roster.instances) {
+    const { running, stopped: retired } = rowsOf(inst, st.rows)
+    const hb = await heartbeatOf($, inst.slug)
+    const b = list.find(x => x.inst.slug === inst.slug)
+    const isDown = down.has(inst.slug)
+    if (running) {
+      const fresh = !!hb && now - hb.at < HEARTBEAT_STALE_MS && (hb.ref === running.ref || hb.sessionId === running.sessionId)
+      if (fresh) noFleetSince.delete(running.ref)
+      else if (!noFleetSince.has(running.ref)) noFleetSince.set(running.ref, now)
+      if (!fresh && now - (noFleetSince.get(running.ref) ?? now) >= 90000) marks[running.ref] = { badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true }
+      else if (isDown) marks[running.ref] = { badge: '↓', tint: 'inactive', line: 'down (/fleet down): s in the panel stops it' }
+      else if (b?.state === 'over') marks[running.ref] = { badge: '$', tint: 'error', line: `budget used up (${usd(b.usd)} today): /fleet budget "${inst.name}" +n`, needsPerson: true }
+      else if (b?.state === 'warn') marks[running.ref] = { badge: '$', tint: 'warning', line: `budget: ${usd(b.usd)} of ${usd(b.cap ?? budgetCache.project.cap ?? 0)} today` }
+      continue
+    }
+    if (!retired || isDown || b?.state === 'over' || !hb?.ref || hb.ref !== retired.ref) continue
+    const answered = records.some(r => r.asker.ref === retired.ref && knownKind(r) && progress(r.id, slots(r), present).complete)
+    if (!answered && !(await isBehind($, hb.sessionId))) continue
+    const nudges = await readWire<WakeCount>($, `${instDir(inst.slug)}/nudges.json`)
+    const others = nudges && nudges.day === day ? nudges.count : 0
+    if (wakeVerdict(swept.instances[inst.slug] ?? null, others, now, day, wakes, answered) !== 'ok' || !(await has($, 'wake'))) continue
+    const reason = answered ? 'fleet: the person answered it' : 'fleet: shared files it read changed'
+    const r = await race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: retired.ref, reason }))
+    if (r?.ok) {
+      swept.instances[inst.slug] = countWake(swept.instances[inst.slug] ?? null, now, day)
+      woke = true
+      log($, `woke ${inst.name} (${reason})`)
+    } else if (r) log($, `${inst.name} not woken: ${r.detail ?? r.reason}`)
+  }
+  if (woke) await replace($, stateDir('wakes.json'), json(swept))
+  await setFleetMarks($, marks, now)
+}
+
+// The marks this session (the sweeper) keeps on the instances' rows, set again every minute (they last 150 s, so a
+// sweeper that stops leaves none behind for long)
+async function setFleetMarks($: any, rows: Record<string, Record<string, unknown>>, now: number) {
+  const key = JSON.stringify(rows)
+  const empty = key === '{}'
+  if (empty && !marksSet.key) return
+  if (key === marksSet.key && now - marksSet.at < 60000) return
+  if (!(await has($, 'setMarks'))) return
+  const r = await race<Result>($, () => $.sessions.setMarks!({ source: 'fleet', rows: rows as any, ttlMs: 150000 }))
+  if (r?.ok) {
+    if (key !== marksSet.key) log($, `marks: ${empty ? 'none' : Object.keys(rows).join(', ')}`)
+    marksSet.key = empty ? '' : key
+    marksSet.at = now
+  }
+}
+
+// ---- /fleet up, down, remove, budget, worktrees: the person's (typed at a terminal); --dry-run and the lists are
+// anyone's ----
+
+function onlyPerson(what: string, origin: string): string {
+  return `Only the person ${what}, typing it at a terminal (this came from ${origin || 'somewhere else'})`
+}
+
+async function freshRoster($: any): Promise<string | null> {
+  roster = null
+  await loadRoster($)
+  if (roster) return null
+  return rosterProblem ? `${rosterProblem}.` : 'No roster.json in .claude/fleet/: /fleet init <template> writes one (solo, software or proposal), or write your own.'
+}
+
+function startLine(i: Instance): string {
+  return `cd "${root}" && claude --bg --agent ${i.agent} --settings "${settingsPath(i.slug)}" -n "${i.name}"`
+}
+
+async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: string): Promise<string> {
+  if (!c.dryRun && origin !== 'composer') return `${onlyPerson('starts instances', origin)}; /fleet up --dry-run shows the plan`
+  const none = await freshRoster($)
+  if (none) return none
+  const r = roster as { r: Roster; instances: Instance[] }
+  const all = r.instances
+  let chosen = all
+  if (c.names.length) {
+    const p = pickInstances(c.names, all)
+    if (p.unknown.length) return `Not in roster.json: ${p.unknown.join(', ')}. It has ${all.map(i => i.name).join(', ') || 'no instances'} (quote a name with spaces, or give its file name, as ${all[0]?.slug ?? 'area-a'}).`
+    chosen = p.picked
+  } else if (c.wave !== null) chosen = all.filter(i => i.wave <= (c.wave as number))
+  const roleFiles = new Map<string, string | null>()
+  for (const a of new Set(all.map(i => i.agent))) roleFiles.set(a, await readText($, `${root}/.claude/agents/${a}.md`))
+  const lint = lintRoster(r.r, roleFiles)
+  const down = await downSet($)
+  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: chosen.map(i => i.name) })) : null
+  const plan = chosen.map(inst => {
+    const { running, stopped: retired } = st?.ready ? rowsOf(inst, st.rows) : { running: null, stopped: null }
+    const action = down.has(inst.slug) && !c.names.length ? 'down' : running ? 'running' : retired ? 'wake' : 'start'
+    return { inst, action, ref: (running ?? retired)?.ref ?? null, state: (running ?? retired)?.state ?? null }
+  })
+  const wakes = wakesOf(r.r)
+  const f = forecastOf(chosen, wakes)
+  const cap = projectCap(r.r)
+  const out: string[] = [`${c.dryRun ? 'The plan' : '/fleet up'} for ${chosen.length} of the roster's ${all.length} instance(s)${c.wave !== null && !c.names.length ? ` (waves 1 to ${c.wave})` : ''}:`]
+  for (const p of plan) {
+    const i = p.inst
+    const where = `${i.section ? i.section.title : 'no section'}${i.parent ? `, under ${i.parent}` : ''}`
+    const runs = `${i.model ?? 'the default model'}${i.effort ? ` (${i.effort})` : ''}`
+    const w = wakeUsd(i.model, wakes.perDay)
+    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day` : ''}`
+    const now =
+      p.action === 'start' ? 'to start' : p.action === 'running' ? `running (${p.state}): placed, not started again` : p.action === 'wake' ? 'stopped: to wake' : 'down: skipped (/fleet up <name> brings it back)'
+    out.push(`  ${i.name} · ${i.role} (.claude/agents/${i.agent}.md) · ${where} · wave ${i.wave} · ${runs} · ${cost} · ${now}`)
+  }
+  out.push(
+    `Cost, estimated at list price: the budgets add up to ${usd(f.caps)} a day${cap !== null ? ` (the project's cap: ${usd(cap)})` : ''}; wakes about ${usd(f.wakesUsd)} a day (each instance at most ${wakes.perDay} a day, one every ${wakes.everyMin} min, each reopening a ~40k-token context at the cache-write price)${f.unpriced.length ? `; not priced: ${f.unpriced.join(', ')}` : ''}. On a subscription it counts against your plan's limits instead.`,
+  )
+  if (lint.errors.length) out.push('Errors (fix roster.json or the role files):', ...lint.errors.map(x => `  ✗ ${x}`))
+  if (lint.warnings.length) out.push('Warnings:', ...lint.warnings.map(x => `  ! ${x}`))
+  const loose = await unstamped($)
+  if (loose.length) out.push(`Changed outside fleet (not through a change you applied): ${loose.join(', ')}. /fleet accept <path> stamps your own edit as yours.`)
+  if (c.dryRun) return [...out, 'Nothing was started (--dry-run).'].join('\n')
+  if (lint.errors.length) return [...out, 'Nothing was started: fix the errors, then /fleet up again.'].join('\n')
+  // By the project's path and, when a link leads there, by its real one too
+  const level = await commandLevelNow($)
+  const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
+  await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
+  for (const p of plan) if (p.action !== 'down') await $.fs.write(settingsPath(p.inst.slug), settingsText(settingsFor(p.inst, root as string, deny)))
+  if (c.names.length) await setDown($, plan.map(p => p.inst.slug), false)
+  const canStart = await has($, 'start')
+  const canWake = await has($, 'wake')
+  const results: string[] = []
+  for (const p of plan) {
+    if (p.action === 'start') {
+      if (!canStart) {
+        results.push(`  ${p.inst.name}: this sessions can't start sessions (restart it, u); by hand: ${startLine(p.inst)}`)
+        continue
+      }
+      const s = await race<Result>($, () => $.sessions.start!({ name: p.inst.name, cwd: root as string, agent: p.inst.agent, settings: settingsPath(p.inst.slug) }))
+      results.push(s?.ok ? `  ${p.inst.name}: starting` : `  ${p.inst.name}: not started: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions didn't answer"}`)
+      log($, `start ${p.inst.name}: ${s?.ok ? 'queued' : s && !s.ok ? s.reason : 'no answer'}`)
+    } else if (p.action === 'wake' && p.ref) {
+      const s = canWake ? await race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: p.ref as string, reason: 'fleet up' })) : null
+      results.push(s?.ok ? `  ${p.inst.name}: waking` : `  ${p.inst.name}: not woken: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions can't wake it"} (u in the panel restarts it)`)
+    }
+  }
+  if (!results.length) return [...out, "Nothing to start: they're running. Their settings files were written again: one whose settings changed takes them when restarted (u)."].join('\n')
+  return [...out, 'Now:', ...results, 'Each one binds and seeds itself within a minute (/fleet status shows them); a row marked ✗ has no fleet and needs a restart (u).'].join('\n')
+}
+
+async function downCommand($: any, names: string[], origin: string): Promise<string> {
+  if (origin !== 'composer') return onlyPerson('takes instances down', origin)
+  const none = await freshRoster($)
+  if (none) return none
+  const all = (roster as { instances: Instance[] }).instances
+  const p = names.length ? pickInstances(names, all) : { picked: all, unknown: [] }
+  if (p.unknown.length) return `Not in roster.json: ${p.unknown.join(', ')}`
+  await setDown($, p.picked.map(i => i.slug), true)
+  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: p.picked.map(i => i.name) })) : null
+  const running = st?.ready ? p.picked.filter(i => rowsOf(i, st.rows).running) : []
+  return [
+    `Down: ${p.picked.map(i => i.name).join(', ')}. fleet won't wake or nudge them, and /fleet up skips them (/fleet up <name> brings one back).`,
+    running.length ? `Still running: ${running.map(i => i.name).join(', ')}: s in the panel stops one (fleet never stops a session).` : 'None of them is running.',
+  ].join('\n')
+}
+
+async function removeCommand($: any, names: string[], yes: boolean, origin: string): Promise<string> {
+  if (origin !== 'composer') return onlyPerson("removes an instance's files", origin)
+  const none = await freshRoster($)
+  if (none) return none
+  const p = pickInstances(names, (roster as { instances: Instance[] }).instances)
+  if (p.unknown.length) return `Not in roster.json: ${p.unknown.join(', ')}`
+  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: p.picked.map(i => i.name) })) : null
+  const out: string[] = []
+  const ready: { inst: Instance; paths: string[]; dirs: string[] }[] = []
+  for (const inst of p.picked) {
+    if (st?.ready && rowsOf(inst, st.rows).running) {
+      out.push(`${inst.name} is still running: /fleet down "${inst.name}", stop it with s in the panel, then /fleet remove again.`)
+      continue
+    }
+    const hb = await heartbeatOf($, inst.slug)
+    const paths = [settingsPath(inst.slug), ...(hb?.sessionId ? [readsPath(hb.sessionId)] : [])]
+    ready.push({ inst, paths: [], dirs: [] })
+    const entry = ready[ready.length - 1] as { paths: string[]; dirs: string[] }
+    for (const x of paths) if (await exists($, x)) entry.paths.push(x)
+    if (await exists($, instDir(inst.slug))) entry.dirs.push(instDir(inst.slug))
+  }
+  if (!ready.length) return out.join('\n')
+  if (!yes) {
+    for (const r of ready) out.push(`${r.inst.name}: would delete ${[...r.paths, ...r.dirs.map(d => `${d}/`)].join(', ') || 'nothing (no files)'}`)
+    out.push(`It stays in roster.json, down (/fleet up <name> starts it afresh, a new session seeded again); its records and decisions stay. /fleet remove ${ready.map(r => `"${r.inst.name}"`).join(' ')} --yes deletes those files.`)
+    return out.join('\n')
+  }
+  for (const r of ready) {
+    await remove($, r.paths)
+    for (const d of r.dirs) await run($, ['rm', '-rf', d])
+    log($, `removed ${r.inst.name}'s files`)
+  }
+  await setDown($, ready.map(r => r.inst.slug), true)
+  out.push(`Removed the files of ${ready.map(r => r.inst.name).join(', ')}. ${ready.length === 1 ? 'It stays' : 'They stay'} in roster.json, down: /fleet up <name> starts one afresh.`)
+  return out.join('\n')
+}
+
+async function budgetCommand($: any, target: string, amount: string, origin: string): Promise<string> {
+  const none = await freshRoster($)
+  if (none) return none
+  const all = (roster as { instances: Instance[] }).instances
+  budgetCache.at = 0
+  const list = await budgets($)
+  const p = budgetCache.project
+  const row = (b: BudgetRow) => `  ${b.inst.name}: ${usd(b.usd)}${b.cap !== null ? ` of ${usd(b.cap)}` : ''} today${b.state === 'over' ? ', used up' : b.state === 'warn' ? ', past 80%' : ''}`
+  const projectLine = `project: ${usd(p.usd)}${p.cap !== null ? ` of ${usd(p.cap)}` : ' (no project cap)'} today${p.state === 'over' ? ', used up: every instance counts as over' : ''}`
+  if (!target) return ['Budgets today (estimated at list price; each instance from its own session\'s cost):', projectLine, ...list.map(row), '/fleet budget <name|project> <amount|+n> sets or raises one for today.'].join('\n')
+  let key: string | null = null
+  let name = 'the project'
+  let amt = amount
+  if (target.toLowerCase() !== 'project') {
+    let pick = pickInstances([target], all)
+    if (!pick.picked.length && amt) {
+      pick = pickInstances([`${target} ${amt}`], all)
+      if (pick.picked.length) amt = ''
+    }
+    const inst = pick.picked[0]
+    if (!inst) return `Not in roster.json: ${target}`
+    key = inst.slug
+    name = inst.name
+  }
+  const b = key === null ? null : (list.find(x => x.inst.slug === key) ?? null)
+  if (!amt) return key === null ? projectLine : row(b as BudgetRow).trim()
+  if (origin !== 'composer') return onlyPerson('sets a budget', origin)
+  const a = parseAmount(amt)
+  if (!a) return 'Write the amount in dollars: /fleet budget <name> 20, or +5 to raise today’s'
+  const now = await $.clock.now()
+  const day = today(now)
+  const had = await readWire<LiftsFile>($, stateDir('lifts.json'))
+  const lifts: LiftsFile = had && had.day === day ? had : { format: FORMAT, day, instances: {} }
+  const current = key === null ? p.cap : (b?.cap ?? null)
+  const next = 'set' in a ? a.set : (current ?? 0) + a.add
+  if (key === null) lifts.project = next
+  else lifts.instances[key] = next
+  if (!(await replace($, stateDir('lifts.json'), json(lifts)))) {
+    await run($, ['mkdir', '-p', stateDir()])
+    await replace($, stateDir('lifts.json'), json(lifts))
+  }
+  budgetCache.at = 0
+  log($, `budget of ${name} for ${day}: ${next}`)
+  return `${name}: ${usd(next)} for today (${usd(key === null ? p.usd : (b?.usd ?? 0))} spent so far). Tomorrow it's the roster's again.`
+}
+
+async function worktreesCommand($: any, prune: boolean, yes: boolean, origin: string): Promise<string> {
+  await ensureWorld($)
+  const base = realRoot || (root as string)
+  if (!(await gitOf($, base))) return "This project isn't in a git repository: it has no worktrees."
+  const l = await run($, ['git', '-C', base, 'worktree', 'list', '--porcelain'])
+  const under = `${base}/.claude/worktrees/`
+  const list = (l.exitCode === 0 ? worktreeFolders(l.stdout).slice(1) : []).filter(t => t.startsWith(under))
+  if (!list.length) return 'No linked worktrees under .claude/worktrees/.'
+  await loadRoster($)
+  const now = await $.clock.now()
+  const inUse = new Map<string, string>()
+  for (const inst of roster?.instances ?? []) {
+    const hb = await heartbeatOf($, inst.slug)
+    if (!hb || now - hb.at >= HEARTBEAT_STALE_MS) continue
+    for (const t of list) if (hb.cwd === t || hb.cwd.startsWith(`${t}/`)) inUse.set(t, inst.name)
+  }
+  const free = list.filter(t => !inUse.has(t))
+  const lines = list.map(t => `  ${t.slice(base.length + 1)}${inUse.has(t) ? `: ${inUse.get(t)} works in it (ask it to go back to the project folder and restart it, u, first)` : ''}`)
+  if (!prune) return ['Linked worktrees:', ...lines, free.length ? '/fleet worktrees prune lists what it would remove.' : ''].filter(Boolean).join('\n')
+  if (origin !== 'composer') return onlyPerson('removes worktrees', origin)
+  if (!free.length) return ['Nothing to remove: every worktree has an instance in it.', ...lines].join('\n')
+  if (!yes) return [`Would remove (git refuses one with changes not committed; fleet knows only its instances' folders, not your own sessions'):`, ...free.map(t => `  ${t.slice(base.length + 1)}`), '/fleet worktrees prune --yes removes them.'].join('\n')
+  const out: string[] = []
+  for (const t of free) {
+    const r = await run($, ['git', '-C', base, 'worktree', 'remove', t], { timeoutMs: 30000 })
+    out.push(`  ${t.slice(base.length + 1)}: ${r.exitCode === 0 ? 'removed' : (r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 200) || `git exit ${r.exitCode}`}`)
+  }
+  return ['Worktrees:', ...out].join('\n')
+}
+
+// /fleet status's part: each instance's state, fleet, spend and wakes; this session as an instance; config flags
+async function rosterStatus($: any): Promise<string[]> {
+  await loadRoster($)
+  if (rosterProblem) return [`roster: ${rosterProblem}`]
+  if (!roster) return ['roster: none (/fleet init <template> writes one)']
+  const all = roster.instances
+  const lines = [`roster: ${all.length} instance(s) in ${new Set(all.map(i => i.wave)).size} wave(s) (roster.json, rosterFormat ${roster.r.rosterFormat})`]
+  budgetCache.at = 0
+  const list = await budgets($)
+  const p = budgetCache.project
+  const wakes = wakesOf(roster.r)
+  const f = forecastOf(all, wakes)
+  lines.push(`budget today: ${usd(p.usd)}${p.cap !== null ? ` of ${usd(p.cap)} (the project's cap)` : ' (no project cap)'}; wakes forecast ~${usd(f.wakesUsd)} a day; at most ${wakes.perDay} wakes a day each, one every ${wakes.everyMin} min`)
+  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
+  const down = await downSet($)
+  const now = await $.clock.now()
+  const day = today(now)
+  const swept = await readWire<WakesFile>($, stateDir('wakes.json'))
+  for (const inst of all) {
+    const { running, stopped: retired } = st?.ready ? rowsOf(inst, st.rows) : { running: null, stopped: null }
+    const hb = await heartbeatOf($, inst.slug)
+    const b = list.find(x => x.inst.slug === inst.slug)
+    const parts = [inst.name, inst.role, `${inst.section ? inst.section.title : 'no section'}${inst.parent ? ` under ${inst.parent}` : ''}`, `wave ${inst.wave}`]
+    const row = running ?? retired
+    parts.push(!st?.ready ? 'state unknown (sessions)' : row ? String(row.state) : 'not started')
+    if (running) {
+      const fresh = !!hb && now - hb.at < HEARTBEAT_STALE_MS && (hb.ref === running.ref || hb.sessionId === running.sessionId)
+      if (!fresh) parts.push('no fleet (u restarts it)')
+      else {
+        parts.push(`fleet ${ago(now - hb.at)} ago${hb.bound ? '' : `, unbound: ${hb.why ?? ''}`}`)
+        const t = await readText($, settingsPath(inst.slug))
+        if (hb.settingsHash !== null && t !== null && hb.settingsHash !== hashText(t)) parts.push('its settings changed since it started: u restarts it with them')
+        if (hb.ref && (await exists($, `${instDir(inst.slug)}/seed-${hb.ref}.json`))) parts.push('seeded')
+      }
+    }
+    if (b) parts.push(`${usd(b.usd)}${b.cap !== null ? ` of ${usd(b.cap)}` : ''} today${b.state === 'over' ? ' (used up)' : b.state === 'warn' ? ' (past 80%)' : ''}`)
+    const n = await readWire<WakeCount>($, `${instDir(inst.slug)}/nudges.json`)
+    const w = (n && n.day === day ? n.count : 0) + (swept && swept.day === day ? (swept.instances[inst.slug]?.count ?? 0) : 0)
+    if (w) parts.push(`${w} wake(s) today`)
+    if (down.has(inst.slug)) parts.push('down')
+    lines.push(`  ${parts.join(' · ')}`)
+  }
+  if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
+  const loose = await unstamped($)
+  if (loose.length) lines.push(`changed outside fleet (not through a change you applied): ${loose.join(', ')}: /fleet accept <path> stamps your own edit as yours`)
+  return lines
+}
+
+// ---- /fleet init's templates: plugins/fleet/templates/<name>/ (or FLEET_TEMPLATES_DIR/<name>/, looked in first) ----
+
+const TEMPLATE_FORMAT = 1
+
+async function templateDirs($: any): Promise<string[]> {
+  const own = ((await $.env.get('FLEET_TEMPLATES_DIR')) ?? '').replace(/\/+$/, '')
+  return [...(own ? [own] : []), `${$.plugin.root}/templates`]
+}
+
+async function findTemplate($: any, name: string): Promise<{ dir: string; meta: Record<string, unknown> } | { problem: string }> {
+  if (!/^[a-z0-9][a-z0-9-]{0,40}$/.test(name)) return { problem: `"${name}" can't be a template's name (lowercase letters, digits and -)` }
+  const dirs = await templateDirs($)
+  for (const d of dirs) {
+    const t = await readText($, `${d}/${name}/template.json`)
+    if (t === null) continue
+    let meta: any
+    try {
+      meta = JSON.parse(t)
+    } catch {
+      return { problem: `${d}/${name}/template.json isn't valid JSON` }
+    }
+    if (!meta || typeof meta.templateFormat !== 'number') return { problem: `${d}/${name}/template.json has no templateFormat` }
+    if (meta.templateFormat > TEMPLATE_FORMAT) return { problem: `the template ${name} needs a newer fleet (templateFormat ${meta.templateFormat}): update fleet and restart (u)` }
+    return { dir: `${d}/${name}`, meta }
+  }
+  const known = new Set<string>()
+  for (const d of dirs) for (const n of await names($, d)) if (await exists($, `${d}/${n}/template.json`)) known.add(n)
+  return { problem: `No template "${name}"${known.size ? `: there are ${[...known].sort().join(', ')}` : ''}` }
+}
+
+// A template's files into the project, never over a file that's there (it's the person's, or a copy he changed)
+async function copyTree($: any, from: string, to: string, rel: string, written: string[], kept: string[]) {
+  let entries: any[] = []
+  try {
+    entries = [...(await $.fs.list(from))].sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)))
+  } catch {
+    return
+  }
+  for (const x of entries) {
+    const name = String(x.name)
+    if (x.kind === 'dir') {
+      await copyTree($, `${from}/${name}`, `${to}/${name}`, `${rel}/${name}`, written, kept)
+      continue
+    }
+    if (x.kind !== 'file') continue
+    if (await exists($, `${to}/${name}`)) {
+      kept.push(`${rel}/${name}`)
+      continue
+    }
+    const text = await readText($, `${from}/${name}`)
+    if (text === null) continue
+    await run($, ['mkdir', '-p', to])
+    await $.fs.write(`${to}/${name}`, text)
+    written.push(`${rel}/${name}`)
+  }
+}
+
 // ---- /fleet ----
 
 async function askerViews($: any, records: QueueRecord[]): Promise<(r: QueueRecord) => AskerView> {
@@ -2366,10 +3448,22 @@ async function listCommand($: any): Promise<string> {
   const keys: string[] = []
   const shown: string[] = []
   const waiting: string[] = []
+  let changes = 0
+  let unknown = 0
   for (const r of records) {
-    const p = progress(r.id, r.questions.length, present)
+    if (!knownKind(r)) {
+      unknown++
+      continue
+    }
+    const p = progress(r.id, slots(r), present)
     if (p.complete) {
       waiting.push(waitingText(r, view(r), p.dropped))
+      continue
+    }
+    if (r.kind === 'change') {
+      keys.push(`${r.id}.1`)
+      shown.push(await changeHeld($, keys.length, r, view(r), now))
+      changes++
       continue
     }
     for (let q = 1; q <= r.questions.length; q++) {
@@ -2381,10 +3475,14 @@ async function listCommand($: any): Promise<string> {
   await update($, listing, () => keys)
   const out: string[] = []
   if (keys.length) {
-    out.push(`${keys.length} question${keys.length === 1 ? '' : 's'} for you · answer with /fleet 1a${keys.length > 1 ? ' 2b' : ''} · /fleet help`, '', shown.join('\n\n'))
+    const asked = keys.length - changes
+    const what = [asked ? `${asked} question${asked === 1 ? '' : 's'}` : '', changes ? `${changes} change${changes === 1 ? '' : 's'}` : ''].filter(Boolean).join(' and ')
+    const how = asked ? `answer with /fleet 1a${keys.length > 1 ? ' 2b' : ''}` : `answer with /fleet 1 apply`
+    out.push(`${what} for you · ${how} · /fleet help`, '', shown.join('\n\n'))
   } else out.push('Nothing is waiting for you in this project.')
   if (waiting.length) out.push('', 'Answered, not delivered yet:', ...waiting)
   if (other) out.push('', `${other} decision${other === 1 ? ' was' : 's were'} asked by a fleet with another format: restart the sessions (u)`)
+  if (unknown) out.push('', `${unknown} decision${unknown === 1 ? ' is' : 's are'} of a kind this fleet doesn't know: restart this session (u)`)
   bg(beat($))
   return out.join('\n')
 }
@@ -2437,12 +3535,24 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
       lines.push(`${it.n}: ${item.id} was asked by a fleet with another format: restart that session (u), then answer`)
       continue
     }
-    const question = rec.questions[item.q - 1]
-    if (!question) continue
+    if (!knownKind(rec)) {
+      lines.push(`${it.n}: ${item.id} is a kind of decision this fleet doesn't know: restart this session (u)`)
+      continue
+    }
     if (await exists($, dec(`answers/${dropName(item.id)}`))) {
       lines.push(`${it.n}: ${item.id} was dropped`)
       continue
     }
+    if (rec.kind === 'change') {
+      lines.push((await answerChange($, it, rec, origin, here, now)).line)
+      continue
+    }
+    if (it.verb) {
+      lines.push(`${it.n}: that's a question: answer it with a letter (${it.n}a), or your words in quotes`)
+      continue
+    }
+    const question = rec.questions[item.q - 1]
+    if (!question) continue
     let chosen: { label: string } | { text: string }
     if (it.letter !== undefined) {
       const o = question.options['abcd'.indexOf(it.letter)]
@@ -2473,7 +3583,7 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
   const present = await answerNames($)
   const view = await askerViews($, [...touched.values()])
   for (const [id, rec] of touched) {
-    const p = progress(id, rec.questions.length, present)
+    const p = progress(id, slots(rec), present)
     const left = p.answered.filter(a => !a).length
     lines.push(left ? `${id}: ${left} more question${left === 1 ? '' : 's'} to go` : `${id} goes to ${view(rec).name} when it's idle`)
   }
@@ -2530,7 +3640,7 @@ async function statusCommand($: any): Promise<string> {
   if (root) {
     const { records, other } = await queueRecords($)
     const present = await answerNames($)
-    const waiting = records.filter(r => progress(r.id, r.questions.length, present).complete).length
+    const waiting = records.filter(r => knownKind(r) && progress(r.id, slots(r), present).complete).length
     lines.push(`project: ${heldCount(records, present)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
     if (jobRef) {
       const mine = Object.keys(await read($, open))
@@ -2538,14 +3648,16 @@ async function statusCommand($: any): Promise<string> {
       lines.push(`asked here: ${mine.length ? mine.join(', ') : 'nothing open'}${pending.length ? ` · being delivered: ${pending.join(', ')}` : ''}`)
       if (await read($, stopped)) lines.push('delivery: waiting for you to type something here (an Esc stopped this session)')
     }
+    lines.push(...(await rosterStatus($)))
     lines.push(...(await worldStatus($)))
   }
-  lines.push(`formats: files ${FORMAT}, register ${REGISTER_FORMAT}, config ${CONFIG_FORMAT}, world ${WORLD_FORMAT}`)
+  lines.push(`formats: files ${FORMAT}, register ${REGISTER_FORMAT}, config ${CONFIG_FORMAT}, world ${WORLD_FORMAT}, roster ${ROSTER_FORMAT}`)
   return lines.join('\n')
 }
 
+// /fleet init [<template>]: the project's .claude/fleet/ and the template's files (its roster, world.json, charter,
+// interview, seeds and role files), never over a file that's there. Again, it only adds what's missing
 async function initCommand($: any, template: string, commitRegister: boolean): Promise<string> {
-  if (template !== 'blank') return `fleet ${version} has one template, blank: /fleet init`
   const here = String(await $.session.root()).replace(/\/+$/, '')
   if (root && root !== here) return `Already set up for this folder, in ${root}/.claude/fleet/`
   if (here === home || !here) return "Not in your home folder: start a session in the project's folder and run /fleet init there"
@@ -2557,63 +3669,88 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
     if ('problem' in p) return p.problem
     config = p.config
   }
-  if (commitRegister) config = { ...config, commitRegister: true }
+  const name = template || (before !== null ? config.template : 'blank')
+  const tpl = await findTemplate($, name)
+  if ('problem' in tpl) return tpl.problem
+  config = { ...config, template: name, ...(commitRegister ? { commitRegister: true } : {}) }
   const made = await run($, ['mkdir', '-p', ...['queue', 'answers', 'register', 'tmp', 'prune'].map(d => `${dir}/decisions/${d}`), `${dir}/events`, `${dir}/reads`])
   if (made.exitCode !== 0) return `couldn't create ${dir}: ${made.stderr.trim()}`
   if (before !== configText(config)) await $.fs.write(`${dir}/config.json`, configText(config))
   await $.fs.write(`${dir}/.gitignore`, gitignoreText(config.commitRegister))
-  // The world: written once with the default globs, then the person's (/fleet world add, remove)
-  const worldBefore = await readText($, `${dir}/world.json`)
-  const parsed = worldBefore === null ? null : parseWorld(worldBefore)
-  if (worldBefore === null) await $.fs.write(`${dir}/world.json`, worldText(newWorld()))
-  const globs = parsed && 'world' in parsed ? parsed.world.paths : worldBefore === null ? newWorld().paths : []
+  const written: string[] = []
+  const kept: string[] = []
+  await copyTree($, `${tpl.dir}/fleet`, dir, '.claude/fleet', written, kept)
+  await copyTree($, `${tpl.dir}/agents`, `${here}/.claude/agents`, '.claude/agents', written, kept)
+  // The world: the template's, else the default globs; then the person's (/fleet world add, remove)
+  let worldNow = await readText($, `${dir}/world.json`)
+  if (worldNow === null) {
+    worldNow = worldText(newWorld())
+    await $.fs.write(`${dir}/world.json`, worldNow)
+    written.push('.claude/fleet/world.json')
+  }
+  const parsed = parseWorld(worldNow)
+  const folders = (Array.isArray(tpl.meta.folders) ? tpl.meta.folders : []).filter((f: unknown): f is string => typeof f === 'string' && !checkGlob(f) && !/[*?{]/.test(f))
+  if (folders.length) await run($, ['mkdir', '-p', ...folders.map((f: string) => `${here}/${f}`)])
   const fresh = root === null
   root = here
   configProblem = ''
   if (fresh) worldReady = null
+  roster = null
+  await writeStamps($, await configFiles($))
   timers($)
   if (jobRef && !offered) await offer($).catch(() => {})
   if (!jobRef) whyNot = "this isn't a background session: here the model asks with AskUserQuestion, and fleet records the answers"
-  log($, `init ${dir}`)
+  log($, `init ${dir} (${name})`)
+  const next = (Array.isArray(tpl.meta.next) ? tpl.meta.next : []).filter((x: unknown): x is string => typeof x === 'string')
   return [
-    `${fresh ? 'Set up' : 'Up to date'} in ${dir}/ (template blank).`,
+    `${fresh ? 'Set up' : 'Up to date'} in ${dir}/ (template ${name}${typeof tpl.meta.description === 'string' ? `: ${tpl.meta.description}` : ''}).`,
+    written.length ? `Written: ${written.join(', ')}.` : '',
+    kept.length ? `Kept as they were (yours): ${kept.join(', ')}.` : '',
     "Background sessions of this project get mcp__fleet__decide: they ask you without stopping, and the answer reaches them when they're idle.",
     'Their questions show with /fleet in any session of the project, and as "? n for you · /fleet" above the prompt.',
-    parsed && 'problem' in parsed
+    'problem' in parsed
       ? parsed.problem
-      : `Shared files (world.json): ${globs.length ? globList(globs) : 'none'}. A session's write of one that changed since it read it is refused once with who changed it, and it hears of such changes at its next step. /fleet world changes the list.`,
+      : `Shared files (world.json): ${parsed.world.paths.length ? globList(parsed.world.paths) : 'none'}. A session's write of one that changed since it read it is refused once with who changed it, and it hears of such changes at its next step. /fleet world changes the list.`,
     config.commitRegister
-      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/ and state/ stay out of git.'
-      : 'decisions/, events/, reads/ and state/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
+      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/, state/ and instances/ stay out of git.'
+      : 'decisions/, events/, reads/, state/ and instances/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
+    ...next,
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
-  ].join('\n')
+  ]
+    .filter(Boolean)
+    .join('\n')
 }
 
 async function fleetCommand($: any, e: any): Promise<string> {
   const c = parseCommand(String(e.args ?? ''))
   await locate($)
+  const origin = String(e.origin?.kind ?? '')
   if (c.kind === 'help') return HELP
   if (c.kind === 'bad') return `${c.reason}\n\n${HELP}`
   if (c.kind === 'status') return statusCommand($)
-  if (c.kind === 'init') return initCommand($, c.template, c.commitRegister)
+  if (c.kind === 'init') return origin === 'composer' ? initCommand($, c.template, c.commitRegister) : onlyPerson('sets a project up', origin)
   if (!root) return `Not set up in this project: /fleet init sets it up in ${await $.session.root()}`
   if (c.kind === 'list') return listCommand($)
-  // The world and accept are the person's own too, like answers (below): typed at a terminal
-  if (c.kind === 'world') return worldCommand($, c.action, c.glob, String(e.origin?.kind ?? ''))
-  if (c.kind === 'accept') return acceptCommand($, c.path, String(e.origin?.kind ?? ''))
+  // The world, accept and the roster's commands are the person's own too, like answers (below): typed at a terminal
+  if (c.kind === 'world') return worldCommand($, c.action, c.glob, origin)
+  if (c.kind === 'accept') return acceptCommand($, c.path, origin)
+  if (c.kind === 'up') return upCommand($, c, origin)
+  if (c.kind === 'down') return downCommand($, c.names, origin)
+  if (c.kind === 'remove') return removeCommand($, c.names, c.yes, origin)
+  if (c.kind === 'budget') return budgetCommand($, c.target, c.amount, origin)
+  if (c.kind === 'worktrees') return worktreesCommand($, c.prune, c.yes, origin)
   // Answers, notes and drops are the person's own: typed at a terminal (the model can't run a plugin's command, and
   // another plugin's $.command.run reads as plugin).
   // TODO(G7): accept 'bridge' (Remote Control from the phone) once it's checked that a command typed there runs here
   // and reads origin bridge
-  const kind = String(e.origin?.kind ?? '')
-  if (kind !== 'composer') {
-    return kind === 'bridge'
+  if (origin !== 'composer') {
+    return origin === 'bridge'
       ? "Answers typed over Remote Control aren't taken yet (not tried): answer from a terminal session of the project"
-      : `Only the person answers, typing /fleet at a terminal (this came from ${kind || 'somewhere else'})`
+      : `Only the person answers, typing /fleet at a terminal (this came from ${origin || 'somewhere else'})`
   }
-  if (c.kind === 'answer') return answerCommand($, c.items, kind)
-  if (c.kind === 'note') return noteCommand($, c.n, c.text, kind)
-  return dropCommand($, c.target, c.why, kind)
+  if (c.kind === 'answer') return answerCommand($, c.items, origin)
+  if (c.kind === 'note') return noteCommand($, c.n, c.text, origin)
+  return dropCommand($, c.target, c.why, origin)
 }
 
 // ---- AskUserQuestion: what the person answered in a dialog goes to the register too ----
@@ -2664,12 +3801,19 @@ export const register: Register = on => {
 
   // The engine's own watcher (C9, Q6-bg: it fires in a background session with no viewer, after /clear and compaction)
   // on events/latest, so a landing reaches every session in under a second; the 2 s tick is the fallback
+  // And an instance of the roster learns there, every time its conversation starts again (after /clear, compaction,
+  // resume), who it is, what it can't write and its budget; fleet learns the role it runs as (agent_type)
   on('classic.SessionStart', async ($, e, next) => {
+    if (typeof e.agent_type === 'string' && e.agent_type) agentType = e.agent_type
     const r = await next(e)
     try {
       await ensureWorld($)
       if (!root) return r
-      return { ...r, watchPaths: [...(r?.watchPaths ?? []), `${eventsDir()}/latest`] }
+      const out = { ...r, watchPaths: [...(r?.watchPaths ?? []), `${eventsDir()}/latest`] }
+      if (!envInstance || !jobRef) return out
+      await loadRoster($)
+      const inst = instanceNamed(envInstance)
+      return inst ? { ...out, additionalContext: [...(r?.additionalContext ?? []), await instanceContext($, inst)] } : out
     } catch {
       return r
     }
@@ -2721,7 +3865,7 @@ export const register: Register = on => {
     if ((e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') && timersOn) {
       bg((async () => ((await read($, stopped)) ? update($, stopped, () => false) : null))())
     }
-    if (e.command || !worldOn()) return next(e)
+    if (e.command || (!worldOn() && !myInstance)) return next(e)
     const d = await digestFor($, 'main')
     if (!d.lines.length) return next(e)
     const r = await next({ ...e, context: [...(e.context ?? []), ...d.lines] })
@@ -2733,6 +3877,9 @@ export const register: Register = on => {
     if (e.agentId !== undefined) return { deny: SUBAGENT_REFUSAL }
     await locate($)
     if (!root) return { deny: "fleet isn't set up in this project any more: ask the person in plain text" }
+    const kind = (e as any).kind
+    if (kind === 'change') return fileChange($, e)
+    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions) or "change" (a change to a command-level file). Nothing was queued.' }
     const checked = checkDecide(e)
     if (!checked.ok) return { deny: `${checked.reason}. Nothing was queued: call mcp__fleet__decide again with that fixed.` }
     const asker = await askerNow($)
@@ -2751,6 +3898,15 @@ export const register: Register = on => {
     bg(beat($))
     return { result: ticketText(record.id) }
   }).catch(() => ({ result: "fleet couldn't queue this question: ask the person in plain text" }))
+
+  // An instance over its budget starts no new helper (the one thing the budget refuses: never a turn, never another
+  // tool). It fails open: a fleet that errs lets the helper start
+  on('agent.spawn', async ($, e, next) => {
+    const refusal = myInstance ? await spawnRefusal($) : null
+    if (!refusal) return next(e)
+    log($, 'refused a helper: over budget')
+    return { deny: refusal }
+  }).catch(($, e, next) => next(e))
 
   // The model's own AskUserQuestion only: another plugin's $.ui.ask goes by untouched. It only watches: the dialog is
   // the usual one, and what it returns goes back unchanged
@@ -2785,8 +3941,9 @@ export const register: Register = on => {
     if (e.props.hasSurvey) return beneath
     const n = await read($, held)
     const f = await read($, flags)
-    if (n <= 0 && f <= 0) return beneath
-    const parts = [...(n > 0 ? [`? ${n} for you`] : []), ...(f > 0 ? [`!! ${f} flagged`] : []), n > 0 ? '/fleet' : '/fleet status']
+    const o = await read($, overBudget)
+    if (n <= 0 && f <= 0 && o <= 0) return beneath
+    const parts = [...(n > 0 ? [`? ${n} for you`] : []), ...(f > 0 ? [`!! ${f} flagged`] : []), ...(o > 0 ? [`$ ${o} over budget`] : []), n > 0 ? '/fleet' : f > 0 ? '/fleet status' : '/fleet budget']
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">
