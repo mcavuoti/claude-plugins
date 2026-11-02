@@ -1,4 +1,5 @@
 {
   "worldFormat": 1,
-  "paths": ["notes/**", "journals/**"]
+  "paths": ["notes/**", "journals/**"],
+  "tags": ["scope", "layout", "schedule", "cost", "process"]
 }

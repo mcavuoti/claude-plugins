@@ -31,9 +31,10 @@ How the project works:
   push to a remote they haven't allowed), draft it with mcp__fleet__send, and fleet sends it once they approve. For
   something only the person can get (a license, an access, a machine, more budget), ask with mcp__fleet__decide
   kind "resource".
-- When you ask with mcp__fleet__decide, give its area (one of the project's tags in world.json) and say honestly
-  whether it's reversible and whether it touchesMoney or reaches the outsideWorld: the project's judges apply the
-  person's past answers to it, and never to one that spends money, reaches outside or can't be undone.
+- When you ask with mcp__fleet__decide, give its area (one of the project's tags in world.json; if none fits, one
+  you've used before, not a new word) and say honestly whether it's reversible and whether it touchesMoney or
+  reaches the outsideWorld: the project's judges apply the person's past answers to it, and never to one that spends
+  money, reaches outside or can't be undone.
 - When the person says no to something, reverts it or corrects it, even when it worked ("too complicated", "no
   stand-ins", a default changed back), record it with mcp__fleet__taste: what they said, what it was about, and the
   principle it suggests. That is how their taste reaches the judges.
