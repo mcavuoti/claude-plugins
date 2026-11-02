@@ -1987,7 +1987,7 @@ async function folderOf($: any, dir: string | null): Promise<string> {
   return dir.startsWith('/') ? dir : `${cwd}/${dir}`
 }
 
-/** Whether a folder is the project's or in it (its . and .. folded) */
+/** Whether a folder is the project's or in it (its . and .. folded), or in the linked worktree this session started in */
 function inProject(dir: string): boolean {
   const out: string[] = []
   for (const s of dir.split('/')) {
@@ -1996,7 +1996,7 @@ function inProject(dir: string): boolean {
     else out.push(s)
   }
   const d = `/${out.join('/')}`
-  return [root, realRoot].some(r => !!r && (d === r || d.startsWith(`${r}/`)))
+  return [root, realRoot, startedInTree].some(r => !!r && (d === r || d.startsWith(`${r}/`)))
 }
 
 // The URLs the name entries of outbound.json's remotes have (origin, team-*), per folder they were resolved in, for
