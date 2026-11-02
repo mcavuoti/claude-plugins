@@ -349,7 +349,7 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
 /** The command-level files: what no agent's own tools may write, and what a `change` may change (relative to the
  * project). instances/ is denied too (its settings and state are fleet's), but it isn't changed through a change */
 export function commandLevel(world: WorldConfig | null, checkScripts: readonly string[]): { files: string[]; globs: string[] } {
-  const files = ['.claude/fleet/charter.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', ...checkScripts]
+  const files = ['.claude/fleet/charter.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/fleet/outbound.json', ...checkScripts]
   const globs = ['.claude/agents/**', ...commandGlobs(world)]
   return { files: [...new Set(files)], globs: [...new Set(globs)] }
 }

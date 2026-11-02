@@ -53,14 +53,15 @@ test('/fleet init <template> copies its files, never over yours, and stamps the 
   await startSession($, w)
   const said = await fleet($, 'init solo')
   expect(said).toContain(`Set up in ${FLEET}/ (template solo: three owners).`)
-  expect(said).toContain('Written: .claude/fleet/charter.md, .claude/fleet/roster.json, .claude/fleet/seeds/owner.md, .claude/fleet/world.json, .claude/agents/owner.md.')
+  expect(said).toContain('Written: .claude/fleet/charter.md, .claude/fleet/roster.json, .claude/fleet/seeds/owner.md, .claude/fleet/world.json, .claude/agents/owner.md, .claude/fleet/outbound.json.')
+  expect(json(w, `${FLEET}/outbound.json`)).toEqual({ outboundFormat: 1, hosts: [], remotes: [], recipients: [], tools: { outbound: [], free: [] }, commands: [], outside: [] })
   expect(said).toContain('Shared files (world.json): `notes/**`.')
   expect(said).toContain('Next: /fleet up --dry-run.')
   expect(json(w, `${FLEET}/config.json`)).toEqual({ configFormat: 1, template: 'solo', commitRegister: false })
   expect(w.files.get(`${ROOT}/.claude/agents/owner.md`)).toBe(OWNER)
   expect(w.dirs.has(`${ROOT}/notes`)).toBe(true)
   expect(w.files.get(`${FLEET}/.gitignore`)).toContain('\ninstances/\n')
-  expect(Object.keys(json(w, `${STATE}/stamps.json`).files)).toEqual(['.claude/fleet/charter.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/agents/owner.md'])
+  expect(Object.keys(json(w, `${STATE}/stamps.json`).files)).toEqual(['.claude/fleet/charter.md', '.claude/fleet/roster.json', '.claude/fleet/world.json', '.claude/fleet/outbound.json', '.claude/agents/owner.md'])
   // Again, with a file of the person's changed: kept as it is
   w.files.set(`${ROOT}/.claude/agents/owner.md`, `${OWNER}Mine.\n`)
   const again = await fleet($, 'init')
@@ -95,6 +96,7 @@ test('/fleet up --dry-run: the plan, the cost and the lints, and nothing started
     `Edit(/${ROOT}/.claude/fleet/charter.md)`,
     `Edit(/${ROOT}/.claude/fleet/roster.json)`,
     `Edit(/${ROOT}/.claude/fleet/world.json)`,
+    `Edit(/${ROOT}/.claude/fleet/outbound.json)`,
     `Edit(/${ROOT}/.claude/agents/**)`,
     `Edit(/${ROOT}/.claude/fleet/instances/**)`,
   ])
