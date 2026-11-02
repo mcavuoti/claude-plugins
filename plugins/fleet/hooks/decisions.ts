@@ -448,7 +448,7 @@ export type Command =
   | { kind: 'budget'; target: string; amount: string }
   | { kind: 'brief'; chief: boolean }
   | { kind: 'stats'; area: string }
-  | { kind: 'judges'; action: 'list' | 'live' | 'off'; area: string; force: boolean; why: string }
+  | { kind: 'judges'; action: 'list' | 'live' | 'off'; area: string }
   | { kind: 'overrule'; id: string; answers: { q: number; letter?: string; text?: string }[]; why: string }
   | { kind: 'help' }
   | { kind: 'bad'; reason: string }
@@ -509,15 +509,11 @@ export function parseCommand(args: string): Command {
     }
     case 'judges': {
       const w = wordsOf(tail)
-      if (!w.length) return { kind: 'judges', action: 'list', area: '', force: false, why: '' }
+      if (!w.length) return { kind: 'judges', action: 'list', area: '' }
       const [action = '', area = '', ...rest] = w
       const a = action.toLowerCase()
-      const force = rest.includes('--force')
-      const extra = rest.filter(x => x !== '--force')
-      if ((a !== 'live' && a !== 'off') || !area || area.startsWith('--') || (a === 'off' && rest.length) || extra.length > 1) {
-        return { kind: 'bad', reason: 'write /fleet judges, /fleet judges live <area> [--force "why"] or /fleet judges off <area>' }
-      }
-      return { kind: 'judges', action: a, area: area.toLowerCase(), force, why: cut(extra[0] ?? '', 300) }
+      if ((a !== 'live' && a !== 'off') || !area || area.startsWith('--') || rest.length) return { kind: 'bad', reason: 'write /fleet judges, /fleet judges live <area> or /fleet judges off <area>' }
+      return { kind: 'judges', action: a, area: area.toLowerCase() }
     }
     case 'overrule':
       return parseOverrule(tail)
@@ -640,7 +636,7 @@ export const HELP = [
   '/fleet 6 send --allow  send it, and add its host or git remote to outbound.json as yours, so the next one needs no draft',
   '/fleet brief [--chief] what needs you, what changed and who changed it, what’s blocked, the spend, the inputs and ideas',
   '/fleet stats [area]    what the judges proposed per area, how often you agreed, what they cost',
-  '/fleet judges          the live areas, the areas back in shadow, your taste; /fleet judges live <area> [--force "why"], /fleet judges off <area>',
+  '/fleet judges          the live areas, the areas back in shadow, your taste; /fleet judges live <area> (its exact repeats answered at once), /fleet judges off <area>',
   '/fleet overrule D-7 b ["why"]  correct the judge\'s answer to D-7: its asker hears it, and the judges read it next time',
   '/fleet init [template] set fleet up in this project (.claude/fleet/): blank, solo, software or proposal',
   '/fleet up [--dry-run] [--wave n] [name…]  start the roster\'s instances that aren\'t running (--dry-run: the plan, the lints, the cost)',

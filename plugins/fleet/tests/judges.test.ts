@@ -18,6 +18,7 @@ import {
   supportProblem,
   liveGate,
   liveWords,
+  areaStateLine,
   overruleText,
   reviewText,
   areaOf,
@@ -41,7 +42,6 @@ import {
   parseVerdicts,
   reaskOf,
   precedentsOf,
-  promoteCheck,
   proposalLine,
   questionText,
   relevantOf,
@@ -345,13 +345,10 @@ test('agreement, the register’s entry and /fleet’s line; the stats per area'
   expect(statsLine(s)).toBe('storage: 2 decisions, 3 questions: 2 decided (2 exact repeats), agreed 1 of 2 (50%): repeats 1 of 2 (50%), model verdicts 0 of 0 (—) · 0 sent back · 1 held · 1 decision (2 questions) held by a gate · $0.0006 in 2 calls')
   expect(stats.get('(no area)')?.sentBack).toBe(1)
   const c = judgesOf(null).judges
-  expect(promoteCheck(s, c)).toEqual({ ok: false, why: 'it has 2 proposals (it needs 30 proposals and 90% agreement on what the judge decided)' })
-  expect(promoteCheck({ ...s, proposals: 40, agreed: 36, disagreed: 4 }, c).ok).toBe(true)
-  expect(promoteCheck({ ...s, proposals: 40, agreed: 35, disagreed: 5 }, c).why).toContain('its agreement is 88%')
-  // 30 exact repeats and no model verdict: the area may go live, for the repeats; the model's own verdicts have no record
+  // 30 exact repeats and no model verdict: the repeats are his own answers; the model's own verdicts have no record
   const repeat = { area: 'storage', judge: judgeEntryOf({ ...f, verdicts: [f.verdicts[0]!] }, [{ label: 'SQLite' }]) }
   const repeats = statsOf(Array.from({ length: 30 }, () => repeat)).get('storage')
-  expect(promoteCheck(repeats, c)).toEqual({ ok: true, why: '30 proposals, 100% agreement' })
+  expect(modelCheck(undefined, c).ok).toBe(false)
   expect(modelCheck(repeats, c)).toEqual({ ok: false, why: "the model's own verdicts have 0 compared (they need 30 compared at 90%)" })
   const own = (label: string) => ({ area: 'storage', judge: judgeEntryOf({ ...f, verdicts: [{ q: 1, outcome: 'decided', option: 'SQLite', cites: ['principles.md:3'], why: '' }] }, [{ label }]) })
   const model = statsOf([...Array.from({ length: 27 }, () => own('SQLite')), ...Array.from({ length: 3 }, () => own('Redis'))]).get('storage')
@@ -387,14 +384,17 @@ test('live: the asker’s own word is needed (a flag left out says nothing); the
   expect(liveGate({ reversible: true, touchesMoney: false })).toBe("its asker didn't say it stays inside the project")
   const c = judgesOf(null).judges
   const notYet = { ok: false, why: "the model's own verdicts have 0 compared (they need 30 compared at 90%)" }
-  expect(liveWords('storage', { ok: false, why: 'it has 3 proposals (…)' }, false, c, notYet).ok).toBe(false)
-  const forced = liveWords('storage', { ok: false, why: 'it has 3 proposals (…)' }, true, c, notYet)
-  expect(forced.ok).toBe(true)
-  expect(forced.text).toContain('Area storage is live (forced: it has 3 proposals (…); recorded).')
-  expect(forced.text).toContain('when it\'s an exact repeat of your answer, labelled as the judge\'s; at most 20 a day in the project')
-  expect(forced.text).toContain("The model's own verdicts only propose there until they earn it apart (the model's own verdicts have 0 compared")
-  expect(forced.text).toContain('goes back to shadow once you overrule 2 of the last 10 live answers you reviewed')
-  expect(liveWords('storage', { ok: true, why: '30 proposals, 100% agreement' }, false, c, { ok: true, why: 'x' }).text).toContain("The model's own verdicts answer too")
+  // Live at once, with nothing judged yet: what it turns on is the exact repeats; the model's verdicts keep their threshold
+  const words = liveWords('storage', c, notYet)
+  expect(words.split('\n')[0]).toBe('Area storage is live.')
+  expect(words).toContain('when it\'s an exact repeat of your answer, labelled as the judge\'s; at most 20 a day in the project')
+  expect(words).toContain("The model's own verdicts only propose there until they earn it apart (the model's own verdicts have 0 compared")
+  expect(words).toContain('goes back to shadow once you overrule 2 of the last 10 live answers you reviewed')
+  expect(liveWords('storage', c, { ok: true, why: 'x' })).toContain("The model's own verdicts answer too")
+  expect(areaStateLine('storage', true, notYet)).toBe("storage: live, its exact repeats answered at once; the model's own verdicts have 0 compared (they need 30 compared at 90%): they only propose")
+  expect(areaStateLine('ui', false, { ok: true, why: "the model's own verdicts: 30 compared, 93% agreement" })).toBe(
+    "ui: in shadow (/fleet judges live ui answers its exact repeats at once); the model's own verdicts: 30 compared, 93% agreement: they'd answer too",
+  )
   // A live answer counts once the person reviewed it: overruled (not agreed), or seen listed and let stand (agreed)
   const one = (extra: { overruled?: number[]; seen?: boolean }) => ({ area: 'storage', judge: { area: 'storage', verdicts: [{ q: 1, outcome: 'decided' as const, option: 'SQLite', cites: ['D-1'], why: '' }], agreed: [null], answered: [1] }, ...extra })
   const s = statsOf([one({ overruled: [1] })]).get('storage')!
@@ -425,10 +425,12 @@ test('live: the asker’s own word is needed (a flag left out says nothing); the
 })
 
 test('/fleet judges and /fleet overrule: the grammar', () => {
-  expect(parseCommand('judges')).toEqual({ kind: 'judges', action: 'list', area: '', force: false, why: '' })
-  expect(parseCommand('judges live Storage --force "trying it"')).toEqual({ kind: 'judges', action: 'live', area: 'storage', force: true, why: 'trying it' })
-  expect(parseCommand('judges off ui')).toEqual({ kind: 'judges', action: 'off', area: 'ui', force: false, why: '' })
+  expect(parseCommand('judges')).toEqual({ kind: 'judges', action: 'list', area: '' })
+  expect(parseCommand('judges live Storage')).toEqual({ kind: 'judges', action: 'live', area: 'storage' })
+  expect(parseCommand('judges off ui')).toEqual({ kind: 'judges', action: 'off', area: 'ui' })
   expect(parseCommand('judges live').kind).toBe('bad')
+  // There's no --force: an area goes live at once
+  expect(parseCommand('judges live storage --force "trying it"')).toEqual({ kind: 'bad', reason: 'write /fleet judges, /fleet judges live <area> or /fleet judges off <area>' })
   expect(parseCommand('judges off ui --force').kind).toBe('bad')
   expect(parseCommand('overrule D-7 b')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 1, letter: 'b' }], why: '' })
   expect(parseCommand('overrule d-7 1b 2a "too slow"')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 1, letter: 'b' }, { q: 2, letter: 'a' }], why: 'too slow' })

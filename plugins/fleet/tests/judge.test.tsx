@@ -229,19 +229,23 @@ test('taste in a turn fleet started to deliver his words: his when it says what 
 
 const FLAGS = { reversible: true, touchesMoney: false, outsideWorld: false }
 
-test('live: an area turned on by the person (forced); an exact repeat answered by the judge, the model’s own verdicts only proposing, a money one held', WITH_SESSIONS, async ($, on) => {
+test('live: an area the person turns on goes live at once; an exact repeat answered by the judge, the model’s own verdicts only proposing, a money one held', WITH_SESSIONS, async ($, on) => {
   const asked = model(on, text => (text.includes('Which cache, the fast one or the quick one?') ? '{"answers": [{"q": 1, "outcome": "send-back", "why": "the two options are the same thing"}]}' : '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}'))
   const w = project(on)
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
   await startSession($, w)
-  // Not earned: refused, unless forced (recorded); only the person turns an area live
+  // Only the person turns an area live, and it's live at once (nothing judged yet): its exact repeats are his answers
   expect(await fleet($, 'judges live storage', { kind: 'plugin', name: 'other' })).toContain('Only the person turns an area live')
-  expect(await fleet($, 'judges live storage')).toBe('Not turned live: storage: it has 0 proposals (it needs 30 proposals and 90% agreement on what the judge decided). /fleet stats storage shows it; /fleet judges live storage --force "why" turns it on anyway (for exact repeats), recorded as forced.')
   expect(await fleet($, 'judges live hosting')).toContain("hosting isn't one of the project's tags (storage, ui)")
-  const on1 = await fleet($, 'judges live storage --force "trying it"')
-  expect(on1).toContain('Area storage is live (forced: it has 0 proposals')
+  expect(await fleet($, 'judges live storage --force "trying it"')).toContain('write /fleet judges, /fleet judges live <area> or /fleet judges off <area>')
+  expect(w.files.has(`${FLEET}/state/judges.json`)).toBe(false)
+  expect(await fleet($, 'stats storage')).toContain("storage: in shadow (/fleet judges live storage answers its exact repeats at once); the model's own verdicts have 0 compared (they need 30 compared at 90%): they'd only propose")
+  const on1 = await fleet($, 'judges live storage')
+  expect(on1.split('\n')[0]).toBe('Area storage is live.')
   expect(on1).toContain("The model's own verdicts only propose there until they earn it apart (the model's own verdicts have 0 compared (they need 30 compared at 90%))")
-  expect(json(w, `${FLEET}/state/judges.json`)).toMatchObject({ format: 1, live: { storage: { forced: true, why: 'trying it', by: 'TEST A' } } })
+  expect(json(w, `${FLEET}/state/judges.json`)).toEqual({ format: 1, live: { storage: { at: expect.any(Number), by: 'TEST A' } }, back: {}, seen: {} })
+  expect(await fleet($, 'judges live storage')).toContain('storage is live already')
+  expect(await fleet($, 'stats storage')).toContain("storage: live, its exact repeats answered at once; the model's own verdicts have 0 compared (they need 30 compared at 90%): they only propose")
   // An exact repeat of D-1, with the asker's word that it's reversible, touches no money and stays inside: answered at once
   await decide($, { questions: [DB], area: 'storage', ...FLAGS })
   await tick(w)
@@ -307,7 +311,7 @@ test('live: the model’s own verdicts answer once they earned it apart, citing 
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
   await startSession($, w)
   const on1 = await fleet($, 'judges live storage')
-  expect(on1).toContain('Area storage is live (2 proposals, 100% agreement).')
+  expect(on1).toContain('Area storage is live.')
   expect(on1).toContain("The model's own verdicts answer too (a citation of charter.md, principles.md or your answers that code checks), and one it finds malformed goes back to its asker with why: the model's own verdicts: 2 compared, 100% agreement.")
   expect(await fleet($, 'stats storage')).toContain('model verdicts 2 of 2 (100%)')
   // A model verdict citing principles.md: the asker's answer, labelled
@@ -341,7 +345,7 @@ test('overrule: the asker hears it once, the correction is case law ahead of the
   w.touch(`${FLEET}/world.json`, JSON.stringify({ worldFormat: 1, paths: ['notes/**'], tags: ['storage', 'ui'], judges: { reviewer: 'TEST A' } }))
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
   await startSession($, w)
-  await fleet($, 'judges live storage --force')
+  await fleet($, 'judges live storage')
   // Two live answers, the same question twice (exact repeats of D-1)
   for (let n = 0; n < 2; n++) {
     await decide($, { questions: [DB], area: 'storage', ...FLAGS })
@@ -358,7 +362,7 @@ test('overrule: the asker hears it once, the correction is case law ahead of the
   expect(said).toContain('Area storage: you overruled 1 of the last 1 live answer you reviewed, still live (2 of the last 10 bring it back to shadow).')
   expect(await fleet($, 'overrule D-2 b')).toBe('D-2 was overruled already: the judges read that correction')
   expect(json(w, `${DEC}/register/2026-11/D-2.overrule.json`)).toMatchObject({ registerFormat: 1, id: 'D-2', overrules: 'D-2', answers: [{ label: 'Redis', origin: 'composer', session: 'TEST A' }], judged: ['SQLite'], why: 'the queue runs it', area: 'storage' })
-  expect(json(w, `${FLEET}/state/judges.json`)).toMatchObject({ live: { storage: { forced: true } }, back: {} })
+  expect(json(w, `${FLEET}/state/judges.json`)).toMatchObject({ live: { storage: { by: 'TEST A' } }, back: {} })
   expect(await fleet($, '')).toContain("   D-2 · TEST A · you overruled the judge, told when it's idle")
   // Delivered once, at idle; the notice goes
   for (let i = 0; i < 3; i++) await tick(w)
@@ -457,7 +461,7 @@ test('overrule before delivery: the person’s answer replaces the judge’s, re
   const w = project(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], tags: ['storage', 'ui'], judges: { reviewer: 'Chief' } }) } })
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'working') } })
   await startSession($, w)
-  await fleet($, 'judges live storage --force')
+  await fleet($, 'judges live storage')
   // The asker is in a turn: the judge's live answer waits for it to end
   await $.turn.start({ text: 'working on the cache', turnId: 't-1' })
   await decide($, { questions: [DB], area: 'storage', ...FLAGS })

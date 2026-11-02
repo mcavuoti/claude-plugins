@@ -33,7 +33,8 @@ export type JudgeConfig = {
   skip: string[]
   /** How many past answers the call reads, picked by code */
   precedents: number
-  /** What an area needs to be turned live: so many proposals, and so much agreement on what the judge decided */
+  /** What the model's own verdicts need to answer in a live area: so many of them the person compared, at so much
+   * agreement (the exact repeats answer there as soon as he turns it live) */
   promote: { proposals: number; agreement: number }
   /** Live answers a day in the project, and dollars a day of judge calls (at list price) */
   perDay: number
@@ -894,20 +895,10 @@ export function statsLine(s: AreaStats): string {
   ].join(' · ')
 }
 
-/** Whether an area has earned live answers (0.7.0): enough proposals, and enough agreement on what the judge decided.
- * What that turns on is the exact repeats; the model's own verdicts need modelCheck too */
-export function promoteCheck(s: AreaStats | undefined, c: JudgeConfig): { ok: boolean; why: string } {
-  const p = s?.proposals ?? 0
-  const r = s ? agreementRate(s) : null
-  const need = `${c.promote.proposals} proposals and ${Math.round(c.promote.agreement * 100)}% agreement on what the judge decided`
-  if (p < c.promote.proposals) return { ok: false, why: `it has ${p} proposal${p === 1 ? '' : 's'} (it needs ${need})` }
-  if (r === null || r < c.promote.agreement) return { ok: false, why: `its agreement is ${pct(r)} (it needs ${need})` }
-  return { ok: true, why: `${p} proposals, ${pct(r)} agreement` }
-}
-
 /** Whether the model's own verdicts (not exact repeats) have earned live answers in an area: promote.proposals of them
  * the person compared (answered himself, or reviewed live), at promote.agreement. Checked at each answer, so they join
- * a live area once they earn it, and leave it once they fall below. --force doesn't reach them (the owner's D3) */
+ * a live area once they earn it, and leave it once they fall below. Turning an area live doesn't reach them (the
+ * owner's D3): it turns on the exact repeats, which are his own answers */
 export function modelCheck(s: AreaStats | undefined, c: JudgeConfig): { ok: boolean; why: string } {
   const a = s?.modelAgreed ?? 0
   const n = a + (s?.modelDisagreed ?? 0)
@@ -1017,11 +1008,11 @@ export function tasteResult(id: string, t: TasteSpec, notHeard = "the person did
 // ---- Live areas (0.7.0): state/judges.json, written by the person's /fleet judges, by an overrule that brings an
 // area back to shadow, and by the listings he typed that showed him live answers ----
 
-/** Which areas are live (since when, forced past the threshold, why), which went back to shadow by themselves, and
- * the live answers the person saw listed (a decision's id → when he first saw it; at most SEEN_KEPT) */
+/** Which areas are live (since when, turned on in which session), which went back to shadow by themselves, and the
+ * live answers the person saw listed (a decision's id → when he first saw it; at most SEEN_KEPT) */
 export type JudgesState = {
   format: number
-  live: Record<string, { at: number; forced?: true; why?: string; by?: string }>
+  live: Record<string, { at: number; by?: string }>
   back: Record<string, { at: number; why: string }>
   seen?: Record<string, number>
 }
@@ -1049,22 +1040,24 @@ export function reviewedBy(seenAt: number | undefined, now: number): boolean {
   return seenAt !== undefined && now - seenAt >= REVIEW_MS
 }
 
-/** The words for an area going live, or the refusal: it hasn't earned it, and --force wasn't given. model: whether the
- * model's own verdicts have earned it there too (modelCheck); --force reaches only the exact repeats */
-export function liveWords(area: string, check: { ok: boolean; why: string }, force: boolean, c: JudgeConfig, model: { ok: boolean; why: string }): { ok: boolean; text: string } {
-  if (!check.ok && !force) return { ok: false, text: `Not turned live: ${area}: ${check.why}. /fleet stats ${area} shows it; /fleet judges live ${area} --force "why" turns it on anyway (for exact repeats), recorded as forced.` }
-  return {
-    ok: true,
-    text: [
-      `Area ${area} is live${check.ok ? ` (${check.why})` : ` (forced: ${check.why}; recorded)`}.`,
-      `In it, a question that passes every gate, and whose asker says it's reversible, touches no money and stays inside the project, is answered by the judge at once when it's an exact repeat of your answer, labelled as the judge's; at most ${c.perDay} a day in the project.`,
-      model.ok
-        ? `The model's own verdicts answer too (a citation of charter.md, principles.md or your answers that code checks), and one it finds malformed goes back to its asker with why: ${model.why}.`
-        : `The model's own verdicts only propose there until they earn it apart (${model.why}); then they answer too, and send back what's malformed.`,
-      'The rest wait for you as always.',
-      `/fleet overrule D-<n> <answer> ["why"] corrects one: the asker hears it, the judges read it next time, and ${area} goes back to shadow once you overrule ${WINDOW_OVERRULES} of the last ${WINDOW} live answers you reviewed (seen in /fleet brief or /fleet stats ${area}). /fleet judges off ${area} stops it.`,
-    ].join('\n'),
-  }
+/** The words for an area going live, at once: its exact repeats answer from now on. model: whether the model's own
+ * verdicts have earned it there too (modelCheck), which turning the area live doesn't reach */
+export function liveWords(area: string, c: JudgeConfig, model: { ok: boolean; why: string }): string {
+  return [
+    `Area ${area} is live.`,
+    `In it, a question that passes every gate, and whose asker says it's reversible, touches no money and stays inside the project, is answered by the judge at once when it's an exact repeat of your answer, labelled as the judge's; at most ${c.perDay} a day in the project.`,
+    model.ok
+      ? `The model's own verdicts answer too (a citation of charter.md, principles.md or your answers that code checks), and one it finds malformed goes back to its asker with why: ${model.why}.`
+      : `The model's own verdicts only propose there until they earn it apart (${model.why}); then they answer too, and send back what's malformed.`,
+    'The rest wait for you as always.',
+    `/fleet overrule D-<n> <answer> ["why"] corrects one: the asker hears it, the judges read it next time, and ${area} goes back to shadow once you overrule ${WINDOW_OVERRULES} of the last ${WINDOW} live answers you reviewed (seen in /fleet brief or /fleet stats ${area}). /fleet judges off ${area} stops it.`,
+  ].join('\n')
+}
+
+/** An area's state, for /fleet stats <area>: live or in shadow, and where the model's own verdicts stand (modelCheck) */
+export function areaStateLine(area: string, live: boolean, model: { ok: boolean; why: string }): string {
+  const own = `${model.why}: ${model.ok ? (live ? 'they answer too' : "they'd answer too") : live ? 'they only propose' : "they'd only propose"}`
+  return live ? `${area}: live, its exact repeats answered at once; ${own}` : `${area}: in shadow (/fleet judges live ${area} answers its exact repeats at once); ${own}`
 }
 
 // ---- Overrules (0.7.0): the person's correction of a judge, in the register beside the decision, and told to the asker

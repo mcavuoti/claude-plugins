@@ -151,6 +151,7 @@ import {
   TASTE_SCHEMA,
   agreementOf,
   areaOf,
+  areaStateLine,
   demoteCheck,
   heardIn,
   liveActs,
@@ -163,7 +164,6 @@ import {
   reviewedBy,
   newJudgesState,
   overruleText,
-  promoteCheck,
   reviewText,
   type JudgesState,
   type OverruleNotice,
@@ -6490,6 +6490,7 @@ async function statsCommand($: any, area: string, origin: string): Promise<strin
     const key = area === 'none' ? NO_AREA : area
     const s = stats.get(key)
     lines.push(s ? statsLine(s) : `${key}: nothing judged yet`)
+    if (c.on && key !== NO_AREA) lines.push(areaStateLine(key, !!st.live[key], modelCheck(s, c)))
     const mine = entries.filter(x => (x.area ?? NO_AREA) === key).slice(-10)
     for (const x of mine) {
       const j = x.judge
@@ -6567,12 +6568,12 @@ async function judgesCommand($: any, c: Extract<Command, { kind: 'judges' }>, or
     const live = Object.entries(st.live).sort(([a], [b]) => a.localeCompare(b))
     lines.push(
       live.length
-        ? `Live: ${live.map(([area, x]) => `${area} (since ${ago(now - x.at)} ago${x.forced ? `, forced${x.why ? `: "${x.why}"` : ''}` : ''}; ${stats.get(area)?.live ?? 0} answered, ${stats.get(area)?.overruled ?? 0} overruled; ${modelCheck(stats.get(area), cfg).ok ? "the model's own verdicts answer too" : 'exact repeats only'})`).join('; ')}. Shadow elsewhere.`
+        ? `Live: ${live.map(([area, x]) => `${area} (since ${ago(now - x.at)} ago; ${stats.get(area)?.live ?? 0} answered, ${stats.get(area)?.overruled ?? 0} overruled; ${modelCheck(stats.get(area), cfg).ok ? "the model's own verdicts answer too" : 'exact repeats only'})`).join('; ')}. Shadow elsewhere.`
         : 'Live: no area; the judges only propose (shadow).',
     )
     for (const [area, b] of Object.entries(st.back).sort(([, x], [, y]) => y.at - x.at).slice(0, 5)) lines.push(`Back to shadow: ${area} at ${clock(b.at, me.offsetMin)} (${ago(now - b.at)} ago): ${b.why}`)
     lines.push(
-      `To turn an area live: /fleet judges live <area> (it needs ${cfg.promote.proposals} proposals and ${Math.round(cfg.promote.agreement * 100)}% agreement on what the judge decided; --force "why" turns it on anyway, recorded); /fleet judges off <area>. There exact repeats answer at once; the model's own verdicts once ${cfg.promote.proposals} of them you compared agree ${Math.round(cfg.promote.agreement * 100)}% or more.`,
+      `To turn an area live: /fleet judges live <area>, and its exact repeats of your answers are answered at once; /fleet judges off <area>. The model's own verdicts answer there once ${cfg.promote.proposals} of them you compared agree ${Math.round(cfg.promote.agreement * 100)}% or more.`,
     )
     for (const s of [...stats.values()].sort((a, b) => b.proposals - a.proposals || a.area.localeCompare(b.area))) lines.push(`  ${statsLine(s)}`)
     const taste = records.filter(r => r.source === 'taste' && r.taste).slice(-5)
@@ -6599,15 +6600,13 @@ async function judgesCommand($: any, c: Extract<Command, { kind: 'judges' }>, or
   }
   if (!cfg.on) return 'The judges are off (world.json says "judges": false): turn them on first.'
   if (st.live[area]) return `${area} is live already (since ${ago(now - st.live[area].at)} ago).`
-  const areaStats = statsOf(await judgedEntries($)).get(area)
-  const check = promoteCheck(areaStats, cfg)
-  const w = liveWords(area, check, c.force, cfg, modelCheck(areaStats, cfg))
-  if (!w.ok) return w.text
-  st.live[area] = { at: now, by: here, ...(check.ok ? {} : { forced: true as const }), ...(c.why ? { why: c.why } : {}) }
+  // At once: what it turns on is the exact repeats of his own answers; the model's own verdicts keep their threshold
+  const text = liveWords(area, cfg, modelCheck(statsOf(await judgedEntries($)).get(area), cfg))
+  st.live[area] = { at: now, by: here }
   delete st.back[area]
   if (!(await writeJudgesState($, st))) return `couldn't write ${stateDir('judges.json')}`
-  log($, `judges: ${area} live${check.ok ? '' : ` (forced: ${check.why})`} (the person, in ${here})`)
-  return w.text
+  log($, `judges: ${area} live (the person, in ${here})`)
+  return text
 }
 
 /** /fleet overrule D-<n> <answer> ["why"]: the person's correction of a judge's answer (or of its sending a decision
