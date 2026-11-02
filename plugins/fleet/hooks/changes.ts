@@ -345,14 +345,16 @@ export function caseProbe(path: string): string | null {
 
 export type DigestItem = { path: string; event: ChangeEvent }
 
-/** The world files this thread read whose newest event is someone else's and that it hasn't read or been told since */
-export function digestItems(reads: Readonly<Record<string, FleetRead>> | undefined, latest: ReadonlyMap<string, ChangeEvent>, me: Me): DigestItem[] {
+/** The world files this thread read whose newest event is someone else's and that it hasn't read or been told since.
+ * thread: 'main' or a helper's agentId; reads and the gate are per thread, so a helper's landing is news to main */
+export function digestItems(reads: Readonly<Record<string, FleetRead>> | undefined, latest: ReadonlyMap<string, ChangeEvent>, me: Me, thread = 'main'): DigestItem[] {
   const out: DigestItem[] = []
   for (const [path, r] of Object.entries(reads ?? {})) {
     const e = latest.get(path)
     if (!e || e.to === r.v || e.to === r.told || e.at < r.at) continue
-    // This session's own landings aren't news to it; the person's stamp typed here is (his change, not the model's)
-    if (e.by?.sessionId && e.by.sessionId === me.sessionId && !e.by.person) continue
+    // This thread's own landings aren't news to it (another thread's of this session are: a helper's to main, and the
+    // reverse); the person's stamp typed here is (his change, not the model's)
+    if (e.by?.sessionId && e.by.sessionId === me.sessionId && (e.by.agentId ?? 'main') === thread && !e.by.person) continue
     out.push({ path, event: e })
   }
   return out.sort((a, b) => b.event.at - a.event.at || a.path.localeCompare(b.path))

@@ -596,7 +596,7 @@ What happens, in every session of the project (background or not), for each thre
 
   After a new read it passes. The gate is soft: a second try at the same version passes too, the model having been told. A new file, and anything outside the world, is never held. A helper's read doesn't count for the main thread, nor the reverse: whoever writes has to have seen it.
 - **Every landing** (a write to a shared file by any session) is one small event: the file, who (session and helper), the tool, the versions, when. Never the content.
-- **At its next step**, a thread that read a file someone else changed hears it, with no content, at most ten lines:
+- **At its next step**, a thread that read a file someone else changed (another session, or another thread of its own: the main thread hears what its helper changed, and the reverse) hears it, with no content, at most ten lines:
 
   ```
   fleet: a shared file you read has changed since you read it. Read it again before you rely on it or write it:

@@ -1765,7 +1765,7 @@ async function digestFor($: any, thread: string, withBudget = true): Promise<{ l
   await eventsTick($)
   const mine = (await read($, reads))[thread]
   const me = await meNow($)
-  const items = mine && latest.size ? digestItems(mine, latest, me) : []
+  const items = mine && latest.size ? digestItems(mine, latest, me, thread) : []
   let own: { lines: string[]; keys: string[] } = { lines: [], keys: [] }
   let intake: { lines: string[]; ids: string[]; at: number } = { lines: [], ids: [], at: 0 }
   if (thread === 'main') {

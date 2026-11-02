@@ -183,6 +183,12 @@ test('the digest: the files this thread read that someone else changed since, to
     ].join('\n'),
   )
   expect(digestItems(undefined, latest, ME)).toEqual([])
+  // Reads are per thread: a helper's landing is news to main, and main's to the helper; a thread's own isn't
+  const helper = new Map<string, ChangeEvent>([['notes/mine.md', ev({ path: 'notes/mine.md', by: { ...B, sessionId: ME.sessionId, agentId: 'a1' } })]])
+  expect(digestItems(reads, helper, ME).map(i => i.path)).toEqual(['notes/mine.md'])
+  expect(digestText(digestItems(reads, helper, ME), ME)).toContain('- notes/mine.md: changed at 14:02 by a helper of this session (Edit)')
+  expect(digestItems(reads, helper, ME, 'a1')).toEqual([])
+  expect(digestItems(reads, latest, ME, 'a1').map(i => i.path)).toEqual(['notes/todo.md', 'notes/mine.md', 'notes/plan.md', 'notes/stamped.md'])
   const many = Array.from({ length: 13 }, (_, i) => ({ path: `notes/n${i}.md`, event: ev({ path: `notes/n${i}.md` }) }))
   const text = digestText(many, ME)
   expect(text.split('\n').length).toBe(12)
