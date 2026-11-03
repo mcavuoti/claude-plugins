@@ -36,6 +36,9 @@ export type Platform = {
   openWindow(run: Run, front: string, title: string, command: string): Promise<boolean>
   // Closes a window that isn't busy; a no-op where windows end by themselves (the launcher leaves a plain shell)
   closeWindow(run: Run, tty: string): Promise<void>
+  // A command line from ps as `claude <args>` if that is the program it runs (some systems run claude through a
+  // loader, which ps lists instead); any other command as it is
+  clientCommand(command: string): string
   // A process's program, as lines "n<path>" (lsof -Fn style; the shared code looks for .../claude/versions/X.Y.Z)
   processProgram(run: Run, pid: string): Promise<string>
   // A process's working folder ('' if unknown)

@@ -45,6 +45,13 @@ esac
 SH
 cat > "$work/bin/ps" <<'SH'
 #!/usr/bin/env bash
+# As a real ps reads -o (POSIX, which procps keeps to the letter): in `name=header` the header runs to the end of that
+# -o argument, so `-o pid=,tty=,command=` is one pid column headed ",tty=,command=", and only pids are listed
+prev=''
+for a in "$@"; do
+  if [ "$prev" = -o ] && [[ "$a" == *=?* ]]; then echo "${a#*=}"; awk '{print $1}' "$FIX/ps.txt" 2>/dev/null; exit 0; fi
+  prev=$a
+done
 cat "$FIX/ps.txt" 2>/dev/null
 SH
 chmod +x "$work/bin/claude" "$work/bin/ps"

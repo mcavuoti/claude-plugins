@@ -421,7 +421,7 @@ test('reopen: only those from the last 2 h count towards the limit', () => {
   expect(recentReopens(undefined, now)).toEqual([])
 })
 
-// One window of each kind, as `ps -A -o pid=,tty=,command=` lists them on macOS and on Linux
+// One window of each kind, as `ps -A -o pid= -o tty= -o command=` lists them on macOS and on Linux
 const PS_MAC = [
   '  101 ttys001  bash /Users/x/.claude/plugins/cache/m/sessions/0.10.0/hooks/visor.sh attach aaaaaaaa',
   '  102 ttys001  claude attach aaaaaaaa',

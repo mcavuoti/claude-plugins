@@ -47,7 +47,7 @@ export type World = {
   bgError: { value: string }
   // macOS's memory pressure level (sysctl kern.memorystatus_vm_pressure_level): 1 normal, 4 critical
   memory: { value: string }
-  // What `ps -A -o pid=,tty=,command=` lists (no window by default), and what Terminal's AppleScript answers, by its
+  // What `ps -A -o pid= -o tty= -o command=` lists (no window by default), and what Terminal's AppleScript answers, by its
   // mode words (frente, leer, traer, cerrar, abrir: hooks/platform/macos.ts; '' by default)
   ps: { value: string }
   terminal: { value: (args: string[]) => string }
@@ -192,7 +192,12 @@ export function world(on: On, options: WorldOptions = {}): World {
     // The end of a file (the background service's log), as tail -n reads it
     if (argv[0] === 'tail') return files.has(argv.at(-1) ?? '') ? ok(files.get(argv.at(-1) ?? '')) : failed()
     if (argv[0] === 'sysctl') return ok(`${memory.value}\n`)
-    if (argv[0] === 'ps') return ok(ps.value)
+    // As a real ps reads -o (POSIX, which procps keeps to the letter): in `name=header` the header runs to the end of
+    // that -o argument, so `-o pid=,tty=,command=` is one pid column headed ",tty=,command=", and only pids are listed
+    if (argv[0] === 'ps') {
+      const header = argv.find((a, i) => argv[i - 1] === '-o' && /=./.test(a))
+      return ok(header ? [header.slice(header.indexOf('=') + 1), ...ps.value.split('\n').map(l => l.trim().split(/\s+/)[0])].join('\n') : ps.value)
+    }
     if (argv[0] === 'osascript') return ok(terminal.value(argv.slice(2)))
     if (argv[0] === '/bin/claude' && argv[1] === '--bg' && bgError.value) return { value: { exitCode: 1, stdout: '', stderr: bgError.value, isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === '/bin/claude' && argv[1] === '--version') return ok('2.1.316 (Claude Code)')

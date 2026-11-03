@@ -182,6 +182,8 @@ On macOS the panel drives Terminal.app (which window is in front, bring one forw
 | Automatic "seen" (yellow → green) | no: there's no telling which window is in front, so it stays yellow until you type in that session |
 | Closing the windows of a stopped session | not needed: the viewer ends with the session and the launcher leaves the shell |
 
+**Older distributions** (tried on CentOS 7): where the system's glibc is too old for Claude's binary and Claude runs through the glibc loader (`ld-linux… --library-path … …/claude/versions/X.Y.Z`), `ps` lists its viewers and agent views as the loader's command line; the mod and the launcher read such a line as `claude <args>`, and take the program from `/proc/<pid>/cmdline`. The `ps` calls pass one `-o` per column, since an older procps reads `-o pid=,tty=,command=` as the pid column alone.
+
 To try this mode on a Mac, start test sessions with `SESSIONS_PORTABLE=1` in their `--settings` `env`.
 
 ## Background sessions on macOS

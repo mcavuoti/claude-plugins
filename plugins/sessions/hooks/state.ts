@@ -448,7 +448,7 @@ export function validateList(text: string): any[] | string {
   return list
 }
 
-// Which terminal windows show each session, from `ps -A -o pid=,tty=,command=` (same columns on macOS and Linux; a
+// Which terminal windows show each session, from `ps -A -o pid= -o tty= -o command=` (same columns on macOS and Linux; a
 // process without a terminal shows `??` on macOS and `?` on Linux). Only clients count as showing a session: the viewer
 // (`claude attach <id>`) and the agent view (`claude agents`), never a session's own process (except byPid, which maps
 // every process to its terminal). launchers: the windows running the mod's launcher (`bash …/visor.sh`)
@@ -459,12 +459,12 @@ export type Windows = {
   clients: Record<string, string>
   launchers: Record<string, string>
 }
-export function parseWindows(ps: string): Windows {
+export function parseWindows(ps: string, clientCommand: (command: string) => string = c => c): Windows {
   const v: Windows = { byId: {}, byPid: {}, agentsViews: [], clients: {}, launchers: {} }
   for (const line of ps.split('\n')) {
     const [pid, tty, ...rest] = line.trim().split(/\s+/)
     if (!pid || !tty || tty === '??' || tty === '?' || tty === '-') continue
-    const command = rest.join(' ')
+    const command = clientCommand(rest.join(' '))
     const dev = `/dev/${tty}`
     v.byPid[pid] = dev
     const m = command.match(/^(\S*\/)?claude attach ([0-9a-f]{8})$/)

@@ -231,6 +231,13 @@ def order_rows(rows, order):
     return sorted(rest, key=lambda s: position.get(s['sessionId'], len(position)))
 
 
+# A claude run through the glibc loader (hosts whose glibc is too old) is listed by ps as the loader's line: read it as
+# `claude <args>`, as clientCommand in platform/linux.ts does; any other command stays as it is
+def client_command(command):
+    m = re.match(r'^\S*/ld-linux[^\s/]*\s+(?:--library-path\s+\S+\s+)?\S*/claude/versions/\d+\.\d+\.\d+(?:\s+(.*))?$', command)
+    return ('claude ' + m.group(1) if m.group(1) else 'claude') if m else command
+
+
 # Which windows show which session, from ps (parseWindows in state.ts): viewers (claude attach <id>), launchers, and
 # every process's terminal (by_pid: a regular session's own window)
 def parse_windows(ps):
@@ -239,7 +246,7 @@ def parse_windows(ps):
         parts = line.split()
         if len(parts) < 3 or parts[1] in ('??', '?', '-'):
             continue
-        pid, tty, command = parts[0], '/dev/' + parts[1], ' '.join(parts[2:])
+        pid, tty, command = parts[0], '/dev/' + parts[1], client_command(' '.join(parts[2:]))
         by_pid[pid] = tty
         m = re.match(r'^(\S*/)?claude attach ([0-9a-f]{8})$', command)
         if m:
@@ -253,7 +260,8 @@ def parse_windows(ps):
 
 
 def read_windows():
-    code, out, _ = run(['ps', '-A', '-o', 'pid=,tty=,command='])
+    # One -o per column, as windows() in register.tsx: procps reads `-o pid=,tty=,command=` as the pid column alone
+    code, out, _ = run(['ps', '-A', '-o', 'pid=', '-o', 'tty=', '-o', 'command='])
     return parse_windows(out if code == 0 else '')
 
 

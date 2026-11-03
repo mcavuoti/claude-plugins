@@ -404,8 +404,9 @@ async function readState($: any, sessionId: string): Promise<SessionState | null
 
 // Which terminal windows show each session: "claude attach <id>" viewers, agent views, and classic sessions by their pid
 async function windows($: any): Promise<Windows> {
-  // -A: every process, on macOS and on Linux (on macOS it's the same as -ax)
-  return parseWindows((await run($, ['ps', '-A', '-o', 'pid=,tty=,command='])).stdout)
+  // -A: every process, on macOS and on Linux (on macOS it's the same as -ax). One -o per column: a header runs to the end
+  // of its -o argument (POSIX), so procps reads `-o pid=,tty=,command=` as the pid column alone
+  return parseWindows((await run($, ['ps', '-A', '-o', 'pid=', '-o', 'tty=', '-o', 'command='])).stdout, platform.clientCommand)
 }
 
 // The window this session's panel was just used from (macOS: the front Terminal window, if it shows this session;

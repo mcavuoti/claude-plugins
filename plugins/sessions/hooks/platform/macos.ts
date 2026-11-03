@@ -125,6 +125,9 @@ export const macos: Platform = {
     await terminal(run, ['cerrar', tty])
   },
 
+  // Nothing runs through a loader here: ps lists claude as it is
+  clientCommand: command => command,
+
   async processProgram(run, pid) {
     const r = await run(['lsof', '-a', '-p', pid, '-d', 'txt', '-Fn'], { timeoutMs: 15000 })
     return r.exitCode === 0 ? r.stdout : ''

@@ -1,11 +1,11 @@
 import { expect, test } from 'claude-code/testing'
 
-import { exactTitlePattern, pickWindowShowingMe, terminalCommand } from '../hooks/platform/linux'
+import { clientCommand, exactTitlePattern, pickWindowShowingMe, programFromCmdline, terminalCommand } from '../hooks/platform/linux'
 import { parseWindows } from '../hooks/state'
 
 // The Linux platform's pure parts. They run on any system (the CI runs them on macOS and Linux)
 
-// One window of each kind, as `ps -A -o pid=,tty=,command=` lists them on macOS and on Linux
+// One window of each kind, as `ps -A -o pid= -o tty= -o command=` lists them on macOS and on Linux
 const PS_MAC = [
   '  101 ttys001  bash /Users/x/.claude/plugins/cache/m/sessions/0.10.0/hooks/visor.sh attach aaaaaaaa',
   '  102 ttys001  claude attach aaaaaaaa',
@@ -51,4 +51,27 @@ test('new window: each terminal emulator takes the command its own way', () => {
   expect(terminalCommand('xfce4-terminal', 'echo hi')).toEqual(['xfce4-terminal', '-x', 'bash', '-c', 'echo hi'])
   expect(terminalCommand('x-terminal-emulator', 'echo hi')).toEqual(['x-terminal-emulator', '-e', 'bash', '-c', 'echo hi'])
   expect(terminalCommand('some-unknown-term', 'echo hi')).toBe(null)
+})
+
+// A host whose glibc is too old runs claude through a loader, so ps lists the viewer as the loader's command line
+const LD = '/home/x/.local/lib/glibc-compat/ld-linux-x86-64.so.2 --library-path /home/x/.local/lib/glibc-compat /home/x/.local/share/claude/versions/2.1.317'
+
+test('a claude run through the glibc loader is read as claude: viewers and agent views are found, other programs left alone', () => {
+  expect(clientCommand(`${LD} attach aaaaaaaa`)).toBe('claude attach aaaaaaaa')
+  expect(clientCommand(`${LD} agents --cwd .`)).toBe('claude agents --cwd .')
+  expect(clientCommand(LD)).toBe('claude')
+  expect(clientCommand('claude attach aaaaaaaa')).toBe('claude attach aaaaaaaa')
+  expect(clientCommand('/lib64/ld-linux-x86-64.so.2 /usr/bin/ls -l')).toBe('/lib64/ld-linux-x86-64.so.2 /usr/bin/ls -l')
+  const ps = [` 301 pts/3    bash /x/hooks/visor.sh start`, ` 302 pts/3    ${LD} attach aaaaaaaa`, ` 303 pts/4    ${LD} agents --cwd .`].join('\n')
+  const v = parseWindows(ps, clientCommand)
+  expect(v.byId).toEqual({ aaaaaaaa: ['/dev/pts/3'] })
+  expect(v.clients).toEqual({ '/dev/pts/3': '302', '/dev/pts/4': '303' })
+  expect(v.agentsViews).toEqual([{ pid: '303', tty: '/dev/pts/4' }])
+  expect(pickWindowShowingMe(v, 'aaaaaaaa')).toBe('/dev/pts/3')
+})
+
+test("a loader's process runs the program named on its command line, not the loader", () => {
+  const cmdline = ['/home/x/.local/lib/glibc-compat/ld-linux-x86-64.so.2', '--library-path', '/home/x/.local/lib/glibc-compat', '/home/x/.local/share/claude/versions/2.1.317', 'attach', 'aaaaaaaa'].join('\0')
+  expect(programFromCmdline(cmdline)).toBe('/home/x/.local/share/claude/versions/2.1.317')
+  expect(programFromCmdline('claude\0attach\0aaaaaaaa')).toBe('')
 })

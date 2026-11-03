@@ -48,4 +48,4 @@ the desktop (X11 or Wayland) and the terminal app.
     your terminal's notifications (kitty, Ghostty) or your `Notification` hooks, and none after that for the same wait.
     `/sessions status` says what PushNotification and the notification channel answered.
 
-Anything off: note what you pressed, what the window showed, and the output of `ps -A -o pid=,tty=,command= | grep -E 'claude|visor'`.
+Anything off: note what you pressed, what the window showed, and the output of `ps -A -o pid= -o tty= -o command= | grep -E 'claude|visor'`.

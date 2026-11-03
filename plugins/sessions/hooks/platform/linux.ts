@@ -77,6 +77,20 @@ export const LINUX_TERMINALS = [
   'xterm',
 ]
 
+// A host whose glibc is too old for the claude binary runs it through a loader (`ld-linux… [--library-path DIR]
+// …/claude/versions/X.Y.Z <args>`), so ps lists a viewer or agent view as that line and never as `claude <args>`. This
+// reads such a line as `claude <args>`; any other command is returned as it is
+export function clientCommand(command: string): string {
+  const m = command.match(/^\S*\/ld-linux[^\s/]*\s+(?:--library-path\s+\S+\s+)?\S*\/claude\/versions\/\d+\.\d+\.\d+(?:\s+(.*))?$/)
+  return m ? (m[1] ? `claude ${m[1]}` : 'claude') : command
+}
+
+// The program a loader runs, from its NUL-separated /proc/<pid>/cmdline: the argument that is a claude version's
+// path; '' if it names none (/proc/<pid>/exe is the loader itself there)
+export function programFromCmdline(cmdline: string): string {
+  return cmdline.split('\0').find(arg => /\/claude\/versions\/\d+\.\d+\.\d+$/.test(arg)) ?? ''
+}
+
 export const linux: Platform = {
   name: 'linux',
 
@@ -128,9 +142,15 @@ export const linux: Platform = {
   // Nothing to close: a viewer ends with its session and the launcher leaves the plain shell
   async closeWindow() {},
 
+  clientCommand,
+
   async processProgram(run, pid) {
     const r = await run(['/bin/sh', '-c', 'printf "n%s" "$(readlink "/proc/$1/exe")"', 'sh', pid])
-    return r.exitCode === 0 ? r.stdout : ''
+    if (r.exitCode !== 0) return ''
+    if (!/\/ld-linux[^/]*$/.test(r.stdout)) return r.stdout
+    // Run through a loader: the program is on its command line
+    const program = programFromCmdline((await run(['cat', `/proc/${pid}/cmdline`])).stdout)
+    return program ? `n${program}` : r.stdout
   },
 
   async processCwd(run, pid) {
