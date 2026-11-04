@@ -420,6 +420,8 @@ test("s on a session that can't show the question: it's asked here instead, and 
   await w.clock.settle()
   expect(asked).toBe(1)
   expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === 'stop' && a[2] === 'bbbbbbbb')).toBe(true)
+  // The person's stop is remembered, so a plugin's wake leaves it stopped
+  expect(typeof w.store.get(`personStop:${BRAVO}`)).toBe('number')
   // An answer nobody asked for any more does nothing
   await $.session.receive({ text: buildNotice('answer', { sessionId: BRAVO, action: 'unshown', cameBack: true }), origin: PEER } as any)
   await w.clock.settle()

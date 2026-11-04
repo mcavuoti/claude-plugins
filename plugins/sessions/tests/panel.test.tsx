@@ -5,6 +5,7 @@ import {
   actionFromAnswer,
   reconcilePins,
   sparkline,
+  stoppedKind,
   stopReasons,
   daysUpTo,
   paneWidth,
@@ -93,6 +94,11 @@ test('colors: each official status gives its color and when the time counts from
 
 test("colors: a status that doesn't exist today shows as gray, not as done", () => {
   expect(colorOf({ status: 'paused' }, { finished: 1 }, 0).color).toBe('gray')
+})
+
+test("colors: the list's state (blocked after a respawn with orphaned background tasks) doesn't change them: status idle is idle", () => {
+  expect(colorOf({ status: 'idle', state: 'blocked', pid: 4242 }, { finished: 100 }, 200)).toEqual({ color: 'green', since: 100 })
+  expect(colorOf({ status: 'idle', state: 'blocked', pid: 4242 }, { finished: 100 }, 0)).toEqual({ color: 'yellow', since: 100 })
 })
 
 test('short time: now, minutes, hours and days', () => {
@@ -413,6 +419,20 @@ test('why a session stopped: retired for being idle, closed for lack of memory, 
   // A process that ends with no retire before it was stopped some other way (the person, a crash)
   expect(stopReasons(log + '\n[2026-10-26T14:00:00.000Z] [bg] bg claimed-spare cccccccc (fleet)\n[2026-10-26T15:00:00.000Z] [bg] bg settled cccccccc (killed)').cccccccc).toEqual({ at: Date.parse('2026-10-26T15:00:00.000Z'), why: 'stopped' })
   expect(stopReasons('')).toEqual({})
+  // A process that ended by itself (a crash) is told apart from one killed by a claude stop
+  expect(stopReasons('[2026-10-26T15:00:00.000Z] [bg] bg settled cccccccc (crashed): SIGKILL (137) before init').cccccccc?.why).toBe('ended')
+})
+
+test('why a stopped session is stopped: retired, closed for memory, the person (logged, or remembered until it ran again), else it ended by itself', () => {
+  expect(stoppedKind({ at: 1, why: 'idle' }, 5, 0)).toBe('idle')
+  expect(stoppedKind({ at: 1, why: 'low-memory' }, undefined, 0)).toBe('memory')
+  expect(stoppedKind({ at: 1, why: 'stopped' }, undefined, 0)).toBe('person')
+  expect(stoppedKind({ at: 1, why: 'ended' }, undefined, 0)).toBe('ended')
+  // No line at all: a machine or service restart, unless the panel's s stopped it and it hasn't been started since
+  expect(stoppedKind(undefined, undefined, 100)).toBe('ended')
+  expect(stoppedKind(undefined, 200, 100)).toBe('person')
+  expect(stoppedKind(undefined, 200, undefined)).toBe('person')
+  expect(stoppedKind(undefined, 200, 300)).toBe('ended')
 })
 
 test('reopen: only those from the last 2 h count towards the limit', () => {

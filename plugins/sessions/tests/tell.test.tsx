@@ -177,5 +177,5 @@ test('ccc tell for a stopped session: a running session wakes it under the wake 
   w.files.set(`${DATA}/inbox/${SID}`, `format=3\naction=wake\nat=${w.clock.now()}\nref=eeeeeeee\nreply=${DATA}/replies/1-2\n`)
   await w.clock.advance(600)
   expect(w.runs.some(a => a[1] === 'respawn' && a[2] === 'eeeeeeee')).toBe(false)
-  expect(w.files.get(`${DATA}/replies/1-2`)).toContain('result=failed\nstate=refused\nreason=“stopped one” wasn\'t retired for being idle')
+  expect(w.files.get(`${DATA}/replies/1-2`)).toContain('result=failed\nstate=refused\nreason=“stopped one” was stopped by you')
 })

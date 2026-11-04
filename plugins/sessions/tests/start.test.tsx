@@ -68,6 +68,15 @@ test('the heartbeat is rewritten every 15 s, with the pid from the official list
   expect(beat).toContain(`at=${1_000_000_000 + 15000}\n`)
 })
 
+test("after a restart with another model, the row shows the session's configured model at once, with no turn of its own", async ($, on) => {
+  // What the row showed before the restart: the model of the conversation's last turn
+  const w = world(on, { store: { [`state:${SID}`]: { created: 1, model: 'Sonnet 5.5', context: 40 } } })
+  // The restarted process's main loop model, as /model shows it (the world's session.model: Opus 5.5)
+  await startSession($, w)
+  await w.clock.settle()
+  expect((w.store.get(`state:${SID}`) as any)?.model).toBe('Opus 5.5')
+})
+
 test('a fresh focus request from ccc gives the panel the keyboard and is consumed; a stale one is dropped', async ($, on) => {
   const w = world(on)
   await startSession($, w)

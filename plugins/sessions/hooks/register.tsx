@@ -63,6 +63,7 @@ import {
   paneWidth,
   buildNotice,
   sparkline,
+  stoppedKind,
   stopReasons,
   storeNamespace,
   shellQuote,
@@ -340,7 +341,8 @@ function debugLine($: any, text: string) {
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
 // and the window in front, shared for 1.5 s by the seen check: at, windows / tty), answer:<id> (the answer to a Stop or
 // Restart question that session asked, when the asked session couldn't send it as a notice: format, sessionId,
-// action, cameBack, at; that session's panel takes it and deletes it).
+// action, cameBack, at; that session's panel takes it and deletes it), personStop:<id> (when the person stopped that
+// session from a panel: a plugin's wake leaves it stopped until it's started again).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
@@ -566,7 +568,7 @@ async function prune($: any) {
   const ids = new Set<string>()
   const keys = await storeKeys($)
   for (const k of keys) {
-    const m = k.match(/^(state|seen|title|waiting|restarted|reopened|needsSince|pushed|spend):(.+)$/)
+    const m = k.match(/^(state|seen|title|waiting|restarted|reopened|needsSince|pushed|spend|personStop):(.+)$/)
     if (m?.[2] && !alive.has(m[2])) ids.add(m[2])
   }
   let files: string[] = []
@@ -917,17 +919,23 @@ async function reopenPass($: any) {
   }
 }
 
-// Why a stopped session stopped, from the background service's log (stopReasons), read right then
-async function stopReasonOf($: any, id: string): Promise<StopReason | undefined> {
-  if (!daemonLog) return undefined
+// Why stopped sessions stopped, from the background service's log (stopReasons), read right then
+async function stopReasonsNow($: any): Promise<Record<string, StopReason>> {
+  if (!daemonLog) return {}
   const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
-  return r.exitCode === 0 ? stopReasons(r.stdout)[id] : undefined
+  return r.exitCode === 0 ? stopReasons(r.stdout) : {}
 }
 
-// Whether a session can be woken (another plugin's wake, ccc tell): running already, or stopped and wakeable. Only a
-// background session the service retired for being idle is woken, or one it closed for lack of memory once memory is
-// normal again. Never a regular session (it lives in its own window), one the person stopped, nor one closed for lack
-// of memory while memory is still short
+// Why a background session of the list with no process is stopped (stoppedKind): the log's reasons, read once by the
+// caller, and the person's stop this mod remembers
+async function stoppedOf($: any, s: any, reasons: Record<string, StopReason>): Promise<'person' | 'idle' | 'memory' | 'ended'> {
+  return stoppedKind(typeof s.id === 'string' ? reasons[s.id] : undefined, await storeGet($, `personStop:${s.sessionId}`), s.startedAt)
+}
+
+// Whether a session can be woken (another plugin's wake, ccc tell): running already, or stopped and wakeable. A
+// background session the service retired for being idle is woken, one that ended by itself (a crash, or the machine or
+// the service restarted under it), and one it closed for lack of memory once memory is normal again. Never a regular
+// session (it lives in its own window), one the person stopped, nor one closed for lack of memory while memory is short
 type WakeVerdict = { state: 'running' } | { state: 'refused'; detail: string } | { state: 'wake'; id: string; name: string }
 async function wakeVerdict($: any, ref: string): Promise<WakeVerdict> {
   const s = lastList.find(x => refOf(x) === ref)
@@ -935,13 +943,10 @@ async function wakeVerdict($: any, ref: string): Promise<WakeVerdict> {
   const name = String(projectRows.find(f => f.sessionId === s.sessionId)?.title ?? (s.name || s.id || ref))
   if (s.kind !== 'background' || typeof s.id !== 'string') return { state: 'refused', detail: `“${name}” is a regular session: it lives in its own window` }
   if (s.pid) return { state: 'running' }
-  const why = await stopReasonOf($, s.id)
-  if (why?.why === 'idle') return { state: 'wake', id: s.id, name }
-  if (why?.why === 'low-memory') {
-    if ((await platform.memoryNormal(sys($))) === true) return { state: 'wake', id: s.id, name }
-    return { state: 'refused', detail: `Claude closed “${name}” for lack of memory, and memory is still short` }
-  }
-  return { state: 'refused', detail: `“${name}” wasn't retired for being idle (it was stopped by you, or another way): Enter or u restarts it` }
+  const why = await stoppedOf($, s, await stopReasonsNow($))
+  if (why === 'person') return { state: 'refused', detail: `“${name}” was stopped by you: Enter or u restarts it` }
+  if (why === 'memory' && (await platform.memoryNormal(sys($))) !== true) return { state: 'refused', detail: `Claude closed “${name}” for lack of memory, and memory is still short` }
+  return { state: 'wake', id: s.id, name }
 }
 
 // The sessions other plugins asked to wake ($.sessions.wake), from this mod's own 0.5 s timer: claude respawn, if
@@ -1622,6 +1627,8 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
       $.ui.toast(`Couldn't stop “${f.title}”`)
       return
     }
+    // The person stopped it: a plugin's wake leaves it stopped (stoppedKind), even once the service's log no longer has it
+    await storeSet($, `personStop:${f.sessionId}`, await $.clock.now())
   }
   if (action !== 'stop') {
     const r = await run($, [claude, 'rm', f.id])
@@ -2698,21 +2705,24 @@ async function ownVersion($: any): Promise<string> {
   return versionRead
 }
 
-// A session of the official list as another plugin sees it
-async function statusOf($: any, s: any, now: number): Promise<SessionsStatus> {
+// A session of the official list as another plugin sees it. reasons: the service log's stop reasons, read once by the
+// caller when a row it answers is stopped
+async function statusOf($: any, s: any, now: number, reasons: () => Promise<Record<string, StopReason>>): Promise<SessionsStatus> {
   const e = await readState($, s.sessionId)
   const mine = s.sessionId === myId
   const hb = mine ? 'ok' : s.pid ? heartbeatStatus((await readHeartbeats($, [s.sessionId]))[s.sessionId] ?? null, s.pid, now) : 'missing'
   const shown = projectRows.find(f => f.sessionId === s.sessionId)?.title
+  const state = s.status === 'busy' ? 'working' : s.status === 'waiting' ? 'waiting' : s.status === 'idle' ? 'idle' : 'stopped'
   return {
     ref: refOf(s),
     sessionId: s.sessionId,
     name: shown ?? (typeof s.name === 'string' && s.name ? s.name : null),
-    state: s.status === 'busy' ? 'working' : s.status === 'waiting' ? 'waiting' : s.status === 'idle' ? 'idle' : 'stopped',
+    state,
     panel: hb === 'ok' ? 'ok' : hb === 'other-format' ? 'other-format' : 'none',
     root: mine ? myCwd : typeof e?.root === 'string' ? e.root : null,
     background: s.kind === 'background',
     agent: mine ? (agentFor === myId ? myAgent : null) : typeof e?.agent === 'string' ? e.agent : null,
+    ...(state === 'stopped' && s.kind === 'background' && !s.pid ? { stopped: await stoppedOf($, s, await reasons()) } : {}),
   }
 }
 
@@ -2737,16 +2747,19 @@ function sessionsApi($: any): Sessions {
       const now = await $.clock.now()
       const out: SessionsStatus[] = []
       const done = new Set<string>()
+      // The service's log is read once, and only when a row is stopped
+      let log: Record<string, StopReason> | null = null
+      const reasons = async () => (log ??= await stopReasonsNow($))
       for (const ref of strings(input?.refs)) {
         const s = lastList.find(x => refOf(x) === ref)
         if (done.has(s?.sessionId ?? `gone:${ref}`)) continue
         done.add(s?.sessionId ?? `gone:${ref}`)
-        out.push(s ? await statusOf($, s, now) : { ref, sessionId: null, name: null, state: 'gone', panel: 'none', root: null, background: false, agent: null })
+        out.push(s ? await statusOf($, s, now, reasons) : { ref, sessionId: null, name: null, state: 'gone', panel: 'none', root: null, background: false, agent: null })
       }
       for (const name of strings(input?.names)) {
         for (const s of lastList.filter(x => x.name === name && !done.has(x.sessionId))) {
           done.add(s.sessionId)
-          out.push(await statusOf($, s, now))
+          out.push(await statusOf($, s, now, reasons))
         }
       }
       return { ready: true, rows: out }
@@ -2935,6 +2948,8 @@ async function start($: any) {
     void recordTitle($).catch(() => {})
     bg(readAgent($).then(() => publishUsage($)))
     bg(pinRemoteSessions($))
+    // Running again: a stop of the person's from before no longer keeps a plugin's wake away from it
+    if (myId) bg(storeDelete($, `personStop:${myId}`))
   })
   await step('panel', async () => {
     if (!(await closedByYou($))) {
