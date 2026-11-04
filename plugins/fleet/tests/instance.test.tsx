@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
+import { dateLine } from '../hooks/roster'
 import { BAND, DEC, FAKE_LOG, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 import { OWNER, PROJECT } from './up.test'
 
@@ -50,9 +51,9 @@ test('an instance binds from its settings, writes a heartbeat with its spend, is
   await tick(w)
   expect(json(w, `${HB}/state.json`)).toMatchObject({ format: 1, instance: 'Owner A', slug: 'owner-a', ref: REF, sessionId: SID, bound: true, agentType: 'owner', cost: 0.25, settingsHash: hashText('{"env":{}}\n'), budget: { usd: 0.25, cap: 1, state: 'ok' } })
   expect(json(w, `${HB}/spend.json`)).toMatchObject({ day: '2026-11-02', usd: 0.25, last: 0.25 })
-  // The seed: once, as fleet's own prompt, from the role's seed and the brief
+  // The seed: once, as fleet's own prompt, from the role's seed and the brief, and today's date (in the machine's zone)
   expect(w.submits).toEqual([
-    `You are Owner A, the owner of this project's fleet (the project folder is ${ROOT}; its roster is .claude/fleet/roster.json).\n\nYour brief: You own notes/a.\n\nRead the charter, then plan your part (Owner A).`,
+    `You are Owner A, the owner of this project's fleet (the project folder is ${ROOT}; its roster is .claude/fleet/roster.json).\n\nYour brief: You own notes/a.\n\nRead the charter, then plan your part (Owner A).\n\n${dateLine(w.clock.now(), -new Date(w.clock.now()).getTimezoneOffset())}`,
   ])
   expect(json(w, `${HB}/seed-${REF}.json`)).toMatchObject({ format: 1, ref: REF })
   await tick(w, 40000)

@@ -445,7 +445,7 @@ export type Command =
   | { kind: 'answer'; items: AnswerItem[] }
   | { kind: 'note'; n: number | string; text: string }
   | { kind: 'drop'; target: string; why: string }
-  | { kind: 'status' }
+  | { kind: 'status'; all?: boolean }
   | { kind: 'init'; template: string; commitRegister: boolean }
   | { kind: 'world'; action: 'list' | 'add' | 'remove'; glob: string }
   | { kind: 'accept'; paths: string[] }
@@ -505,7 +505,8 @@ export function parseCommand(args: string): Command {
   const tail = line.slice(word.length).trim()
   switch (word.toLowerCase()) {
     case 'status':
-      return { kind: 'status' }
+      if (more.some(w => w !== '--all')) return { kind: 'bad', reason: 'write /fleet status, or /fleet status --all for every file behind or suspect' }
+      return more.includes('--all') ? { kind: 'status', all: true } : { kind: 'status' }
     case 'help':
       return { kind: 'help' }
     case 'brief': {
@@ -636,7 +637,7 @@ export const HELP = [
   '/fleet note <n> <text> add a note for whoever asked question n',
   '/fleet drop <n> [why]  drop the decision of question n without answering it',
   '                       answers, notes and drops are taken over Remote Control too; the rest is typed at a terminal',
-  '/fleet status          what fleet does in this session, the shared files, what changed and who is behind',
+  '/fleet status          what fleet does in this session, the shared files, what changed and who is behind (--all: each file)',
   '/fleet world           the shared files (world.json); /fleet world add <glob>, /fleet world remove <glob>',
   '/fleet accept [path…]  stamp changes made outside fleet (your editor, a script) as yours, one path or several; alone, lists them',
   '/fleet accept checks   let fleet run the check scripts world.json lists, as they are now',
