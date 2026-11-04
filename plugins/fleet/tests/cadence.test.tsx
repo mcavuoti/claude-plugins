@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
-import { FAKE_LOG, FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
+import { BAND, FAKE_LOG, FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 import { OWNER } from './up.test'
 
 // An instance's cadence (a mark and one nudge when nothing landed in a period), its fresh periods (/clear and its
@@ -52,21 +52,25 @@ async function instance($: any, on: any, role: Record<string, unknown>) {
   return w
 }
 
-test('nothing landed in its cadence period: one nudge from its own fleet, never a second for that period', WITH_SESSIONS, async ($, on) => {
+test('nothing landed in its cadence period: a nudge from its own fleet each period while nothing lands, at most 3 a day', { ...WITH_SESSIONS, timeoutMs: 60000 }, async ($, on) => {
   const w = await instance($, on, { cadenceH: 0.25, context: 'long' })
   await tick(w)
   expect(w.submits.length).toBe(1)
   const ctx: any = await $.classic.SessionStart({ source: 'startup', agent_type: 'owner' } as any)
-  expect(ctx.additionalContext.join('\n')).toContain('Keep your journal at journals/owner-a.md: what you did, what you found (a negative result too), where you stopped. Land something every 15 min (in the shared files, or your journal).')
+  expect(ctx.additionalContext.join('\n')).toContain("Keep your journal at journals/owner-a.md: what you did, what you found (a negative result too), where you stopped. Land something every 15 min (in the shared files, or your journal; while you own open board items, a journal line alone doesn't count).")
   expect(ctx.additionalContext.join('\n')).toContain('draft it with mcp__fleet__send')
   await tick(w, 8 * 60000)
   expect(w.submits.length).toBe(1)
   await tick(w, 8 * 60000)
   expect(w.submits.length).toBe(2)
-  expect(w.submits[1]).toBe("fleet: 15 min since you last landed anything in the shared world (your cadence is 15 min). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (journals/owner-a.md) and where your work goes; or ask the person with mcp__fleet__decide. This is fleet's one nudge for this period.")
-  expect(json(w, `${HB}/nudges.json`)).toMatchObject({ format: 1, count: 1 })
-  await tick(w, 20 * 60000)
+  expect(w.submits[1]).toBe("fleet: 15 min since you last landed anything in the shared world (your cadence is 15 min). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (journals/owner-a.md) and where your work goes; or ask the person with mcp__fleet__decide. fleet nudges once each period while nothing lands, at most 3 a day.")
+  expect(json(w, `${HB}/nudges.json`)).toMatchObject({ format: 1, count: 1, cadenceCount: 1 })
+  // Not again in the same period; again in the next one (it was once ever, while nothing landed)
+  await tick(w, 10 * 60000)
   expect(w.submits.length).toBe(2)
+  await tick(w, 10 * 60000)
+  expect(w.submits.length).toBe(3)
+  expect(w.submits[2]).toContain('since you last landed anything')
   // It lands its journal (a negative result counts): the next period counts from there
   const r: any = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/journals/owner-a.md`, content: 'result: nothing found in the first source\n' } as any)
   expect(r.deny).toBe(undefined)
@@ -74,8 +78,47 @@ test('nothing landed in its cadence period: one nudge from its own fleet, never 
   expect(json(w, `${HB}/state.json`)).toMatchObject({ cadenceH: 0.25, context: 'long', journal: 'journals/owner-a.md' })
   expect(json(w, `${HB}/state.json`).lastLanding).toBeGreaterThan(Date.UTC(2026, 10, 2, 12, 30, 0))
   await tick(w, 16 * 60000)
-  expect(w.submits.length).toBe(3)
-  expect(w.submits[2]).toContain('since you last landed anything')
+  expect(w.submits.length).toBe(4)
+  expect(w.submits[3]).toContain('since you last landed anything')
+  // Three today: no fourth in the next period with nothing landed
+  await tick(w, 16 * 60000)
+  expect(w.submits.length).toBe(4)
+  expect(json(w, `${HB}/nudges.json`)).toMatchObject({ cadenceCount: 3 })
+})
+
+test('an instance that owns open board items: a journal line alone doesn’t satisfy its cadence, and the nudge names its items', WITH_SESSIONS, async ($, on) => {
+  const w = await instance($, on, { cadenceH: 0.25, context: 'long' })
+  w.touch(`${ROOT}/board/B-2.md`, '---\nowner: Owner A\nstatus: open\n---\n# B-2 the second part\n')
+  w.touch(`${ROOT}/board/B-3.md`, '---\nowner: Owner C\nstatus: open\n---\n# B-3\n')
+  w.touch(`${ROOT}/board/B-1.md`, '---\nowner: Owner A\nstatus: done\n---\n# B-1\n')
+  await tick(w)
+  // It lands only its journal ("nothing to do without a request"): its cadence counts from its start all the same
+  await $.tool.call({ tool: 'Write', file_path: `${ROOT}/journals/owner-a.md`, content: 'no change; nothing to do without a request\n' } as any)
+  await tick(w, 16 * 60000)
+  const nudge = w.submits.find(x => x.includes('Your open items'))
+  expect(nudge).toContain('Your open items: B-2. They\'re your work: take the first one that needs nobody\'s decision and land a step of it')
+  expect(json(w, `${HB}/state.json`)).toMatchObject({ owns: ['B-2'] })
+  const status = await fleet($, 'status')
+  expect(status).toContain('owns 1 open item(s) (B-2), landed only its journal in')
+  // Its context says so from the start, and that Read reads PDFs
+  const ctx: any = await $.classic.SessionStart({ source: 'startup', agent_type: 'owner' } as any)
+  expect(ctx.additionalContext.join('\n')).toContain('The board items you own (owner: Owner A, status open or started) are your work')
+  expect(ctx.additionalContext.join('\n')).toContain('Read reads PDFs')
+})
+
+test('freshH: a short cadence nudges without clearing; the context is cleared only each fresh period', WITH_SESSIONS, async ($, on) => {
+  const cleared: string[] = []
+  on('command.run', { command: 'clear' }, () => (cleared.push('x'), { text: '' }))
+  const w = await instance($, on, { cadenceH: 0.25, freshH: 1 })
+  await tick(w)
+  await $.tool.call({ tool: 'Write', file_path: `${ROOT}/journals/owner-a.md`, content: '# Owner A\n\n- next: the second part\n' } as any)
+  await tick(w, 31 * 60000)
+  expect(cleared).toEqual([])
+  expect(w.submits.some(x => x.includes('since you last landed anything'))).toBe(true)
+  expect(json(w, `${HB}/state.json`)).toMatchObject({ cadenceH: 0.25, freshH: 1 })
+  await tick(w, 31 * 60000)
+  expect(cleared).toEqual(['x'])
+  expect(w.submits[w.submits.length - 1]).toContain('fleet cleared your context after 1 h')
 })
 
 test('a fresh period: a period-old conversation, idle, its journal written: fleet clears it and hands it the journal', WITH_SESSIONS, async ($, on) => {
@@ -170,6 +213,62 @@ test('the sweeper marks an instance quiet past its cadence and wakes a retired o
   expect(calls(w, 'wake').length).toBe(1)
   const brief = await fleet($, 'brief')
   expect(brief).toContain('   - Owner A: nothing landed in 3 h (its cadence is 2 h)')
+})
+
+test('after a restart: the band and /fleet status say which instances it stopped, /fleet up wakes them; one stopped by the person or retired is said apart', WITH_SESSIONS, async ($, on) => {
+  const now = Date.UTC(2026, 10, 2, 12, 0, 0)
+  const beat = (name: string, slug: string, ref: string, extra: Record<string, unknown> = {}) => JSON.stringify({ format: 1, instance: name, slug, ref, sessionId: 'dddddddd-0000-0000-0000-000000000000', at: now - HOUR, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: now - 3 * HOUR, lastLanding: now - 30 * 60000, ...extra })
+  const w = world(on, {
+    background: false,
+    files: {
+      [`${FLEET}/roster.json`]: roster({ cadenceH: 2 }),
+      [`${ROOT}/.claude/agents/owner.md`]: OWNER,
+      [`${FLEET}/instances/owner-a/state.json`]: beat('Owner A', 'owner-a', 'aaaaaaa1'),
+      [`${FLEET}/instances/owner-c/state.json`]: beat('Owner C', 'owner-c', 'ccccccc1'),
+    },
+  })
+  sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'ended' }, ccccccc1: { ...row('ccccccc1', 'Owner C', 'stopped'), stopped: 'person' } } })
+  await startSession($, w)
+  await tick(w, 10100)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await ui.drawn())).toContain('1 stopped since a restart: /fleet up --wave 1')
+  await ui.unmount()
+  const status = await fleet($, 'status')
+  expect(status).toContain('Owner A · owner · Owners · wave 1 · stopped since a restart (/fleet up wakes it) · job aaaaaaa1, session dddddddd')
+  expect(status).toContain('Owner C · owner · Owners · wave 1 · stopped by you · job ccccccc1')
+  // What it waits on and when it works next
+  expect(status).toContain('next cadence in 1 h')
+  const brief = await fleet($, 'brief')
+  expect(brief).toContain('   - stopped since a restart: Owner A (/fleet up --wave 1 brings them back)')
+  // /fleet up asks sessions to wake the one a restart stopped; the one the person stopped is left alone
+  const up = await fleet($, 'up')
+  expect(up).toContain('Owner A: waking')
+  expect(up).toContain('Owner C: stopped by you, left alone (Enter or u in the panel restarts it)')
+  expect(calls(w, 'wake').map(x => x.ref)).toEqual(['aaaaaaa1'])
+})
+
+test('a retired instance with something for it the wakes’ cap holds back: /fleet status and the brief say why it wasn’t woken', WITH_SESSIONS, async ($, on) => {
+  const now = Date.UTC(2026, 10, 2, 12, 0, 0)
+  const beat = JSON.stringify({ format: 1, instance: 'Owner C', slug: 'owner-c', ref: 'ccccccc1', sessionId: 'ccccccc1-sid', at: now - HOUR, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: now - 5 * HOUR, lastLanding: null })
+  const w = world(on, {
+    background: false,
+    files: {
+      [`${FLEET}/roster.json`]: roster({ cadenceH: 2 }, { wakes: { everyMin: 60, perDay: 1 } }),
+      [`${ROOT}/.claude/agents/owner.md`]: OWNER,
+      [`${FLEET}/instances/owner-c/state.json`]: beat,
+      [`${FLEET}/instances/owner-c/nudges.json`]: JSON.stringify({ format: 1, day: '2026-11-02', count: 1, last: now - 3 * HOUR }),
+    },
+  })
+  sessionsSay(w, { rows: { ccccccc1: { ...row('ccccccc1', 'Owner C', 'stopped'), stopped: 'idle' } } })
+  await startSession($, w)
+  await tick(w, 61000)
+  expect(calls(w, 'wake')).toEqual([])
+  const status = await fleet($, 'status')
+  expect(status).toContain('retired for being idle (fleet wakes it when something is for it)')
+  expect(status).toContain('not woken')
+  expect(status).toContain('wakes 1/1 today')
+  const brief = await fleet($, 'brief')
+  expect(brief).toContain('   - Owner C: retired for being idle; not woken: wakes 1/1 today')
 })
 
 test('/fleet brief: what needs you, what changed and who changed it, what’s blocked, the spend, the inputs and ideas', WITH_SESSIONS, async ($, on) => {

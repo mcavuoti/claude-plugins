@@ -34,6 +34,9 @@ export type BriefFacts = {
     cadence: { name: string; hours: number; cadenceH: number }[]
     noFleet: string[]
     down: string[]
+    /** Instances not running though nobody took them down: a restart stopped them (wave: the highest of them), or the
+     * background service retired them for being idle (why the sweeper last didn't wake one, when it didn't) */
+    stopped?: { restart: string[]; wave: number; retired: { name: string; notWoken: string | null }[] }
     stale: { name: string; files: number }[]
     /** What auto mode blocked each instance today, which only that session's /permissions lists */
     autoMode?: { name: string; blocks: BlocksFile }[]
@@ -144,6 +147,8 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
     ...(b.autoMode ?? []).flatMap(x => blocksLines(x.name, x.blocks, f.me.offsetMin).map((l, i) => `${i ? '     ' : '   - '}${l}`)),
     ...b.noFleet.map(x => `   - ${x}: running with no fleet (u in the panel restarts it)`),
     ...b.down.map(x => `   - ${x}: down (/fleet up "${x}" brings it back)`),
+    ...(b.stopped?.restart.length ? [`   - stopped since a restart: ${b.stopped.restart.join(', ')} (/fleet up --wave ${b.stopped.wave} brings them back)`] : []),
+    ...(b.stopped?.retired ?? []).map(x => `   - ${x.name}: retired for being idle${x.notWoken ? `; not woken: ${x.notWoken}` : ' (fleet wakes it when something is for it)'}`),
     ...(f.derived ?? []).map(d => `   - stale: ${d.path} (${d.kind}, owned by ${d.owner}): ${d.pins.join(', ')} moved since it cited them`),
     ...(f.slots ?? []).flatMap(x => x.waiting.map(w => `   - ${w.name} waits for the slot ${x.slot} (${ago(f.now - w.at)})`)),
   ]

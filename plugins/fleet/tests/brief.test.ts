@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import { checkResource, isAnswerOrigin, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, preAnswer, resourceDelivery } from '../hooks/authority'
 import { briefText, chiefLines, closedLine, type BriefFacts } from '../hooks/brief'
 import { globList, type ChangeEvent } from '../hooks/changes'
-import { cadenceOf, freshDue, handoffText, hoursText, instancesOf, journalTail, lintRoster } from '../hooks/roster'
+import { boardItemOf, cadenceOf, freshDue, handoffText, hoursText, instancesOf, journalTail, lintRoster, ownsOpenItem } from '../hooks/roster'
 
 // Who may command (person origins, launch prompts, outside marks, levels, pre-answering, resources), the cadence and
 // fresh periods, and the brief: pure logic
@@ -57,13 +57,19 @@ test('a resource: what and why, optional cost, by when and alternatives; its del
 })
 
 test('cadence: from the last landing or the start, due past the period; fresh periods only for those that don’t keep a long context', () => {
-  expect(cadenceOf({ cadenceH: 6, lastLanding: null, startedAt: NOW - 7 * HOUR, now: NOW })).toEqual({ due: true, anchor: NOW - 7 * HOUR, hours: 7 })
+  expect(cadenceOf({ cadenceH: 6, lastLanding: null, startedAt: NOW - 7 * HOUR, now: NOW })).toEqual({ due: true, anchor: NOW - 7 * HOUR, hours: 7, key: `${NOW - 7 * HOUR}:1`, nextMs: 5 * HOUR, journalOnly: false })
+  // A period each cadence: the key changes with each one, so a nudge goes once per period while nothing lands
+  expect(cadenceOf({ cadenceH: 6, lastLanding: null, startedAt: NOW - 13 * HOUR, now: NOW }).key).toBe(`${NOW - 13 * HOUR}:2`)
+  // While it owns open board items only work landed elsewhere counts: a journal line alone doesn't reset it
+  const owning = cadenceOf({ cadenceH: 6, lastLanding: NOW - HOUR, lastWork: NOW - 8 * HOUR, ownsOpen: 2, startedAt: NOW - 9 * HOUR, now: NOW })
+  expect(owning).toMatchObject({ due: true, anchor: NOW - 8 * HOUR, journalOnly: true })
+  expect(cadenceOf({ cadenceH: 6, lastLanding: NOW - HOUR, lastWork: NOW - 8 * HOUR, ownsOpen: 0, startedAt: NOW - 9 * HOUR, now: NOW }).due).toBe(false)
   expect(cadenceOf({ cadenceH: 6, lastLanding: NOW - HOUR, startedAt: NOW - 7 * HOUR, now: NOW }).due).toBe(false)
   expect(cadenceOf({ cadenceH: null, lastLanding: null, startedAt: 0, now: NOW }).due).toBe(false)
   expect(hoursText(0.25)).toBe('15 min')
   expect(hoursText(7.9)).toBe('7 h')
   expect(hoursText(50)).toBe('2 d')
-  const due = { context: 'fresh' as const, cadenceH: 6, conversationAt: NOW - 7 * HOUR, journalAt: NOW - HOUR, now: NOW, idleMs: 120000, pending: false }
+  const due = { context: 'fresh' as const, freshH: 6, conversationAt: NOW - 7 * HOUR, journalAt: NOW - HOUR, now: NOW, idleMs: 120000, pending: false }
   expect(freshDue(due)).toBe(true)
   expect(freshDue({ ...due, context: 'long' })).toBe(false)
   expect(freshDue({ ...due, journalAt: NOW - 8 * HOUR })).toBe(false)
@@ -71,7 +77,13 @@ test('cadence: from the last landing or the start, due past the period; fresh pe
   expect(freshDue({ ...due, idleMs: 5000 })).toBe(false)
   expect(freshDue({ ...due, conversationAt: NOW - HOUR })).toBe(false)
   expect(journalTail('a\nb\nc\n', 3)).toBe('c')
-  expect(handoffText({ name: 'Owner A', role: 'owner', cadenceH: 6, journal: 'journals/owner-a.md' }, '/Users/x/proj', 'c', false)).toContain("Your journal's last entries:\n\nc")
+  expect(handoffText({ name: 'Owner A', role: 'owner', freshH: 6, journal: 'journals/owner-a.md' }, '/Users/x/proj', 'c', false)).toContain("Your journal's last entries:\n\nc")
+  // A board item's owner and status, front matter or plain lines; open and started are owned work
+  expect(boardItemOf('---\nowner: Area A\nstatus: started\n---\n# B-3\n')).toEqual({ owner: 'Area A', status: 'started' })
+  expect(boardItemOf('# B-4\n- **Owner:** Area A\n- **Status:** Open\n')).toEqual({ owner: 'Area A', status: 'open' })
+  expect(ownsOpenItem({ owner: 'area a', status: 'open' }, 'Area A')).toBe(true)
+  expect(ownsOpenItem({ owner: 'Area A', status: 'done' }, 'Area A')).toBe(false)
+  expect(ownsOpenItem({ owner: 'open', status: 'open' }, 'Area A')).toBe(false)
 })
 
 test('the roster: a role’s context and journal, by default fresh and journals/<slug>.md; a journal under .claude/ is refused', () => {
