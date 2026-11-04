@@ -116,8 +116,9 @@ export type SessionsCurrent = {
 export type SessionsState = 'working' | 'waiting' | 'idle' | 'stopped' | 'gone'
 /** 0.13.4. Why a stopped background session is stopped: person (the person stopped it: a claude stop, or the panel's s,
  * until it's started again); idle (the background service retired it for being idle); memory (closed for lack of
- * memory); ended (it ended by itself: a crash, or the machine or the background service restarted under it) */
-export type SessionsStopped = 'person' | 'idle' | 'memory' | 'ended'
+ * memory); ended (it ended by itself, on the service log's evidence: a crash, or the machine or the background service
+ * restarted under it); unknown (nothing says why: wake refuses it, as a person's stop) */
+export type SessionsStopped = 'person' | 'idle' | 'memory' | 'ended' | 'unknown'
 /** Another session, from the panel's last refresh (every 3 s) */
 export type SessionsStatus = {
   ref: SessionsRef

@@ -285,8 +285,10 @@ test("wake after a reboot or a crash: a background session that ended with no st
   const bg = (id: string, name: string, extra: Record<string, unknown> = {}) => ({ id, sessionId: `${id}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', name, ...extra })
   const sessionsList = [
     ...list(),
-    // The machine restarted: the process died with no line in the service's log
+    // The machine restarted: the process died with no line of its own; the service's next start found workers dead
     bg('dddddddd', 'rebooted', { startedAt: at - 3600000 }),
+    // Nothing in the log says why it stopped (its lines rolled out): not woken
+    bg('55555555', 'no evidence', { startedAt: at - 3600000 }),
     // Stopped with claude stop (the panel's s, or typed): its process was killed
     bg('eeeeeeee', 'stopped by the person', { startedAt: at - 3600000 }),
     // It crashed
@@ -314,10 +316,15 @@ test("wake after a reboot or a crash: a background session that ended with no st
       '[2026-10-26T09:32:00.000Z] [bg] bg retire 33333333: settled, idle 61m',
       '[2026-10-26T09:32:01.000Z] [bg] bg settled 33333333 (done)',
       '[2026-10-26T09:33:00.000Z] [bg] bg retire 44444444: settled, idle 38h [low memory, pinned]',
+      // Started again after the person's stop from the panel
+      '[2026-10-26T09:40:00.000Z] [bg] bg claimed-spare 22222222 (fleet)',
+      // The machine restarted: the service's next start found its workers dead
+      '[2026-10-26T09:50:00.000Z] [supervisor] ─── daemon start ─── version=2.1.316 pid=1 origin=transient',
+      '[2026-10-26T09:50:01.000Z] [bg] bg adopt: adopted=0 respawned=0 dead=3',
     ].join('\n'),
   )
   await startSession($, w)
-  const rows = (await call($, 'status', { refs: ['dddddddd', 'eeeeeeee', 'ffffffff', '11111111', '22222222', '33333333', '44444444', 'aaaaaaaa'] })).rows
+  const rows = (await call($, 'status', { refs: ['dddddddd', 'eeeeeeee', 'ffffffff', '11111111', '22222222', '33333333', '44444444', '55555555', 'aaaaaaaa'] })).rows
   expect(Object.fromEntries(rows.map((r: any) => [r.ref, r.stopped ?? null]))).toEqual({
     dddddddd: 'ended',
     eeeeeeee: 'person',
@@ -326,8 +333,22 @@ test("wake after a reboot or a crash: a background session that ended with no st
     '22222222': 'ended',
     '33333333': 'idle',
     '44444444': 'memory',
+    '55555555': 'unknown',
     aaaaaaaa: null,
   })
+  // The person's claude stop the log shows is remembered: it outlives the log's tail
+  expect(w.store.get('personStop:eeeeeeee-0000-0000-0000-000000000000')).toBe(Date.parse('2026-10-26T09:30:00.000Z'))
+  w.files.set('/Users/x/daemon.log', '')
+  expect((await call($, 'status', { refs: ['eeeeeeee', 'dddddddd'] })).rows.map((r: any) => r.stopped)).toEqual(['person', 'unknown'])
+  w.files.set('/Users/x/daemon.log', [
+    '[2026-10-26T09:00:00.000Z] [bg] bg claimed-spare dddddddd (fleet)',
+    '[2026-10-26T09:00:00.000Z] [bg] bg claimed-spare eeeeeeee (fleet)',
+    '[2026-10-26T09:30:00.000Z] [bg] bg settled eeeeeeee (killed)',
+    '[2026-10-26T09:31:00.000Z] [bg] bg settled ffffffff (crashed): SIGKILL (137) before init',
+    '[2026-10-26T09:40:00.000Z] [bg] bg claimed-spare 22222222 (fleet)',
+    '[2026-10-26T09:50:01.000Z] [bg] bg adopt: adopted=0 respawned=0 dead=3',
+  ].join('\n'))
+  expect(await (async () => { const r = await call($, 'wake', { ref: '55555555', reason: 'x' }); return `${r.state}: ${r.detail}` })()).toBe('refused: nothing says why “no evidence” stopped (not a crash or a restart the service\'s log shows): Enter or u restarts it')
   const wake = async (ref: string) => {
     const r = await call($, 'wake', { ref, reason: 'x' })
     return r.ok ? r.state : `${r.state}: ${r.detail}`

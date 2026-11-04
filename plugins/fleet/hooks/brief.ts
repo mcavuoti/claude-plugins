@@ -200,10 +200,18 @@ export function closedLine(r: { id: string; kind?: string; change?: { path: stri
   return null
 }
 
-/** A closed choice's outcome in words: each question and what it was answered (a label, or the person's words), or
- * dropped; for the brief, and for a session that waited on it */
-export function outcomeWords(r: { state?: string; questions: { question: string }[]; answers: ({ label?: string; text?: string; origin?: string } | null)[] }): string {
+/** A closed decision's outcome in words: for a choice, each question and what it was answered (a label, or the person's
+ * words), or dropped; for a change, a resource or an outbound, what the person did with it and his words (applied,
+ * rejected, stale; done, no; sent, done, rejected). For the brief, and for a session that waited on it */
+export function outcomeWords(r: { kind?: string; state?: string; questions: { question: string }[]; answers: ({ label?: string; text?: string; note?: string; origin?: string } | null)[] }): string {
   if (r.state === 'dropped') return 'dropped, unanswered'
+  if (r.kind === 'change' || r.kind === 'resource' || r.kind === 'outbound') {
+    const a = r.answers[0]
+    const words = a?.note || a?.text
+    if (!a?.label) return words ? `"${shown(words, 200)}"` : 'closed'
+    const label = a.label === 'stale' ? 'not applied (its file changed after it was drafted)' : a.label
+    return `${label}${words ? `: "${shown(words, 200)}"` : ''}`
+  }
   const parts = r.questions.map((q, i) => {
     const a = r.answers[i]
     const what = !a ? 'not answered' : a.label !== undefined ? a.label : `"${shown(a.text ?? '', 160)}"`

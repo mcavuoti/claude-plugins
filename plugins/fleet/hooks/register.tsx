@@ -424,6 +424,8 @@ const warned = atom({ plugin: 'fleet', key: 'warned' } as const, {} as Record<st
 const flags = atom({ plugin: 'fleet', key: 'flags' } as const, 0)
 const ownTold = atom({ plugin: 'fleet', key: 'ownTold' } as const, {} as Record<string, number>)
 const waitsOn = atom({ plugin: 'fleet', key: 'waitsOn' } as const, {} as Record<string, number>)
+// What fleet's change dialog came to, for this session's model at its next step (it closed with no turn of its own)
+const dialogNews = atom({ plugin: 'fleet', key: 'dialogNews' } as const, [] as string[])
 const overBudget = atom({ plugin: 'fleet', key: 'overBudget' } as const, 0)
 const seedSent = atom({ plugin: 'fleet', key: 'seedSent' } as const, '')
 const budgetTold = atom({ plugin: 'fleet', key: 'budgetTold' } as const, '')
@@ -1130,7 +1132,7 @@ async function deliver($: any) {
     const sent = parts.map(p => p.record.id)
     await update($, inflight, m => ({ ...m, ...Object.fromEntries(sent.map(id => [id, { at: now, epoch: EPOCH }])) }))
     log($, `delivering ${sent.join(', ')}`)
-    submitOwn($, deliveryText(parts, ownDelivery)).then(
+    submitOwn($, dated(deliveryText(parts, ownDelivery), now)).then(
       (r: any) => bg(submitted($, sent, r)),
       (err: unknown) => bg(failed($, sent, err)),
     )
@@ -1977,8 +1979,9 @@ async function clearReads($: any, oldSessionId: string) {
 /** The digest lines for one thread, and what marks them told (called once they're on their way): the world files it
  * read that changed since; for the main thread the files this session wrote last that are flagged, and for an instance
  * the items from outside routed to it, the derived documents it owns gone stale, and the slots it waited for.
- * urgent: a slot is its now (a nudge for it doesn't wait for the wakes' window) */
-async function digestFor($: any, thread: string, withBudget = true): Promise<{ lines: string[]; told: () => Promise<void>; urgent?: boolean }> {
+ * urgent: a slot is its now (a nudge for it doesn't wait for the wakes' window). forNudge: a nudge's digest, which
+ * leaves out the changes the person applied (they're told at the next step that comes anyway: never a wake of its own) */
+async function digestFor($: any, thread: string, withBudget = true, forNudge = false): Promise<{ lines: string[]; told: () => Promise<void>; urgent?: boolean }> {
   const none = { lines: [], told: async () => {} }
   // An instance's budget, once per state and day, at its main thread's next step (it holds nothing)
   const budget = withBudget && thread === 'main' ? await budgetLine($) : null
@@ -1991,7 +1994,7 @@ async function digestFor($: any, thread: string, withBudget = true): Promise<{ l
   // An instance hears what moved upstream under its own code (the code watch: whatever the world)
   const code = thread === 'main' ? await codeLines($) : { lines: [], keys: [] }
   // Decisions around it: a change the person applied to a command-level file, a decision it waits on closed
-  const news = thread === 'main' ? await newsLines($) : { lines: [], told: async () => {} }
+  const news = thread === 'main' ? await newsLines($, !forNudge) : { lines: [], told: async () => {} }
   const alone = async () => {
     await sayBudget()
     await slots.told()
@@ -2966,7 +2969,7 @@ async function worldTick($: any) {
 
 // ---- The sweeper: one session of the project, elected by a lease, every 60 s (and soon after each landing) ----
 
-const sweep = { bornAt: 0, holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0, running: false, dirty: false, intakeDirty: false, slotsDirty: false, lastRun: {} as Record<string, number>, commitNote: '', suspectsKey: '' }
+const sweep = { bornAt: 0, holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0, running: false, asking: false, dirty: false, intakeDirty: false, slotsDirty: false, lastRun: {} as Record<string, number>, commitNote: '', suspectsKey: '' }
 
 // The lease, <project>/.claude/fleet/state/sweeper.json: whoever holds it rewrites it every 20 s; one older than 90 s
 // (or none) is taken by writing it, and the taker sweeps once it still finds itself there 2 s later (two that took it
@@ -3038,16 +3041,26 @@ async function releaseLease($: any) {
 // Every 2 s: a full sweep every 60 s, and the suspects again soon after a landing anywhere in the project. The world's
 // parts (suspects, checks, the world commit) only while the world is on and this session has its baseline
 async function sweepTick($: any) {
-  if (!sweep.holding || sweep.running) return
+  if (!sweep.holding) return
+  // The queue or its answers moved (a question asked, answered, closed): the ask marks follow within this tick, on a
+  // flag of their own, so a long sweep (a check, the code watch's ssh, intake's model calls) doesn't hold them
+  if (!sweep.asking) {
+    sweep.asking = true
+    try {
+      if (await decisionsMoved($)) await asksTick($, await $.clock.now())
+    } catch (err) {
+      log($, `marks: ${String(err).slice(0, 200)}`)
+    } finally {
+      sweep.asking = false
+    }
+  }
+  if (sweep.running) return
   const now = await $.clock.now()
   const full = now - sweep.lastSweep >= 60000
   const worldUp = worldOn() && baselined
-  // The queue or its answers moved (a question asked, answered, closed): the ask marks follow within this tick
-  const asksMoved = !full && (await decisionsMoved($))
-  if (!full && !(sweep.dirty && worldUp) && !sweep.intakeDirty && !sweep.slotsDirty && !asksMoved) return
+  if (!full && !(sweep.dirty && worldUp) && !sweep.intakeDirty && !sweep.slotsDirty) return
   sweep.running = true
   try {
-    if (asksMoved) await asksTick($, now).catch(err => log($, `marks: ${String(err).slice(0, 200)}`))
     if (worldUp && (full || sweep.dirty)) await computeSuspects($)
     if (full || sweep.slotsDirty) await sweepSlotsNow($).catch(err => log($, `slots: ${String(err).slice(0, 200)}`))
     if (full) {
@@ -4732,6 +4745,8 @@ type Heartbeat = {
   model?: string | null
   classicStart?: boolean
   orgAsk?: string[]
+  /** The other sessions' decisions its conversation waits on (decide kind wait), and since when */
+  waits?: Record<string, number>
 }
 // That model, from turn.step (B4: a roster model the account lacks ran the org default, and nothing said so)
 let stepModel: string | null = null
@@ -4880,6 +4895,11 @@ async function heartbeat($: any) {
     carried.lastLanding = typeof prev?.lastLanding === 'number' ? prev.lastLanding : 0
     carried.lastWork = typeof prev?.lastWork === 'number' ? prev.lastWork : 0
     if (prev && prev.sessionId === sessionId && typeof prev.conversationAt === 'number') await update($, conversationAt, () => prev.conversationAt as number)
+    // The decisions its conversation waits on (decide kind wait), when it's the same conversation: a restart keeps them
+    if (prev && prev.sessionId === sessionId && prev.waits && typeof prev.waits === 'object') {
+      const kept = Object.fromEntries(Object.entries(prev.waits).filter(([id, t]) => isDecisionId(id) && typeof t === 'number'))
+      if (Object.keys(kept).length) await update($, waitsOn, m => ({ ...kept, ...m }))
+    }
   }
   if (!(await read($, conversationAt))) await update($, conversationAt, () => now)
   const journalAt = await mtimeOf($, `${root}/${inst.journal}`)
@@ -4926,6 +4946,7 @@ async function heartbeat($: any) {
     model: stepModel,
     classicStart: !!(await read($, classicSeen)).SessionStart,
     ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
+    waits: await read($, waitsOn),
   }
   await replace($, `${dir}/state.json`, json(beat))
 }
@@ -5274,7 +5295,7 @@ async function nudgeTick($: any) {
     nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: cadenceToday + 1 }), now)
     return
   }
-  const d = await digestFor($, 'main', false)
+  const d = await digestFor($, 'main', false, true)
   if (!d.lines.length) return
   await update($, nudgeAt, () => now)
   log($, `nudge to ${inst.name}`)
@@ -5317,6 +5338,13 @@ async function identityOwed($: any): Promise<string> {
   const inst = myInstance
   if (!inst || !jobRef || !root || (await read($, identityTold))) return ''
   return instanceContext($, inst)
+}
+
+/** A delivery (answers, an applied or rejected change, an overrule, a late note) to an instance, with today's date after
+ * it, as its nudges carry it: a long conversation reckons the date badly from the hours it has run (G5). From the
+ * caller's now. The person's own sessions get it as it is */
+function dated(text: string, now: number): string {
+  return myInstance ? `${text}\n\n${dateLine(now, -new Date(now).getTimezoneOffset())}` : text
 }
 
 /** fleet's own prompt, with who the instance is first when its conversation wasn't told yet (its turn's start says it
@@ -5567,6 +5595,9 @@ async function answeredHere($: any, e: any) {
   return { result: `${id} is off the person's queue: what they typed this turn is the answer to question ${q}, in the register.\n\n${deliveryText([{ record: rec, outcomes, drop }])}` }
 }
 
+// A diff this short goes in the dialog's question; a longer one to the transcript, this many lines at most
+const DIFF_IN_QUESTION = 20
+const DIFF_SHOWN = 80
 const APPLY = 'Apply'
 const SHOW_DIFF = 'Show the diff'
 const DONT_APPLY = "Don't apply"
@@ -5577,21 +5608,30 @@ const DONT_APPLY = "Don't apply"
  * Its asker hears the outcome as a delivery, as for any change */
 async function confirmChange($: any, record: QueueRecord, quoted: string) {
   const spec = record.change as ChangeSpec
-  const question = `Apply ${record.id} to ${spec.path}? ${cut(spec.summary, 200)} (+${spec.added} −${spec.removed})`
-  const ask = async (options: string[]): Promise<string | null> => {
+  // Ending in its question mark (the dialog's question)
+  const question = `Apply ${record.id} to ${spec.path} ("${cut(spec.summary, 200)}", +${spec.added} −${spec.removed})?`
+  const ask = async (q: string, options: string[]): Promise<string | null> => {
     try {
-      return String(await $.ui.ask(question, { options, header: record.id }))
+      return String(await $.ui.ask(q, { options, header: record.id }))
     } catch {
       return null
     }
   }
-  let a = await ask([APPLY, SHOW_DIFF, DONT_APPLY])
+  let a = await ask(question, [APPLY, SHOW_DIFF, DONT_APPLY])
   if (a === SHOW_DIFF) {
-    const diff = (await readText($, `${fleetDir()}/${spec.diff}`)) ?? '(the diff is gone)'
-    try {
-      $.ui.log(`fleet: ${record.id}, the change to ${spec.path}:\n${diff.length > 1900 ? `${diff.slice(0, 1900)}\n… (the whole diff: ${fleetDir()}/${spec.diff})` : diff}`)
-    } catch {}
-    a = await ask([APPLY, DONT_APPLY])
+    const diff = ((await readText($, `${fleetDir()}/${spec.diff}`)) ?? '(the diff is gone)').replace(/\r\n/g, '\n').replace(/\n+$/, '')
+    const lines = diff.split('\n')
+    // A short diff goes in the question itself; a longer one to the person's transcript, one line per row ($.ui.log
+    // draws one line: a newline in it isn't one), up to DIFF_SHOWN lines and where the rest is
+    if (lines.length <= DIFF_IN_QUESTION && diff.length <= 1500) a = await ask(`${diff}\n\n${question}`, [APPLY, DONT_APPLY])
+    else {
+      try {
+        $.ui.log(`fleet: ${record.id}, the change to ${spec.path}:`)
+        for (const l of lines.slice(0, DIFF_SHOWN)) $.ui.log(`  ${l.slice(0, 300)}`)
+        if (lines.length > DIFF_SHOWN) $.ui.log(`  … ${lines.length - DIFF_SHOWN} more lines: ${fleetDir()}/${spec.diff}`)
+      } catch {}
+      a = await ask(question, [APPLY, DONT_APPLY])
+    }
   }
   const now = await $.clock.now()
   const here = await sessionName($)
@@ -5603,6 +5643,15 @@ async function confirmChange($: any, record: QueueRecord, quoted: string) {
         $.ui.toast(r.line.slice(0, 300))
       } catch {}
     }
+    // Closed here, with no turn of its own: he answered in this session, and the model hears it at its next step
+    const outcome =
+      a === DONT_APPLY
+        ? `the person said no in fleet's dialog: ${spec.path} stays as it was (don't make the change another way unless he asks)`
+        : r.applied
+          ? `the person applied it in fleet's dialog: ${spec.path} is as you drafted it`
+          : `it wasn't applied: ${cut(r.line, 300)}`
+    await update($, dialogNews, l => [...l, `fleet: ${record.id}, your change to ${spec.path}: ${outcome}.`])
+    await close($, record.id, { state: 'delivered', how: 'result' })
   } else {
     log($, `${record.id} left in the person's queue: ${a === null ? 'no dialog, or dismissed' : 'other words'}`)
     try {
@@ -5634,10 +5683,14 @@ async function waitFor($: any, e: any) {
   if (q && !('otherFormat' in q)) {
     const me = String(await $.session.id())
     if (q.asker.sessionId === me || (jobRef && q.asker.ref === jobRef)) return { result: `${id} is your own: its answer reaches you anyway, as a message from the fleet plugin that starts with [${id}].` }
+    const s = await settledWords($, id)
+    if (s) return { result: `${id} is settled already${s.asker ? ` (asked by ${s.asker})` : ''}: ${s.words}.` }
     const now = await $.clock.now()
     await update($, waitsOn, m => ({ ...m, [id]: now }))
+    // In its heartbeat at once: a restart keeps it, and /fleet status shows it
+    if (myInstance) bg(heartbeat($))
     log($, `waits on ${id} (${q.asker.name || q.asker.ref})`)
-    return { result: `${id} (asked by ${q.asker.name || q.asker.ref || 'another session'}) is still open: fleet tells you at your next step once it closes, with its outcome. Keep working on what doesn't depend on it.` }
+    return { result: `${id} (asked by ${q.asker.name || q.asker.ref || 'another session'}) is still open: fleet tells you at your next step once it's settled, with its outcome. Keep working on what doesn't depend on it.` }
   }
   if (q) return { deny: `${id} was asked by a fleet of another version: leave it. Nothing was changed.` }
   const r = await registerRecordOf($, id)
@@ -5645,46 +5698,108 @@ async function waitFor($: any, e: any) {
   return { deny: `${id} isn't a decision of this project (neither in its queue nor in this or last month's register). Nothing was changed.` }
 }
 
-// decisions/applied/'s time at the last scan that found nothing new for this conversation (a /clear starts over)
-const newsSeen = { applied: -2 }
+// The scans that found nothing new for this conversation (a /clear starts over): decisions/applied/'s time, the
+// register's months' times, and the register records already looked at (a closed record never changes)
+const newsSeen = { applied: -2, register: '', examined: new Set<string>() }
+
+/** A decision another session waits on, settled: closed (in the register), or answered whole while its asker hasn't
+ * been told yet (its answers in answers/); its outcome in words, or null while it's open */
+async function settledWords($: any, id: string): Promise<{ words: string; asker: string } | null> {
+  const q = await readQueue($, id)
+  if (q && 'otherFormat' in q) return null
+  if (q) {
+    const present = await answerNames($)
+    if (!progress(id, slots(q), present).complete && !present.has(dropName(id))) return null
+    const { outcomes, drop } = await outcomesOf($, q, present)
+    return { words: drop ? `dropped (${cut(drop.why ?? '', 160) || 'no reason given'})` : outcomeWords({ kind: q.kind, questions: q.questions, answers: outcomes }), asker: q.asker.name || q.asker.ref || '' }
+  }
+  const r = await registerRecordOf($, id)
+  return { words: r ? outcomeWords(r) : 'its record is gone', asker: r?.asker?.name ?? '' }
+}
 
 /** What an instance hears of the decisions around it, at its next step: a change the person applied to a command-level
  * file since this conversation started, drafted by another session (its drafter hears it as its answer), once each; and
- * the decisions it said it waits on, once each closes */
-async function newsLines($: any): Promise<{ lines: string[]; told: () => Promise<void> }> {
+ * the decisions it said it waits on, once each is settled. withApplied false (a nudge's digest): the applied changes wait
+ * for the next step that comes anyway, so one apply never wakes every idle instance */
+async function newsLines($: any, withApplied = true): Promise<{ lines: string[]; told: () => Promise<void> }> {
   const none = { lines: [], told: async () => {} }
   if (!root) return none
   const lines: string[] = []
   const keys: string[] = []
   const me = await meNow($)
-  // decisions/applied/ moves only when something is applied: unchanged since a scan that found nothing new, no scan
-  let appliedAt = -1
-  try {
-    appliedAt = Number((await $.fs.stat(dec('applied'))).mtimeMs)
-  } catch {}
-  if (myInstance && appliedAt !== -1 && appliedAt !== newsSeen.applied) {
+  if (myInstance && withApplied) {
     const since = await read($, conversationAt)
     const told = await read($, ownTold)
-    for (const name of (await names($, dec('applied'))).filter(n => /^D-\d+\.json$/.test(n))) {
-      const id = name.slice(0, -'.json'.length)
-      if (told[`a|${id}`]) continue
-      const claim = parseWire<{ at: number }>((await readText($, dec(`applied/${name}`))) ?? '')
-      if (!claim || !('value' in claim) || !(claim.value.at >= since)) continue
-      const q = await readQueue($, id)
-      const rec = q && !('otherFormat' in q) ? q : await registerRecordOf($, id)
-      if (!rec || rec.kind !== 'change' || !rec.change) continue
-      if (rec.asker.sessionId === me.sessionId || (jobRef && rec.asker.ref === jobRef)) continue
-      lines.push(`fleet: the person applied ${id}, a change to ${rec.change.path} ("${cut(rec.change.summary, 120)}", drafted by ${rec.asker.name || rec.asker.ref || 'another session'}), at ${clock(claim.value.at, me.offsetMin)}: read ${rec.change.path} again before you rely on it.`)
-      keys.push(`a|${id}`)
+    const found = new Set<string>()
+    const say = (rec: { id: string; asker: Asker; change?: ChangeSpec }, at: number) => {
+      if (!rec.change) return
+      lines.push(`fleet: the person applied ${rec.id}, a change to ${rec.change.path} ("${cut(rec.change.summary, 120)}", drafted by ${rec.asker.name || rec.asker.ref || 'another session'}), at ${clock(at, me.offsetMin)}: read ${rec.change.path} again before you rely on it.`)
+      keys.push(`a|${rec.id}`)
+      found.add(rec.id)
     }
-    if (!keys.length) newsSeen.applied = appliedAt
+    const mine = (a: Asker) => a.sessionId === me.sessionId || (!!jobRef && a.ref === jobRef)
+    // In flight: decisions/applied/'s claim, while its drafter hasn't been told yet (it moves only when one is applied)
+    let appliedAt = -1
+    try {
+      appliedAt = Number((await $.fs.stat(dec('applied'))).mtimeMs)
+    } catch {}
+    if (appliedAt !== -1 && appliedAt !== newsSeen.applied) {
+      let any = false
+      for (const name of (await names($, dec('applied'))).filter(n => /^D-\d+\.json$/.test(n))) {
+        const id = name.slice(0, -'.json'.length)
+        if (told[`a|${id}`]) continue
+        const claim = parseWire<{ at: number }>((await readText($, dec(`applied/${name}`))) ?? '')
+        if (!claim || !('value' in claim) || !(claim.value.at >= since)) continue
+        const q = await readQueue($, id)
+        if (!q || 'otherFormat' in q || q.kind !== 'change' || mine(q.asker)) continue
+        say(q, claim.value.at)
+        any = true
+      }
+      if (!any) newsSeen.applied = appliedAt
+    }
+    // Closed: the register, this month and the one before (the claim goes once its drafter is told; the record stays)
+    const now = await $.clock.now()
+    const months = [monthOf(now), monthBefore(monthOf(now))]
+    let stamp = ''
+    for (const m of months) {
+      try {
+        stamp += `${m}:${Number((await $.fs.stat(dec(`register/${m}`))).mtimeMs)};`
+      } catch {}
+    }
+    if (stamp && stamp !== newsSeen.register) {
+      let any = false
+      for (const m of months) {
+        for (const name of (await names($, dec(`register/${m}`))).filter(n => /^D-\d+\.json$/.test(n))) {
+          const id = name.slice(0, -'.json'.length)
+          if (newsSeen.examined.has(id) || told[`a|${id}`] || found.has(id)) continue
+          const t = await readText($, dec(`register/${m}/${name}`))
+          let r: RegisterRecord | null = null
+          try {
+            r = t === null ? null : (JSON.parse(t) as RegisterRecord)
+          } catch {}
+          const a = r?.answers?.[0]
+          const at = typeof a?.at === 'number' ? a.at : (r?.closedAt ?? 0)
+          if (!r || r.kind !== 'change' || !r.change || a?.label !== 'applied' || mine(r.asker)) {
+            newsSeen.examined.add(id)
+            continue
+          }
+          if (!(at >= since)) continue
+          say(r, at)
+          any = true
+        }
+      }
+      if (!any) newsSeen.register = stamp
+    }
   }
+  // What fleet's change dialog came to in this session (closed with no turn of its own)
+  const dialog = await read($, dialogNews)
+  lines.push(...dialog)
   const waits = await read($, waitsOn)
   const closed: string[] = []
   for (const id of Object.keys(waits).sort((a, b) => idNumber(a) - idNumber(b))) {
-    if (await readQueue($, id)) continue
-    const r = await registerRecordOf($, id)
-    lines.push(`fleet: ${id}, which your work waits on, is closed${r?.asker?.name ? ` (asked by ${r.asker.name})` : ''}: ${r ? outcomeWords(r) : 'its record is gone'}. Go on with what waited on it.`)
+    const s = await settledWords($, id)
+    if (!s) continue
+    lines.push(`fleet: ${id}, which your work waits on, is settled${s.asker ? ` (asked by ${s.asker})` : ''}: ${s.words}. Go on with what waited on it.`)
     closed.push(id)
   }
   if (!lines.length) return none
@@ -5695,7 +5810,11 @@ async function newsLines($: any): Promise<{ lines: string[]; told: () => Promise
         const at = await $.clock.now()
         await update($, ownTold, m => ({ ...m, ...Object.fromEntries(keys.map(k => [k, at])) }))
       }
-      if (closed.length) await update($, waitsOn, m => Object.fromEntries(Object.entries(m).filter(([id]) => !closed.includes(id))))
+      if (closed.length) {
+        await update($, waitsOn, m => Object.fromEntries(Object.entries(m).filter(([id]) => !closed.includes(id))))
+        if (myInstance) bg(heartbeat($))
+      }
+      if (dialog.length) await update($, dialogNews, l => l.slice(dialog.length))
       log($, `news to ${myInstance?.name ?? 'main'}: ${[...keys.map(k => k.slice(2)), ...closed].join(', ')}`)
     },
   }
@@ -6053,7 +6172,7 @@ async function saveNote($: any, id: string, note: string | undefined, origin: st
 async function answerResource($: any, it: AnswerItem, rec: QueueRecord, origin: string, here: string, now: number): Promise<string> {
   const x = rec.resource as ResourceSpec
   const n = it.n
-  // Words alone (/fleet 6 "four years, thirty people") are what he got: a done with them as its note, said so, never
+  // Words alone (/fleet 2 "in the lab cabinet") are what he got: a done with them as its note, said so, never
   // dropped
   const words = !it.verb && it.text?.trim() ? it.text.trim() : ''
   const verb = words ? 'done' : it.verb === 'reject' ? 'no' : it.verb
@@ -6076,7 +6195,12 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   const o = rec.outbound as OutboundSpec
   const n = it.n
   const verb = it.verb === 'no' ? 'reject' : it.verb
-  if (verb !== 'send' && verb !== 'reject' && verb !== 'edit' && verb !== 'done') return `${n}: ${rec.id} would send ${o.what} to ${o.to}: answer /fleet ${n} send, /fleet ${n} reject, /fleet ${n} edit, or /fleet ${n} done if you sent it yourself`
+  if (verb !== 'send' && verb !== 'reject' && verb !== 'edit' && verb !== 'done') {
+    // Words alone on an outbound: not recorded, said plainly, with the forms that keep them
+    const words = !it.verb && it.text?.trim() ? it.text.trim() : ''
+    if (words) return `${n}: NOT recorded: "${cut(words, 120)}" answers no outbound by itself. ${rec.id} would send ${o.what} to ${o.to}: /fleet ${n} reject "${cut(words, 60)}" says no with your words (its asker hears them), /fleet ${n} done "…" if you sent it yourself, /fleet ${n} send, or /fleet ${n} edit`
+    return `${n}: ${rec.id} would send ${o.what} to ${o.to}: answer /fleet ${n} send, /fleet ${n} reject, /fleet ${n} edit, or /fleet ${n} done if you sent it yourself`
+  }
   const answerPath = dec(`answers/${answerName(rec.id, 1)}`)
   if (await exists($, answerPath)) return `${n}: ${rec.id} was answered already`
   const draftAbs = `${fleetDir()}/${o.draft}`
@@ -6251,7 +6375,12 @@ function effectOf(path: string): string {
 async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: string, here: string, now: number, pre?: { quoted: string }): Promise<{ line: string; done: boolean; applied?: true }> {
   const spec = rec.change as ChangeSpec
   const n = it.n
-  if (!it.verb || (it.verb !== 'apply' && it.verb !== 'reject' && it.verb !== 'edit')) return { line: `${n}: ${rec.id} is a change to ${spec.path}: answer /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit`, done: false }
+  if (!it.verb || (it.verb !== 'apply' && it.verb !== 'reject' && it.verb !== 'edit')) {
+    // Words alone on a change: not recorded, said plainly, with the forms that keep them
+    const words = !it.verb && it.text?.trim() ? it.text.trim() : ''
+    if (words) return { line: `${n}: NOT recorded: "${cut(words, 120)}" answers no change by itself. ${rec.id} is a change to ${spec.path}: /fleet ${n} reject "${cut(words, 60)}" says no with your words (its asker hears them), /fleet note ${rec.id} "…" adds them to it, /fleet ${n} apply or /fleet ${n} edit`, done: false }
+    return { line: `${n}: ${rec.id} is a change to ${spec.path}: answer /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit`, done: false }
+  }
   const answerPath = dec(`answers/${answerName(rec.id, 1)}`)
   const before = parseWire<AnswerFile>((await readText($, answerPath)) ?? '')
   if (before) return { line: `${n}: ${rec.id} was ${'value' in before ? (before.value.label ?? 'answered') : 'answered by a fleet with another format'} already`, done: false }
@@ -7197,6 +7326,9 @@ async function rosterStatus($: any): Promise<string[]> {
     const next: string[] = []
     const asked = hb?.ref ? records.filter(r => r.asker.ref === hb.ref && knownKind(r) && !progress(r.id, slots(r), present).complete).map(r => r.id) : []
     if (asked.length) next.push(`waits ${asked.join(', ')}`)
+    // Other sessions' decisions its work waits on (decide kind wait), as its heartbeat keeps them
+    const waitsFor = hb?.waits && typeof hb.waits === 'object' ? Object.keys(hb.waits).filter(isDecisionId).sort((a, b) => idNumber(a) - idNumber(b)) : []
+    if (waitsFor.length) next.push(`waits on ${waitsFor.map(id => { const r = records.find(x => x.id === id); return r ? `${id} (${r.asker.name || r.asker.ref}'s)` : id }).join(', ')}`)
     const cad = hb && !down.has(inst.slug) && inst.cadenceH ? cadenceOfBeat(inst, hb, now) : null
     if (cad) next.push(cad.due ? `cadence due: nothing landed in ${hoursText(cad.hours)}` : `next cadence in ${hoursText(Math.max(0, cad.nextMs ?? 0) / HOUR)}`)
     if (hb?.owns?.length && cad?.journalOnly) next.push(`owns ${hb.owns.length} open item(s) (${hb.owns.slice(0, 5).join(', ')}${hb.owns.length > 5 ? '…' : ''}), landed only its journal in ${hoursText((now - Math.max(hb.lastWork ?? 0, hb.startedAt ?? hb.at)) / HOUR)}`)
@@ -7927,7 +8059,7 @@ async function deliverOverrules($: any) {
   const ids = mine.map(x => x.id)
   await update($, overruling, m => ({ ...m, ...Object.fromEntries(ids.map(id => [id, { at: now, epoch: EPOCH }])) }))
   log($, `delivering the overrule of ${ids.join(', ')}`)
-  submitOwn($, mine.map(overruleText).join('\n\n')).then(
+  submitOwn($, dated(mine.map(overruleText).join('\n\n'), now)).then(
     (r: any) =>
       bg(
         (async () => {
@@ -7977,7 +8109,7 @@ async function deliverLate($: any) {
   await update($, lateNotes, m => ({ ...m, ...Object.fromEntries(ready.filter(id => m[id]).map(id => [id, { ...(m[id] as FleetLate), sent: { at: now, epoch: EPOCH } }])) }))
   log($, `delivering the late notes of ${ready.join(', ')}`)
   const unsend = (m: Record<string, FleetLate>) => Object.fromEntries(Object.entries(m).map(([id, x]) => [id, ready.includes(id) ? { notes: x.notes, at: x.at } : x]))
-  submitOwn($, ready.map(id => lateNoteText(id, (waiting[id] as FleetLate).notes)).join('\n\n')).then(
+  submitOwn($, dated(ready.map(id => lateNoteText(id, (waiting[id] as FleetLate).notes)).join('\n\n'), now)).then(
     (r: any) =>
       bg(
         (async () => {
@@ -8567,11 +8699,16 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
       } catch {}
       if (!r || r.closedAt < since) continue
       const asker = r.asker?.name || r.asker?.ref || 'a session'
-      // A question closed (answered or dropped): what the instances that waited on it act on. One the judge answered is
-      // in the judges' lines already (with any overrule of his)
+      // A question closed (answered or dropped): what the instances that waited on it act on. One the judge answered
+      // whole is in the judges' lines already (with any overrule of his); one he answered in part keeps the person's part
       if (r.kind === undefined && r.source !== 'dialog' && r.source !== 'taste' && Array.isArray(r.questions) && r.questions.length) {
-        const byJudge = r.answers.some(a => (a as { origin?: string } | null)?.origin === 'judge')
-        if (!byJudge) answered.push({ id: r.id, at: r.closedAt, line: answeredLine(r, asker) })
+        const byJudge = (a: unknown) => (a as { origin?: string } | null)?.origin === 'judge'
+        if (r.state === 'dropped' || !r.answers.every(byJudge)) answered.push({ id: r.id, at: r.closedAt, line: answeredLine(r, asker) })
+        continue
+      }
+      // A resource the person got (or said no to), with his words: other instances act on it too
+      if (r.kind === 'resource' && r.resource) {
+        answered.push({ id: r.id, at: r.closedAt, line: `${r.id} (${asker}, ${cut(r.resource.what, 80)}): ${outcomeWords(r)}` })
         continue
       }
       if (r.kind !== 'change' && r.kind !== 'outbound') continue

@@ -157,7 +157,8 @@ test('a change: filed with its draft and diff, listed, applied once by fleet at 
   expect(await fleet($, '1 apply')).toBe('1: D-1 was applied already')
   // The asker hears it, and the decision closes at the turn that carries it
   await tick(w)
-  expect(w.submits[w.submits.length - 1]).toBe('[D-1] The person applied your change to .claude/fleet/charter.md ("the goal, from the interview"): fleet wrote it as you drafted it.')
+  // With today's date after it (an instance's deliveries carry it: G5)
+  expect(w.submits[w.submits.length - 1]?.split('\n\nToday is ')[0]).toBe('[D-1] The person applied your change to .claude/fleet/charter.md ("the goal, from the interview"): fleet wrote it as you drafted it.')
   await $.turn.start({ text: `The fleet plugin sent a message:\n${w.submits[w.submits.length - 1]}`, turnId: 't-1' })
   await w.clock.settle()
   release({ text: '' })
