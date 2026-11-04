@@ -7,14 +7,16 @@ import type { Color, Period, RateLimit, SessionsMark, SessionsMember, SessionsRe
 // The launcher (hooks/launcher.py, hooks/visor.sh) reads and writes the same formats: change them together.
 export const FORMAT = 3
 
-// Where a session keeps its keys in the shared store: '' for the sessions you use, and @<hash>/ for one started with any
-// SESSIONS_* override (a test session: SESSIONS_DATA_DIR, SESSIONS_JOBS_DIR, SESSIONS_DAEMON_LOG, SESSIONS_CLAUDE,
-// SESSIONS_PLUGIN_VERSION, SESSIONS_PLUGIN_SINCE, in that order), so test sessions never read nor write theirs: the
-// session list they cache from a stand-in claude, the pins they record, the notifications they count, their marks and
-// the choices made in their panels, nor the prune of keys of sessions missing from their list. The hash is FNV-1a of
-// the values, one per line
+// Where a session keeps its keys in the shared store: '' for the sessions you use, and @<hash>/ for a test session, one
+// started with a location override (SESSIONS_DATA_DIR, SESSIONS_JOBS_DIR, SESSIONS_DAEMON_LOG, SESSIONS_CLAUDE: the
+// first four values, in that order), so test sessions never read nor write theirs: the session list they cache from a
+// stand-in claude, the pins they record, the notifications they count, their marks and the choices made in their panels,
+// nor the prune of keys of sessions missing from their list. SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the last
+// two) count only beside a location: ccc sets them for its launcher, and a background service a launcher before 0.13.6
+// brought up hands them on to every session it starts, which isn't a test session. The hash is FNV-1a of the values, one
+// per line
 export function storeNamespace(values: readonly (string | undefined)[]): string {
-  if (!values.some(v => v)) return ''
+  if (!values.slice(0, 4).some(v => v)) return ''
   let h = 0x811c9dc5
   for (const c of new TextEncoder().encode(values.map(v => v ?? '').join('\n'))) h = Math.imul(h ^ c, 0x01000193) >>> 0
   return `@${h.toString(16).padStart(8, '0')}/`

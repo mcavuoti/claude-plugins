@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { storeNamespace } from '../hooks/state'
-import { BAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
+import { BAND, COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // How the mod starts in a session (the world it sees is in world.ts)
 
@@ -332,12 +332,16 @@ test('a missing auto-pin record is rebuilt once, under the pins lock, from the p
   expect(w.files.get('/Users/x/jobs/pins.json')).toBe('[\n  "aaaaaaaa",\n  "bbbbbbbb"\n]')
 })
 
-test('a test session (any SESSIONS_* override) keeps every store key under a namespace of its own', async ($, on) => {
+test('a test session (a location override) keeps every store key under a namespace of its own', async ($, on) => {
   expect(storeNamespace([undefined, '', undefined, undefined, undefined, undefined])).toBe('')
   const one = storeNamespace([undefined, '/Users/x/jobs', '/Users/x/daemon.log', '/bin/claude', undefined, undefined])
   expect(one).toMatch(/^@[0-9a-f]{8}\/$/)
   expect(storeNamespace([undefined, '/Users/x/jobs', '/Users/x/daemon.log', '/bin/claude', undefined, undefined])).toBe(one)
   expect(storeNamespace(['/tmp/t/data', '/Users/x/jobs', '/Users/x/daemon.log', '/bin/claude', undefined, undefined])).not.toBe(one)
+  // ccc's installed version and since when count only beside a location: alone (a background service handed them on)
+  // they make no test session
+  expect(storeNamespace([undefined, undefined, undefined, undefined, '0.13.2', '1'])).toBe('')
+  expect(storeNamespace(['/tmp/t/data', undefined, undefined, undefined, '0.13.2', '1'])).toMatch(/^@[0-9a-f]{8}\/$/)
   // The tests' world sets overrides: the list cache, the pins record, the marks and the person's choices, all inside it
   const w = world(on)
   await startSession($, w)
@@ -455,5 +459,51 @@ test('New in a session whose folder is gone: a clear notice, nothing created, an
   await w.clock.advance(1000)
   expect(w.runs.some(a => a[1] === '--bg')).toBe(false)
   expect(w.toasts).toContain(`Can't create a session: this session's folder no longer exists (${GONE})`)
+  await ui.unmount()
+})
+
+// What ccc hands its launcher (the installed version and since when) is for the launcher alone: a claude command the
+// mod runs with them would pass them on to the background service (when that command is what starts it), and from there
+// to every session it starts, whose mod would keep its data apart. An empty value reads as not set everywhere
+test('what ccc hands its launcher never reaches a command the mod runs: SESSIONS_PLUGIN_VERSION/SINCE are blank in each', async ($, on) => {
+  const w = world(on, { env: { SESSIONS_PLUGIN_VERSION: '0.13.2', SESSIONS_PLUGIN_SINCE: '1' } })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const claudes = w.runs.map((argv, i) => ({ argv, env: w.envs[i] })).filter(r => r.argv.includes('/bin/claude'))
+  expect(claudes.length).toBeGreaterThan(0)
+  for (const r of claudes) expect(r.env).toMatchObject({ SESSIONS_PLUGIN_VERSION: '', SESSIONS_PLUGIN_SINCE: '' })
+  expect(w.envs.every(e => e?.SESSIONS_PLUGIN_VERSION === '' && e?.SESSIONS_PLUGIN_SINCE === '')).toBe(true)
+})
+
+test('a test session says it keeps its panel data apart: /sessions status names its location overrides, the band marks it', async ($, on) => {
+  const w = world(on)
+  await startSession($, w)
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  const said = String(r.text)
+  expect(said).toContain('This session keeps its panel data apart, as a test session: SESSIONS_JOBS_DIR, SESSIONS_DAEMON_LOG, SESSIONS_CLAUDE are set in its environment')
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await w.clock.advance(100)
+  expect(JSON.stringify(await ui.drawn())).toContain('data apart: /sessions status')
+  await ui.unmount()
+})
+
+// A session a background service handed ccc's variables (that service was brought up by a launcher before 0.13.6): it
+// isn't a test session, so it shares the store, reads the installed version as usual, and says the variables are ignored
+test("ccc's SESSIONS_PLUGIN_VERSION/SINCE alone make no test session: shared keys, the real installed version, said ignored", async ($, on) => {
+  const w = world(on, { env: { SESSIONS_CLAUDE: '', SESSIONS_JOBS_DIR: '', SESSIONS_DAEMON_LOG: '', SESSIONS_PLUGIN_VERSION: '0.13.2', SESSIONS_PLUGIN_SINCE: '1' } })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  expect(w.namespace).toBe('')
+  expect([...w.storeKeys].length).toBeGreaterThan(3)
+  expect([...w.storeKeys].filter(k => k.startsWith('@'))).toEqual([])
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  const said = String(r.text)
+  expect(said).not.toContain('keeps its panel data apart')
+  expect(said).not.toContain('installed (0.13.2)')
+  expect(said).not.toContain('(installed: 0.13.2)')
+  expect(said).toContain('SESSIONS_PLUGIN_VERSION, SESSIONS_PLUGIN_SINCE: set in this session\'s environment and ignored')
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await w.clock.advance(100)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('data apart')
   await ui.unmount()
 })

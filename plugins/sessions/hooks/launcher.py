@@ -123,9 +123,17 @@ def in_project(cwd, root, home):
     return cwd.startswith(root + '/')
 
 
+# What ccc hands the launcher (the installed plugin's version and since when) is for the launcher alone. A claude it ran
+# with them would pass them on: to the background service, when that call is what starts it, and from there to every
+# session the service starts, whose mod would keep its data apart (a store namespace, as a test session's). Every other
+# variable goes on (tests pass SESSIONS_DATA_DIR and the like on purpose)
+LAUNCHER_ONLY = ('SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE')
+CHILD_ENV = {k: v for k, v in os.environ.items() if k not in LAUNCHER_ONLY}
+
+
 def run(argv, cwd=None, timeout=30):
     try:
-        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=CHILD_ENV)
         return r.returncode, r.stdout, r.stderr
     except (OSError, subprocess.SubprocessError) as err:
         return 127, '', str(err)
