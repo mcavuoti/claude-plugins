@@ -4,7 +4,7 @@ import { linux } from './linux'
 import { macos } from './macos'
 import type { Platform, Run } from './types'
 
-export type { Me, Platform, Run } from './types'
+export type { Me, Platform, Run, Shown } from './types'
 export { linux, macos }
 
 export async function choosePlatform(run: Run): Promise<Platform> {

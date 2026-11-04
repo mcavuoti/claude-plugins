@@ -318,6 +318,23 @@ test('seen: a session shown in no window asks Terminal nothing; its viewer in fr
   expect(w.runs.filter(a => a[0] === 'osascript')).toHaveLength(1)
 })
 
+test('seen on Linux (X11): its viewer\'s window in front, its title showing the session\'s name, sees it; another one doesn\'t', async ($, on) => {
+  const w = world(on, { list: list(), system: 'Linux', store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  w.ps.value = ['  101 pts/1  claude attach aaaaaaaa', '  102 pts/2  claude attach bbbbbbbb'].join('\n')
+  const front = { value: 'Terminal - \u2733 bravo' }
+  w.xprop.value = args =>
+    args.join(' ') === '-root _NET_ACTIVE_WINDOW' ? '_NET_ACTIVE_WINDOW(WINDOW): window id # 0x1, 0x0' : args.join(' ') === '-id 0x1 _NET_WM_NAME' ? `_NET_WM_NAME(UTF8_STRING) = "${front.value}"` : null
+  await startSession($, w)
+  await w.clock.advance(6000)
+  // The window in front shows another session of the project
+  expect(w.runs.some(a => a[0] === 'xprop')).toBe(true)
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  // Now the one showing this session
+  front.value = 'Terminal - \u2733 alpha'
+  await w.clock.advance(2000)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+})
+
 test('seen: what another session found a moment ago (the windows, the one in front) serves this one too', async ($, on) => {
   const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
   w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')

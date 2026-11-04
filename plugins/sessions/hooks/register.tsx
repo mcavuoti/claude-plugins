@@ -146,7 +146,7 @@ import {
   FORMAT,
   NOTICE_MARKER,
 } from './state'
-import { choosePlatform, macos, type Me, type Platform, type Run } from './platform'
+import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
 
 const PANE = 'sessions'
 
@@ -480,19 +480,32 @@ async function sharedWindows($: any): Promise<Windows> {
   return v
 }
 
-async function sharedFront($: any): Promise<string | null> {
+async function sharedFront($: any, v: Windows): Promise<string | null> {
   const now = await $.clock.now()
   const c = await storeGet($, 'frontWindow')
   if (c && now - Number(c.at) < SHARED_MS && (typeof c.tty === 'string' || c.tty === null)) return c.tty
-  const tty = await platform.windowInFront(sys($))
+  const tty = await platform.windowInFront(sys($), await shownWindows($, v))
   await storeSet($, 'frontWindow', { at: now, tty })
   return tty
+}
+
+// The viewers' windows, each with the name of the session it shows (its viewer titles the window with it), for a
+// platform that can only tell the window in front by its title. Sessions without a name of their own are left out
+async function shownWindows($: any, v: Windows): Promise<Shown[]> {
+  const list = await officialList($)
+  if (!Array.isArray(list)) return []
+  const names = new Map<string, string>()
+  for (const s of list) if (s?.id && s.name && s.name !== s.id) names.set(String(s.id), String(s.name))
+  return Object.entries(v.byId).flatMap(([id, ttys]) => {
+    const title = names.get(id)
+    return title ? ttys.map(tty => ({ tty, id, title })) : []
+  })
 }
 
 // Are you looking at me? Someone at the computer (the platform can tell on macOS: screen unlocked, recent input) and a
 // window in front with one of my viewers, or an agent view showing my tag. A session shown in no window (most
 // background sessions) asks nothing: no question to Terminal, which a quit Terminal would also take as a reason to
-// start. Where the front window can't be known (Linux), a session counts as seen only when you type in it
+// start. Where the front window can't be known (Linux without X11), a session counts as seen only when you type in it
 async function markSeenIfLooking($: any) {
   if (!platform.frontKnown) return
   const finished = (await readState($, myId))?.finished ?? 0
@@ -501,7 +514,7 @@ async function markSeenIfLooking($: any) {
   const v = await sharedWindows($)
   const mine = myWindowsIn(v)
   if (mine.length === 0 && v.agentsViews.length === 0) return
-  const tty = await sharedFront($)
+  const tty = await sharedFront($, v)
   if (!tty) return
   let looking = mine.includes(tty)
   if (!looking && v.agentsViews.some(c => c.tty === tty)) {

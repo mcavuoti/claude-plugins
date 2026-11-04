@@ -164,11 +164,12 @@ Off by default. Turn on **Debug logs for new sessions** in the plugin's options 
 
 ## Linux
 
-On macOS the panel drives Terminal.app (which window is in front, bring one forward, open one). On Linux there's no portable way to do that, so the panel works from processes and its launcher only, which every terminal has:
+On macOS the panel drives Terminal.app (which window is in front, bring one forward, open one). On Linux there's no portable way to drive a terminal, so the panel works from processes and its launcher only, which every terminal has, and asks the X11 desktop which window is in front:
 
 - **The window you're in** is the one whose launcher has your session open (found with `ps`). Open your windows with `ccc` (or the panel's Enter, New and Agents, which use the launcher too). `ccc` brings the project's window forward the same way the panel does (`wmctrl`/`xdotool`), or opens here when it can't.
 - **Switching** happens in that same window, through the launcher, exactly as on macOS.
 - **A session already open in another window** is brought forward with `wmctrl` or `xdotool` when one is installed (X11; the launcher titles each window with its session's name, and the whole title is matched, so no other window whose title holds that name comes up). On Wayland, or without either tool, the session opens in the current window too.
+- **Seen** (yellow → green): on X11 with `xprop` (part of the X11 utilities on most desktops), the panel reads the title of the window in front: a viewer titles its window with Claude's status mark and the session's name (`✳ name`, which a terminal may put inside its own words, `Terminal - ✳ name` or `✳ name – Konsole`), and a session whose whole name it shows is seen. A session with no name of its own, or a name another session also has, isn't told apart this way, nor is one inside an agent view. On Wayland, or without `xprop`, it stays yellow until you type in that session. There's no telling whether you're at the computer, so a window left in front while you're away counts as seen.
 - **A new window** (for example, pressing Enter in the panel of a regular `claude` session, which can't be switched in place) opens with `$TERMINAL` if it's a known one, else `x-terminal-emulator`, GNOME Terminal (`gnome-terminal`, `kgx`, `ptyxis`), Konsole, Xfce Terminal, kitty, Alacritty, WezTerm, foot, Tilix, Terminator or xterm, whichever is found first.
 
 | Feature | On Linux |
@@ -179,7 +180,7 @@ On macOS the panel drives Terminal.app (which window is in front, bring one forw
 | Bring forward a window showing another session | X11 with `wmctrl` or `xdotool`; otherwise it opens in the current window |
 | A window opened without the launcher (`claude attach` typed by hand) | can't be switched in place (there's no way to type into it): open it with `ccc` |
 | ↑ for an outdated version, token usage, pinning (◆), reopening after a memory shortage | works (version and folders read from `/proc`, memory from `/proc/meminfo`) |
-| Automatic "seen" (yellow → green) | no: there's no telling which window is in front, so it stays yellow until you type in that session |
+| Automatic "seen" (yellow → green) | X11 with `xprop`: the window in front, by its title (a session with a name of its own, not inside an agent view); otherwise it stays yellow until you type in that session |
 | Closing the windows of a stopped session | not needed: the viewer ends with the session and the launcher leaves the shell |
 
 **Older distributions** (tried on CentOS 7): where the system's glibc is too old for Claude's binary and Claude runs through the glibc loader (`ld-linux… --library-path … …/claude/versions/X.Y.Z`), `ps` lists its viewers and agent views as the loader's command line; the mod and the launcher read such a line as `claude <args>`, and take the program from `/proc/<pid>/cmdline`. The `ps` calls pass one `-o` per column, since an older procps reads `-o pid=,tty=,command=` as the pid column alone.
@@ -242,7 +243,7 @@ plugins/sessions/
 │   ├── platform/                 what differs by system: windows, processes, memory
 │   │   ├── types.ts              the contract each system provides
 │   │   ├── macos.ts              Terminal.app (AppleScript), ioreg, lsof, sysctl
-│   │   ├── linux.ts              processes + launcher, wmctrl/xdotool, terminal emulators, /proc
+│   │   ├── linux.ts              processes + launcher, xprop, wmctrl/xdotool, terminal emulators, /proc
 │   │   └── index.ts              picks one when a session starts
 │   ├── visor.sh                  the launcher that runs in each window
 │   ├── launcher.py               what ccc opens: the top session, one window per project, the Name prompt; ccc tell, ccc section

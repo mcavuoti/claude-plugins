@@ -15,7 +15,7 @@ In `plugins/sessions`:
 | `types/index.d.ts`, `docs/plugin-contract.md`, `tests/contract.test.tsx` | the API other plugins call (`$.sessions`): its types, how it evolves, its golden method list | either |
 | `hooks/platform/types.ts` | the contract: what each system has to provide (windows, processes, memory) | either, together with both implementations |
 | `hooks/platform/macos.ts` | macOS: Terminal.app through AppleScript, `ioreg`, `lsof`, `sysctl` | a Mac |
-| `hooks/platform/linux.ts` | Linux: windows found by process and switched through the launcher, `wmctrl`/`xdotool`, terminal emulators, `/proc` | Linux |
+| `hooks/platform/linux.ts` | Linux: windows found by process and switched through the launcher, the window in front by its title (`xprop`), `wmctrl`/`xdotool`, terminal emulators, `/proc` | Linux |
 | `extras/macos/` | macOS only extras | a Mac |
 | `tests/panel.test.tsx`, `tests/rows.test.tsx`, `tests/start.test.tsx`, `tests/tell.test.tsx`, `tests/alerts.test.tsx` (with `tests/world.tsx`) | shared logic and drawing, what the rows show, how the mod starts, `ccc tell`'s side in the session, the notifications, ⧗ and spend marks | either |
 | `tests/macos.test.tsx`, `tests/linux.test.tsx` | each platform's pure parts (they run on both systems) | its system |

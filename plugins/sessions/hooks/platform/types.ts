@@ -14,6 +14,10 @@ export type Run = (
 // and whether it's a background session (whose process has the background service's internal terminal, not a window)
 export type Me = { shortId: string; pid?: number; background: boolean }
 
+// A window showing a session through a viewer (claude attach): its terminal, the session's short id, and its name, which
+// the viewer puts in the window's title
+export type Shown = { tty: string; id: string; title: string }
+
 export type Platform = {
   name: 'macos' | 'linux'
   // The window this session's panel was just used from (its terminal, "/dev/…"), or null
@@ -21,8 +25,9 @@ export type Platform = {
   // Whether windowInFront can tell at all (false: it always answers null, and a session counts as seen only when you
   // type in it): where it can't, the seen check runs no command
   frontKnown: boolean
-  // The window in front right now, for marking a session as seen; null where that can't be known
-  windowInFront(run: Run): Promise<string | null>
+  // The window in front right now (its terminal), for marking a session as seen; null where that can't be known.
+  // `shown` lists the viewers' windows, for a system that can only tell the front window by its title
+  windowInFront(run: Run, shown: Shown[]): Promise<string | null>
   // Whether someone is at the computer (screen unlocked, recent input); true where that can't be known
   userPresent(run: Run): Promise<boolean>
   // A window's visible text, used to tell which session an agent view shows; '' where windows can't be read

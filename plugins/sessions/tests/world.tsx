@@ -51,6 +51,8 @@ export type World = {
   // mode words (frente, leer, traer, cerrar, abrir: hooks/platform/macos.ts; '' by default)
   ps: { value: string }
   terminal: { value: (args: string[]) => string }
+  // What xprop answers (X11 on Linux), by its arguments; null: xprop fails, as without a display (the default)
+  xprop: { value: (args: string[]) => string | null }
   // What the mod asked to tell the person: the PushNotification calls' messages and $.ui.notify's texts, and what each
   // answers (by default, what a session gets with nobody away from the computer and no notifying terminal)
   pushes: string[]
@@ -67,6 +69,8 @@ export type WorldOptions = {
   env?: Record<string, string>
   // The start of this session's transcript (~/.claude/projects/*/<id>.jsonl); none: there's no transcript yet
   transcript?: string
+  // What uname -s answers, which picks the platform (Darwin by default)
+  system?: string
 }
 
 // A session with an id and a root, an in-memory folder tree, a claude that lists one session
@@ -88,6 +92,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const memory = { value: '1' }
   const ps = { value: '' }
   const terminal = { value: (_args: string[]) => '' }
+  const xprop = { value: (_args: string[]): string | null => null }
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
@@ -199,10 +204,14 @@ export function world(on: On, options: WorldOptions = {}): World {
       return ok(header ? [header.slice(header.indexOf('=') + 1), ...ps.value.split('\n').map(l => l.trim().split(/\s+/)[0])].join('\n') : ps.value)
     }
     if (argv[0] === 'osascript') return ok(terminal.value(argv.slice(2)))
+    if (argv[0] === 'xprop') {
+      const answer = xprop.value(argv.slice(1))
+      return answer === null ? failed() : ok(answer)
+    }
     if (argv[0] === '/bin/claude' && argv[1] === '--bg' && bgError.value) return { value: { exitCode: 1, stdout: '', stderr: bgError.value, isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === '/bin/claude' && argv[1] === '--version') return ok('2.1.316 (Claude Code)')
     if (argv[0] === '/bin/claude' && argv[1] === 'plugin') return ok('[]')
-    if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok('Darwin|')
+    if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok(`${options.system ?? 'Darwin'}|`)
     // The transcript's first row (readAgent)
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('.jsonl')) return transcript.value === undefined ? failed() : ok(transcript.value)
     return ok()
@@ -243,7 +252,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

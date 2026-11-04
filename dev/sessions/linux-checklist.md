@@ -47,5 +47,10 @@ the desktop (X11 or Wayland) and the terminal app.
     question, a permission) and leave it waiting: about two minutes later you get one notification naming it, through
     your terminal's notifications (kitty, Ghostty) or your `Notification` hooks, and none after that for the same wait.
     `/sessions status` says what PushNotification and the notification channel answered.
+17. **Seen (yellow → green):** have a background session finish a turn while another window is in front: its row is
+    yellow in the other sessions' panels. X11 with `xprop`: bring its window forward (or switch to it with Enter) and
+    without typing anything, within about 2 s it turns green. Check `xprop -id "$(xprop -root _NET_ACTIVE_WINDOW | grep -o
+    '0x[0-9a-f]*' | head -1)" _NET_WM_NAME` holds the session's name. On Wayland or without `xprop` it stays yellow
+    until you type in it.
 
 Anything off: note what you pressed, what the window showed, and the output of `ps -A -o pid= -o tty= -o command= | grep -E 'claude|visor'`.

@@ -1,10 +1,11 @@
-// Linux (and any system other than macOS; SESSIONS_PORTABLE=1 tries it on a Mac): there's no portable way to ask the
-// desktop which window is in front or to type into one, so windows are found from processes and switched through the
-// launcher only, which every terminal has. Windows are brought forward with wmctrl or xdotool (X11 only) and opened with
-// the first terminal emulator found; a process's program and folder come from /proc, memory from /proc/meminfo.
+// Linux (and any system other than macOS; SESSIONS_PORTABLE=1 tries it on a Mac): there's no portable way to type into a
+// window, so windows are found from processes and switched through the launcher only, which every terminal has. Which
+// window is in front is read with xprop (X11 only), by its title; windows are brought forward with wmctrl or xdotool
+// (X11 only) and opened with the first terminal emulator found; a process's program and folder come from /proc, memory
+// from /proc/meminfo.
 // Only fully testable on Linux: edit this file from there (see CONTRIBUTING.md).
 import type { Windows } from '../state'
-import type { Platform } from './types'
+import type { Platform, Shown } from './types'
 
 // Without asking the desktop which window is in front (Linux: no portable way, and none at all on Wayland), the window
 // this session is shown in, which is where its panel was just used: a viewer of this session, preferring one that runs
@@ -91,6 +92,45 @@ export function programFromCmdline(cmdline: string): string {
   return cmdline.split('\0').find(arg => /\/claude\/versions\/\d+\.\d+\.\d+$/.test(arg)) ?? ''
 }
 
+// The window in front, as `xprop -root _NET_ACTIVE_WINDOW` answers it ("… window id # 0x2e52d4b, 0x0"); null for none
+export function activeWindowId(answer: string): string | null {
+  const id = answer.match(/window id # (0x[0-9a-f]+)/i)?.[1]
+  return id && Number(id) !== 0 ? id : null
+}
+
+// A text property, as `xprop -id <window> _NET_WM_NAME` answers it (`NAME(UTF8_STRING) = "…"`), in UTF-8: xprop escapes
+// `"` and `\`, and under a locale that isn't UTF-8 writes each byte past ASCII as an octal escape (\342\227\220).
+// null if the window has no such property
+export function xpropText(answer: string): string | null {
+  const quoted = answer.match(/^[^=\n]*= "(.*)"\s*$/m)?.[1]
+  if (quoted === undefined) return null
+  const bytes: number[] = []
+  const encoder = new TextEncoder()
+  for (const [, octal, escaped, plain] of quoted.matchAll(/\\([0-7]{1,3})|\\(.)|([^\\]+)/gsu)) {
+    if (octal) bytes.push(parseInt(octal, 8) & 0xff)
+    else bytes.push(...encoder.encode(escaped ?? plain ?? ''))
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes))
+}
+
+// Whether a window's title shows a session: its viewer titles the window with Claude's title, a status mark and the
+// session's name ("✳ name"), which terminals show as is or inside their own words ("Terminal - ✳ name", "✳ name –
+// Konsole"). The whole name, then: after the start or a mark and a space, and before the end or a separator
+export function titleShows(title: string, name: string): boolean {
+  if (!name) return false
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(?:^|[^\\p{L}\\p{N}\\s] )${escaped}(?:$| [-\u2013\u2014|:] )`, 'u').test(title)
+}
+
+// The terminal of the window in front, from its title: a window of the one session whose whole name the title shows (the
+// longest name, when one holds another); null when it shows none, or two sessions share that name
+export function frontShown(title: string, shown: Shown[]): string | null {
+  const matches = shown.filter(s => titleShows(title, s.title))
+  const longest = Math.max(0, ...matches.map(s => s.title.length))
+  const best = matches.filter(s => s.title.length === longest)
+  return best.length > 0 && new Set(best.map(s => s.id)).size === 1 ? (best[0]?.tty ?? null) : null
+}
+
 export const linux: Platform = {
   name: 'linux',
 
@@ -100,10 +140,17 @@ export const linux: Platform = {
     return pickWindowShowingMe(v, me.shortId, !me.background && me.pid ? me.pid : undefined)
   },
 
-  // There's no telling which window is in front, so a session counts as seen only when you type in it
-  frontKnown: false,
-  async windowInFront() {
-    return null
+  // The window in front, by its title, with xprop (X11). Without X11 or xprop (Wayland, no display) it answers none,
+  // and a session counts as seen only when you type in it
+  frontKnown: true,
+  async windowInFront(run, shown) {
+    if (shown.length === 0) return null
+    const root = await run(['xprop', '-root', '_NET_ACTIVE_WINDOW'], { timeoutMs: 3000 })
+    const id = root.exitCode === 0 ? activeWindowId(root.stdout) : null
+    if (!id) return null
+    const name = await run(['xprop', '-id', id, '_NET_WM_NAME'], { timeoutMs: 3000 })
+    const title = name.exitCode === 0 ? xpropText(name.stdout) : null
+    return title ? frontShown(title, shown) : null
   },
   async userPresent() {
     return true
