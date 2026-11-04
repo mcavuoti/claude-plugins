@@ -274,6 +274,9 @@ test('send --allow: a git push adds its remote’s URL; with no host to name, or
   expect(await fleet($, '1 send --allow')).toBe("1: outbound.json changed outside fleet since it was stamped, so fleet doesn't add to it: if that edit is yours, /fleet accept outbound.json, then /fleet 1 send --allow again (or /fleet 1 send sends D-3 once).")
   expect(runs.length).toBe(1)
   expect(json(w, `${FLEET}/outbound.json`).hosts).toEqual(['devbox', 'other.invalid'])
+  // With no stamps at all: said as such
+  w.files.delete(`${FLEET}/state/stamps.json`)
+  expect(await fleet($, '1 send --allow')).toBe('1: no stamps: read outbound.json and type /fleet accept outbound.json, then /fleet 1 send --allow again (or /fleet 1 send sends D-3 once).')
 })
 
 test('a git push draft shows what it pushes: its commits the remote lacks and their diffstat, a new branch’s too', async ($, on) => {

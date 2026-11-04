@@ -197,6 +197,16 @@ test("a host outbound.json doesn't list as the person's is never reached: the po
   expect(await fleet($, 'up --dry-run')).toContain(`  ! world.json's code depot is on dev.example.invalid: fleet reaches a host over ssh only when outbound.json lists it as yours ("hosts"), so it isn't watched until then`)
 })
 
+test("with no stamps the code watch says so, not that outbound.json doesn't list its host", WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { background: false, stamps: false, files: project({ depot: { kind: 'p4', host: 'dev.example.invalid', depot: '//depot/project/...' } }, { [`${FLEET}/outbound.json`]: JSON.stringify({ outboundFormat: 1, hosts: ['dev.example.invalid'] }) }) })
+  w.exec.value = argv => (argv[0] === 'ssh' ? { exitCode: 0, stdout: '' } : undefined)
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  await run(w, 4)
+  expect(w.runs.some(r => r[0] === 'ssh')).toBe(false)
+  expect(json(w, `${STATE}/code.json`).repos.depot.problem).toBe('no stamps: read outbound.json and type /fleet accept outbound.json (fleet reaches dev.example.invalid over ssh only once it is stamped)')
+})
+
 test("a command repository: the project's two commands run from its folder only once the person stamps them", WITH_SESSIONS, async ($, on) => {
   const now = Date.UTC(2026, 10, 2, 12, 0, 0)
   const w = world(on, {

@@ -58,7 +58,6 @@ import {
   mcpRuleTools,
   draftText,
   hostAllowed,
-  hostOf,
   insideHost,
   hostsNamed,
   matches,
@@ -78,6 +77,7 @@ import {
   remoteName,
   sendWords,
   treeVersion,
+  urlHost,
   widenOutbound,
   type OutboundConfig,
   type OutboundSpec,
@@ -2263,6 +2263,9 @@ let outboundCfg: { c: OutboundConfig; key: string } | null = null
 let outboundProblem = ''
 // outbound.json changed outside fleet since it was stamped: the gate goes on with it as it was stamped
 let outboundUnstamped = false
+// No stamps at all (state/stamps.json missing): what refuses because of it says so, not that outbound.json lacks a host
+let outboundNoStamps = false
+const NO_STAMPS = 'no stamps: read outbound.json and type /fleet accept outbound.json'
 
 /** outbound.json as the person stamped it (or fleet wrote it on his answer), read again when its time or the stamps'
  * moves: an edit made another way isn't used until /fleet accept outbound.json, so it never widens what leaves
@@ -2293,11 +2296,13 @@ async function outboundConfig($: any): Promise<OutboundConfig> {
   const w = raw === null ? null : parseWire<Stamps>(raw)
   if (w && 'otherFormat' in w) {
     outboundUnstamped = false
+    outboundNoStamps = false
     return none(`the stamps (state/stamps.json) are from another fleet (format ${w.otherFormat}): restart this session (u)`)
   }
   const s = w ? w.value : null
   // No stamps (/fleet init writes the first ones): taken away, or never there. Nothing is trusted until the person
   // stamps outbound.json himself, so a deleted stamps file never opens the gate
+  outboundNoStamps = !s
   if (!s) {
     outboundUnstamped = false
     return none(`no stamps (state/stamps.json is missing): nothing but this machine is allowed until you type /fleet accept outbound.json`)
@@ -3832,7 +3837,9 @@ async function pollRepo($: any, repo: Repo, had: RepoState | null, now: number):
     unseen: new Set(),
   })
   const host = repo.kind === 'command' ? null : repo.host
-  if (host && !hostAllowed(sshHost(host), await outboundConfig($))) return fail(`it's on ${host}, which outbound.json doesn't list as yours ("hosts"): fleet reaches a host over ssh only there`)
+  if (host && !hostAllowed(sshHost(host), await outboundConfig($))) {
+    return fail(outboundNoStamps ? `${NO_STAMPS} (fleet reaches ${host} over ssh only once it is stamped)` : `it's on ${host}, which outbound.json doesn't list as yours ("hosts"): fleet reaches a host over ssh only there`)
+  }
   try {
     if (repo.kind === 'git') return await pollGit($, repo, had, now, fail)
     if (repo.kind === 'p4') return await pollP4($, repo, had, now, fail)
@@ -6295,7 +6302,11 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
     const before = await readText($, `${root}/${OUTBOUND_JSON}`)
     const p = before === null ? null : parseOutbound(before)
     if (p && 'problem' in p) return `${n}: ${p.problem}, so fleet doesn't add to it: /fleet ${n} send sends ${rec.id} once.`
-    if (!(await stampedNow($, OUTBOUND_JSON))) return `${n}: outbound.json changed outside fleet since it was stamped, so fleet doesn't add to it: if that edit is yours, /fleet accept outbound.json, then /fleet ${n} send --allow again (or /fleet ${n} send sends ${rec.id} once).`
+    if (!(await stampedNow($, OUTBOUND_JSON))) {
+      await outboundConfig($)
+      if (outboundNoStamps) return `${n}: ${NO_STAMPS}, then /fleet ${n} send --allow again (or /fleet ${n} send sends ${rec.id} once).`
+      return `${n}: outbound.json changed outside fleet since it was stamped, so fleet doesn't add to it: if that edit is yours, /fleet accept outbound.json, then /fleet ${n} send --allow again (or /fleet ${n} send sends ${rec.id} once).`
+    }
     allow = { ...a, before }
   }
   // Once: the first claim wins
@@ -9594,7 +9605,7 @@ export const register: Register = on => {
           // A page of the person's own (outbound.json's inside: his intranet) isn't outside content
           if (e.tool === 'WebFetch' && root) {
             try {
-              if (insideHost(hostOf(String((e as any).url ?? '')), await outboundConfig($))) return
+              if (insideHost(urlHost(String((e as any).url ?? '')), await outboundConfig($))) return
             } catch {}
           }
           await markOutside($, markWhat(String(e.tool), e as any))
