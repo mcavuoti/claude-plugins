@@ -1285,8 +1285,8 @@ async function beat($: any) {
   // The outside scan is the sweeper's (claims dedupe it anyway); every session walks the world once, for its baseline
   if (sweep.holding || !baselined) await scanWorld($).catch(err => log($, `world scan: ${String(err).slice(0, 200)}`))
   // What the band says besides the counts: nobody sweeps, the world too big to scan
-  // In the person's sessions: instances a restart stopped (the machine, or the background service), which /fleet up
-  // brings back; fleet never wakes them by itself
+  // In the person's sessions: instances a restart stopped (the machine, or the background service), which the sweeper
+  // wakes by itself (once per stop, RESTART_WAKES_PER_DAY a day), and the ones it woke a moment ago
   const restarted = !myInstance && roster ? await restartLine($) : ''
   const notes = [...((await sweeperState($)).nobody ? ['nobody sweeps'] : []), ...(restarted ? [restarted] : []), ...(tooBig && worldOn() ? ['world too big: no scan'] : [])].join(' · ')
   if ((await read($, bandNote)) !== notes) await update($, bandNote, () => notes)
@@ -4817,7 +4817,9 @@ const carried = { done: false, startedAt: 0, lastLanding: 0, lastWork: 0 }
 type BudgetRow = { inst: Instance; usd: number; cap: number | null; own: BudgetState; state: BudgetState }
 type ProjectBudget = { usd: number; cap: number | null; state: BudgetState }
 /** The sweeper's wakes today; cadenceFor: the period (its anchor) an instance was last woken for, past its cadence */
-type WakesFile = { format: number; day: string; instances: Record<string, WakeCount & { cadenceFor?: number; cadenceKey?: string; cadenceCount?: number; derivedFor?: string; slotFor?: string; reviewFor?: string; notWoken?: { at: number; why: string } }> }
+/** The sweeper's wakes today, by slug. restartFor/restartAt/restartCount: its wakes after a restart (the stop episode it
+ * woke the instance for, when, how many today), apart from the wakes' caps */
+type WakesFile = { format: number; day: string; instances: Record<string, WakeCount & { cadenceFor?: number; cadenceKey?: string; cadenceCount?: number; derivedFor?: string; slotFor?: string; reviewFor?: string; notWoken?: { at: number; why: string }; restartFor?: string; restartAt?: number; restartCount?: number }> }
 /** The config files' versions as fleet wrote them or the person stamped them; outbound: outbound.json's own text as
  * stamped, which is what the gate uses (an edit made another way waits for /fleet accept) */
 type Stamps = { format: number; files: Record<string, string | null>; outbound?: string | null }
@@ -5108,22 +5110,57 @@ function stopReason(row: any): 'person' | 'idle' | 'memory' | 'ended' | null {
   return r === 'person' || r === 'idle' || r === 'memory' || r === 'ended' ? r : null
 }
 
-/** The instances (not down) a restart stopped, and the band's line for them: "3 stopped since a restart: /fleet up
- * --stopped", which wakes them and starts none that was never started ('' for none) */
-async function stoppedByRestart($: any): Promise<Instance[]> {
-  if (!roster?.instances.length || !(await has($, 'status'))) return []
+// After a restart (the machine, the background service) or a crash, the sweeper wakes the instances it stopped by
+// itself (#22a, the owner's call): once per stop, at most RESTART_WAKES_PER_DAY a day each (a crash loop stops there),
+// apart from the wakes' caps. The band says so for RESTART_SHOWN_MS; one woken RESTART_GRACE_MS ago and still stopped
+// is said as stopped again
+const RESTART_WAKES_PER_DAY = 3
+const RESTART_SHOWN_MS = 10 * 60000
+const RESTART_GRACE_MS = 2 * 60000
+
+/** A stop: the instance's last heartbeat (its conversation, and when it last beat). Once it runs again it beats anew, so
+ * its next stop is another one */
+function stopEpisode(hb: Heartbeat): string {
+  return `${hb.sessionId}@${hb.at}`
+}
+
+/** After a restart, as the band, /fleet status and the brief say it: the instances (not down) a restart stopped and
+ * fleet hasn't just woken (stopped: /fleet up --stopped wakes them, starting none never started), those of them woken
+ * RESTART_WAKES_PER_DAY times today (capped: a crash loop), and the ones fleet woke in the last RESTART_SHOWN_MS */
+async function restartView($: any): Promise<{ stopped: Instance[]; capped: Instance[]; woke: Instance[] }> {
+  const none = { stopped: [], capped: [], woke: [] }
+  if (!roster?.instances.length || !(await has($, 'status'))) return none
   const st = await race<Status>($, () => $.sessions.status({ names: (roster as { instances: Instance[] }).instances.map(i => i.name) }))
-  if (!st?.ready) return []
+  if (!st?.ready) return none
   const down = await downSet($)
-  return roster.instances.filter(i => {
+  const now = await $.clock.now()
+  const swept = await readWire<WakesFile>($, stateDir('wakes.json'))
+  const today_ = swept && swept.day === today(now) ? swept.instances : {}
+  const out: { stopped: Instance[]; capped: Instance[]; woke: Instance[] } = { stopped: [], capped: [], woke: [] }
+  for (const i of roster.instances) {
+    const had = today_[i.slug]
+    if (had?.restartAt !== undefined && now - had.restartAt < RESTART_SHOWN_MS) out.woke.push(i)
     const { running, stopped } = rowsOf(i, st.rows)
-    return !running && !!stopped && !down.has(i.slug) && stopReason(stopped) === 'ended'
-  })
+    if (running || !stopped || down.has(i.slug) || stopReason(stopped) !== 'ended') continue
+    const hb = await heartbeatOf($, i.slug)
+    const waking = !!hb && had?.restartFor === stopEpisode(hb) && had.restartAt !== undefined && now - had.restartAt < RESTART_GRACE_MS
+    if (waking) continue
+    out.stopped.push(i)
+    if ((had?.restartCount ?? 0) >= RESTART_WAKES_PER_DAY) out.capped.push(i)
+  }
+  return out
+}
+/** Whether the sweeper woke this instance after a restart a moment ago (RESTART_GRACE_MS) */
+function restartedNow(swept: WakesFile | null, inst: Instance, now: number, day: string): boolean {
+  const had = swept && swept.day === day ? swept.instances[inst.slug] : undefined
+  return had?.restartAt !== undefined && now - had.restartAt < RESTART_GRACE_MS
 }
 async function restartLine($: any): Promise<string> {
-  const gone = await stoppedByRestart($)
-  if (!gone.length) return ''
-  return `${gone.length} stopped since a restart: /fleet up --stopped`
+  const v = await restartView($)
+  const parts: string[] = []
+  if (v.woke.length) parts.push(`woke ${v.woke.length} after a restart`)
+  if (v.stopped.length) parts.push(`${v.stopped.length} stopped since a restart${v.capped.length ? ` (${v.capped.length} woken ${RESTART_WAKES_PER_DAY}× today: a crash loop?)` : ''}: /fleet up --stopped`)
+  return parts.join(' · ')
 }
 
 /** An instance's cadence as its heartbeat tells it (the sweeper, status, the brief) */
@@ -6678,12 +6715,45 @@ async function rosterTick($: any) {
       continue
     }
     if (!retired || isDown || b?.state === 'over' || !hb?.ref || hb.ref !== retired.ref) continue
-    // Only one the service retired for being idle (or closed for memory, which sessions holds until memory is back) is
-    // woken by the sweeper: one a restart or a crash stopped waits for the person's /fleet up (an automatic wake after
-    // a restart is his call, #22), and one he stopped stays stopped
+    // One the person stopped stays stopped. One whose reason sessions doesn't give (an older sessions, or nothing says why)
+    // goes the usual way: woken when something is for it, sessions refusing what it must
     const why = stopReason(retired)
-    if (why === 'ended' || why === 'person') continue
+    if (why === 'person') continue
     const had = swept.instances[inst.slug]
+    // One a restart or a crash stopped (or closed for lack of memory, which sessions holds until memory is back) is woken
+    // by itself, nothing waiting for it needed (#22a): once per stop, at most RESTART_WAKES_PER_DAY a day, apart from
+    // the wakes' caps. A wake sessions refuses (memory still short) is tried again at the next sweep
+    if (why === 'ended' || why === 'memory') {
+      const episode = stopEpisode(hb)
+      if (had?.restartFor === episode) continue
+      const base = had ?? { day, count: 0, last: 0 }
+      if ((had?.restartCount ?? 0) >= RESTART_WAKES_PER_DAY) {
+        const capped = `woken ${RESTART_WAKES_PER_DAY} times today after a restart: /fleet up --stopped wakes it again`
+        if (had?.notWoken?.why !== capped) {
+          swept.instances[inst.slug] = { ...base, notWoken: { at: now, why: capped } }
+          woke = true
+        }
+        continue
+      }
+      if (!(await has($, 'wake'))) continue
+      const reason = why === 'memory' ? 'fleet: closed for lack of memory, memory is back' : 'fleet: a restart stopped it'
+      const r = await race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: retired.ref, reason }))
+      if (r?.ok) {
+        const kept = { ...base }
+        delete kept.notWoken
+        swept.instances[inst.slug] = { ...kept, restartFor: episode, restartAt: now, restartCount: (had?.restartCount ?? 0) + 1 }
+        woke = true
+        log($, `woke ${inst.name} (${reason})`)
+      } else if (r) {
+        const said = `sessions: ${r.detail ?? r.reason}`
+        if (had?.notWoken?.why !== said) {
+          log($, `${inst.name} not woken after a restart: ${r.detail ?? r.reason}`)
+          swept.instances[inst.slug] = { ...base, notWoken: { at: now, why: said } }
+          woke = true
+        }
+      }
+      continue
+    }
     const answered = records.some(r => r.asker.ref === retired.ref && knownKind(r) && progress(r.id, slots(r), present).complete)
     // The cadence counts the instance's own nudges too (one count, one period key): no wake for a period its own fleet
     // already nudged, none past CADENCE_PER_DAY between them, and none while its way forward is its own open question
@@ -7356,6 +7426,8 @@ async function rosterStatus($: any): Promise<string[]> {
   const now = await $.clock.now()
   const day = today(now)
   const swept = await readWire<WakesFile>($, stateDir('wakes.json'))
+  const restarted = await restartLine($)
+  if (restarted) lines.push(`after a restart: ${restarted}`)
   const { records } = await queueRecords($)
   const present = await answerNames($)
   for (const inst of all) {
@@ -7371,15 +7443,23 @@ async function rosterStatus($: any): Promise<string[]> {
         : !row
           ? 'not started'
           : why === 'ended'
-            ? 'stopped since a restart (/fleet up --stopped wakes it)'
+            ? restartedNow(swept, inst, now, day)
+              ? 'stopped since a restart; fleet just woke it'
+              : (swept && swept.day === day ? (swept.instances[inst.slug]?.restartCount ?? 0) : 0) >= RESTART_WAKES_PER_DAY
+                ? `stopped since a restart; woken ${RESTART_WAKES_PER_DAY} times today, so not again by itself (/fleet up --stopped wakes it)`
+                : 'stopped since a restart (fleet wakes it at its next sweep; /fleet up --stopped now)'
             : why === 'idle'
               ? 'retired for being idle (fleet wakes it when something is for it)'
               : why === 'person'
                 ? 'stopped by you'
                 : why === 'memory'
-                  ? 'closed for lack of memory'
-                  : String(row.state),
+                  ? 'closed for lack of memory (fleet wakes it once memory is back)'
+                  : (retired as any)?.stopped === 'unknown'
+                    ? 'stopped, and nothing says why (Enter or u in the panel restarts it)'
+                    : String(row.state),
     )
+    const restartWake = swept && swept.day === day ? swept.instances[inst.slug] : undefined
+    if (running && restartWake?.restartAt !== undefined && now - restartWake.restartAt < RESTART_SHOWN_MS) parts.push(`woken after a restart ${ago(now - restartWake.restartAt)} ago`)
     // Its ids: the job's (claude agents, claude respawn) and the conversation's, which a fresh period changes
     if (hb?.ref) parts.push(`job ${hb.ref}${hb.sessionId && !hb.sessionId.startsWith(hb.ref) ? `, session ${hb.sessionId.slice(0, 8)}` : ''}`)
     if (running) {
@@ -8831,10 +8911,15 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
       if (!rows.running && rows.stopped && !down.has(inst.slug)) {
         const why = stopReason(rows.stopped)
         if (why === 'ended') {
-          stopped.restart.push(inst.name)
-          stopped.wave = Math.max(stopped.wave, inst.wave)
+          if (!restartedNow(swept, inst, now, today(now))) {
+            stopped.restart.push(inst.name)
+            stopped.wave = Math.max(stopped.wave, inst.wave)
+          }
         } else if (why === 'idle') stopped.retired.push({ name: inst.name, notWoken: swept && swept.day === today(now) ? (swept.instances[inst.slug]?.notWoken?.why ?? null) : null })
       }
+      // Woken after a restart today, by the sweeper (the brief keeps them: these wakes aren't nudges, nor in the caps)
+      const rw = swept && swept.day === today(now) ? swept.instances[inst.slug] : undefined
+      if (rw?.restartAt !== undefined) stopped.woken = [...(stopped.woken ?? []), { name: inst.name, at: rw.restartAt, count: rw.restartCount ?? 1 }]
       // What auto mode blocked it today (only its own /permissions lists it), down or not
       const blocks = await blocksOf($, inst.slug, now)
       if (blocks) autoMode.push({ name: inst.name, blocks })

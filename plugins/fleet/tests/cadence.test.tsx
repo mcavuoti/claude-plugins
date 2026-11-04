@@ -220,7 +220,7 @@ test('the sweeper marks an instance quiet past its cadence and wakes a retired o
   expect(brief).toContain('   - Owner A: nothing landed in 3 h (its cadence is 2 h)')
 })
 
-test('after a restart: the band and /fleet status say which instances it stopped, /fleet up wakes them; one stopped by the person or retired is said apart', WITH_SESSIONS, async ($, on) => {
+test('after a restart: the sweeper wakes the one a restart stopped by itself, and the band, /fleet status and the brief say so; one stopped by the person is left alone', WITH_SESSIONS, async ($, on) => {
   const now = Date.UTC(2026, 10, 2, 12, 0, 0)
   const beat = (name: string, slug: string, ref: string, extra: Record<string, unknown> = {}) => JSON.stringify({ format: 1, instance: name, slug, ref, sessionId: 'dddddddd-0000-0000-0000-000000000000', at: now - HOUR, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: now - 3 * HOUR, lastLanding: now - 30 * 60000, ...extra })
   const w = world(on, {
@@ -235,24 +235,84 @@ test('after a restart: the band and /fleet status say which instances it stopped
   sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'ended' }, ccccccc1: { ...row('ccccccc1', 'Owner C', 'stopped'), stopped: 'person' } } })
   await startSession($, w)
   await tick(w, 10100)
+  // Nothing waits for it: a restart stopped it, and that's enough (#22a)
+  expect(calls(w, 'wake')).toEqual([{ ref: 'aaaaaaa1', reason: 'fleet: a restart stopped it' }])
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(JSON.stringify(await ui.drawn())).toContain('1 stopped since a restart: /fleet up --stopped')
+  expect(JSON.stringify(await ui.drawn())).toContain('woke 1 after a restart')
   await ui.unmount()
   const status = await fleet($, 'status')
-  expect(status).toContain('Owner A · owner · Owners · wave 1 · stopped since a restart (/fleet up --stopped wakes it) · job aaaaaaa1, session dddddddd')
+  expect(status).toContain('after a restart: woke 1 after a restart')
+  expect(status).toContain('Owner A · owner · Owners · wave 1 · stopped since a restart; fleet just woke it · job aaaaaaa1, session dddddddd')
   expect(status).toContain('Owner C · owner · Owners · wave 1 · stopped by you · job ccccccc1')
-  // What it waits on and when it works next
-  expect(status).toContain('next cadence in 1 h')
-  const brief = await fleet($, 'brief')
-  expect(brief).toContain('   - stopped since a restart: Owner A (/fleet up --stopped brings them back and starts nothing else)')
-  // /fleet up asks sessions to wake the one a restart stopped; the one the person stopped is left alone
+  expect(await fleet($, 'brief')).toContain('   - woken after a restart today: Owner A (')
+  // Still stopped two minutes on (its wake didn't take): said as stopped again, not woken again for the same stop
+  for (let k = 0; k < 3; k++) await tick(w, 61000)
+  expect(calls(w, 'wake').length).toBe(1)
+  const ui2 = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await ui2.drawn())).toContain('woke 1 after a restart · 1 stopped since a restart: /fleet up --stopped')
+  await ui2.unmount()
+  expect(await fleet($, 'brief')).toContain('   - stopped since a restart: Owner A (/fleet up --stopped brings them back and starts nothing else)')
+  // /fleet up still wakes it by hand; the person's stays stopped
   const up = await fleet($, 'up')
   expect(up).toContain('Owner A: waking')
   expect(up).toContain('Owner C: stopped by you, left alone (Enter or u in the panel restarts it)')
-  expect(calls(w, 'wake').map(x => x.ref)).toEqual(['aaaaaaa1'])
+  expect(calls(w, 'wake').map(x => x.ref)).toEqual(['aaaaaaa1', 'aaaaaaa1'])
 })
 
-test('the sweeper never wakes one a restart stopped, even with its cadence due; /fleet up --stopped wakes it and starts none never started', WITH_SESSIONS, async ($, on) => {
+test('the sweeper wakes one a restart stopped once per stop, again after it ran and stopped again, at most 3 a day; never one the person stopped, one nothing says why, one down or one over budget', { ...WITH_SESSIONS, timeoutMs: 60000 }, async ($, on) => {
+  const now = Date.UTC(2026, 10, 2, 12, 0, 0)
+  const beat = (name: string, slug: string, ref: string, at = now - 5 * HOUR) => JSON.stringify({ format: 1, instance: name, slug, ref, sessionId: `${ref}-sid`, at, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: now - 9 * HOUR, lastLanding: now - 6 * HOUR })
+  const names = ['Owner A', 'Owner B', 'Owner C', 'Owner D', 'Owner E']
+  const w = world(on, {
+    background: false,
+    files: {
+      [`${FLEET}/roster.json`]: roster({}, { instances: names.map(name => ({ name, role: 'owner', section: 'owners' })) }),
+      [`${ROOT}/.claude/agents/owner.md`]: OWNER,
+      ...Object.fromEntries(names.map(n => { const slug = n.toLowerCase().replace(' ', '-'); const ref = `${slug.slice(-1).repeat(7)}1`; return [`${FLEET}/instances/${slug}/state.json`, beat(n, slug, ref)] })),
+      [`${FLEET}/state/down.json`]: JSON.stringify({ format: 1, instances: { 'owner-d': now - HOUR } }),
+      [`${FLEET}/instances/owner-e/spend.json`]: JSON.stringify({ format: 1, slug: 'owner-e', day: '2026-11-02', usd: 2, sessionId: 's', last: 2, at: now }),
+    },
+  })
+  const rows = (aState = 'stopped') => ({
+    aaaaaaa1: aState === 'stopped' ? { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'ended' } : row('aaaaaaa1', 'Owner A', aState),
+    bbbbbbb1: { ...row('bbbbbbb1', 'Owner B', 'stopped'), stopped: 'person' },
+    ccccccc1: { ...row('ccccccc1', 'Owner C', 'stopped'), stopped: 'unknown' },
+    ddddddd1: { ...row('ddddddd1', 'Owner D', 'stopped'), stopped: 'ended' },
+    eeeeeee1: { ...row('eeeeeee1', 'Owner E', 'stopped'), stopped: 'ended' },
+  })
+  sessionsSay(w, { rows: rows() })
+  await startSession($, w)
+  for (let k = 0; k < 3; k++) await tick(w, 61000)
+  // Only Owner A: B the person stopped, C nothing says why (nothing waits for it either), D is down, E over budget
+  expect(calls(w, 'wake')).toEqual([{ ref: 'aaaaaaa1', reason: 'fleet: a restart stopped it' }])
+  // It runs again (a new heartbeat), then stops again: another stop, woken again; up to 3 a day
+  const runAndStop = async () => {
+    sessionsSay(w, { rows: rows('idle') })
+    w.touch(`${FLEET}/instances/owner-a/state.json`, beat('Owner A', 'owner-a', 'aaaaaaa1', w.clock.now()))
+    await tick(w, 61000)
+    sessionsSay(w, { rows: rows() })
+    for (let k = 0; k < 2; k++) await tick(w, 61000)
+  }
+  await runAndStop()
+  expect(calls(w, 'wake').map(x => x.ref)).toEqual(['aaaaaaa1', 'aaaaaaa1'])
+  await runAndStop()
+  expect(calls(w, 'wake').map(x => x.ref)).toEqual(['aaaaaaa1', 'aaaaaaa1', 'aaaaaaa1'])
+  // The fourth stop today: not woken by itself (a crash loop stops there), and the band and status say so
+  await runAndStop()
+  for (let k = 0; k < 3; k++) await tick(w, 61000)
+  expect(calls(w, 'wake').length).toBe(3)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await ui.drawn())).toContain('woken 3× today: a crash loop?): /fleet up --stopped')
+  await ui.unmount()
+  const status = await fleet($, 'status')
+  expect(status).toContain('Owner A · owner · Owners · wave 1 · stopped since a restart; woken 3 times today, so not again by itself (/fleet up --stopped wakes it)')
+  expect(status).toContain('Owner C · owner · Owners · wave 1 · stopped, and nothing says why (Enter or u in the panel restarts it)')
+  expect(await fleet($, 'brief')).toContain('Owner A (')
+  // These wakes aren't nudges: the wakes' count is untouched
+  expect(json(w, `${FLEET}/state/wakes.json`).instances['owner-a']).toMatchObject({ count: 0, restartCount: 3 })
+})
+
+test('/fleet up --stopped wakes the stopped ones and starts none never started', WITH_SESSIONS, async ($, on) => {
   const now = Date.UTC(2026, 10, 2, 12, 0, 0)
   const beat = (name: string, slug: string, ref: string) => JSON.stringify({ format: 1, instance: name, slug, ref, sessionId: 'dddddddd-0000-0000-0000-000000000000', at: now - 5 * HOUR, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: now - 9 * HOUR, lastLanding: now - 6 * HOUR })
   const w = world(on, {
@@ -267,16 +327,12 @@ test('the sweeper never wakes one a restart stopped, even with its cadence due; 
   // Owner A: a restart stopped it; Owner C: retired for being idle; Owner B: never started
   sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'ended' }, ccccccc1: { ...row('ccccccc1', 'Owner C', 'stopped'), stopped: 'idle' } } })
   await startSession($, w)
-  for (let k = 0; k < 4; k++) await tick(w, 61000)
-  // Only the idle-retired one is woken for its cadence: an automatic wake after a restart is the person's call (#22)
-  expect(calls(w, 'wake')).toEqual([{ ref: 'ccccccc1', reason: 'fleet: nothing landed in its cadence period' }])
   const up = await fleet($, 'up --stopped')
   expect(up).toContain('Owner A: waking')
   expect(up).toContain('never started: left alone (--stopped wakes stopped ones only)')
   expect(up).not.toContain('Owner B: starting')
   expect(calls(w, 'start')).toEqual([])
-  // It wakes every stopped one the person didn't stop: the restart's, and the retired one again
-  expect(calls(w, 'wake').map(x => x.ref)).toEqual(['ccccccc1', 'aaaaaaa1', 'ccccccc1'])
+  expect(calls(w, 'wake').map(x => x.ref)).toEqual(['aaaaaaa1', 'ccccccc1'])
 })
 
 test('a retired instance with something for it the wakes’ cap holds back: /fleet status and the brief say why it wasn’t woken', WITH_SESSIONS, async ($, on) => {
