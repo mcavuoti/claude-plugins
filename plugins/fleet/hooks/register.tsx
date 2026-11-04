@@ -57,6 +57,8 @@ import {
   classifyMcp,
   draftText,
   hostAllowed,
+  hostOf,
+  insideHost,
   hostsNamed,
   matches,
   mayReachNetwork,
@@ -107,6 +109,8 @@ import {
   newer,
   oldDays,
   overwroteText,
+  duringText,
+  bashWritesNothing,
   parseReads,
   parseWorld,
   placeable,
@@ -451,6 +455,8 @@ const bgCommands = atom({ plugin: 'fleet', key: 'bgCommands' } as const, {} as R
 const handoff = atom({ plugin: 'fleet', key: 'handoff' } as const, null as { text: string; at: number } | null)
 // What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing)
 const bandNote = atom({ plugin: 'fleet', key: 'bandNote' } as const, '')
+const classicSeen = atom({ plugin: 'fleet', key: 'classicSeen' } as const, {} as Record<string, number>)
+const identityTold = atom({ plugin: 'fleet', key: 'identityTold' } as const, false)
 
 // This copy of the module: a hot reload makes a new one and drops the old one's timers and the submits it waited on
 const EPOCH = Math.random().toString(36).slice(2, 10)
@@ -1124,7 +1130,7 @@ async function deliver($: any) {
     const sent = parts.map(p => p.record.id)
     await update($, inflight, m => ({ ...m, ...Object.fromEntries(sent.map(id => [id, { at: now, epoch: EPOCH }])) }))
     log($, `delivering ${sent.join(', ')}`)
-    $.prompt.submit({ text: deliveryText(parts, ownDelivery) }).then(
+    submitOwn($, deliveryText(parts, ownDelivery)).then(
       (r: any) => bg(submitted($, sent, r)),
       (err: unknown) => bg(failed($, sent, err)),
     )
@@ -2385,7 +2391,7 @@ async function outboundOf($: any, e: any, c: OutboundConfig): Promise<{ sends: S
     return { sends, how: 'command', outside: r.reads.length ? `a command that read ${r.reads.slice(0, 3).join(', ')}` : null }
   }
   const { tool: _t, tool_use_id: _u, agentId: _a, ...input } = e
-  const r = classifyMcp(String(e.tool), input, c)
+  const r = classifyMcp(String(e.tool), input, c, myInstance?.name ?? null)
   return { sends: r.send ? [r.send] : [], how: 'tool', outside: r.outside ? `${String(e.tool)}` : null }
 }
 
@@ -2628,7 +2634,7 @@ function knownSnapshot(): Snapshot {
 // After a Bash command: every world file it changed is a landing of this thread, marked blind (it didn't go through
 // the gate: decision 3c flags it, never blocks). One whose newest change was someone else's after this thread read it
 // gets a line for the model; so does one whose pins this thread hadn't read as they are, and it's marked suspect
-async function afterBash($: any, thread: string, before: Snapshot, startedAt: number): Promise<string[]> {
+async function afterBash($: any, thread: string, before: Snapshot, startedAt: number, readOnly = false): Promise<string[]> {
   const after = await snapshot($)
   if (!after) return []
   const changed = removalsLast(changedPaths(before, after), after)
@@ -2637,6 +2643,7 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   const sessionId = String(await $.session.id())
   const out: string[] = []
   const landed: string[] = []
+  const during: string[] = []
   type Landing = { rel: string; s: { mtimeMs: number; size: number } | undefined; f: { v: string | null; text: string | null }; last?: ChangeEvent; k?: Known; mine?: FleetRead; pc: PinCheck | null; suspect: string[]; by: Who; fields: Partial<ChangeEvent> }
   const settle = (x: Pick<Landing, 'rel' | 's' | 'f'>) => {
     if (x.s) setKnown(x.rel, { ...x.s, v: x.f.v, pins: pinsFrom(x.f.text, x.rel) })
@@ -2653,6 +2660,12 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     // Someone's landing during the command, or only its time moved
     if ((last && last.to === v && last.at >= startedAt - 1000) || (k && k.v === v && v !== null)) {
       settle({ rel, s, f })
+      continue
+    }
+    // A command with no write syntax changed nothing: another session's write landed while it ran (its event says so,
+    // or will, and the scan takes it then). It isn't this thread's landing: its model hears what changed under it
+    if (readOnly) {
+      during.push(rel)
       continue
     }
     const mine = (await read($, reads))[thread]?.[rel]
@@ -2707,6 +2720,10 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     if (v !== null) landed.push(x.rel)
   }
   scheduleChecks($, landed)
+  for (const rel of during) {
+    const last = latest.get(rel)
+    out.push(duringText(rel, last && last.by?.sessionId !== sessionId ? last : null, await meNow($)))
+  }
   return out
 }
 
@@ -2760,7 +2777,7 @@ async function bashHook($: any, e: any, next: any) {
     before = undefined
   }
   try {
-    if (before) extra.push(...(await afterBash($, thread, before, startedAt)))
+    if (before) extra.push(...(await afterBash($, thread, before, startedAt, bashWritesNothing(String(e.command ?? '')))))
     const target = bashReadTarget(String(e.command ?? ''))
     if (target && r && !r.isError && r.deny === undefined) extra.push(...(await noteRead($, thread, target)))
   } catch (err) {
@@ -4679,7 +4696,9 @@ let instDirMade = ''
  * started (a fresh period starts a new one); outside: what outside content its conversation read; fleet: the version
  * of fleet it runs; mode: the permission mode it runs in (classic.SessionStart's permission_mode); waitingOn: a
  * permission prompt it waits on, with nobody at it; remote: whether it has Remote Control (null: not known);
- * contextTokens: the tokens its last answer was read over, what a wake reopens (null: not known yet) */
+ * contextTokens: the tokens its last answer was read over, what a wake reopens (null: not known yet); classicStart:
+ * whether classic.SessionStart reached fleet in this session (a managed plugin can send it on past it); orgAsk: the
+ * tools an organisation's ceiling makes ask the person on every call */
 type Heartbeat = {
   format: number
   instance: string
@@ -4711,6 +4730,8 @@ type Heartbeat = {
   /** The model its last main-loop request named, as the engine resolved it (a fallback's when the roster's model isn't
    * the account's); null before its first */
   model?: string | null
+  classicStart?: boolean
+  orgAsk?: string[]
 }
 // That model, from turn.step (B4: a roster model the account lacks ran the org default, and nothing said so)
 let stepModel: string | null = null
@@ -4732,6 +4753,12 @@ const budgetCache = { at: 0, list: [] as BudgetRow[], project: { usd: 0, cap: nu
 const noFleetSince = new Map<string, number>()
 const marksSet = { key: '', at: 0, refused: '' }
 const RUNNING = new Set(['working', 'waiting', 'idle'])
+// The modes in which a verdict `ask` doesn't reach a person (auto mode's classifier, or a refusal), unless an
+// organisation's ceiling forces it
+const NO_PROMPT_MODES = new Set(['auto', 'dontAsk', 'bypassPermissions'])
+// The tools this session saw an organisation's ceiling `ask` on (tool.check): every call asks the person, whatever
+// the allow rules say
+const orgAsk = new Set<string>()
 const DEFAULT_SEED =
   "Read the project's charter (.claude/fleet/charter.md) and the shared files your role works on. Then write down your plan for this first period where your role keeps its work, and start on what needs nobody's decision. Whenever you need the person's choice, ask with mcp__fleet__decide and keep going with the rest."
 
@@ -4897,6 +4924,8 @@ async function heartbeat($: any) {
     remote: await remoteControl($),
     contextTokens,
     model: stepModel,
+    classicStart: !!(await read($, classicSeen)).SessionStart,
+    ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
   }
   await replace($, `${dir}/state.json`, json(beat))
 }
@@ -5116,7 +5145,7 @@ async function maybeSeed($: any) {
   const text = await seedText($, inst)
   await update($, seedSent, () => ref)
   log($, `seed for ${inst.name}`)
-  $.prompt.submit({ text }).then(
+  submitOwn($, text).then(
     (r: any) =>
       bg(
         (async () => {
@@ -5167,8 +5196,9 @@ function nudgeSubmit($: any, what: string, text: string, started: () => Promise<
     await update($, nudgeAt, () => 0)
   }
   // Today's date with each nudge and hand-off: a long conversation reckons it badly from the hours it has run (G5). From
-  // the caller's now, submitted at once: a $ call awaited first would run past the dispatch that calls this
-  $.prompt.submit({ text: `${text}\n\n${dateLine(now, -new Date(now).getTimezoneOffset())}` }).then(
+  // the caller's now (a $ call awaited first would run past the dispatch that calls this); who it is goes first when its
+  // conversation wasn't told (submitOwn)
+  submitOwn($, `${text}\n\n${dateLine(now, -new Date(now).getTimezoneOffset())}`).then(
     (r: any) => bg(r && typeof r.drop === 'string' ? settle(`dropped (${r.drop})`, /stopped|nobody has sent input/i.test(r.drop)) : settle(null, false)),
     (err: unknown) => bg(settle(`failed (${String(err).slice(0, 200)})`, false)),
   )
@@ -5262,8 +5292,43 @@ async function nudgeTick($: any) {
   )
 }
 
+/** /fleet status's line on the classic hooks that reached fleet in this session. classic.SessionStart comes before any
+ * prompt: missing, a managed plugin sends it on past the plugins a person installed (next.to beneath their tier) */
+export function classicLine(seen: Record<string, number>): string {
+  const got = Object.keys(seen).sort()
+  if (seen.SessionStart) return `classic hooks reaching fleet here: ${got.join(', ')}`
+  return `classic hooks: SessionStart didn't reach fleet in this session (a managed plugin may send it on past the plugins you installed${got.length ? `; seen: ${got.join(', ')}` : ''}): fleet tells an instance who it is in its prompts and after a compaction, watches the world every 2 s, and finds a permission prompt by the verdict (tool.check)`
+}
+
+/** A classic hook reached fleet: when, by event. A managed plugin can send one on past the plugins a person installed
+ * (next.to beneath their tier): then fleet's own events stand in for it, and /fleet status says what it saw */
+function sawClassic($: any, event: string) {
+  bg(
+    (async () => {
+      const now = await $.clock.now()
+      await update($, classicSeen, m => ({ ...m, [event]: now }))
+    })(),
+  )
+}
+
+/** Who this instance is, when its conversation wasn't told yet (classic.SessionStart tells it; when that hook doesn't
+ * reach fleet, the next prompt, fleet's or anyone's, carries it): '' otherwise */
+async function identityOwed($: any): Promise<string> {
+  const inst = myInstance
+  if (!inst || !jobRef || !root || (await read($, identityTold))) return ''
+  return instanceContext($, inst)
+}
+
+/** fleet's own prompt, with who the instance is first when its conversation wasn't told yet (its turn's start says it
+ * was: turn.start) */
+async function submitOwn($: any, text: string): Promise<any> {
+  const id = await identityOwed($)
+  return $.prompt.submit({ text: id ? `${id}\n\n${text}` : text })
+}
+
 /** What an instance's model reads at the start of its conversation (classic.SessionStart, again after /clear and
- * compaction): who it is, what it can't write, its budget, the day it started. The same text all day, so it caches */
+ * compaction; fleet's own prompts or compaction when that hook doesn't reach it): who it is, what it can't write, its
+ * budget, the day it started. The same text all day, so it caches */
 async function instanceContext($: any, inst: Instance): Promise<string> {
   // What world.json says of proofs and code, read before the first words
   await ensureWorld($)
@@ -5739,7 +5804,7 @@ async function fileOutbound($: any, e: any) {
   let found: Send[] = []
   if (s.command !== undefined) found = classifyBash(s.command, cfg).sends
   else {
-    const m = classifyMcp(s.tool as string, s.input ?? {}, cfg).send
+    const m = classifyMcp(s.tool as string, s.input ?? {}, cfg, myInstance?.name ?? null).send
     found = m ? [m] : []
   }
   const parts = s.tool ? mcpParts(s.tool) : null
@@ -6834,6 +6899,23 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     const [mode, from, waits] = key.split('|')
     lint.warnings.push(`${names.join(', ')}: ${names.length === 1 ? 'runs' : 'run'} in ${mode} mode (${from}): ${waits}. A mode that doesn't ask lets ${names.length === 1 ? 'it' : 'them'} work unattended: roster.json's settings can give one ("permissions": { "defaultMode": "auto" }, as the templates suggest); otherwise answer each prompt from the panel (Enter)`)
   }
+  // A connector tool an organisation keeps at `ask` (its ceiling) asks the person on every call, whatever allow rules
+  // the roster gives: what an instance saw (its heartbeat), and what this session's own check of its allowed tools says
+  const orgWaits = new Map<string, string[]>()
+  for (const p of plan) {
+    if (p.action === 'down') continue
+    const allowed = ((settingsFor(p.inst, root as string, []) as any)?.permissions?.allow ?? []).filter((t: unknown): t is string => typeof t === 'string' && t.startsWith('mcp__') && !t.startsWith('mcp__fleet__'))
+    for (const tool of allowed) {
+      if (orgAsk.has(tool)) continue
+      try {
+        await Promise.race([$.tool.check({ tool, input: {} }), $.clock.sleep(1000)])
+      } catch {}
+    }
+    const hb = await heartbeatOf($, p.inst.slug)
+    const asks = [...new Set([...allowed.filter((t: string) => orgAsk.has(t)), ...(hb?.orgAsk ?? [])])]
+    if (asks.length) orgWaits.set(p.inst.name, asks)
+  }
+  for (const [name, tools] of orgWaits) lint.warnings.push(`${name}: your organisation keeps ${tools.join(', ')} at "ask", so this instance waits for you on every call to ${tools.length === 1 ? 'it' : 'them'}, whatever the roster allows (Enter in the panel answers; the README's work-machine checklist)`)
   if (isolated.length) {
     lint.warnings.push(`${isolated.join(', ')}: the project is in a git repository and ${isolated.length === 1 ? 'this instance edits' : 'these instances edit'} files with no worktree.bgIsolation, so a background session may move into a worktree copy before its first edit, and its shared files land in the copy (the README's Worktrees section; roster.json's settings can say "worktree": { "bgIsolation": "none" })`)
   }
@@ -7096,6 +7178,8 @@ async function rosterStatus($: any): Promise<string[]> {
         if (hb.waitingOn?.kind === 'permission' && running.state === 'waiting') parts.push(`waiting on a permission prompt (${hb.waitingOn.tool}) since ${ago(now - hb.waitingOn.at)}: Enter in the panel answers it`)
         if (hb.remote) parts.push('Remote Control')
         if (typeof hb.model === 'string' && hb.model) parts.push(modelDiffers(inst.model, hb.model) ? `runs ${hb.model}, roster says ${inst.model} (a model the account lacks falls back)` : `runs ${hb.model}`)
+        if (hb.classicStart === false) parts.push('its classic hooks are sent on past fleet (a managed plugin): fleet tells it who it is in its prompts')
+        if (hb.orgAsk?.length) parts.push(`asks you on every call to ${hb.orgAsk.join(', ')} (an organisation's setting: allow rules don't lift it)`)
         if (typeof hb.contextTokens === 'number' && hb.contextTokens > 0) parts.push(`context ${tokensText(hb.contextTokens)}`)
         const t = await readText($, settingsPath(inst.slug))
         if (hb.settingsHash !== null && t !== null && hb.settingsHash !== hashText(t)) parts.push('its settings changed since it started: u restarts it with them')
@@ -7123,6 +7207,7 @@ async function rosterStatus($: any): Promise<string[]> {
     if (blocks) lines.push(...blocksLines(inst.name, blocks, -new Date(now).getTimezoneOffset()).map((l, i) => `${i ? '      ' : '    '}${l}`))
   }
   if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
+  lines.push(classicLine(await read($, classicSeen)))
   const loose = await unstamped($)
   if (loose.length) lines.push(`changed outside fleet (not through a change you applied): ${loose.join(', ')}: /fleet accept <path> stamps your own edit as yours`)
   return lines
@@ -7842,7 +7927,7 @@ async function deliverOverrules($: any) {
   const ids = mine.map(x => x.id)
   await update($, overruling, m => ({ ...m, ...Object.fromEntries(ids.map(id => [id, { at: now, epoch: EPOCH }])) }))
   log($, `delivering the overrule of ${ids.join(', ')}`)
-  $.prompt.submit({ text: mine.map(overruleText).join('\n\n') }).then(
+  submitOwn($, mine.map(overruleText).join('\n\n')).then(
     (r: any) =>
       bg(
         (async () => {
@@ -7892,7 +7977,7 @@ async function deliverLate($: any) {
   await update($, lateNotes, m => ({ ...m, ...Object.fromEntries(ready.filter(id => m[id]).map(id => [id, { ...(m[id] as FleetLate), sent: { at: now, epoch: EPOCH } }])) }))
   log($, `delivering the late notes of ${ready.join(', ')}`)
   const unsend = (m: Record<string, FleetLate>) => Object.fromEntries(Object.entries(m).map(([id, x]) => [id, ready.includes(id) ? { notes: x.notes, at: x.at } : x]))
-  $.prompt.submit({ text: ready.map(id => lateNoteText(id, (waiting[id] as FleetLate).notes)).join('\n\n') }).then(
+  submitOwn($, ready.map(id => lateNoteText(id, (waiting[id] as FleetLate).notes)).join('\n\n')).then(
     (r: any) =>
       bg(
         (async () => {
@@ -8943,6 +9028,11 @@ export const register: Register = on => {
   // A /clear keeps this process and its $.state; the open decisions are read again from the files all the same, and the
   // new conversation has read nothing of the world. A session that ends for good gives up the sweeper's lease
   on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      try {
+        await update($, identityTold, () => false)
+      } catch {}
+    }
     if (e.reason === 'clear' && timersOn && jobRef) $.clock.after(500, () => bg(rebuild($)))
     if (e.reason === 'clear') bg(clearReads($, String(e.sessionId ?? '')))
     else await Promise.race([releaseLease($).catch(() => {}), $.clock.sleep(500)])
@@ -8954,6 +9044,7 @@ export const register: Register = on => {
   // And an instance of the roster learns there, every time its conversation starts again (after /clear, compaction,
   // resume), who it is, what it can't write and its budget; fleet learns the role it runs as (agent_type)
   on('classic.SessionStart', async ($, e, next) => {
+    sawClassic($, 'SessionStart')
     if (typeof e.agent_type === 'string' && e.agent_type) agentType = e.agent_type
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     const r = await next(e)
@@ -8964,7 +9055,10 @@ export const register: Register = on => {
       if (!envInstance || !jobRef) return out
       await loadRoster($)
       const inst = instanceNamed(envInstance)
-      return inst ? { ...out, additionalContext: [...(r?.additionalContext ?? []), await instanceContext($, inst)] } : out
+      if (!inst) return out
+      const told = { ...out, additionalContext: [...(r?.additionalContext ?? []), await instanceContext($, inst)] }
+      await update($, identityTold, () => true)
+      return told
     } catch {
       return r
     }
@@ -8973,6 +9067,7 @@ export const register: Register = on => {
   // A permission prompt an instance waits on, with nobody at it: its heartbeat says so at once, and the sweeper marks
   // its row (it needs the person). Only watched: the prompt is Claude's, and so is its answer
   on('classic.PermissionRequest', async ($, e, next) => {
+    sawClassic($, 'PermissionRequest')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (jobRef && myInstance) {
       permissionWait = { kind: 'permission', tool: String(e.tool_name ?? '').slice(0, 80), at: await $.clock.now() }
@@ -8983,6 +9078,7 @@ export const register: Register = on => {
   // The background work still running at each stop: a Bash command of this session's that's no longer there completed,
   // and what it wrote lands now (bgDone)
   on('classic.Stop', async ($, e, next) => {
+    sawClassic($, 'Stop')
     const r = await next(e)
     const tasks = (e as any).background_tasks
     if (Array.isArray(tasks)) {
@@ -8997,27 +9093,65 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
   // ... until its tool ran or was refused
   on('classic.PostToolUse', async ($, e, next) => {
+    sawClassic($, 'PostToolUse')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (permissionWait) bg(promptAnswered($))
     return next(e)
   }).catch(($, e, next) => next(e))
   on('classic.PostToolUseFailure', async ($, e, next) => {
+    sawClassic($, 'PostToolUseFailure')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (permissionWait) bg(promptAnswered($))
     return next(e)
   }).catch(($, e, next) => next(e))
   // Auto mode refused a call (it fires only in auto mode): an instance's fleet keeps it, for the brief; nothing is held
   on('classic.PermissionDenied', async ($, e, next) => {
+    sawClassic($, 'PermissionDenied')
     if (permissionWait) bg(promptAnswered($))
     if (jobRef && myInstance) bg(noteBlock($, e))
     return next(e)
   }).catch(($, e, next) => next(e))
 
   on('classic.FileChanged', async ($, e, next) => {
+    sawClassic($, 'FileChanged')
     if (root && String(e.file_path).endsWith('/.claude/fleet/events/latest')) bg(eventsTick($))
     // A poller dropped an item: the sweeper reads it at its next tick
     if (root && String(e.file_path).endsWith('/.claude/fleet/inbox/latest')) sweep.intakeDirty = true
     return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // What stands in for the classic hooks when a managed plugin sends them on past fleet (B3), by events it can't skip:
+  // a permission prompt put to the person (an organisation's ceiling `ask` above all: allow rules don't lift it)...
+  on('tool.check', async ($, e, next) => {
+    const r: any = await next(e)
+    try {
+      if (e.ceiling === 'ask' && e.tool) orgAsk.add(String(e.tool))
+      if (r?.decision === 'ask' && e.tool_use_id && e.agentId === undefined && e.approver === 'person' && jobRef && myInstance && !permissionWait) {
+        const mode = permissionMode ?? (await configuredMode($))
+        if (e.ceiling === 'ask' || !NO_PROMPT_MODES.has(mode ?? '')) {
+          permissionWait = { kind: 'permission', tool: String(e.tool).slice(0, 80), at: await $.clock.now() }
+          bg(heartbeat($))
+        }
+      }
+    } catch {}
+    return r
+  }).catch(($, e, next) => next(e))
+  // ... until its tool ran or was refused (the generic tool.call hook below, with the MCP gate)
+  // ... and who an instance is, after a compaction its classic.SessionStart doesn't reach fleet for
+  on('session.compact', async ($, e, next) => {
+    const r: any = await next(e)
+    try {
+      if (e.agentId !== undefined || e.trigger === 'precompute' || !r || !Array.isArray(r.messages) || !myInstance || !jobRef) return r
+      if ((await read($, classicSeen)).SessionStart) {
+        await update($, identityTold, () => false)
+        return r
+      }
+      const id = await instanceContext($, myInstance)
+      await update($, identityTold, () => true)
+      return { ...r, messages: [{ role: 'user', text: id, toolUses: [] }, ...r.messages] }
+    } catch {
+      return r
+    }
   }).catch(($, e, next) => next(e))
 
   // The world's three hooks (changes.ts). They fail open: a fleet that errs lets the tool run as if it weren't there
@@ -9057,6 +9191,8 @@ export const register: Register = on => {
       // Busy whatever the timers are: a hot reload mid-turn resets them (module state) while busy lives on in $.state,
       // and the turn's end has to find it set to clear it. Only the closing work waits for the timers
       await update($, busy, () => true)
+      // A turn of fleet's own that carries who the instance is (submitOwn): its conversation knows now
+      if (String(e.text ?? '').includes('fleet: this session is ')) await update($, identityTold, () => true)
       if (timersOn) bg(turnStarted($, e.text, e.turnId))
     }
     return next(e)
@@ -9112,11 +9248,18 @@ export const register: Register = on => {
     try {
       asked = await openHereLines($, e)
     } catch {}
+    // Who an instance is, when its conversation wasn't told (classic.SessionStart didn't reach fleet)
+    let id = ''
+    try {
+      id = e.command ? '' : await identityOwed($)
+    } catch {}
+    const ids = id ? [id] : []
     if (e.command || (!worldOn() && !myInstance)) return asked.length ? next({ ...e, context: [...(e.context ?? []), ...asked] }) : next(e)
     const d = await digestFor($, 'main')
-    if (!d.lines.length && !asked.length) return next(e)
-    const r = await next({ ...e, context: [...(e.context ?? []), ...asked, ...d.lines] })
+    if (!d.lines.length && !asked.length && !ids.length) return next(e)
+    const r = await next({ ...e, context: [...(e.context ?? []), ...ids, ...asked, ...d.lines] })
     if (r && r.drop === undefined && d.lines.length) bg(d.told())
+    if (r && r.drop === undefined && ids.length) bg(update($, identityTold, () => true))
     return r
   }).catch(($, e, next) => next(e))
 
@@ -9197,13 +9340,20 @@ export const register: Register = on => {
 
   // Every MCP tool: one that would send the project's content outside is refused in a background session (the one hard
   // line); one whose result is outside content marks the conversation. fleet's own pass untouched
+  // And every tool's call settles a permission prompt this instance waited on (it ran or was refused): what
+  // classic.PostToolUse says, by an event a managed plugin can't send on past fleet
   on('tool.call', async ($, e, next) => {
     const tool = String((e as any).tool ?? '')
-    if (!tool.startsWith('mcp__') || tool.startsWith('mcp__fleet__')) return next(e)
+    if (!tool.startsWith('mcp__') || tool.startsWith('mcp__fleet__')) {
+      const r = await next(e)
+      if (permissionWait && e.agentId === undefined) bg(promptAnswered($))
+      return r
+    }
     await locate($)
     const gate = await outboundGate($, e)
     if (gate.held) return gate.held
     const r: any = await next(e)
+    if (permissionWait && e.agentId === undefined) bg(promptAnswered($))
     if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
     return r
   }).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
@@ -9215,6 +9365,12 @@ export const register: Register = on => {
       bg(
         (async () => {
           await locate($)
+          // A page of the person's own (outbound.json's inside: his intranet) isn't outside content
+          if (e.tool === 'WebFetch' && root) {
+            try {
+              if (insideHost(hostOf(String((e as any).url ?? '')), await outboundConfig($))) return
+            } catch {}
+          }
           await markOutside($, markWhat(String(e.tool), e as any))
         })(),
       )

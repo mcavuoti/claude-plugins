@@ -49,6 +49,8 @@ async function instance($: any, on: any, role: Record<string, unknown>) {
   on('classic.SessionStart', () => ({}))
   sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
   await startSession($, w)
+  // Its conversation starts: classic.SessionStart tells it who it is (as Claude does, when nothing sends it on past fleet)
+  await $.classic.SessionStart({ source: 'startup', agent_type: 'owner' } as any)
   return w
 }
 

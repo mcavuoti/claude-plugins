@@ -339,6 +339,63 @@ export function overwroteText(rel: string, last: ChangeEvent, me: Me, how: 'writ
   return `fleet: your write replaced ${rel}, which ${changeLine(last, me)} after you read it: that change may be lost. Read ${rel} and check it's still there.`
 }
 
+/** What the model reads after a command with no write syntax ran while another session's write landed on a world file:
+ * the command didn't change it (it isn't its landing), but what it read may be older than what's there now */
+export function duringText(rel: string, last: ChangeEvent | null, me: Me): string {
+  return `fleet: ${rel} changed while your command ran${last ? ` (it ${changeLine(last, me)})` : ''}; your command didn't change it. If your command read it, read it again.`
+}
+
+// ---- Bash: whether a command writes (its syntax only; a program not known to only read counts as a writer) ----
+
+const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'env', 'printenv', 'id', 'whoami', 'hostname', 'uname'])
+const READ_ONLY_VCS = new Set(['diff', 'log', 'show', 'status', 'grep', 'blame', 'ls-files', 'ls-tree', 'rev-parse', 'cat-file', 'describe', 'shortlog', 'merge-base', 'rev-list', 'whatchanged'])
+
+/** Whether a Bash command has no write syntax: no redirection to a file, and only programs that read (sed without -i,
+ * find without -delete or -exec, git's reading subcommands). Unsure counts as writing */
+export function bashWritesNothing(command: string): boolean {
+  const c = command.trim()
+  if (!c) return false
+  // Quoted text is data: a pattern's | or > isn't the shell's
+  const bare = c.replace(/'[^']*'/g, "''").replace(/"(?:[^"\\]|\\.)*"/g, '""')
+  if (bare.includes('`')) return false
+  // A redirection to a file (2>&1 and >/dev/null are no writes)
+  for (const m of bare.matchAll(/\d*(?:>>?|&>)\s*(&?[^\s;&|]*)/g)) {
+    const to = m[1] ?? ''
+    if (to.startsWith('&') || to === '/dev/null') continue
+    return false
+  }
+  // The redirections said nothing more: out of the way of the commands (2>&1 isn't a command separator)
+  const commands = bare.replace(/\d*(?:>>?|&>)\s*&?[^\s;&|]*/g, ' ').replace(/\d*<\s*[^\s;&|]*/g, ' ')
+  for (const seg of commands.split(/\|\||&&|[|;&\n]|\$\(|\)/)) {
+    const words = seg.trim().split(/\s+/).filter(Boolean)
+    // Leading variable assignments (LC_ALL=C grep …)
+    while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0] as string)) words.shift()
+    if (!words.length) continue
+    const [cmd = '', ...args] = words
+    const prog = cmd.split('/').pop() as string
+    if (prog === 'sed') {
+      if (args.some(a => /^-[a-zA-Z]*i/.test(a) || a.startsWith('--in-place'))) return false
+      continue
+    }
+    if (prog === 'find') {
+      if (args.some(a => /^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(a))) return false
+      continue
+    }
+    if (prog === 'git') {
+      let sub = ''
+      for (let i = 0; i < args.length && !sub; i++) {
+        const a = args[i] as string
+        if (a === '-C' || a === '-c') i++
+        else if (!a.startsWith('-')) sub = a
+      }
+      if (!READ_ONLY_VCS.has(sub)) return false
+      continue
+    }
+    if (!READ_ONLY_PROGRAMS.has(prog)) return false
+  }
+  return true
+}
+
 /** Where a volume's way with case can be seen: the path with its deepest name that has letters in another case (null
  * when no name has any) */
 export function caseProbe(path: string): string | null {

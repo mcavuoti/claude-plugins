@@ -101,6 +101,12 @@ declare module 'claude-code' {
       lateNotes: Record<string, FleetLate>
       /** This session's Bash commands running in the background: task id → them */
       bgCommands: Record<string, FleetBg>
+      /** The classic hooks that reached fleet in this session: event → when, last (a managed plugin can send one on past
+       * the plugins a person installed) */
+      classicSeen: Record<string, number>
+      /** Whether this conversation of an instance was told who it is (classic.SessionStart's context, or fleet's own
+       * when that hook doesn't reach it); false again after /clear, resume and compaction */
+      identityTold: boolean
     }
   }
 }
