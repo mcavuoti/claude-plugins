@@ -219,6 +219,8 @@ test('the person answers in the asker’s own session: the turn hears which ques
   expect(r.result).toContain('[D-1] The person answered:\n1) Should notes/summary.md stay Owner A’s? → they wrote: "keep it as it is, Owner A has it"')
   expect(json(w, `${DEC}/register/2026-11/D-1.json`)).toMatchObject({ state: 'delivered', delivered: { how: 'result' }, answers: [{ text: 'keep it as it is, Owner A has it', origin: 'composer', pre: true }] })
   expect(w.files.has(`${DEC}/queue/D-1.json`)).toBe(false)
+  // The person is told what was recorded, in a line the model doesn't read
+  expect(w.logs).toContain('fleet: recorded as your answer to D-1 ("Should notes/summary.md stay Owner A’s?"): "keep it as it is, Owner A has it". /fleet note D-1 adds to it.')
   await $.turn.complete({ text: '' } as any)
   await tick(w)
   expect(w.submits).toEqual([])
@@ -228,6 +230,10 @@ test('the person answers in the asker’s own session: the turn hears which ques
   await $.prompt.submit({ text: 'and the other one', origin: { kind: 'composer' }, wait: false } as any)
   await $.turn.start({ text: 'and the other one', turnId: 't-2' })
   expect((await decide($, { kind: 'answered', id: 'D-2' })).deny).toContain('was asked by another session (Owner A)')
+  // Nothing of D-2 was recorded from here: two questions of another session's decision, the person's words typed here
+  expect(w.files.has(`${DEC}/answers/D-2.1.json`)).toBe(false)
+  expect((await decide($, { kind: 'answered', id: 'D-2', q: 1 })).deny).toContain('was asked by another session (Owner A)')
+  expect(w.files.has(`${DEC}/answers/D-2.1.json`)).toBe(false)
 })
 
 test('kind answered: one question at a time (q), the rest stay queued; once complete the result brings every answer; never a question asked after the prompt; a prompt typed into the turn adds to the words; from the phone too', WITH_SESSIONS, async ($, on) => {

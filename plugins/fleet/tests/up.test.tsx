@@ -304,6 +304,21 @@ test("the marks keep within sessions' limits: a long name over budget keeps its 
   expect(last.rows.aaaaaaa1).toEqual({ badge: '?1', tint: 'warning', line: 'asks you 1: /fleet', needsPerson: true })
   expect(last.rows.ddddddd1).toEqual({ badge: '?2', tint: 'warning', line: 'asks you 2: /fleet', needsPerson: true })
   expect(w.logs.some(l => l.includes('fleet: marks refused'))).toBe(false)
+  // An answer takes the mark off within seconds, not at the next minute's sweep; so does a new question put one on.
+  // (D-5 and one of the helper's are the same question from two askers: one answer goes to both)
+  await fleet($, '')
+  await fleet($, 'D-5 a')
+  const before = calls(w, 'setMarks').length
+  for (let i = 0; i < 3; i++) await tick(w, 2100)
+  const after = calls(w, 'setMarks')
+  expect(after.length).toBeGreaterThan(before)
+  expect(after[after.length - 1].rows.aaaaaaa1).toBe(undefined)
+  expect(after[after.length - 1].rows.ddddddd1).toEqual({ badge: '?1', tint: 'warning', line: 'asks you 1: /fleet', needsPerson: true })
+  expect(after[after.length - 1].rows.eeeeeee1).toEqual({ badge: '$', tint: 'error', line: 'over budget: /fleet budget "TEST Business Plan" +n', needsPerson: true })
+  w.touch(`${FLEET}/decisions/queue/D-8.json`, ask('D-8', 'aaaaaaa1', 'Owner A'))
+  for (let i = 0; i < 3; i++) await tick(w, 2100)
+  const again = calls(w, 'setMarks')
+  expect(again[again.length - 1].rows.aaaaaaa1).toEqual({ badge: '?1', tint: 'warning', line: 'asks you 1: /fleet', needsPerson: true })
 })
 
 test('/fleet worktrees lists the linked ones and removes only those no instance works in', WITH_SESSIONS, async ($, on) => {

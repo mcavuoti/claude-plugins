@@ -49,6 +49,8 @@ declare module 'claude-code' {
       flags: number
       /** What this session's model was told about the files it owns (suspects, failed checks): key → when */
       ownTold: Record<string, number>
+      /** The decisions of other sessions this one said its work waits on (decide kind wait), by id, when it said so: told once each closes */
+      waitsOn: Record<string, number>
       /** The band's count of the roster's instances over their budget today */
       overBudget: number
       /** The short id this session's seed was submitted for (an instance is seeded once per session) */

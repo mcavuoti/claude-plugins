@@ -411,8 +411,21 @@ test('outside content marks the conversation: a change filed then waits for the 
   expect(await fleet($, 'status')).toContain('this conversation read nothing from outside')
 })
 
-test('the person types, in a clean conversation, and the change it files is applied as it’s filed; a launch prompt isn’t his', async ($, on) => {
+// The person's answers to fleet's own dialogs, in order (null: Esc); what each dialog asked
+function dialogs(on: any, answers: (string | null)[]): string[] {
+  const asked: string[] = []
+  on('tool.call', { tool: 'AskUserQuestion' }, (_: any, e: any) => {
+    const q = String(e.questions?.[0]?.question ?? '')
+    asked.push(q)
+    const a = answers.shift()
+    return a === null || a === undefined ? { deny: 'dismissed' } : { result: { answers: { [q]: a } } }
+  })
+  return asked
+}
+
+test('the person types, in a clean conversation, and fleet asks him there before applying the change it files; a launch prompt isn’t his', async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
+  const asked = dialogs(on, ['Apply', 'Apply'])
   // Started as claude --bg "Set the goal in the charter": the job's intent is its launch prompt
   w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: 'Set the goal in the charter', firstTerminalAt: null }))
   await startSession($, w)
@@ -432,10 +445,12 @@ test('the person types, in a clean conversation, and the change it files is appl
   await $.prompt.submit({ text: 'Make the goal C', origin: { kind: 'composer' }, wait: false } as any)
   await $.turn.start({ text: 'Make the goal C', turnId: 't-3' })
   const r = await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal is C', content: '# Charter\n\nGoal C.\n' })
-  expect(r.result).toContain("Applied at once as D-3: the person typed this turn's prompt, and this conversation read nothing from outside, so fleet wrote .claude/fleet/charter.md as you drafted it")
+  expect(r.result).toContain('Filed as D-3: fleet is asking the person, here, whether to apply this change to .claude/fleet/charter.md (+2 −0)')
+  expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n')
+  await w.clock.settle()
+  expect(asked[0]).toBe('Apply D-3 to .claude/fleet/charter.md? the goal is C (+2 −0)')
   expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n\nGoal C.\n')
-  expect(json(w, `${DEC}/register/2026-11/D-3.json`)).toMatchObject({ state: 'delivered', delivered: { how: 'result' }, kind: 'change', answers: [{ label: 'applied', origin: 'composer' }] })
-  expect(w.files.has(`${DEC}/queue/D-3.json`)).toBe(false)
+  expect(json(w, `${DEC}/answers/D-3.1.json`)).toMatchObject({ label: 'applied', origin: 'composer', pre: true })
   expect(w.logs.some(l => l.includes('prompt from composer: the person'))).toBe(true)
   await $.turn.complete({ text: '' } as any)
   // He types into a running turn; fleet's own prompt (which its own hooks never see) starts the next turn before his
@@ -446,7 +461,9 @@ test('the person types, in a clean conversation, and the change it files is appl
   expect((await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'not his turn', content: '# Charter\n\nGoal X.\n' })).result).toContain('Queued as D-4')
   await $.turn.complete({ text: '' } as any)
   await $.turn.start({ text: 'Then make the goal D', turnId: 't-6' })
-  expect((await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal is D', content: '# Charter\n\nGoal D.\n' })).result).toContain('Applied at once as D-5')
+  expect((await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal is D', content: '# Charter\n\nGoal D.\n' })).result).toContain('Filed as D-5: fleet is asking the person')
+  await w.clock.settle()
+  expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n\nGoal D.\n')
   // The ones that weren't his wait for /fleet n apply
   expect(await fleet($, '')).toContain('3 changes for you')
 })
@@ -454,11 +471,13 @@ test('the person types, in a clean conversation, and the change it files is appl
 test('a session opened with ccc has no launch prompt: its first prompt is the person’s, though the job shows no attach', async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
   w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: null }))
+  dialogs(on, ['Apply'])
   await startSession($, w)
   await $.prompt.submit({ text: 'Set the goal in the charter', origin: { kind: 'composer' }, wait: false } as any)
   await $.turn.start({ text: 'Set the goal in the charter', turnId: 't-1' })
   const r = await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal', content: '# Charter\n\nGoal A.\n' })
-  expect(r.result).toContain('Applied at once as D-1')
+  expect(r.result).toContain('Filed as D-1: fleet is asking the person')
+  await w.clock.settle()
   expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n\nGoal A.\n')
   expect(w.logs.some(l => l.includes('prompt from composer: the person'))).toBe(true)
 })
@@ -475,6 +494,43 @@ test('a resource: asked apart from the questions, answered done or no with a not
   expect(await fleet($, '1 done "the key is in the team vault"')).toContain('1: D-1 (a license for the timing tool): you got it, "the key is in the team vault".')
   await tick(w)
   expect(w.submits[w.submits.length - 1]).toBe('[D-1] The person got what you asked for (a license for the timing tool): the key is in the team vault. Go on with what waited on it.')
+})
+
+test('a change he files in his own turn: Show the diff prints it to him and asks again; Don’t apply closes it; Esc leaves it in his queue', async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
+  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: null }))
+  const asked = dialogs(on, ['Show the diff', "Don't apply", null])
+  await startSession($, w)
+  await $.prompt.submit({ text: 'Set the goal in the charter', origin: { kind: 'composer' }, wait: false } as any)
+  await $.turn.start({ text: 'Set the goal in the charter', turnId: 't-1' })
+  await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal', content: '# Charter\n\nGoal A.\n' })
+  await w.clock.settle()
+  expect(asked.length).toBe(2)
+  expect(w.logs.some(l => l.includes('fleet: D-1, the change to .claude/fleet/charter.md:') && l.includes('+Goal A.'))).toBe(true)
+  expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n')
+  expect(json(w, `${DEC}/answers/D-1.1.json`)).toMatchObject({ label: 'rejected', origin: 'composer' })
+  // Esc: it stays in his queue
+  await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal again', content: '# Charter\n\nGoal B.\n' })
+  await w.clock.settle()
+  expect(w.files.has(`${DEC}/answers/D-2.1.json`)).toBe(false)
+  expect(w.logs.some(l => l.includes("D-2 left in the person's queue: no dialog, or dismissed"))).toBe(true)
+  expect(await fleet($, '')).toContain('1 change for you')
+})
+
+test('a resource answered with words alone is recorded as done with them as its note, said so, and delivered', async ($, on) => {
+  const w = project(on)
+  await startSession($, w)
+  await decide($, { kind: 'resource', what: 'the effort history of the last project', why: 'the plan sizes the work' })
+  await fleet($, '')
+  const said = await fleet($, '1 "four years end to end, a team of thirty"')
+  expect(said).toContain('1: D-1 (the effort history of the last project): recorded as done, "four years end to end, a team of thirty"')
+  expect(said).toContain('(words alone answer a resource as done)')
+  await tick(w)
+  expect(w.submits[w.submits.length - 1]).toBe('[D-1] The person got what you asked for (the effort history of the last project): four years end to end, a team of thirty. Go on with what waited on it.')
+  // A letter still gets the usage, nothing recorded
+  await decide($, { kind: 'resource', what: 'a second license', why: 'more runs' })
+  await fleet($, '')
+  expect(await fleet($, '1a')).toContain('answer /fleet 1 done "a note" once you have it, or /fleet 1 no "why"')
 })
 
 test('an outbound goes only as this session’s list showed it: by its id, or 1 with no list, nothing is sent and the list comes first', async ($, on) => {

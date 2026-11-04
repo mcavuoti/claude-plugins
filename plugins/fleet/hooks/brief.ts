@@ -25,6 +25,9 @@ export type BriefFacts = {
   events: ChangeEvent[]
   /** The decisions closed in the window that changed something or sent something: a change applied, an outbound sent */
   closed: { id: string; at: number; line: string }[]
+  /** Questions closed in the window (answered, by the person or a judge; dropped), newest first: what instances that
+   * waited on them act on */
+  answered?: { id: string; at: number; line: string }[]
   levelOf: (path: string) => Level
   blocked: {
     blocks: { id: string; who: string; at: number; blocks: string }[]
@@ -121,13 +124,17 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   const shared = newestPerFile(f.events, f).filter(e => !['information', 'proposal'].includes(f.levelOf(e.path)))
   const closed = [...f.closed].filter(c => c.at >= f.since).sort((a, b) => b.at - a.at)
   const judged = f.judges ?? []
+  const answered = [...(f.answered ?? [])].filter(c => c.at >= f.since).sort((a, b) => b.at - a.at)
   const counts = [
     shared.length ? `${shared.length} shared file${shared.length === 1 ? '' : 's'}` : '',
     closed.length ? `${closed.length} decision${closed.length === 1 ? '' : 's'} carried out` : '',
+    answered.length ? `${answered.length} question${answered.length === 1 ? '' : 's'} closed` : '',
     judged.length ? 'the judges' : '',
   ].filter(Boolean)
   out.push('', counts.length ? `2. What changed: ${counts.join(', ')}` : '2. No shared file changed.')
   for (const c of closed.slice(0, SHOWN)) out.push(`   - ${c.line}`)
+  for (const c of answered.slice(0, SHOWN)) out.push(`   - ${c.line}`)
+  if (answered.length > SHOWN) out.push(`   - and ${answered.length - SHOWN} more questions closed`)
   for (const j of judged.slice(0, SHOWN)) out.push(`   - ${j}`)
   for (const e of shared.slice(0, SHOWN)) out.push(eventLine(e, f))
   if (shared.length > SHOWN) out.push(`   - and ${shared.length - SHOWN} more: /fleet status lists the last changes`)
@@ -186,6 +193,23 @@ export function closedLine(r: { id: string; kind?: string; change?: { path: stri
     return `went out: ${r.outbound.what} to ${r.outbound.to}, ${r.id} ${a.label === 'sent' ? `sent by fleet as the person approved (${a.text ?? 'done'})` : 'sent by the person himself'}`
   }
   return null
+}
+
+/** A closed choice's outcome in words: each question and what it was answered (a label, or the person's words), or
+ * dropped; for the brief, and for a session that waited on it */
+export function outcomeWords(r: { state?: string; questions: { question: string }[]; answers: ({ label?: string; text?: string; origin?: string } | null)[] }): string {
+  if (r.state === 'dropped') return 'dropped, unanswered'
+  const parts = r.questions.map((q, i) => {
+    const a = r.answers[i]
+    const what = !a ? 'not answered' : a.label !== undefined ? a.label : `"${shown(a.text ?? '', 160)}"`
+    return `"${shown(q.question, 100)}" → ${what}${a?.origin === 'judge' ? ' (by the judge)' : ''}`
+  })
+  return parts.join('; ') || 'closed'
+}
+
+/** A closed question's line for the brief */
+export function answeredLine(r: { id: string; state?: string; questions: { question: string }[]; answers: ({ label?: string; text?: string; origin?: string } | null)[] }, asker: string): string {
+  return `${r.id} (${asker}): ${outcomeWords(r)}`
 }
 
 /** The chief's lines, from its reply: at most five, none empty, each at most 300 characters */
