@@ -84,6 +84,12 @@ test('cadence: from the last landing or the start, due past the period; fresh pe
   expect(ownsOpenItem({ owner: 'area a', status: 'open' }, 'Area A')).toBe(true)
   expect(ownsOpenItem({ owner: 'Area A', status: 'done' }, 'Area A')).toBe(false)
   expect(ownsOpenItem({ owner: 'open', status: 'open' }, 'Area A')).toBe(false)
+  // Its slug, a list of owners, a note in parentheses
+  expect(ownsOpenItem({ owner: 'area-a', status: 'open' }, 'Area A')).toBe(true)
+  expect(ownsOpenItem({ owner: 'PoC A, PoC B', status: 'started' }, 'PoC B')).toBe(true)
+  expect(ownsOpenItem({ owner: 'Tester 1 (claimed 10:00)', status: 'open' }, 'Tester 1')).toBe(true)
+  expect(ownsOpenItem({ owner: 'Area A and Area B', status: 'open' }, 'area b')).toBe(true)
+  expect(ownsOpenItem({ owner: 'PoC AB', status: 'open' }, 'PoC A')).toBe(false)
 })
 
 test('the roster: a role’s context and journal, by default fresh and journals/<slug>.md; a journal under .claude/ is refused', () => {
