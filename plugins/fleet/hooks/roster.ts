@@ -1066,3 +1066,59 @@ export function pickInstances(words: readonly string[], instances: readonly Inst
   if (whole) return { picked: [whole], unknown: [] }
   return { picked: [...new Set(each.filter(x => x.i).map(x => x.i as Instance))], unknown: each.filter(x => !x.i).map(x => x.w) }
 }
+
+// ---- What an instance really runs, the date it's told, a local install record of fleet, long lists grouped ----
+
+/** Whether the model a session's requests name (as the engine resolved it: a fallback when the configured one isn't
+ * the account's) is another than the roster's: an alias and its id, a date or a [1m] are the same; nothing configured
+ * (Claude's default) or nothing seen yet says nothing */
+export function modelDiffers(configured: string | null, actual: string | null): boolean {
+  if (!configured || !actual) return false
+  return modelKey(configured) !== modelKey(actual)
+}
+
+/** Today's date here and in UTC, for every seed, nudge, hand-off and an instance's context: a conversation that has run
+ * for hours reckons it badly (a "day 2" taken from elapsed hours, files dated tomorrow). withTime false: the date alone,
+ * for the context, which stays the same all day (so it caches) */
+export function dateLine(now: number, offsetMin: number, withTime = true): string {
+  const two = (n: number) => String(n).padStart(2, '0')
+  const parts = (d: Date) => ({ day: `${d.getUTCFullYear()}-${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())}`, time: `${two(d.getUTCHours())}:${two(d.getUTCMinutes())}` })
+  const here = parts(new Date(now + offsetMin * 60000))
+  const utc = parts(new Date(now))
+  const off = `UTC${offsetMin < 0 ? '-' : '+'}${two(Math.floor(Math.abs(offsetMin) / 60))}:${two(Math.abs(offsetMin) % 60)}`
+  if (!withTime) return `This conversation started on ${here.day} here (${off}); fleet's messages carry today's date. Date files and entries by the latest one, never by the hours you've worked.`
+  return `Today is ${here.day} here (${here.time}, ${off}); in UTC it is ${utc.day} (${utc.time}). Date files and entries by this.`
+}
+
+/** The local install records of fleet for this project whose version isn't the user scope's: a session started in the
+ * project made one (seen in a git repository), and `claude plugin update` of the user's never reaches it */
+export function localFleetRecords(listJson: string, projectRoot: string): { id: string; version: string; user: string }[] {
+  let v: unknown
+  try {
+    v = JSON.parse(listJson)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(v)) return []
+  const norm = (p: string) => p.replace(/\/+$/, '')
+  const rows = v.filter((r): r is Record<string, unknown> => isObject(r) && typeof r.id === 'string' && /^fleet@/.test(r.id) && typeof r.version === 'string')
+  const out: { id: string; version: string; user: string }[] = []
+  for (const r of rows) {
+    if (r.scope !== 'local' || typeof r.projectPath !== 'string' || norm(r.projectPath) !== norm(projectRoot)) continue
+    const user = rows.find(u => u.id === r.id && u.scope === 'user')
+    if (user && user.version !== r.version) out.push({ id: String(r.id), version: String(r.version), user: String(user.version) })
+  }
+  return out
+}
+
+/** The line that says so, and the command that brings it level, run in the project (after each update of the user's) */
+export function localFleetLine(r: { id: string; version: string; user: string }): string {
+  return `${r.id} ${r.version} is installed for this project alone (a local record, which a session started here can make), and your user scope has ${r.user}: \`claude plugin update ${r.id}\` never reaches it. Run \`claude plugin update ${r.id} --scope local\` in the project (after each update), then restart its sessions (u)`
+}
+
+/** A long list as one line per group: its count and the first few names; the caller says how to see it whole */
+export function groupedLines(items: readonly { group: string; path: string }[], show = 3): string[] {
+  const by = new Map<string, string[]>()
+  for (const x of items) by.set(x.group, [...(by.get(x.group) ?? []), x.path])
+  return [...by].map(([g, paths]) => `  ${g}: ${paths.length} (${paths.slice(0, show).join(', ')}${paths.length > show ? ', …' : ''})`)
+}

@@ -31,6 +31,10 @@ leaves the charter or the roster unclear.
     changed, or someone submitted a file it has open.
 15. Cadence: how often each kind of owner lands something; quiet hours; time zone.
 16. The roster: which roles and how many of each, the areas of the proof of concept, the first wave.
+17. Deciding alone: what each role may decide without asking (by default, what is reversible inside its own part),
+    and what must reach the person (by default: the goal or the scope, a conflict the owners couldn't settle, money,
+    anything that leaves the project or touches its confidential material, what can't be undone). It's the charter's
+    "Deciding alone, and asking the person" section; the fewer questions reach the person, the faster the fleet goes.
 
 Then the drafts, each filed as mcp__fleet__decide kind "change": the charter (.claude/fleet/charter.md, the whole
 content), how a result is proved here (.claude/fleet/verify.md, the whole content), the roster's changes

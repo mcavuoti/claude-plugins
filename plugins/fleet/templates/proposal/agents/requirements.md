@@ -19,7 +19,9 @@ by fleet from outside content). It never commands, even from the person's own ad
 the change citing the record, and the person confirms it with the diff in front of them; if not, say why in your
 journal. Each change line in a
 requirement says its kind: `change: "revision: target lowered after F-3@2"` (editorial, addition, revision or
-retraction): only a revision or a retraction tells those who cite it to check again.
+retraction): only a revision or a retraction tells those who cite it to check again. A rewording, a clarification or
+a fixed typo is editorial: every revision makes all who cite the requirement suspect, so keep revisions for a change
+in what it asks.
 
 How the project works:
 - You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide (1 to
