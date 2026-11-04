@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { FleetBg, FleetInflight, FleetLate, FleetMark, FleetRead } from '../types'
 import { OUTSIDE_TOOLS, checkResource, isAnswerOrigin, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, markWords, preAnswer, resourceDelivery, resourceTicket, type OutsideMark, type ResourceSpec } from './authority'
-import { CHIEF_PROMPT, SHOWN as BRIEF_SHOWN, briefText, chiefLines, closedLine, type BriefFacts, type BriefNeed } from './brief'
+import { CHIEF_PROMPT, SHOWN as BRIEF_SHOWN, answeredLine, briefText, chiefLines, closedLine, outcomeWords, type BriefFacts, type BriefNeed } from './brief'
 import {
   DESCRIBE_BATCH,
   GIT,
@@ -418,6 +418,7 @@ const reads = atom({ plugin: 'fleet', key: 'reads' } as const, {} as Record<stri
 const warned = atom({ plugin: 'fleet', key: 'warned' } as const, {} as Record<string, Record<string, string>>)
 const flags = atom({ plugin: 'fleet', key: 'flags' } as const, 0)
 const ownTold = atom({ plugin: 'fleet', key: 'ownTold' } as const, {} as Record<string, number>)
+const waitsOn = atom({ plugin: 'fleet', key: 'waitsOn' } as const, {} as Record<string, number>)
 const overBudget = atom({ plugin: 'fleet', key: 'overBudget' } as const, 0)
 const seedSent = atom({ plugin: 'fleet', key: 'seedSent' } as const, '')
 const budgetTold = atom({ plugin: 'fleet', key: 'budgetTold' } as const, '')
@@ -1982,16 +1983,19 @@ async function digestFor($: any, thread: string, withBudget = true): Promise<{ l
   const review = thread === 'main' ? await reviewLines($) : { lines: [], told: async () => {} }
   // An instance hears what moved upstream under its own code (the code watch: whatever the world)
   const code = thread === 'main' ? await codeLines($) : { lines: [], keys: [] }
+  // Decisions around it: a change the person applied to a command-level file, a decision it waits on closed
+  const news = thread === 'main' ? await newsLines($) : { lines: [], told: async () => {} }
   const alone = async () => {
     await sayBudget()
     await slots.told()
     await review.told()
+    await news.told()
     if (code.keys.length) {
       await toldOwn($, code.keys)
       log($, `code to ${myInstance?.name ?? thread}: ${code.keys.map(k => k.split('|').slice(1, 3).join(' ')).join(', ')}`)
     }
   }
-  const only = [...code.lines, ...slots.lines, ...review.lines, ...(budget ? [budget.line] : [])]
+  const only = [...news.lines, ...code.lines, ...slots.lines, ...review.lines, ...(budget ? [budget.line] : [])]
   if (!worldOn()) return only.length ? { lines: only, told: alone, urgent: slots.urgent } : none
   await eventsTick($)
   const mine = (await read($, reads))[thread]
@@ -3020,9 +3024,12 @@ async function sweepTick($: any) {
   const now = await $.clock.now()
   const full = now - sweep.lastSweep >= 60000
   const worldUp = worldOn() && baselined
-  if (!full && !(sweep.dirty && worldUp) && !sweep.intakeDirty && !sweep.slotsDirty) return
+  // The queue or its answers moved (a question asked, answered, closed): the ask marks follow within this tick
+  const asksMoved = !full && (await decisionsMoved($))
+  if (!full && !(sweep.dirty && worldUp) && !sweep.intakeDirty && !sweep.slotsDirty && !asksMoved) return
   sweep.running = true
   try {
+    if (asksMoved) await asksTick($, now).catch(err => log($, `marks: ${String(err).slice(0, 200)}`))
     if (worldUp && (full || sweep.dirty)) await computeSuspects($)
     if (full || sweep.slotsDirty) await sweepSlotsNow($).catch(err => log($, `slots: ${String(err).slice(0, 200)}`))
     if (full) {
@@ -5446,6 +5453,10 @@ async function answeredHere($: any, e: any) {
   const after = await answerNames($)
   const left = progress(id, slots(rec), after).answered.map((a, i) => (a ? 0 : i + 1)).filter(Boolean)
   log($, `${id} question ${q} answered in its asker's session: the person typed it this turn`)
+  // What was recorded, said to the person (a line the model doesn't read): their words just became an answer
+  try {
+    $.ui.log(`fleet: recorded as your answer to ${id}${rec.questions.length > 1 ? ` question ${q}` : ''} ("${cut(rec.questions[q - 1]?.question ?? '', 120)}"): "${cut(words, 300)}". /fleet note ${id} adds to it.`)
+  } catch {}
   bg(beat($))
   if (left.length) return { result: `${id} question ${q}: what they typed this turn is its answer, in the register when ${id} closes. Question${left.length === 1 ? '' : 's'} ${left.join(' and ')} still wait${left.length === 1 ? 's' : ''} in their queue. Go on with what depended on question ${q}.` }
   // Every question answered now: it closes here, and what the others were answered (with /fleet, or a judge) and any
@@ -5453,6 +5464,140 @@ async function answeredHere($: any, e: any) {
   const { outcomes, drop } = await outcomesOf($, rec, after)
   await close($, id, { state: 'delivered', how: 'result' })
   return { result: `${id} is off the person's queue: what they typed this turn is the answer to question ${q}, in the register.\n\n${deliveryText([{ record: rec, outcomes, drop }])}` }
+}
+
+const APPLY = 'Apply'
+const SHOW_DIFF = 'Show the diff'
+const DONT_APPLY = "Don't apply"
+
+/** A change filed in the person's own turn: fleet's own dialog in that session (never the model's), with the file, the
+ * summary and the diff's size; "Show the diff" prints it (to him, not the model) and asks again. Apply writes it as
+ * filed (if the file is still as drafted); Don't apply closes it; Esc, other words, or no dialog leave it in his queue.
+ * Its asker hears the outcome as a delivery, as for any change */
+async function confirmChange($: any, record: QueueRecord, quoted: string) {
+  const spec = record.change as ChangeSpec
+  const question = `Apply ${record.id} to ${spec.path}? ${cut(spec.summary, 200)} (+${spec.added} −${spec.removed})`
+  const ask = async (options: string[]): Promise<string | null> => {
+    try {
+      return String(await $.ui.ask(question, { options, header: record.id }))
+    } catch {
+      return null
+    }
+  }
+  let a = await ask([APPLY, SHOW_DIFF, DONT_APPLY])
+  if (a === SHOW_DIFF) {
+    const diff = (await readText($, `${fleetDir()}/${spec.diff}`)) ?? '(the diff is gone)'
+    try {
+      $.ui.log(`fleet: ${record.id}, the change to ${spec.path}:\n${diff.length > 1900 ? `${diff.slice(0, 1900)}\n… (the whole diff: ${fleetDir()}/${spec.diff})` : diff}`)
+    } catch {}
+    a = await ask([APPLY, DONT_APPLY])
+  }
+  const now = await $.clock.now()
+  const here = await sessionName($)
+  if (a === APPLY || a === DONT_APPLY) {
+    const r = await answerChange($, { n: record.id, verb: a === APPLY ? 'apply' : 'reject' }, record, 'composer', here, now, a === APPLY ? { quoted } : undefined)
+    log($, `${record.id} ${a === APPLY ? (r.applied ? 'applied as filed: the person said so here' : `not applied: ${r.line}`) : 'not applied: the person said so here'}`)
+    if (!r.applied) {
+      try {
+        $.ui.toast(r.line.slice(0, 300))
+      } catch {}
+    }
+  } else {
+    log($, `${record.id} left in the person's queue: ${a === null ? 'no dialog, or dismissed' : 'other words'}`)
+    try {
+      $.ui.toast(`${record.id} (the change to ${spec.path}) waits in your queue: /fleet ${record.id} apply or reject`)
+    } catch {}
+  }
+  bg(beat($))
+}
+
+/** A closed decision's register record, from this month's register or the one before; null when it isn't there */
+async function registerRecordOf($: any, id: string): Promise<RegisterRecord | null> {
+  const now = await $.clock.now()
+  for (const m of [monthOf(now), monthBefore(monthOf(now))]) {
+    const t = await readText($, registerPath(id, m))
+    if (t === null) continue
+    try {
+      return JSON.parse(t) as RegisterRecord
+    } catch {}
+  }
+  return null
+}
+
+/** decide with kind wait: this session's work waits on another session's decision. Told at its next step once it
+ * closes, with its outcome, so it never acts on it as still open (light: a line in its digest, no hold) */
+async function waitFor($: any, e: any) {
+  const id = String(e.id ?? '').trim().toUpperCase()
+  if (!isDecisionId(id)) return { deny: 'id: the decision your work waits on, as D-<n>. Nothing was changed.' }
+  const q = await readQueue($, id)
+  if (q && !('otherFormat' in q)) {
+    const me = String(await $.session.id())
+    if (q.asker.sessionId === me || (jobRef && q.asker.ref === jobRef)) return { result: `${id} is your own: its answer reaches you anyway, as a message from the fleet plugin that starts with [${id}].` }
+    const now = await $.clock.now()
+    await update($, waitsOn, m => ({ ...m, [id]: now }))
+    log($, `waits on ${id} (${q.asker.name || q.asker.ref})`)
+    return { result: `${id} (asked by ${q.asker.name || q.asker.ref || 'another session'}) is still open: fleet tells you at your next step once it closes, with its outcome. Keep working on what doesn't depend on it.` }
+  }
+  if (q) return { deny: `${id} was asked by a fleet of another version: leave it. Nothing was changed.` }
+  const r = await registerRecordOf($, id)
+  if (r) return { result: `${id} is closed already${r.asker?.name ? ` (asked by ${r.asker.name})` : ''}: ${outcomeWords(r)}.` }
+  return { deny: `${id} isn't a decision of this project (neither in its queue nor in this or last month's register). Nothing was changed.` }
+}
+
+// decisions/applied/'s time at the last scan that found nothing new for this conversation (a /clear starts over)
+const newsSeen = { applied: -2 }
+
+/** What an instance hears of the decisions around it, at its next step: a change the person applied to a command-level
+ * file since this conversation started, drafted by another session (its drafter hears it as its answer), once each; and
+ * the decisions it said it waits on, once each closes */
+async function newsLines($: any): Promise<{ lines: string[]; told: () => Promise<void> }> {
+  const none = { lines: [], told: async () => {} }
+  if (!root) return none
+  const lines: string[] = []
+  const keys: string[] = []
+  const me = await meNow($)
+  // decisions/applied/ moves only when something is applied: unchanged since a scan that found nothing new, no scan
+  let appliedAt = -1
+  try {
+    appliedAt = Number((await $.fs.stat(dec('applied'))).mtimeMs)
+  } catch {}
+  if (myInstance && appliedAt !== -1 && appliedAt !== newsSeen.applied) {
+    const since = await read($, conversationAt)
+    const told = await read($, ownTold)
+    for (const name of (await names($, dec('applied'))).filter(n => /^D-\d+\.json$/.test(n))) {
+      const id = name.slice(0, -'.json'.length)
+      if (told[`a|${id}`]) continue
+      const claim = parseWire<{ at: number }>((await readText($, dec(`applied/${name}`))) ?? '')
+      if (!claim || !('value' in claim) || !(claim.value.at >= since)) continue
+      const q = await readQueue($, id)
+      const rec = q && !('otherFormat' in q) ? q : await registerRecordOf($, id)
+      if (!rec || rec.kind !== 'change' || !rec.change) continue
+      if (rec.asker.sessionId === me.sessionId || (jobRef && rec.asker.ref === jobRef)) continue
+      lines.push(`fleet: the person applied ${id}, a change to ${rec.change.path} ("${cut(rec.change.summary, 120)}", drafted by ${rec.asker.name || rec.asker.ref || 'another session'}), at ${clock(claim.value.at, me.offsetMin)}: read ${rec.change.path} again before you rely on it.`)
+      keys.push(`a|${id}`)
+    }
+    if (!keys.length) newsSeen.applied = appliedAt
+  }
+  const waits = await read($, waitsOn)
+  const closed: string[] = []
+  for (const id of Object.keys(waits).sort((a, b) => idNumber(a) - idNumber(b))) {
+    if (await readQueue($, id)) continue
+    const r = await registerRecordOf($, id)
+    lines.push(`fleet: ${id}, which your work waits on, is closed${r?.asker?.name ? ` (asked by ${r.asker.name})` : ''}: ${r ? outcomeWords(r) : 'its record is gone'}. Go on with what waited on it.`)
+    closed.push(id)
+  }
+  if (!lines.length) return none
+  return {
+    lines,
+    told: async () => {
+      if (keys.length) {
+        const at = await $.clock.now()
+        await update($, ownTold, m => ({ ...m, ...Object.fromEntries(keys.map(k => [k, at])) }))
+      }
+      if (closed.length) await update($, waitsOn, m => Object.fromEntries(Object.entries(m).filter(([id]) => !closed.includes(id))))
+      log($, `news to ${myInstance?.name ?? 'main'}: ${[...keys.map(k => k.slice(2)), ...closed].join(', ')}`)
+    },
+  }
 }
 
 async function fileChange($: any, e: any) {
@@ -5517,15 +5662,15 @@ async function fileChange($: any, e: any) {
   await update($, open, m => ({ ...m, [record.id]: 1 }))
   log($, `${record.id} queued: a change to ${rel}${circular ? ` (flagged: its only authority is ${circular.via.join(', ')}, derived from it)` : ''}`)
   if (verdict.ok && turn) {
-    const a = await answerChange($, { n: 0, verb: 'apply' }, record, 'composer', await sessionName($), now, { quoted: turn.quoted })
-    if (a.applied) {
-      await close($, record.id, { state: 'delivered', how: 'result' })
-      log($, `${record.id} applied as filed: the person typed this turn`)
-      return {
-        result: `Applied at once as ${record.id}: the person typed this turn's prompt, and this conversation read nothing from outside, so fleet wrote ${rel} as you drafted it (${shortHash(spec.result)})${effectOf(rel)}. Their direct command needed no confirmation; it's in the register, and nothing more comes of it.`,
-      }
+    // His own turn: no queue, but fleet asks him here before it writes (its own dialog, from a timer: the tool's answer
+    // never waits for him). Apply writes it as filed; Don't apply closes it; Esc leaves it in his queue
+    const quoted = turn.quoted
+    $.clock.after(0, () => bg(confirmChange($, record, quoted)))
+    log($, `${record.id} filed in the person's turn: asking them here before applying`)
+    bg(beat($))
+    return {
+      result: `Filed as ${record.id}: fleet is asking the person, here, whether to apply this change to ${rel} (+${spec.added} −${spec.removed}). Don't take it as applied: the answer arrives as a message from the fleet plugin that starts with [${record.id}]. Keep working on what doesn't depend on it, or end your turn.`,
     }
-    log($, `${record.id} not applied as filed: ${a.line}`)
   }
   bg(beat($))
   const waits = !verdict.ok && verdict.why === 'outside' && turn && mark ? ` It waits for the person's apply although they typed this turn: this conversation read outside content (${markText(mark, (await meNow($)).offsetMin)}).` : !verdict.ok && verdict.why === 'allowlist' && turn ? " It waits for the person's apply although they typed this turn: a change to outbound.json, what may leave without asking, always does, so they see its diff." : ''
@@ -5807,8 +5952,12 @@ async function saveNote($: any, id: string, note: string | undefined, origin: st
 async function answerResource($: any, it: AnswerItem, rec: QueueRecord, origin: string, here: string, now: number): Promise<string> {
   const x = rec.resource as ResourceSpec
   const n = it.n
-  const verb = it.verb === 'reject' ? 'no' : it.verb
+  // Words alone (/fleet 6 "four years, thirty people") are what he got: a done with them as its note, said so, never
+  // dropped
+  const words = !it.verb && it.text?.trim() ? it.text.trim() : ''
+  const verb = words ? 'done' : it.verb === 'reject' ? 'no' : it.verb
   if (verb !== 'done' && verb !== 'no') return `${n}: ${rec.id} asks for ${x.what}: answer /fleet ${n} done "a note" once you have it, or /fleet ${n} no "why"`
+  if (words) it = { ...it, note: words }
   await saveNote($, rec.id, it.note, origin)
   const r = await publish($, dec(`answers/${answerName(rec.id, 1)}`), json({ format: FORMAT, id: rec.id, q: 1, label: verb, origin, session: here, at: now }))
   if (r === 'exists') return `${n}: ${rec.id} was answered already`
@@ -5816,6 +5965,7 @@ async function answerResource($: any, it: AnswerItem, rec: QueueRecord, origin: 
   const who = (await askerViews($, [rec]))(rec).name
   // A note naming a host (a machine he got for it): how its first use gets through the outbound gate
   const hint = verb === 'done' && it.note ? await allowHint($, it.note) : ''
+  if (words) return `${n}: ${rec.id} (${x.what}): recorded as done, "${words}" (words alone answer a resource as done). ${who} hears it when it's idle.${hint}`
   return `${n}: ${rec.id} (${x.what}): ${verb === 'done' ? 'you got it' : 'no'}${it.note ? `, "${it.note}"` : ''}. ${who} hears it when it's idle.${hint}`
 }
 
@@ -6295,9 +6445,54 @@ async function rosterTick($: any) {
   await setFleetMarks($, marks, now)
 }
 
+// The decisions folders' times as last seen: a question asked or closed moves queue/, an answer or a note answers/
+const asksSeen = { queue: -1, answers: -1 }
+
+async function decisionsMoved($: any): Promise<boolean> {
+  const at = async (sub: string) => {
+    try {
+      return Number((await $.fs.stat(dec(sub))).mtimeMs)
+    } catch {
+      return -1
+    }
+  }
+  const queue = await at('queue')
+  const answers = await at('answers')
+  const moved = queue !== asksSeen.queue || answers !== asksSeen.answers
+  asksSeen.queue = queue
+  asksSeen.answers = answers
+  return moved
+}
+
+// The marks the last full sweep set (rosterTick), which the ask marks are laid over between sweeps
+let fullMarks: Record<string, RowMark> = {}
+
+/** Between full sweeps, when the queue moved: only the ask marks (?n) change. A row's stronger mark (no fleet, a
+ * permission prompt, over budget) stays; an ask mark that's gone leaves the row bare until the next full sweep puts its
+ * other mark back (within a minute) */
+async function asksTick($: any, now: number) {
+  const { records } = await queueRecords($)
+  const present = await answerNames($)
+  const asking = new Map<string, number>()
+  for (const r of records) if (r.asker.ref && knownKind(r) && !progress(r.id, slots(r), present).complete) asking.set(r.asker.ref, (asking.get(r.asker.ref) ?? 0) + 1)
+  const stronger = (m: RowMark | undefined) => !!m && (m.badge === '✗' || m.badge === '!' || (m.badge === '$' && m.tint === 'error'))
+  const isAsk = (m: RowMark | undefined) => !!m && typeof m.badge === 'string' && m.badge.startsWith('?')
+  const marks: Record<string, RowMark> = {}
+  for (const ref of new Set([...Object.keys(fullMarks), ...asking.keys()])) {
+    const m = fullMarks[ref]
+    const n = asking.get(ref) ?? 0
+    if (stronger(m)) marks[ref] = m as RowMark
+    else if (n) marks[ref] = askMark(n)
+    else if (m && !isAsk(m)) marks[ref] = m
+  }
+  await setFleetMarks($, marks, now, false)
+}
+
 // The marks this session (the sweeper) keeps on the rows, set again every minute (they last 150 s, so a sweeper that
-// stops leaves none behind for long). Each one within sessions' limits (markRow): it refuses the whole call over one
-async function setFleetMarks($: any, given: Record<string, RowMark>, now: number) {
+// stops leaves none behind for long). Each one within sessions' limits (markRow): it refuses the whole call over one.
+// full: a full sweep's (rosterTick), kept for asksTick to lay the ask marks over
+async function setFleetMarks($: any, given: Record<string, RowMark>, now: number, full = true) {
+  if (full) fullMarks = given
   const rows = Object.fromEntries(Object.entries(given).map(([ref, m]) => [ref, markRow(m)]))
   const key = JSON.stringify(rows)
   const empty = key === '{}'
@@ -8032,6 +8227,8 @@ async function answerCommand($: any, items: AnswerItem[], origin: string): Promi
     const left = p.answered.filter(a => !a).length
     lines.push(left ? `${id}: ${left} more question${left === 1 ? '' : 's'} to go` : `${id} goes to ${view(rec).name} when it's idle`)
   }
+  // Typed in an instance's own session: his answers all the same, but said, so a /fleet typed in the wrong window shows
+  if (myInstance && touched.size) lines.push(`(typed in ${myInstance.name}'s session, an instance of the roster: recorded as your answers all the same)`)
   bg(beat($))
   return lines.join('\n')
 }
@@ -8231,14 +8428,24 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
   const wc = wf && 'world' in wf ? wf.world : null
   const events = worldOn() ? await eventsSince($, since) : []
   const closed: BriefFacts['closed'] = []
+  const answered: NonNullable<BriefFacts['answered']> = []
   for (const m of [monthOf(now), monthBefore(monthOf(now))]) {
     for (const name of (await names($, dec(`register/${m}`))).filter(n => /^D-\d+\.json$/.test(n)).slice(-500)) {
       let r: RegisterRecord | null = null
       try {
         r = JSON.parse((await readText($, dec(`register/${m}/${name}`))) ?? 'null')
       } catch {}
-      if (!r || r.closedAt < since || (r.kind !== 'change' && r.kind !== 'outbound')) continue
-      const line = closedLine(r, r.asker?.name || r.asker?.ref || 'a session')
+      if (!r || r.closedAt < since) continue
+      const asker = r.asker?.name || r.asker?.ref || 'a session'
+      // A question closed (answered or dropped): what the instances that waited on it act on. One the judge answered is
+      // in the judges' lines already (with any overrule of his)
+      if (r.kind === undefined && r.source !== 'dialog' && r.source !== 'taste' && Array.isArray(r.questions) && r.questions.length) {
+        const byJudge = r.answers.some(a => (a as { origin?: string } | null)?.origin === 'judge')
+        if (!byJudge) answered.push({ id: r.id, at: r.closedAt, line: answeredLine(r, asker) })
+        continue
+      }
+      if (r.kind !== 'change' && r.kind !== 'outbound') continue
+      const line = closedLine(r, asker)
       if (line) closed.push({ id: r.id, at: r.closedAt, line })
     }
   }
@@ -8304,6 +8511,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     prompts,
     events,
     closed,
+    answered,
     levelOf: p => levelOf(p, wc, insensitive),
     blocked: {
       blocks,
@@ -8868,7 +9076,8 @@ export const register: Register = on => {
     if (kind === 'change') return fileChange($, e)
     if (kind === 'resource') return fileResource($, e)
     if (kind === 'answered') return answeredHere($, e)
-    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions), "change" (a change to a command-level file), "resource" (something only the person can get) or "answered" (one of your own questions the person just answered here, with its id). Nothing was queued.' }
+    if (kind === 'wait') return waitFor($, e)
+    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions), "change" (a change to a command-level file), "resource" (something only the person can get), "answered" (one of your own questions the person just answered here, with its id) or "wait" (another session\'s decision your work waits on, with its id). Nothing was queued.' }
     const checked = checkDecide(e)
     if (!checked.ok) return { deny: `${checked.reason}. Nothing was queued: call mcp__fleet__decide again with that fixed.` }
     const asker = await askerNow($)

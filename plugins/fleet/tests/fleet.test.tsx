@@ -245,12 +245,16 @@ test('the asking session sits in the "Asking you" section while it waits, and le
   await fleet($, '1a')
   await tick(w, 10100)
   const calls = (w.files.get(FAKE_LOG) ?? '').trim().split('\n').map(l => JSON.parse(l))
-  expect(calls).toEqual([
+  expect(calls.filter(c => c.assignSection || c.defineSection)).toEqual([
     { assignSection: { source: 'fleet', ref: REF, section: null } },
     { defineSection: { source: 'fleet', spec: { id: 'fleet:asking', title: 'Asking you' } } },
     { assignSection: { source: 'fleet', ref: REF, section: 'fleet:asking' } },
     { assignSection: { source: 'fleet', ref: REF, section: null } },
   ])
+  // Its ask mark came and went with the queue, within seconds (not at the next minute's sweep)
+  const marks = calls.filter(c => c.setMarks).map(c => c.setMarks.rows)
+  expect(marks.some(r => r[REF]?.badge === '?1')).toBe(true)
+  expect(marks[marks.length - 1][REF]).toBe(undefined)
 })
 
 test('after a restart the open decisions come back from the files, and a /clear keeps them', WITH_SESSIONS, async ($, on) => {
@@ -403,6 +407,10 @@ test("in an instance the model's own AskUserQuestion is refused toward decide; a
   await w.clock.settle()
   expect(w.files.get('/fake/asker-error')).toBe(undefined)
   expect(asked).toBe(1)
+  // A /fleet answer typed in an instance's session is his all the same, and says where it was typed
+  await decide($, { questions: [TWO_QUESTIONS.questions[0]] })
+  await fleet($, '')
+  expect(await fleet($, '1a')).toContain("(typed in Owner A's session, an instance of the roster: recorded as your answers all the same)")
 })
 
 test("in the person's own background session (not an instance) the model's AskUserQuestion is shown, not refused", { plugins: [FAKE_SESSIONS], timeoutMs: 30000 }, async ($, on) => {
