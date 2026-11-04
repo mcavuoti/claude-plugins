@@ -117,7 +117,7 @@ test('a session of the person’s own (no background) isn’t held: Claude’s p
 test('outbound.json widened another way isn’t used until the person stamps it; a change to it always waits for his apply, with the diff', async ($, on) => {
   const w = project(on)
   await startSession($, w)
-  // No stamps yet: what's there counts as stamped
+  // As /fleet init stamped it
   expect((await bash($, 'ssh devbox true')).deny).toBe(undefined)
   expect((await bash($, 'ssh far.invalid true')).deny).toContain('(ssh running a command to far.invalid)')
   // A Bash write widens it (its own tools are denied the file): the gate goes on with the stamped one
@@ -147,6 +147,30 @@ test('outbound.json widened another way isn’t used until the person stamps it;
   expect(await fleet($, '1 apply')).toContain('1: applied D-1: fleet wrote .claude/fleet/outbound.json as drafted')
   // Applied by his answer: stamped, and used
   expect((await bash($, 'ssh build.invalid true')).deny).toBe(undefined)
+})
+
+test('stamps.json taken away: the gate allows nothing but this machine, nothing stamps it again but the person’s /fleet accept, and only of what he names', async ($, on) => {
+  const w = project(on)
+  await startSession($, w)
+  expect((await bash($, 'ssh devbox true')).deny).toBe(undefined)
+  // An instance's Bash widens outbound.json and takes the stamps away (its tools are denied both; Bash isn't held)
+  w.touch(`${FLEET}/outbound.json`, JSON.stringify({ outboundFormat: 1, hosts: ['*'] }))
+  w.files.delete(`${FLEET}/state/stamps.json`)
+  // The sweeper's passes don't stamp what's there
+  await w.clock.advance(70000)
+  await w.clock.settle()
+  expect(w.files.has(`${FLEET}/state/stamps.json`)).toBe(false)
+  expect((await bash($, 'ssh far.invalid true')).deny).toContain('(ssh running a command to far.invalid)')
+  expect((await bash($, 'ssh devbox true')).deny).toContain('(ssh running a command to devbox)')
+  expect((await bash($, 'curl -s http://localhost:8080/health')).deny).toBe(undefined)
+  expect(await fleet($, 'status')).toContain('no stamps (state/stamps.json is missing)')
+  // The person stamps another file: outbound.json isn't stamped with it
+  w.touch(`${FLEET}/charter.md`, '# Charter\n')
+  await fleet($, 'accept charter.md')
+  expect((await bash($, 'ssh far.invalid true')).deny).toContain('(ssh running a command to far.invalid)')
+  // His own /fleet accept outbound.json: used
+  expect(await fleet($, 'accept outbound.json')).toContain('stamped as yours')
+  expect((await bash($, 'ssh far.invalid true')).deny).toBe(undefined)
 })
 
 test('mcp__fleet__send: drafted, shown exactly in /fleet, sent once by fleet as approved; a file changed since needs its new version', async ($, on) => {

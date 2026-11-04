@@ -10,6 +10,7 @@
 
 import type { FleetRead } from '../types'
 import { FORMAT, cut } from './decisions'
+import { commandsOf, stripPrefixes } from './outbound'
 import type { IntakeMeta } from './intake'
 
 /** Project data: world.json. It only gains fields, and a write keeps the fields it doesn't know */
@@ -340,41 +341,69 @@ export function overwroteText(rel: string, last: ChangeEvent, me: Me, how: 'writ
 }
 
 /** What the model reads after a command with no write syntax ran while another session's write landed on a world file:
- * the command didn't change it (it isn't its landing), but what it read may be older than what's there now */
+ * the command didn't change it (it isn't its landing), but what it read may be older than what's there now. last: the
+ * event of the version there now, when fleet has it; else nobody is named */
 export function duringText(rel: string, last: ChangeEvent | null, me: Me): string {
-  return `fleet: ${rel} changed while your command ran${last ? ` (it ${changeLine(last, me)})` : ''}; your command didn't change it. If your command read it, read it again.`
+  return `fleet: ${rel} changed while your command ran (${last ? `it ${changeLine(last, me)}` : "by someone fleet hasn't seen yet: an editor, a script, or a session whose event is still coming"}); your command didn't change it. If your command read it, read it again.`
 }
 
 // ---- Bash: whether a command writes (its syntax only; a program not known to only read counts as a writer) ----
 
-const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'env', 'printenv', 'id', 'whoami', 'hostname', 'uname'])
+// Programs that only read, unless a flag or an operand below names a file they write. env and the like aren't here:
+// the shell reader takes them off and judges the command they run
+const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'printenv', 'id', 'whoami', 'hostname', 'uname'])
 const READ_ONLY_VCS = new Set(['diff', 'log', 'show', 'status', 'grep', 'blame', 'ls-files', 'ls-tree', 'rev-parse', 'cat-file', 'describe', 'shortlog', 'merge-base', 'rev-list', 'whatchanged'])
 
-/** Whether a Bash command has no write syntax: no redirection to a file, and only programs that read (sed without -i,
- * find without -delete or -exec, git's reading subcommands). Unsure counts as writing */
-export function bashWritesNothing(command: string): boolean {
+/** The operands of a command's words (no options, nor the values of the options given that take one) */
+function operandsOf(args: readonly string[], valued: RegExp): string[] {
+  const out: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] as string
+    if (a === '--') {
+      out.push(...args.slice(i + 1))
+      break
+    }
+    if (a.startsWith('-') && a !== '-') {
+      if (valued.test(a)) i++
+      continue
+    }
+    out.push(a)
+  }
+  return out
+}
+
+/** Whether a Bash command writes nothing in the shared world: no redirection to a file, and only programs that read (sed
+ * without -i or a w command, find without -delete or -exec, git's reading subcommands without --output, sort without -o,
+ * uniq and xxd with one operand…). inWorld says whether a file a command writes is a world file (a path as the command
+ * names it); without it, every file counts. A file it can't name ($var) counts. Unsure counts as writing */
+export function bashWritesNothing(command: string, inWorld?: (target: string) => boolean): boolean {
   const c = command.trim()
-  if (!c) return false
-  // Quoted text is data: a pattern's | or > isn't the shell's
-  const bare = c.replace(/'[^']*'/g, "''").replace(/"(?:[^"\\]|\\.)*"/g, '""')
-  if (bare.includes('`')) return false
-  // A redirection to a file (2>&1 and >/dev/null are no writes)
-  for (const m of bare.matchAll(/\d*(?:>>?|&>)\s*(&?[^\s;&|]*)/g)) {
-    const to = m[1] ?? ''
-    if (to.startsWith('&') || to === '/dev/null') continue
+  if (!c || c.includes('`')) return false
+  const targets: string[] = []
+  let cmds: string[][]
+  try {
+    cmds = commandsOf(c, 0, targets)
+  } catch {
     return false
   }
-  // The redirections said nothing more: out of the way of the commands (2>&1 isn't a command separator)
-  const commands = bare.replace(/\d*(?:>>?|&>)\s*&?[^\s;&|]*/g, ' ').replace(/\d*<\s*[^\s;&|]*/g, ' ')
-  for (const seg of commands.split(/\|\||&&|[|;&\n]|\$\(|\)/)) {
-    const words = seg.trim().split(/\s+/).filter(Boolean)
-    // Leading variable assignments (LC_ALL=C grep …)
-    while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0] as string)) words.shift()
-    if (!words.length) continue
-    const [cmd = '', ...args] = words
-    const prog = cmd.split('/').pop() as string
+  // A file the command writes into the world: /dev/null and the terminal aren't; a name with $ in it may be anything
+  const writes = (t: string | undefined): boolean => {
+    if (t === undefined || t === '') return true
+    if (/^\/dev\/(null|stdout|stderr|tty|fd\/[0-2])$/.test(t)) return false
+    if (/[$`*?]/.test(t)) return true
+    return inWorld ? inWorld(t) : true
+  }
+  if (targets.some(writes)) return false
+  for (const words of cmds) {
+    const w = stripPrefixes(words)
+    if (!w.length) continue
+    const prog = (w[0] as string).split('/').pop() as string
+    const args = w.slice(1)
     if (prog === 'sed') {
-      if (args.some(a => /^-[a-zA-Z]*i/.test(a) || a.startsWith('--in-place'))) return false
+      if (args.some(a => /^-[a-zA-Z]*i/.test(a) || a.startsWith('--in-place') || /^-[a-zA-Z]*f/.test(a) || a === '--file')) return false
+      // A script's w or W command (/x/w file, 1,5w file) or an s command's w flag (s/a/b/gw file) writes a file: a w
+      // after a non-letter or after a / and flags (a pattern like /what/ counts too: the safe side)
+      if (args.some(a => !a.startsWith('-') && (/(^|[^A-Za-z])[wW]/.test(a) || /\/[gpiImMe0-9]*[wW]/.test(a)))) return false
       continue
     }
     if (prog === 'find') {
@@ -389,8 +418,41 @@ export function bashWritesNothing(command: string): boolean {
         else if (!a.startsWith('-')) sub = a
       }
       if (!READ_ONLY_VCS.has(sub)) return false
+      const k = args.findIndex(a => /^--output(=|$)/.test(a))
+      if (k >= 0 && writes((args[k] as string).includes('=') ? (args[k] as string).slice('--output='.length) : args[k + 1])) return false
       continue
     }
+    if (prog === 'sort') {
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i] as string
+        if (a === '--output' || /^-[a-zA-Z]*o$/.test(a)) {
+          if (writes(args[i + 1])) return false
+        } else if (a.startsWith('--output=')) {
+          if (writes(a.slice('--output='.length))) return false
+        } else if (/^-[a-zA-Z]*o./.test(a) && !a.startsWith('--')) {
+          if (writes(a.slice(a.indexOf('o') + 1))) return false
+        }
+      }
+      continue
+    }
+    // A second operand is the file they write
+    if (prog === 'uniq') {
+      if (writes(operandsOf(args, /^-[fsw]$|^--(skip-fields|skip-chars|check-chars)$/)[1] ?? '/dev/null')) return false
+      continue
+    }
+    if (prog === 'xxd') {
+      if (writes(operandsOf(args, /^-[cglson]$|^-(cols|groupsize|len|seek|name)$/)[1] ?? '/dev/null')) return false
+      continue
+    }
+    if (prog === 'tree') {
+      const k = args.findIndex(a => a === '-o')
+      if (k >= 0 && writes(args[k + 1])) return false
+      continue
+    }
+    // A log file, a compiled magic file, a preprocessor it runs
+    if (prog === 'less' && args.some(a => /^-[a-zA-Z]*[oO]/.test(a) || a.startsWith('--log-file') || a.startsWith('--LOG-FILE'))) return false
+    if (prog === 'file' && args.some(a => /^-[a-zA-Z]*C/.test(a) || a === '--compile')) return false
+    if (prog === 'rg' && args.some(a => a === '--pre' || a.startsWith('--pre='))) return false
     if (!READ_ONLY_PROGRAMS.has(prog)) return false
   }
   return true

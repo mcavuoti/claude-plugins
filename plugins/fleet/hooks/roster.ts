@@ -500,11 +500,15 @@ export function expandBraces(glob: string): string[] {
   return m[1]!.split(',').flatMap(alt => expandBraces(glob.slice(0, m.index) + alt + glob.slice(m.index + m[0].length)))
 }
 
-/** The deny rules: Edit (which covers Write and NotebookEdit too) of each command-level file and of instances/, by
- * absolute path (//<path>) */
+/** The person's own state: his stamps (what the outbound gate trusts), the checks' and the channel's stamps, his budget
+ * lifts, his downs and his live areas. Only fleet writes them, for his typed commands */
+export const PERSON_STATE = ['stamps.json', 'checks-stamp.json', 'channel-stamp.json', 'lifts.json', 'down.json', 'judges.json'].map(n => `.claude/fleet/state/${n}`)
+
+/** The deny rules: Edit (which covers Write and NotebookEdit too) of each command-level file, of instances/ and of the
+ * person's own state, by absolute path (//<path>) */
 export function denyRules(root: string, level: { files: readonly string[]; globs: readonly string[] }): string[] {
   const abs = (rel: string) => `Edit(/${root.replace(/\/+$/, '')}/${rel})`
-  return [...new Set([...level.files.map(abs), ...[...level.globs, '.claude/fleet/instances/**'].flatMap(expandBraces).map(abs)])]
+  return [...new Set([...level.files.map(abs), ...[...level.globs, '.claude/fleet/instances/**'].flatMap(expandBraces).map(abs), ...PERSON_STATE.map(abs)])]
 }
 
 /** What /fleet up writes for an instance: the roster's settings for it, then fleet's own (they can't be taken out) */

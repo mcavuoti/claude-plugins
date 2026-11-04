@@ -64,8 +64,8 @@ function strings(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map(x => x.trim()) : []
 }
 
-/** calls: each entry with a tool and at least one input key to match (a call with nothing to match would free the whole
- * tool: that's tools.free); the rest is left out */
+/** calls: each entry with a tool and at least one input key to match with something besides wildcards (a call with
+ * nothing to match, or only * and ?, would free the whole tool: that's tools.free); the rest is left out */
 function callsOf(v: unknown): OutboundCall[] {
   if (!Array.isArray(v)) return []
   const out: OutboundCall[] = []
@@ -75,7 +75,7 @@ function callsOf(v: unknown): OutboundCall[] {
     if (typeof o.tool !== 'string' || !o.tool.trim() || !o.match || typeof o.match !== 'object') continue
     const match: Record<string, string> = {}
     for (const [k, val] of Object.entries(o.match as Record<string, unknown>)) if (typeof val === 'string' || typeof val === 'number') match[k] = String(val)
-    if (!Object.keys(match).length) continue
+    if (!Object.keys(match).length || Object.values(match).every(m => /^[*?\s]*$/.test(m))) continue
     out.push({ tool: o.tool.trim(), match, instances: strings(o.instances) })
   }
   return out
@@ -232,8 +232,13 @@ const WRITES = new Set([
   'tweet', 'append', 'insert', 'edit', 'respond', 'notify', 'upsert', 'patch', 'push', 'save', 'input', 'type', 'fill', 'execute',
 ])
 // Words that send as the tool's verb, its first word fleet knows (copy_file, add_attachment, draft_email, message),
-// but are things a read names elsewhere (get_message, list_drafts, list_commits)
-const LEADING_WRITES = new Set(['add', 'set', 'sync', 'copy', 'deploy', 'release', 'message', 'draft', 'transfer', 'import', 'commit'])
+// but are things a read names elsewhere (get_message, list_drafts, list_commits). The verbs among them send whatever
+// follows (add_card_to_list, set_status, deploy_preview); the nouns yield to a read verb after them (chat_message_search,
+// release_list), never to a read word that isn't a verb (message_select_recipients, commit_status)
+const LEADING_VERBS = new Set(['add', 'set', 'sync', 'copy', 'deploy', 'transfer', 'import'])
+const LEADING_NOUNS = new Set(['message', 'draft', 'commit', 'release'])
+const LEADING_WRITES = new Set([...LEADING_VERBS, ...LEADING_NOUNS])
+const READ_VERBS = new Set(['get', 'list', 'search', 'read', 'fetch', 'query', 'find', 'lookup', 'count', 'view'])
 const READS = new Set([
   'get', 'list', 'search', 'read', 'fetch', 'query', 'find', 'describe', 'view', 'download', 'export', 'lookup', 'check', 'count',
   'show', 'status', 'scan', 'inspect', 'preview', 'suggest', 'resolve', 'info', 'browse', 'context', 'select', 'screenshot', 'console',
@@ -276,17 +281,59 @@ function toolListed(tool: string, globs: readonly string[]): boolean {
 
 const RECIPIENT_KEYS = ['to', 'cc', 'bcc', 'recipient', 'recipients', 'email', 'emails', 'attendees', 'address', 'addresses']
 
-/** A call outbound.json's calls let pass: its tool, every key it names holding that value (a glob), and this session one
- * of the instances it names (or it names none). who: this session's instance, null for none */
+/** A value against a calls entry's glob, strictly: * (and ?) never runs over a list separator, an @, a path separator, a
+ * space or an angle bracket, so "*@corp.example" names one address and "docs/*" one file */
+export function callMatches(value: string, pattern: string): boolean {
+  const v = value.toLowerCase()
+  const p = pattern.toLowerCase()
+  if (p === v) return true
+  if (!/[*?]/.test(p)) return false
+  const re = p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^,;@/\\\\\\s<>]*').replace(/\?/g, '[^,;@/\\\\\\s<>]')
+  return new RegExp(`^${re}$`).test(v)
+}
+
+/** A calls entry's key in a call's input, as the values it holds: a recipient key's list one address each (split on , and
+ * ;), another key's whole value; null when it holds something else (an object, nothing): no match */
+function callValues(key: string, v: unknown): string[] | null {
+  const recipient = RECIPIENT_KEYS.includes(key)
+  const one = (x: unknown): string[] | null => {
+    if (typeof x === 'number') return [String(x)]
+    if (typeof x !== 'string') return null
+    return recipient ? x.split(/[,;]/).map(s => s.trim()).filter(Boolean) : [x]
+  }
+  const out: string[] = []
+  for (const x of Array.isArray(v) ? v : [v]) {
+    const vals = one(x)
+    if (!vals) return null
+    out.push(...vals)
+  }
+  return out.length ? out : null
+}
+
+/** A call outbound.json's calls let pass: its tool, every key it names holding only values its glob matches, every other
+ * recipient the call names one the person's recipients allow, and this session one of the instances it names (or it
+ * names none). who: this session's instance, null for none */
 export function callAllowed(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null): boolean {
   return (c.calls ?? []).some(k => {
     if (!matches(tool, k.tool)) return false
     if (k.instances.length && !(who && k.instances.some(i => i.toLowerCase() === who.toLowerCase()))) return false
-    return Object.entries(k.match).every(([key, want]) => {
-      const v = input[key]
-      return (typeof v === 'string' || typeof v === 'number') && matches(String(v), want)
+    const named = Object.entries(k.match).every(([key, want]) => {
+      const vals = callValues(key, input[key])
+      return !!vals && vals.every(v => callMatches(v, want))
     })
+    if (!named) return false
+    // A recipient on a key the entry doesn't name goes only where the person's recipients allow
+    const others = RECIPIENT_KEYS.filter(key => key in input && !(key in k.match))
+    return others.every(key => recipientsOf({ [key]: input[key] }).every(r => recipientAllowed(r, c)))
   })
+}
+
+/** The tools an allow rule stands for, among the names a session has: a whole server's (mcp__<server>, or a glob such as
+ * mcp__<server>__*), else the rule's own tool name */
+export function mcpRuleTools(rule: string, names: readonly string[]): string[] {
+  if (/[*?]/.test(rule)) return names.filter(n => matches(n, rule))
+  if (!mcpParts(rule)) return names.filter(n => n.startsWith(`${rule}__`))
+  return [rule]
 }
 
 /** A host of the person's own (outbound.json's inside: a host, or *.domain): what's read there isn't outside content */
@@ -337,9 +384,9 @@ export function classifyMcp(tool: string, input: Record<string, unknown>, c: Out
   const words = nameWords(parts.name)
   const remote = outsideServer(parts.server)
   const verb = words.find(w => WRITES.has(w) || LEADING_WRITES.has(w) || READS.has(w) || NEUTRAL.has(w))
-  // A verb that only reads wins over a leading word that is a noun there (chat_message_search searches messages): a
-  // recipient it names is a filter, nothing goes to it
-  const writes = words.some(w => WRITES.has(w)) || (!!verb && LEADING_WRITES.has(verb) && !words.some(w => READS.has(w)))
+  // A read verb wins only over a leading noun (chat_message_search searches messages: a recipient it names is a filter,
+  // nothing goes to it); a verb that sends, anywhere or leading, always wins
+  const writes = words.some(w => WRITES.has(w)) || (!!verb && LEADING_VERBS.has(verb)) || (!!verb && LEADING_NOUNS.has(verb) && !words.some(w => READ_VERBS.has(w)))
   const reads = !writes && words.some(w => READS.has(w))
   const neutral = !writes && !reads && words.some(w => NEUTRAL.has(w))
   const outside = (toolListed(tool, c.outside) || (remote && reads)) && !insideCall(tool, input, c)

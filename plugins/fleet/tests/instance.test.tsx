@@ -108,7 +108,7 @@ test('the person’s own session writes the charter (his edit is his; /fleet acc
   const w = world(on, { background: false, worldPaths: ['notes/**'], files: { ...PROJECT, [`${FLEET}/charter.md`]: '# Charter\n' } })
   sessionsSay(w, { rows: {} })
   await startSession($, w)
-  // No stamps yet: what's there is the baseline
+  // As /fleet init left it: nothing waits to be stamped
   expect(await fleet($, 'accept')).toBe('No change made outside fleet waits to be stamped.')
   const r: any = await $.tool.call({ tool: 'Write', file_path: `${FLEET}/charter.md`, content: '# Charter, by hand\n' } as any)
   expect(r.deny).toBe(undefined)

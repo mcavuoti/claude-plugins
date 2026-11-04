@@ -12,6 +12,7 @@ import {
   hostOf,
   hostsNamed,
   insideHost,
+  mcpRuleTools,
   mayReachNetwork,
   newOutbound,
   outboundDelivery,
@@ -337,21 +338,38 @@ test('mcp__fleet__send: its input, the draft fleet keeps and runs, the version t
   )
 })
 
-test('a read verb wins over a leading noun: a search with a recipient filter reads, sends nothing', () => {
+test('a read verb wins only over a leading noun (message, draft, commit, release): a search with a recipient filter reads; every verb that sends still sends', () => {
   const c = (tool: string, input: Record<string, unknown> = {}) => classifyMcp(tool, input, NONE)
   expect(c('mcp__claude_ai_Office__chat_message_search', { query: '*', recipient: 'someone@example.org' })).toEqual({ send: null, outside: true })
   expect(c('mcp__claude_ai_Office__message_list', { from: 'someone@example.org' })).toEqual({ send: null, outside: true })
+  // On a server that isn't an outside service, a tool sends exactly when its name says it writes
+  const sends = (name: string) => c(`mcp__x__${name}`).send !== null
+  // Each of these sent in 0.8.1 and still does: a real verb wins, whatever read word comes after it
+  for (const name of [
+    'add_card_to_list', 'add_list_item', 'sync_shared_list', 'slack_set_status', 'set_issue_status', 'commit_status', 'deploy_preview', 'set_context',
+    'add_contact_info', 'copy_object_list', 'message_select_recipients', 'add_attachment_preview', 'import_query_results', 'transfer_list',
+    'forward_message', 'reply_all', 'share_file', 'share_search_results', 'post_message', 'post_status', 'send_chat_message', 'draft_email', 'message',
+    'publish_release_list', 'invite_user_search', 'upload_view', 'create_list', 'update_status', 'write_query', 'comment_on_list', 'react_to_message',
+    'delete_and_send_message',
+  ]) {
+    expect([name, sends(name)]).toEqual([name, true])
+  }
+  // Reads: a read verb first, or a leading noun that a read verb follows (and no verb that sends)
+  for (const name of ['chat_message_search', 'search_messages', 'list_messages', 'get_message', 'read_resource', 'message_list', 'list_commits', 'get_draft', 'release_list', 'draft_get', 'commit_search']) {
+    expect([name, sends(name)]).toEqual([name, false])
+  }
   expect(c('mcp__discord__message', { to: 'someone@example.org' }).send).not.toBe(null)
   expect(c('mcp__claude_ai_Office__send_chat_message', { chatId: '19:aaaa', body: 'hi' }).send).not.toBe(null)
-  expect(c('mcp__x__draft_email').send).not.toBe(null)
+  expect(c('mcp__claude_ai_Office__forward_message', { query: 'x' }).send).not.toBe(null)
 })
 
 test('outbound.json calls: one chat of a sending tool passes, for the instances it names; the rest of the tool is held', () => {
   const tool = 'mcp__claude_ai_Office__send_chat_message'
-  const parsed = parseOutbound(JSON.stringify({ outboundFormat: 1, calls: [{ tool: 'mcp__claude_ai_Office__send_*', match: { chatId: '19:aaaa*' }, instances: ['Liaison'] }, { tool: 'mcp__x__y' }, { tool: 'mcp__x__z', match: {} }] }))
+  // An entry with nothing to match, or only wildcards (that's tools.free), is left out
+  const parsed = parseOutbound(JSON.stringify({ outboundFormat: 1, calls: [{ tool: 'mcp__claude_ai_Office__send_*', match: { chatId: '19:aaaa*@thread*' }, instances: ['Liaison'] }, { tool: 'mcp__x__y' }, { tool: 'mcp__x__z', match: {} }, { tool: 'mcp__x__w', match: { note: '*' } }, { tool: 'mcp__x__v', match: { a: '*', b: '?' } }] }))
   if (!('outbound' in parsed)) throw new Error('no outbound')
   const cfg = parsed.outbound
-  expect(cfg.calls).toEqual([{ tool: 'mcp__claude_ai_Office__send_*', match: { chatId: '19:aaaa*' }, instances: ['Liaison'] }])
+  expect(cfg.calls).toEqual([{ tool: 'mcp__claude_ai_Office__send_*', match: { chatId: '19:aaaa*@thread*' }, instances: ['Liaison'] }])
   expect(classifyMcp(tool, { chatId: '19:aaaa@thread', body: 'hi' }, cfg, 'Liaison').send).toBe(null)
   expect(classifyMcp(tool, { chatId: '19:aaaa@thread', body: 'hi' }, cfg, 'liaison').send).toBe(null)
   expect(classifyMcp(tool, { chatId: '19:aaaa@thread', body: 'hi' }, cfg, 'Owner A').send).not.toBe(null)
@@ -361,6 +379,42 @@ test('outbound.json calls: one chat of a sending tool passes, for the instances 
   // None named: any session
   const any: OutboundConfig = { ...newOutbound(), calls: [{ tool, match: { chatId: '19:aaaa' }, instances: [] }] }
   expect(classifyMcp(tool, { chatId: '19:aaaa', body: 'hi' }, any, null).send).toBe(null)
+})
+
+test('outbound.json calls: a match covers every recipient the call names, and * stops at a list separator, an @ and a path separator', () => {
+  const mail = 'mcp__claude_ai_Mail__send_message'
+  const one: OutboundConfig = { ...newOutbound(), calls: [{ tool: mail, match: { to: 'boss@corp.example' }, instances: [] }] }
+  expect(classifyMcp(mail, { to: 'boss@corp.example', body: 'x' }, one).send).toBe(null)
+  // Another recipient on a key the entry doesn't name: held (unless the person's recipients allow it)
+  expect(classifyMcp(mail, { to: 'boss@corp.example', bcc: 'outsider@elsewhere.example' }, one).send).not.toBe(null)
+  expect(classifyMcp(mail, { to: 'boss@corp.example', cc: ['outsider@elsewhere.example'] }, one).send).not.toBe(null)
+  expect(classifyMcp(mail, { to: 'boss@corp.example', cc: ['ann@corp.example'] }, { ...one, recipients: ['*@corp.example'] }).send).toBe(null)
+  // Each address of a list on its own
+  const domain: OutboundConfig = { ...newOutbound(), calls: [{ tool: mail, match: { to: '*@corp.example' }, instances: [] }] }
+  expect(classifyMcp(mail, { to: 'ann@corp.example' }, domain).send).toBe(null)
+  expect(classifyMcp(mail, { to: 'ann@corp.example, bob@corp.example' }, domain).send).toBe(null)
+  expect(classifyMcp(mail, { to: ['ann@corp.example', 'bob@corp.example'] }, domain).send).toBe(null)
+  expect(classifyMcp(mail, { to: 'outsider@elsewhere.example, ann@corp.example' }, domain).send).not.toBe(null)
+  expect(classifyMcp(mail, { to: '"x" <outsider@elsewhere.example> ann@corp.example' }, domain).send).not.toBe(null)
+  expect(classifyMcp(mail, { to: ['ann@corp.example', 'outsider@elsewhere.example'] }, domain).send).not.toBe(null)
+  expect(classifyMcp(mail, { to: 'outsider@corp.example@elsewhere.example' }, domain).send).not.toBe(null)
+  expect(classifyMcp(mail, { to: [] }, domain).send).not.toBe(null)
+  // * doesn't cross a path separator either
+  const post = 'mcp__x__post_file'
+  const docs: OutboundConfig = { ...newOutbound(), calls: [{ tool: post, match: { path: 'docs/*' }, instances: [] }] }
+  expect(classifyMcp(post, { path: 'docs/a.md' }, docs).send).toBe(null)
+  expect(classifyMcp(post, { path: 'docs/../secret/a.md' }, docs).send).not.toBe(null)
+  expect(classifyMcp(post, { path: { nested: 'docs/a.md' } }, docs).send).not.toBe(null)
+})
+
+test('an allow rule for a whole MCP server stands for each of its tools the session has', () => {
+  const names = ['Bash', 'mcp__claude_ai_Office__read_resource', 'mcp__claude_ai_Office__send_chat_message', 'mcp__claude_ai_Officer__x', 'mcp__fleet__decide']
+  expect(mcpRuleTools('mcp__claude_ai_Office', names)).toEqual(['mcp__claude_ai_Office__read_resource', 'mcp__claude_ai_Office__send_chat_message'])
+  expect(mcpRuleTools('mcp__claude_ai_Office__*', names)).toEqual(['mcp__claude_ai_Office__read_resource', 'mcp__claude_ai_Office__send_chat_message'])
+  expect(mcpRuleTools('mcp__claude_ai_Office__send_chat_message', names)).toEqual(['mcp__claude_ai_Office__send_chat_message'])
+  // A tool this session doesn't have is still the rule's own name (checked as it is)
+  expect(mcpRuleTools('mcp__claude_ai_Office__send_mail', names)).toEqual(['mcp__claude_ai_Office__send_mail'])
+  expect(mcpRuleTools('mcp__other', names)).toEqual([])
 })
 
 test('outbound.json inside: the person’s own tools and hosts are no outside content', () => {

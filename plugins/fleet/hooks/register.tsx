@@ -55,6 +55,7 @@ import {
   checkSend,
   classifyBash,
   classifyMcp,
+  mcpRuleTools,
   draftText,
   hostAllowed,
   hostOf,
@@ -303,6 +304,7 @@ import {
   compareVersions,
   countWake,
   denyRules,
+  PERSON_STATE,
   familyPriceNote,
   forecastOf,
   freshDue,
@@ -1940,7 +1942,8 @@ async function saveReads($: any) {
 /** The commands this session runs now that the others should know of: a foreground one past 3 s, a background one */
 async function runningHere($: any): Promise<Running[]> {
   const out: Running[] = [...fgRunning.values()].filter(c => c.shown).map(c => ({ thread: c.thread, at: c.at }))
-  for (const [task, b] of Object.entries(await read($, bgCommands))) out.push({ thread: b.thread, at: b.at, task })
+  // A background command that writes nothing in the world isn't one a change may be blamed on
+  for (const [task, b] of Object.entries(await read($, bgCommands))) if (!b.readOnly) out.push({ thread: b.thread, at: b.at, task })
   return out
 }
 
@@ -2260,7 +2263,8 @@ let outboundUnstamped = false
 
 /** outbound.json as the person stamped it (or fleet wrote it on his answer), read again when its time or the stamps'
  * moves: an edit made another way isn't used until /fleet accept outbound.json, so it never widens what leaves
- * unseen (with no stamps yet, what's there counts as stamped). None: nothing is allowed but this machine. One fleet
+ * unseen. No stamps (taken away: /fleet init writes the first ones): nothing but this machine, until he stamps it. None:
+ * nothing is allowed but this machine. One fleet
  * can't read (a newer one, or not JSON; or stamps of another fleet): the same, and /fleet status says why (the hard
  * line never opens by itself) */
 async function outboundConfig($: any): Promise<OutboundConfig> {
@@ -2289,12 +2293,18 @@ async function outboundConfig($: any): Promise<OutboundConfig> {
     return none(`the stamps (state/stamps.json) are from another fleet (format ${w.otherFormat}): restart this session (u)`)
   }
   const s = w ? w.value : null
-  const had = s?.files[OUTBOUND_JSON]
+  // No stamps (/fleet init writes the first ones): taken away, or never there. Nothing is trusted until the person
+  // stamps outbound.json himself, so a deleted stamps file never opens the gate
+  if (!s) {
+    outboundUnstamped = false
+    return none(`no stamps (state/stamps.json is missing): nothing but this machine is allowed until you type /fleet accept outbound.json`)
+  }
+  const had = s.files[OUTBOUND_JSON]
   const v = now === null ? null : hashText(now)
-  const stamped = !s || (had === undefined ? v === null : had === v)
+  const stamped = had === undefined ? v === null : had === v
   if (!stamped && !outboundUnstamped) log($, 'outbound.json changed outside fleet: the gate goes on with it as it was stamped, until /fleet accept outbound.json')
   outboundUnstamped = !stamped
-  const t = stamped ? now : typeof s?.outbound === 'string' && hashText(s.outbound) === had ? s.outbound : null
+  const t = stamped ? now : typeof s.outbound === 'string' && hashText(s.outbound) === had ? s.outbound : null
   if (t === null) return none('')
   const p = parseOutbound(t)
   if ('problem' in p) return none(p.problem)
@@ -2643,7 +2653,7 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   const sessionId = String(await $.session.id())
   const out: string[] = []
   const landed: string[] = []
-  const during: string[] = []
+  const during: { rel: string; v: string | null }[] = []
   type Landing = { rel: string; s: { mtimeMs: number; size: number } | undefined; f: { v: string | null; text: string | null }; last?: ChangeEvent; k?: Known; mine?: FleetRead; pc: PinCheck | null; suspect: string[]; by: Who; fields: Partial<ChangeEvent> }
   const settle = (x: Pick<Landing, 'rel' | 's' | 'f'>) => {
     if (x.s) setKnown(x.rel, { ...x.s, v: x.f.v, pins: pinsFrom(x.f.text, x.rel) })
@@ -2665,7 +2675,7 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     // A command with no write syntax changed nothing: another session's write landed while it ran (its event says so,
     // or will, and the scan takes it then). It isn't this thread's landing: its model hears what changed under it
     if (readOnly) {
-      during.push(rel)
+      during.push({ rel, v })
       continue
     }
     const mine = (await read($, reads))[thread]?.[rel]
@@ -2720,11 +2730,41 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     if (v !== null) landed.push(x.rel)
   }
   scheduleChecks($, landed)
-  for (const rel of during) {
+  // The writer named only when its event is the version there now (an older event isn't who wrote this one)
+  for (const { rel, v } of during) {
     const last = latest.get(rel)
-    out.push(duringText(rel, last && last.by?.sessionId !== sessionId ? last : null, await meNow($)))
+    out.push(duringText(rel, last && last.to === v && last.by?.sessionId !== sessionId ? last : null, await meNow($)))
   }
   return out
+}
+
+/** Whether a file a Bash command writes (as the command names it) is a world file: resolved from the session's folder,
+ * then placed in the project. Outside the project, or not among the shared files: no */
+async function bashTargetPredicate($: any): Promise<(target: string) => boolean> {
+  const cwd = String(await $.session.cwd()).replace(/\/+$/, '')
+  let home = ''
+  try {
+    home = String((await $.env.get('HOME')) ?? '')
+  } catch {}
+  const res = world ? world.res : null
+  const base = realRoot || root
+  return (target: string) => {
+    if (!res || !base) return true
+    let abs = target
+    if (target === '~' || target.startsWith('~/')) {
+      if (!home) return true
+      abs = `${home}${target.slice(1)}`
+    } else if (!target.startsWith('/')) abs = `${cwd}/${target}`
+    // . and .. folded, as a path lands
+    const parts: string[] = []
+    for (const p of abs.split('/')) {
+      if (p === '' || p === '.') continue
+      if (p === '..') parts.pop()
+      else parts.push(p)
+    }
+    const rel = relOf(`/${parts.join('/')}`, base, insensitive)
+    return rel !== null && inWorld(rel, res)
+  }
 }
 
 async function bashHook($: any, e: any, next: any) {
@@ -2766,18 +2806,24 @@ async function bashHook($: any, e: any, next: any) {
   }
   if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
   const extra: string[] = []
+  // Whether it writes nothing in the world, by its syntax (a file it writes outside the shared files doesn't count)
+  let readOnly = false
+  try {
+    readOnly = bashWritesNothing(String(e.command ?? ''), await bashTargetPredicate($))
+  } catch {}
   // Run in the background (or moved there): what it writes comes later. Its world as it was is kept under its task id,
   // and compared with when it completes (bgDone); meanwhile the sweeper takes a change it can't explain as probably its
+  // (not a command that writes nothing)
   const task = typeof r?.result?.backgroundTaskId === 'string' && r.result.backgroundTaskId ? (r.result.backgroundTaskId as string) : null
   if (task && before) {
-    const b: FleetBg = { thread, at: startedAt, before: [...before].map(([p, s]) => [p, s.mtimeMs, s.size]) }
+    const b: FleetBg = { thread, at: startedAt, before: [...before].map(([p, s]) => [p, s.mtimeMs, s.size]), ...(readOnly ? { readOnly: true } : {}) }
     await update($, bgCommands, m => ({ ...m, [task]: b }))
     saveReadsSoon($)
     log($, `Bash in the background (${task}) by ${thread}: its landings when it completes`)
     before = undefined
   }
   try {
-    if (before) extra.push(...(await afterBash($, thread, before, startedAt, bashWritesNothing(String(e.command ?? '')))))
+    if (before) extra.push(...(await afterBash($, thread, before, startedAt, readOnly)))
     const target = bashReadTarget(String(e.command ?? ''))
     if (target && r && !r.isError && r.deny === undefined) extra.push(...(await noteRead($, thread, target)))
   } catch (err) {
@@ -2799,7 +2845,7 @@ async function bgDone($: any, task: string) {
   saveReadsSoon($)
   if (!b || !worldOn()) return
   const before: Snapshot = new Map(b.before.map(([p, mtimeMs, size]) => [p, { mtimeMs, size }]))
-  const lines = await afterBash($, b.thread, before, b.at).catch(err => [`after the background command ${task}: ${String(err).slice(0, 200)}`])
+  const lines = await afterBash($, b.thread, before, b.at, b.readOnly === true).catch(err => [`after the background command ${task}: ${String(err).slice(0, 200)}`])
   log($, `Bash in the background (${task}) completed${lines.length ? `: ${lines.join(' | ').slice(0, 400)}` : ''}`)
 }
 
@@ -2811,7 +2857,7 @@ async function runningNow($: any): Promise<RunningNow> {
   const now = await $.clock.now()
   const sessionId = String(await $.session.id())
   const out: RunningNow = { foreground: [...fgRunning.values()].map(c => c.at), background: [] }
-  for (const b of Object.values(await read($, bgCommands))) out.background.push({ who: await whoAmI($, b.thread), at: b.at })
+  for (const b of Object.values(await read($, bgCommands))) if (!b.readOnly) out.background.push({ who: await whoAmI($, b.thread), at: b.at })
   for (const name of await names($, `${fleetDir()}/reads`)) {
     if (!name.endsWith('.json') || name === `${sessionId}.json`) continue
     const p = parseReads((await readText($, `${fleetDir()}/reads/${name}`)) ?? '')
@@ -5385,6 +5431,7 @@ async function commandRefusal($: any, path: unknown): Promise<string | null> {
   const rel = abs ? relOf(abs, realRoot, insensitive) : null
   if (rel === null) return null
   if (/^\.claude\/fleet\/instances(\/|$)/i.test(rel)) return `fleet: ${rel} is fleet's own (an instance's settings and state): nothing writes it by hand (this write was not made).`
+  if (PERSON_STATE.some(p => (insensitive ? p.toLowerCase() === rel.toLowerCase() : p === rel))) return `fleet: ${rel} is the person's own (what he stamped, lifted or took down): only his typed /fleet commands write it (this write was not made).`
   if (!isCommandLevel(rel, await commandLevelNow($), insensitive)) return null
   return `fleet: ${rel} is a command-level file of this project, and your own tools don't write it (this write was not made). To change it, call mcp__fleet__decide with kind "change", path "${rel}", a one-line summary, and edits (old_string → new_string, as with Edit) or the whole content: the person reads the diff and applies it.`
 }
@@ -5401,9 +5448,9 @@ async function configFiles($: any): Promise<string[]> {
 async function writeStamps($: any, rels: readonly string[]) {
   const had = await readWire<Stamps>($, stateDir('stamps.json'))
   const s = had ?? { format: FORMAT, files: {} }
-  // The first stamps are a baseline of every config file as it is (what's there counts as stamped, as it did with no
-  // stamps), so the ones not given aren't flagged as changed outside fleet
-  for (const rel of had ? rels : [...new Set([...(await configFiles($)), ...rels])]) {
+  // Only the files given: /fleet init gives every config file it wrote; with the stamps taken away, the person's
+  // /fleet accept of one stamps that one, and the others stay flagged until he names them
+  for (const rel of rels) {
     const t = await readText($, `${root}/${rel}`)
     s.files[rel] = t === null ? null : hashText(t)
     if (rel === OUTBOUND_JSON) s.outbound = t
@@ -5416,20 +5463,16 @@ async function writeStamps($: any, rels: readonly string[]) {
   }
 }
 
-/** The config files changed since fleet wrote them or the person stamped them. With no stamps yet (a project set up
- * before them), what's there now is the baseline */
+/** The config files changed since fleet wrote them or the person stamped them. With no stamps (taken away: /fleet init
+ * writes the first ones), every one that's there: nothing stamps what's there by itself */
 async function unstamped($: any): Promise<string[]> {
   const files = await configFiles($)
   const s = await readWire<Stamps>($, stateDir('stamps.json'))
-  if (!s) {
-    await writeStamps($, files)
-    return []
-  }
   const out: string[] = []
   for (const rel of files) {
     const t = await readText($, `${root}/${rel}`)
     const v = t === null ? null : hashText(t)
-    const had = s.files[rel]
+    const had = s?.files[rel]
     if (had === undefined ? v !== null : had !== v) out.push(rel)
   }
   return out
@@ -5441,10 +5484,10 @@ function acceptName(rel: string): string {
   return /\s/.test(name) ? JSON.stringify(name) : name
 }
 
-/** Whether a config file is as fleet wrote it or the person stamped it (with no stamps yet, what's there is) */
+/** Whether a config file is as fleet wrote it or the person stamped it (with no stamps, none is) */
 async function stampedNow($: any, rel: string): Promise<boolean> {
   const s = await readWire<Stamps>($, stateDir('stamps.json'))
-  if (!s) return true
+  if (!s) return false
   const t = await readText($, `${root}/${rel}`)
   const v = t === null ? null : hashText(t)
   const had = s.files[rel]
@@ -6902,9 +6945,15 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   // A connector tool an organisation keeps at `ask` (its ceiling) asks the person on every call, whatever allow rules
   // the roster gives: what an instance saw (its heartbeat), and what this session's own check of its allowed tools says
   const orgWaits = new Map<string, string[]>()
+  // A rule for a whole server (mcp__<server>, or mcp__<server>__*) stands for each of its tools this session has
+  let toolNames: string[] = []
+  try {
+    toolNames = ((await Promise.race([$.tool.list(), $.clock.sleep(1000).then(() => [])])) as { name: string }[]).map(t => t.name)
+  } catch {}
   for (const p of plan) {
     if (p.action === 'down') continue
-    const allowed = ((settingsFor(p.inst, root as string, []) as any)?.permissions?.allow ?? []).filter((t: unknown): t is string => typeof t === 'string' && t.startsWith('mcp__') && !t.startsWith('mcp__fleet__'))
+    const rules: string[] = ((settingsFor(p.inst, root as string, []) as any)?.permissions?.allow ?? []).filter((t: unknown): t is string => typeof t === 'string' && t.startsWith('mcp__') && !t.startsWith('mcp__fleet__'))
+    const allowed: string[] = [...new Set(rules.flatMap(r => mcpRuleTools(r, toolNames)))].filter(t => !t.startsWith('mcp__fleet__'))
     for (const tool of allowed) {
       if (orgAsk.has(tool)) continue
       try {

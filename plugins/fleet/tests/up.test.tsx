@@ -123,6 +123,7 @@ test('/fleet up --dry-run: the plan, the cost and the lints, and nothing started
     `Edit(/${ROOT}/.claude/fleet/slots.json)`,
     `Edit(/${ROOT}/.claude/agents/**)`,
     `Edit(/${ROOT}/.claude/fleet/instances/**)`,
+    ...['stamps', 'checks-stamp', 'channel-stamp', 'lifts', 'down', 'judges'].map(n => `Edit(/${ROOT}/.claude/fleet/state/${n}.json)`),
   ])
   expect(calls(w, 'start')).toEqual([
     { name: 'Owner A', cwd: ROOT, agent: 'owner', settings: `${FLEET}/instances/owner-a.json` },
