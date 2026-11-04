@@ -237,6 +237,9 @@ const WRITES = new Set([
 // release_list), never to a read word that isn't a verb (message_select_recipients, commit_status)
 const LEADING_VERBS = new Set(['add', 'set', 'sync', 'copy', 'deploy', 'transfer', 'import'])
 const LEADING_NOUNS = new Set(['message', 'draft', 'commit', 'release'])
+// The nouns a leading-noun read may name besides its one read verb (chat_message_search, channel_message_list): a word
+// not here (members, url), a conjunction or a preposition (and, to, for) makes the name a send, as before 0.8.2
+const READ_NOUNS = new Set(['message', 'messages', 'draft', 'drafts', 'commit', 'commits', 'release', 'releases', 'chat', 'chats', 'channel', 'channels', 'thread', 'threads', 'mail', 'mails', 'inbox'])
 const LEADING_WRITES = new Set([...LEADING_VERBS, ...LEADING_NOUNS])
 const READ_VERBS = new Set(['get', 'list', 'search', 'read', 'fetch', 'query', 'find', 'lookup', 'count', 'view'])
 const READS = new Set([
@@ -279,27 +282,119 @@ function toolListed(tool: string, globs: readonly string[]): boolean {
   return globs.some(g => matches(tool, g))
 }
 
-const RECIPIENT_KEYS = ['to', 'cc', 'bcc', 'recipient', 'recipients', 'email', 'emails', 'attendees', 'address', 'addresses']
+const RECIPIENT_KEYS = ['to', 'cc', 'bcc', 'recipient', 'recipients', 'email', 'emails', 'attendees', 'attendeeEmails', 'address', 'addresses']
+// The words of an input key that make it a recipient (attendeeEmails, toRecipients, shareWith, guests, members…): a key
+// with one of them names someone the call reaches, whatever the tool calls it
+const RECIPIENT_WORDS = new Set(['to', 'cc', 'bcc', 'email', 'recipient', 'attendee', 'invitee', 'participant', 'member', 'guest', 'share', 'sharing', 'user', 'address'])
+
+/** An input key that names who a call reaches: one of RECIPIENT_KEYS, or a word of it (singular) among RECIPIENT_WORDS */
+export function recipientKey(key: string): boolean {
+  if (RECIPIENT_KEYS.includes(key)) return true
+  return nameWords(key).some(w => RECIPIENT_WORDS.has(w) || (w.endsWith('es') && RECIPIENT_WORDS.has(w.slice(0, -2))) || (w.endsWith('s') && RECIPIENT_WORDS.has(w.slice(0, -1))))
+}
+
+/** The addresses a recipient key's value holds (a string split on , and ;, a list, an object's email, address, mail or
+ * emailAddress.address); null when some part of it can't be read as an address (an object with none of those, a
+ * number), so a recipient fleet can't see is never taken for one the person allows */
+export function addressesOf(v: unknown): string[] | null {
+  if (v === undefined || v === null || v === '' || v === false) return []
+  if (typeof v === 'string') return v.split(/[,;]/).map(p => p.trim()).filter(Boolean)
+  if (Array.isArray(v)) {
+    const out: string[] = []
+    for (const x of v) {
+      const a = addressesOf(x)
+      if (a === null || (x !== null && typeof x === 'object' && !Array.isArray(x) && !a.length)) return null
+      out.push(...a)
+    }
+    return out
+  }
+  if (typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    const inner = o.emailAddress && typeof o.emailAddress === 'object' ? (o.emailAddress as Record<string, unknown>).address : o.emailAddress
+    const a = [o.email, o.address, o.mail, inner].find(x => typeof x === 'string' && x.trim())
+    return typeof a === 'string' ? [a.trim()] : null
+  }
+  return null
+}
+
+/** Recipients the input doesn't hold: a draft sent by its id (the draft's own recipients get it), a reply to all (the
+ * thread's) */
+export function implicitRecipients(input: Record<string, unknown>): boolean {
+  return Object.entries(input).some(([k, v]) => {
+    if (v === undefined || v === null || v === false || v === '') return false
+    const w = nameWords(k)
+    return w.includes('draft') || (w.includes('reply') && w.includes('all'))
+  })
+}
+
+/** Whether every recipient the input names can be read as an address (none unreadable, none implicit) */
+function recipientsReadable(input: Record<string, unknown>): boolean {
+  if (implicitRecipients(input)) return false
+  return Object.keys(input).every(k => !recipientKey(k) || addressesOf(input[k]) !== null)
+}
 
 /** A value against a calls entry's glob, strictly: * (and ?) never runs over a list separator, an @, a path separator, a
- * space or an angle bracket, so "*@corp.example" names one address and "docs/*" one file */
-export function callMatches(value: string, pattern: string): boolean {
+ * space, an angle bracket, a ?, a # or a :, so "*@corp.example" names one address and "docs/*" one file. stop: the
+ * characters a wildcard doesn't cross, as a regex class's body */
+export function callMatches(value: string, pattern: string, stop = ',;@/\\\\\\s<>?#:'): boolean {
   const v = value.toLowerCase()
   const p = pattern.toLowerCase()
   if (p === v) return true
   if (!/[*?]/.test(p)) return false
-  const re = p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^,;@/\\\\\\s<>]*').replace(/\?/g, '[^,;@/\\\\\\s<>]')
+  // One pass, so the class a * becomes isn't read again as wildcards
+  const re = p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/[*?]/g, w => (w === '*' ? `[^${stop}]*` : `[^${stop}]`))
   return new RegExp(`^${re}$`).test(v)
+}
+
+/** A URL as a browser reads it (WHATWG: a \ is a /, user info apart, ? # and the port apart): its scheme, host, port and
+ * path; null when it isn't an absolute URL */
+export function parsedUrl(v: string): { scheme: string; host: string; port: string; path: string } | null {
+  try {
+    const u = new URL(v.trim())
+    const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
+    return host ? { scheme: u.protocol.replace(/:$/, '').toLowerCase(), host, port: u.port, path: u.pathname } : null
+  } catch {
+    return null
+  }
+}
+
+/** The host a URL goes to, as a browser reads it; null when it isn't one */
+export function urlHost(v: string): string | null {
+  return parsedUrl(v)?.host ?? null
+}
+
+/** An input key that holds a URL (url, link, uri, href, webhookUrl…) */
+function urlKey(key: string): boolean {
+  return nameWords(key).some(w => w === 'url' || w === 'urls' || w === 'link' || w === 'links' || w === 'uri' || w === 'href')
+}
+
+/** A URL value against a calls entry's URL pattern (scheme://host[:port]/path, globs in the host and the path), by the
+ * URL as a browser reads it, never its raw text: the scheme; the host (*.domain: the domain or under it; else a * stays
+ * within a label); the port (none named: the default only); the path (a * stays within a segment). A pattern that isn't
+ * a URL matches none */
+export function urlMatches(value: string, pattern: string): boolean {
+  const u = parsedUrl(value)
+  const m = /^([a-z][a-z0-9+.-]*):\/\/([^/?#]*)(\/[^?#]*)?$/i.exec(pattern.trim())
+  if (!u || !m) return false
+  const scheme = (m[1] as string).toLowerCase()
+  const hp = /^(.*?)(?::(\d+))?$/.exec(m[2] as string) as RegExpExecArray
+  const host = (hp[1] as string).toLowerCase().replace(/\.$/, '')
+  if (scheme !== u.scheme || (hp[2] ?? '') !== u.port || !host) return false
+  const hostOk = host.startsWith('*.') ? u.host === host.slice(2) || u.host.endsWith(host.slice(1)) : callMatches(u.host, host, ',;@/\\\\\\s<>?#:.')
+  return hostOk && callMatches(u.path, m[3] ?? '/')
 }
 
 /** A calls entry's key in a call's input, as the values it holds: a recipient key's list one address each (split on , and
  * ;), another key's whole value; null when it holds something else (an object, nothing): no match */
 function callValues(key: string, v: unknown): string[] | null {
-  const recipient = RECIPIENT_KEYS.includes(key)
+  if (recipientKey(key)) {
+    const a = addressesOf(v)
+    return a && a.length ? a : null
+  }
   const one = (x: unknown): string[] | null => {
     if (typeof x === 'number') return [String(x)]
     if (typeof x !== 'string') return null
-    return recipient ? x.split(/[,;]/).map(s => s.trim()).filter(Boolean) : [x]
+    return [x]
   }
   const out: string[] = []
   for (const x of Array.isArray(v) ? v : [v]) {
@@ -319,12 +414,18 @@ export function callAllowed(tool: string, input: Record<string, unknown>, c: Out
     if (k.instances.length && !(who && k.instances.some(i => i.toLowerCase() === who.toLowerCase()))) return false
     const named = Object.entries(k.match).every(([key, want]) => {
       const vals = callValues(key, input[key])
-      return !!vals && vals.every(v => callMatches(v, want))
+      return !!vals && vals.every(v => (urlKey(key) ? urlMatches(v, want) : callMatches(v, want)))
     })
     if (!named) return false
-    // A recipient on a key the entry doesn't name goes only where the person's recipients allow
-    const others = RECIPIENT_KEYS.filter(key => key in input && !(key in k.match))
-    return others.every(key => recipientsOf({ [key]: input[key] }).every(r => recipientAllowed(r, c)))
+    // Recipients the input doesn't hold (a draft by its id, a reply to all): never
+    if (implicitRecipients(input)) return false
+    // A recipient on a key the entry doesn't name goes only where the person's recipients allow; one fleet can't read
+    // is held
+    const others = Object.keys(input).filter(key => recipientKey(key) && !(key in k.match))
+    return others.every(key => {
+      const a = addressesOf(input[key])
+      return a !== null && a.every(r => recipientAllowed(r, c))
+    })
   })
 }
 
@@ -350,11 +451,12 @@ export function insideHost(host: string | null, c: OutboundConfig): boolean {
 /** An MCP read of the person's own (outbound.json's inside: the tool, or the host of a url its input names) */
 export function insideCall(tool: string, input: Record<string, unknown>, c: OutboundConfig): boolean {
   if ((c.inside ?? []).some(g => g.startsWith('mcp__') && matches(tool, g))) return true
-  for (const key of ['url', 'link', 'uri', 'href']) {
-    const v = input[key]
-    if (typeof v === 'string' && insideHost(hostOf(v), c)) return true
-  }
-  return false
+  // A url decides what's read only on a tool that fetches it (another may read a tab, a resource, anything): there, by
+  // its host as a browser reads it, every url the input names
+  const parts = mcpParts(tool)
+  if (!parts || !nameWords(parts.name).includes('fetch')) return false
+  const urls = Object.keys(input).filter(urlKey).map(k => input[k])
+  return urls.length > 0 && urls.every(v => typeof v === 'string' && insideHost(urlHost(v), c))
 }
 
 /** The addresses an MCP call's input names (to, cc, bcc, attendees…), as text */
@@ -366,11 +468,11 @@ export function recipientsOf(input: Record<string, unknown>): string[] {
     } else if (Array.isArray(v)) {
       for (const x of v) add(x)
     } else if (v && typeof v === 'object') {
-      const o = v as Record<string, unknown>
-      add(o.email ?? o.address)
+      const a = addressesOf(v)
+      if (a) out.push(...a)
     }
   }
-  for (const k of RECIPIENT_KEYS) if (k in input) add(input[k])
+  for (const k of Object.keys(input)) if (recipientKey(k)) add(input[k])
   return out
 }
 
@@ -386,7 +488,9 @@ export function classifyMcp(tool: string, input: Record<string, unknown>, c: Out
   const verb = words.find(w => WRITES.has(w) || LEADING_WRITES.has(w) || READS.has(w) || NEUTRAL.has(w))
   // A read verb wins only over a leading noun (chat_message_search searches messages: a recipient it names is a filter,
   // nothing goes to it); a verb that sends, anywhere or leading, always wins
-  const writes = words.some(w => WRITES.has(w)) || (!!verb && LEADING_VERBS.has(verb)) || (!!verb && LEADING_NOUNS.has(verb) && !words.some(w => READ_VERBS.has(w)))
+  // A leading noun reads only when the whole name is nouns fleet knows and one read verb (chat_message_search)
+  const nounRead = words.every(w => READ_NOUNS.has(w) || READ_VERBS.has(w)) && words.filter(w => READ_VERBS.has(w)).length === 1
+  const writes = words.some(w => WRITES.has(w)) || (!!verb && LEADING_VERBS.has(verb)) || (!!verb && LEADING_NOUNS.has(verb) && !nounRead)
   const reads = !writes && words.some(w => READS.has(w))
   const neutral = !writes && !reads && words.some(w => NEUTRAL.has(w))
   const outside = (toolListed(tool, c.outside) || (remote && reads)) && !insideCall(tool, input, c)
@@ -395,7 +499,7 @@ export function classifyMcp(tool: string, input: Record<string, unknown>, c: Out
   if (callAllowed(tool, input, c, who)) return { send: null, outside }
   if (!listed && !writes && !(remote && !reads && !neutral)) return { send: null, outside }
   const to = recipientsOf(input)
-  if (!listed && to.length && to.every(r => recipientAllowed(r, c))) return { send: null, outside }
+  if (!listed && to.length && recipientsReadable(input) && to.every(r => recipientAllowed(r, c))) return { send: null, outside }
   return { send: { what: `${parts.name} on ${parts.server}`, to: to.length ? to : [parts.server], files: [] }, outside }
 }
 

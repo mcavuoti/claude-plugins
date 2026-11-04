@@ -3,6 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import { checkResource } from '../hooks/authority'
 import { hashText } from '../hooks/changes'
 import {
+  callMatches,
   checkSend,
   classifyBash,
   classifyMcp,
@@ -11,6 +12,7 @@ import {
   hostAllowed,
   hostOf,
   hostsNamed,
+  insideCall,
   insideHost,
   mcpRuleTools,
   mayReachNetwork,
@@ -26,6 +28,7 @@ import {
   recipientsOf,
   remoteAllowed,
   treeVersion,
+  urlHost,
   widenOutbound,
   type OutboundConfig,
 } from '../hooks/outbound'
@@ -420,11 +423,91 @@ test('an allow rule for a whole MCP server stands for each of its tools the sess
 test('outbound.json inside: the person’s own tools and hosts are no outside content', () => {
   const cfg: OutboundConfig = { ...newOutbound(), inside: ['mcp__claude_ai_Office__search_people', '*.intranet.example', 'wiki.example.org'] }
   expect(classifyMcp('mcp__claude_ai_Office__search_people', { query: 'x' }, cfg)).toEqual({ send: null, outside: false })
-  expect(classifyMcp('mcp__claude_ai_Office__read_resource', { url: 'https://docs.intranet.example/p' }, cfg)).toEqual({ send: null, outside: false })
+  // A url on a tool that isn't itself inside or a fetch tool isn't trusted: what it reads may be anything (a tab, a resource)
+  expect(classifyMcp('mcp__claude_ai_Office__read_resource', { url: 'https://docs.intranet.example/p' }, cfg)).toEqual({ send: null, outside: true })
+  expect(classifyMcp('mcp__claude_ai_Office__read_resource', { url: 'https://docs.intranet.example/p' }, { ...cfg, inside: [...(cfg.inside ?? []), 'mcp__claude_ai_Office__read_*'] })).toEqual({ send: null, outside: false })
   expect(classifyMcp('mcp__claude_ai_Office__read_resource', { url: 'https://far.example/p' }, cfg)).toEqual({ send: null, outside: true })
   expect(classifyMcp('mcp__claude_ai_Office__search_people', { query: 'x' }, NONE)).toEqual({ send: null, outside: true })
   expect(insideHost('wiki.example.org', cfg)).toBe(true)
   expect(insideHost('intranet.example', cfg)).toBe(true)
   expect(insideHost('far.example', cfg)).toBe(false)
   expect(insideHost('search_people', cfg)).toBe(false)
+})
+
+test('outbound.json calls on a URL key: host and path as a browser reads them, never the raw text; * stops at ? # and : anywhere', () => {
+  const nav = 'mcp__claude-in-chrome__navigate'
+  const cfg: OutboundConfig = { ...newOutbound(), calls: [{ tool: nav, match: { url: 'https://*.corp.example/*' }, instances: [] }] }
+  expect(classifyMcp(nav, { url: 'https://wiki.corp.example/page' }, cfg).send).toBe(null)
+  expect(classifyMcp(nav, { url: 'https://wiki.corp.example/page?q=1' }, cfg).send).toBe(null)
+  for (const url of [
+    'https://evil.example?q=SECRET.corp.example/x',
+    'https://evil.example#.corp.example/x',
+    'https://evil.example:8443?.corp.example/a',
+    'https://evil.example\\@wiki.corp.example/',
+    'https://wiki.corp.example@evil.example/',
+    'https://corp.example.evil.example/x',
+    'http://wiki.corp.example/page',
+    'https://wiki.corp.example:8443/page',
+    'https://wiki.corp.example/a/b',
+    'not a url',
+  ]) {
+    expect([url, classifyMcp(nav, { url }, cfg).send !== null]).toEqual([url, true])
+  }
+  expect(callMatches('a?b', '*')).toBe(false)
+  expect(callMatches('a#b', 'a*')).toBe(false)
+  expect(callMatches('team:x', 'team*')).toBe(false)
+  expect(callMatches('19:aaaa@thread.v2', '19:aaaa*@thread*')).toBe(true)
+})
+
+test('a call that names a recipient fleet can’t read, or on a key the rule doesn’t name, is held; so is a draft sent by reference or a reply to all', () => {
+  const cal = 'mcp__claude_ai_Calendar__create_event'
+  const cfg: OutboundConfig = { ...newOutbound(), calls: [{ tool: cal, match: { calendarId: 'primary' }, instances: [] }] }
+  expect(classifyMcp(cal, { calendarId: 'primary', summary: 's' }, cfg).send).toBe(null)
+  for (const extra of [
+    { attendeeEmails: ['outsider@elsewhere.example'] },
+    { toRecipients: [{ emailAddress: { address: 'outsider@elsewhere.example' } }] },
+    { cc: [{ mail: 'outsider@elsewhere.example' }] },
+    { guests: 'outsider@elsewhere.example' },
+    { invitees: [{ name: 'Someone' }] },
+    { participants: ['outsider@elsewhere.example'] },
+    { shareWith: 'outsider@elsewhere.example' },
+    { members: [{ id: 'u1' }] },
+  ]) {
+    expect([extra, classifyMcp(cal, { calendarId: 'primary', ...extra }, cfg).send !== null]).toEqual([extra, true])
+  }
+  // The person's recipients rule fails closed the same way
+  expect(classifyMcp(cal, { attendees: ['me@example.com'] }, MINE).send).toBe(null)
+  expect(classifyMcp(cal, { attendees: ['me@example.com'], attendeeEmails: ['outsider@elsewhere.example'] }, MINE).send).not.toBe(null)
+  expect(classifyMcp(cal, { attendees: [{ name: 'Me' }] }, MINE).send).not.toBe(null)
+  expect(classifyMcp('mcp__claude_ai_Mail__send_message', { toRecipients: [{ emailAddress: { address: 'me@example.com' } }] }, MINE).send).toBe(null)
+  // Recipients the input doesn't hold: a draft sent by its id, a reply to all
+  const gmail = 'mcp__claude_ai_Gmail__send_message'
+  const boss: OutboundConfig = { ...newOutbound(), recipients: ['boss@corp.example'], calls: [{ tool: gmail, match: { to: 'boss@corp.example' }, instances: [] }] }
+  expect(classifyMcp(gmail, { to: ['boss@corp.example'], body: 'x' }, boss).send).toBe(null)
+  expect(classifyMcp(gmail, { to: ['boss@corp.example'], draftId: 'd1' }, boss).send).not.toBe(null)
+  expect(classifyMcp(gmail, { to: ['boss@corp.example'], draft_id: 'd1' }, { ...boss, calls: [] }).send).not.toBe(null)
+  expect(classifyMcp('mcp__claude_ai_Gmail__reply', { messageId: 'm', to: ['boss@corp.example'], replyAll: true }, boss).send).not.toBe(null)
+  expect(classifyMcp('mcp__claude_ai_Gmail__reply', { messageId: 'm', to: ['boss@corp.example'], reply_all: true }, boss).send).not.toBe(null)
+  expect(classifyMcp('mcp__claude_ai_Gmail__reply', { messageId: 'm', to: ['boss@corp.example'] }, boss).send).toBe(null)
+})
+
+test('a leading noun reads only with nouns fleet knows and one read verb: no conjunction, preposition or unknown word', () => {
+  const sends = (name: string) => classifyMcp(`mcp__x__${name}`, { to: 'outsider@elsewhere.example' }, NONE).send !== null
+  for (const name of ['message_to_list', 'message_list_members', 'release_and_get_url', 'draft_and_view', 'commit_and_fetch', 'message_search_and_forward', 'draft_list_for_user']) {
+    expect([name, sends(name)]).toEqual([name, true])
+  }
+  for (const name of ['chat_message_search', 'message_list', 'release_list', 'commit_search', 'draft_get', 'channel_message_list']) {
+    expect([name, sends(name)]).toEqual([name, false])
+  }
+})
+
+test('outbound.json inside: a host as a browser reads it, and a url trusted only on a fetch tool or a tool that is inside', () => {
+  const cfg: OutboundConfig = { ...newOutbound(), inside: ['*.corp.example'] }
+  expect(urlHost('https://wiki.corp.example/p')).toBe('wiki.corp.example')
+  expect(urlHost('https://evil.example\\@wiki.corp.example/')).toBe('evil.example')
+  expect(urlHost('https://me@evil.example/')).toBe('evil.example')
+  expect(urlHost('not a url')).toBe(null)
+  expect(insideCall('mcp__fetch__fetch', { url: 'https://wiki.corp.example/' }, cfg)).toBe(true)
+  expect(insideCall('mcp__fetch__fetch', { url: 'https://evil.example\\@wiki.corp.example/' }, cfg)).toBe(false)
+  expect(insideCall('mcp__claude-in-chrome__get_page_text', { tabId: 7, url: 'https://wiki.corp.example/' }, cfg)).toBe(false)
 })
