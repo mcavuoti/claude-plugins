@@ -389,7 +389,7 @@ async function apartText($: any): Promise<string> {
     return `This session keeps its panel data apart, as a test session: ${locations.join(', ')} ${locations.length === 1 ? 'is' : 'are'} set in its environment${launcherOnly.length ? ` (with ${launcherOnly.join(', ')})` : ''}, so the other sessions' panels don't see what it records (seen, done, its state), nor it theirs`
   }
   if (!launcherOnly.length) return ''
-  return `${launcherOnly.join(', ')}: set in this session's environment and ignored (they count only beside a location override, in a test session). ccc sets them for its launcher; a background service that a launcher before sessions 0.13.6 brought up hands them on to every session it starts. Harmless now; stopping the service once your sessions are idle (claude daemon stop) clears them`
+  return `${launcherOnly.join(', ')}: set in this session's environment and ignored (they count only beside a location override, in a test session). ccc sets them for its launcher; a background service that a launcher before sessions 0.13.6 brought up hands them on to every session it starts. Harmless now: nothing to do`
 }
 
 async function storeGet($: any, key: string): Promise<any> {
