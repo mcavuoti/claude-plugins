@@ -98,9 +98,11 @@ main() {
     if [ -n "$folder" ]; then cd "$folder" 2>/dev/null || true; fi
     began=$(date +%s)
     code=0
+    # Without what ccc hands the launcher (SESSIONS_PLUGIN_VERSION/SINCE): a viewer that brings up the background
+    # service would pass them on to it, and from it to every session it starts (launcher.py's CHILD_ENV)
     case "$cmd" in
-      attach) if [[ "$id" =~ ^[0-9a-f]{8}$ ]]; then "$claude" attach "$id"; code=$?; fi ;;
-      agents) "$claude" agents --cwd .; code=$? ;;
+      attach) if [[ "$id" =~ ^[0-9a-f]{8}$ ]]; then (unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE; exec "$claude" attach "$id"); code=$?; fi ;;
+      agents) (unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE; exec "$claude" agents --cwd .); code=$? ;;
     esac
     # A viewer that ends at once on the first open of ccc failed to attach (the session went away meanwhile): pick
     # again, once, without it. Unless something was written down for this window: then the panel is switching it

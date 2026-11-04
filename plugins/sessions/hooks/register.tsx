@@ -273,13 +273,20 @@ let workDir = '/'
 // A command that can't be run (it doesn't exist on this computer: Linux has no osascript or ioreg, and lsof isn't
 // always there) or that didn't finish in time counts as one more failure (exit code 127), instead of aborting
 // everything that called it
+// What ccc hands its launcher (the installed plugin's version and since when) is for the launcher alone. A claude command
+// run with them would pass them on: to the background service, when that command is what starts it, and from there to
+// every session the service starts, whose mod would keep its data apart (a store namespace, as a test session's). So
+// every command runs with both blank, which reads as not set everywhere (the mod, launcher.py, ccc); $.process.run's env
+// only sets over the session's, it can't unset
+const LAUNCHER_ONLY: Record<string, string> = { SESSIONS_PLUGIN_VERSION: '', SESSIONS_PLUGIN_SINCE: '' }
+
 async function runSafe(
   $: any,
   argv: string[],
   init?: { stdin?: string; timeoutMs?: number; cwd?: string },
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   try {
-    return await $.process.run(argv, { ...init, cwd: init?.cwd || workDir })
+    return await $.process.run(argv, { ...init, cwd: init?.cwd || workDir, env: LAUNCHER_ONLY })
   } catch (err) {
     return { exitCode: 127, stdout: '', stderr: String(err) }
   }
@@ -348,18 +355,41 @@ function debugLine($: any, text: string) {
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
 let namespaceNow: string | undefined
+// The overrides set in this session's environment, by name: what keeps its data apart (none for the sessions you use)
+let apartBecause: string[] = []
 async function storeNamespaceOf($: any): Promise<string> {
   if (namespaceNow !== undefined) return namespaceNow
   // Each variable's name written out: the $ another plugin's call lends has only these
-  namespaceNow = storeNamespace([
+  const values = [
     await $.env.get('SESSIONS_DATA_DIR'),
     await $.env.get('SESSIONS_JOBS_DIR'),
     await $.env.get('SESSIONS_DAEMON_LOG'),
     await $.env.get('SESSIONS_CLAUDE'),
     await $.env.get('SESSIONS_PLUGIN_VERSION'),
     await $.env.get('SESSIONS_PLUGIN_SINCE'),
-  ])
+  ]
+  const names = ['SESSIONS_DATA_DIR', 'SESSIONS_JOBS_DIR', 'SESSIONS_DAEMON_LOG', 'SESSIONS_CLAUDE', 'SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE']
+  apartBecause = names.filter((_, i) => values[i])
+  namespaceNow = storeNamespace(values)
   return namespaceNow
+}
+
+// A test session: a location override in its environment. ccc's SESSIONS_PLUGIN_VERSION/SINCE count only beside one
+async function isTestSession($: any): Promise<boolean> {
+  return (await storeNamespaceOf($)) !== ''
+}
+
+// /sessions status, about the overrides: a test session keeps its panel data apart; ccc's variables alone are ignored
+async function apartText($: any): Promise<string> {
+  await storeNamespaceOf($)
+  const isLauncherOnly = (n: string) => n === 'SESSIONS_PLUGIN_VERSION' || n === 'SESSIONS_PLUGIN_SINCE'
+  const launcherOnly = apartBecause.filter(isLauncherOnly)
+  const locations = apartBecause.filter(n => !isLauncherOnly(n))
+  if (await isTestSession($)) {
+    return `This session keeps its panel data apart, as a test session: ${locations.join(', ')} ${locations.length === 1 ? 'is' : 'are'} set in its environment${launcherOnly.length ? ` (with ${launcherOnly.join(', ')})` : ''}, so the other sessions' panels don't see what it records (seen, done, its state), nor it theirs`
+  }
+  if (!launcherOnly.length) return ''
+  return `${launcherOnly.join(', ')}: set in this session's environment and ignored (they count only beside a location override, in a test session). ccc sets them for its launcher; a background service that a launcher before sessions 0.13.6 brought up hands them on to every session it starts. Harmless now; stopping the service once your sessions are idle (claude daemon stop) clears them`
 }
 
 async function storeGet($: any, key: string): Promise<any> {
@@ -703,9 +733,10 @@ async function readInstalledVersion($: any): Promise<string> {
 
 // The installed plugin (`claude plugin list --json`), once every 5 minutes for all sessions: which version of the mod
 // sessions start with, and since when, to tell which sessions should have a heartbeat. SESSIONS_PLUGIN_VERSION and
-// SESSIONS_PLUGIN_SINCE (ms) stand in for it in tests
+// SESSIONS_PLUGIN_SINCE (ms) stand in for it in a test session only (a location override beside them); elsewhere they're
+// ccc's, handed on by a background service, and stale after the next update, so the real one is read
 async function installedPlugin($: any): Promise<InstalledPlugin | null> {
-  const version = await $.env.get('SESSIONS_PLUGIN_VERSION')
+  const version = (await isTestSession($)) ? await $.env.get('SESSIONS_PLUGIN_VERSION') : ''
   if (version) return { path: '', version, since: Number(await $.env.get('SESSIONS_PLUGIN_SINCE')) || 0 }
   const now = await $.clock.now()
   const c = await storeGet($, 'plugin')
@@ -2662,6 +2693,8 @@ async function statusText($: any): Promise<string> {
       : 'Marks: none',
     await notificationsText($, now),
   ]
+  const apart = await apartText($)
+  if (apart) lines.push(apart)
   if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)
   return lines.join('\n')
 }
@@ -3036,7 +3069,7 @@ export const register: Register = (on, options) => {
         stat: (path: string) => $.fs.stat(path),
         list: (path: string) => $.fs.list(path),
       },
-      process: { run: (argv: string[], init?: { stdin?: string; timeoutMs?: number; cwd?: string }) => $.process.run(argv, init) },
+      process: { run: (argv: string[], init?: { stdin?: string; timeoutMs?: number; cwd?: string; env?: Record<string, string> }) => $.process.run(argv, init) },
       clock: { now: () => $.clock.now(), sleep: (ms: number) => $.clock.sleep(ms) },
       store: {
         get: (key: string) => $.store.get(key),
@@ -3260,6 +3293,9 @@ export const register: Register = (on, options) => {
     const why = note === 'closed' ? 'panel closed · /sessions to open' : note === 'narrow' ? 'panel hidden: window too narrow · /sessions to show' : ''
     // On a subscription, each of the account's windows once ("7d 43%"); off one (an API key) the panel shows the cost
     const account = limitsText(await read($, limits))
+    // A session whose data is kept apart (a test session, or one a background service handed ccc's variables): its
+    // seen and state never reach the other panels, so it says so where it can't go unnoticed
+    const apart = (await storeNamespaceOf($)) ? 'data apart: /sessions status' : ''
     const counts = (
       <Text dimColor>
         {reds > 0 && <Text color={TINT.red}>● </Text>}
@@ -3275,12 +3311,14 @@ export const register: Register = (on, options) => {
           {counts}
           {why && `${why}  `}
           {account && `${account}  `}⟨{id}⟩
+          {apart && <Text color={TINT.yellow}>{`  ${apart}`}</Text>}
         </Text>
       ) : (
         <Box flexDirection="row">
           {counts}
           <Button key="show-panel" plain dimColor label={why} onPress={() => { bg(openByYou($)) }} />
           <Text dimColor>{`  ${account ? `${account}  ` : ''}⟨${id}⟩`}</Text>
+          {apart && <Text color={TINT.yellow}>{`  ${apart}`}</Text>}
         </Box>
       )
     return (

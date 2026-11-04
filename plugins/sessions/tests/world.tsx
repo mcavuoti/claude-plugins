@@ -28,8 +28,9 @@ export type World = {
   storeKeys: Set<string>
   namespace: string
   runs: string[][]
-  // The folder each command ran in
+  // The folder each command ran in, and the variables it set over the session's
   cwds: (string | undefined)[]
+  envs: (Record<string, string> | undefined)[]
   // The folders that exist (mkdir and rmdir change them, with when each was made), and the session's root and current
   // folder ($.session.root(), $.session.cwd())
   dirs: Set<string>
@@ -156,10 +157,12 @@ export function world(on: On, options: WorldOptions = {}): World {
   })
   const runs: string[][] = []
   const cwds: (string | undefined)[] = []
+  const envs: (Record<string, string> | undefined)[] = []
   on('process.run', (_, e) => {
     const argv = e.argv
     runs.push([...argv])
     cwds.push(e.init?.cwd)
+    envs.push(e.init?.env ? { ...e.init.env } : undefined)
     // As on a real computer: a command can't start in a folder that's gone (its own, or else the session's)
     const where = e.init?.cwd ?? cwd.value
     if (!dirs.has(where)) throw new Error(`can't start in ${where}: no such folder`)
@@ -252,7 +255,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

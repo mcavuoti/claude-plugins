@@ -21,8 +21,12 @@ fix="$work/fix"
 
 cat > "$work/bin/claude" <<'SH'
 #!/usr/bin/env bash
-# A stand-in for claude: answers from $FIX, logs every call to $FIX/calls.log
+# A stand-in for claude: answers from $FIX, logs every call to $FIX/calls.log, and to $FIX/leaks.log a call that still
+# sees what ccc hands the launcher (a claude would pass it on to the background service, and on to every session);
+# $EVERY_CALL and $LEAKS outlive the fixtures' resets
 echo "$*" >> "$FIX/calls.log"
+echo "$*" >> "$EVERY_CALL"
+if [ -n "${SESSIONS_PLUGIN_VERSION+x}" ] || [ -n "${SESSIONS_PLUGIN_SINCE+x}" ]; then echo "$*" >> "$LEAKS"; fi
 case "$1 $2" in
   "agents --json") cat "$FIX/agents.json" ;;
   "plugin list") cat "$FIX/plugins.json" 2>/dev/null || echo '[]' ;;
@@ -57,7 +61,7 @@ SH
 chmod +x "$work/bin/claude" "$work/bin/ps"
 
 export HOME="$work/home" FIX="$fix" SESSIONS_CLAUDE="$work/bin/claude" SESSIONS_DATA_DIR="$data" PATH="$work/bin:$PATH"
-export SESSIONS_TTY=/dev/ttys900 SESSIONS_START_WAIT=1
+export SESSIONS_TTY=/dev/ttys900 SESSIONS_START_WAIT=1 EVERY_CALL="$work/every-call.log" LEAKS="$work/leaks.log"
 unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
 
 now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
@@ -395,5 +399,13 @@ printf '{"sectionsFormat": 2, "sections": [], "members": {}}\n' > "$data/section
 grep -q "from a newer sessions" <<<"$(sect --session alpha Renders || true)" || fail "section" "a newer sections.json was used"
 grep -q '"sectionsFormat": 2' "$data/sections.json" || fail "section" "a newer sections.json was rewritten"
 pass "section: the window's session or --session, as the person's, refused without one window, a newer file untouched"
+
+# What ccc hands the launcher (the installed version and since when) never reaches a claude it runs: a viewer or a
+# start that brings up the background service would pass it on to every session the service starts
+[ ! -s "$LEAKS" ] || fail "environment" "claude saw SESSIONS_PLUGIN_VERSION/SINCE: $(sort -u "$LEAKS" | head -5 | tr '\n' ';')"
+for kind in '--bg' 'attach ' 'respawn '; do
+  grep -q -- "^$kind" "$EVERY_CALL" || fail "environment" "the check never saw a claude $kind"
+done
+pass "environment: no claude the launcher runs (start, viewer, respawn, list) sees SESSIONS_PLUGIN_VERSION/SINCE"
 
 echo "launcher: ok"
