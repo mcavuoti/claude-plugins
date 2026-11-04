@@ -148,7 +148,8 @@ test('a command with no write syntax is never blamed for another session’s wri
   }
   const r2: any = await $.tool.call({ tool: 'Bash', command: 'grep -n plan notes/plan.md | wc -l' } as any)
   const said2 = (r2.context ?? []).join('\n')
-  expect(said2).toContain('- notes/plan.md: changed at 09:00 by TEST B (Edit)')
+  // The hour is the machine's local time (the CI runs in UTC): any HH:MM, named by B
+  expect(said2).toMatch(/- notes\/plan\.md: changed at \d\d:\d\d by TEST B \(Edit\)/)
   expect(said2).not.toContain('your command changed')
   const mine = [...w.files.keys()].filter(p => p.startsWith(`${FLEET}/events/`) && p.endsWith('.json') && !p.endsWith('latest')).map(p => JSON.parse(w.files.get(p) as string)).filter(e => e.by?.sessionId === SID)
   expect(mine).toEqual([])
