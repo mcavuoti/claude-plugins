@@ -154,7 +154,7 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
     ...(b.autoMode ?? []).flatMap(x => blocksLines(x.name, x.blocks, f.me.offsetMin).map((l, i) => `${i ? '     ' : '   - '}${l}`)),
     ...b.noFleet.map(x => `   - ${x}: running with no fleet (u in the panel restarts it)`),
     ...b.down.map(x => `   - ${x}: down (/fleet up "${x}" brings it back)`),
-    ...(b.stopped?.restart.length ? [`   - stopped since a restart: ${b.stopped.restart.join(', ')} (/fleet up --wave ${b.stopped.wave} brings them back)`] : []),
+    ...(b.stopped?.restart.length ? [`   - stopped since a restart: ${b.stopped.restart.join(', ')} (/fleet up --stopped brings them back and starts nothing else)`] : []),
     ...(b.stopped?.retired ?? []).map(x => `   - ${x.name}: retired for being idle${x.notWoken ? `; not woken: ${x.notWoken}` : ' (fleet wakes it when something is for it)'}`),
     ...(f.derived ?? []).map(d => `   - stale: ${d.path} (${d.kind}, owned by ${d.owner}): ${d.pins.join(', ')} moved since it cited them`),
     ...(f.slots ?? []).flatMap(x => x.waiting.map(w => `   - ${w.name} waits for the slot ${x.slot} (${ago(f.now - w.at)})`)),

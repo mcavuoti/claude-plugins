@@ -4727,14 +4727,19 @@ type Heartbeat = {
   waitingOn?: { kind: 'permission'; tool: string; at: number } | null
   remote?: boolean | null
   contextTokens?: number | null
-  /** The model its last main-loop request named, as the engine resolved it (a fallback's when the roster's model isn't
-   * the account's); null before its first */
+  /** The model that answered its last main-loop request, as the API reported it (the request's model when no answer
+   * came): a fallback's when the roster's model isn't the account's; null before its first */
   model?: string | null
+  /** Its last main-loop turn, when an API error ended it (a model the account lacks, retries exhausted): when, and what
+   * it said; null once a turn answers */
+  failed?: { at: number; why: string } | null
   classicStart?: boolean
   orgAsk?: string[]
 }
 // That model, from turn.step (B4: a roster model the account lacks ran the org default, and nothing said so)
 let stepModel: string | null = null
+// Its last turn's failure, from turn.complete (an instance whose every turn fails isn't idle)
+let turnFailed: { at: number; why: string } | null = null
 // The permission mode this session runs in (classic.SessionStart, again with each permission request), and the
 // permission prompt it waits on now (classic.PermissionRequest, until its tool ran or was refused, or the turn ended)
 let permissionMode: string | null = null
@@ -4924,6 +4929,7 @@ async function heartbeat($: any) {
     remote: await remoteControl($),
     contextTokens,
     model: stepModel,
+    failed: turnFailed,
     classicStart: !!(await read($, classicSeen)).SessionStart,
     ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
   }
@@ -5014,7 +5020,7 @@ async function ownedOpen($: any, inst: Instance): Promise<string[]> {
   const items: string[] = []
   for (const n of (await names($, dir)).filter(x => x.endsWith('.md')).sort((a, b) => numberIn(a) - numberIn(b) || a.localeCompare(b))) {
     const t = await readText($, `${dir}/${n}`)
-    if (t !== null && ownsOpenItem(boardItemOf(t), inst.name)) items.push(n.replace(/\.md$/, ''))
+    if (t !== null && ownsOpenItem(boardItemOf(t), inst.name, inst.slug)) items.push(n.replace(/\.md$/, ''))
   }
   ownedCache.at = now
   ownedCache.items = items
@@ -5029,7 +5035,7 @@ function stopReason(row: any): 'person' | 'idle' | 'memory' | 'ended' | null {
 }
 
 /** The instances (not down) a restart stopped, and the band's line for them: "3 stopped since a restart: /fleet up
- * --wave 2" ('' for none) */
+ * --stopped", which wakes them and starts none that was never started ('' for none) */
 async function stoppedByRestart($: any): Promise<Instance[]> {
   if (!roster?.instances.length || !(await has($, 'status'))) return []
   const st = await race<Status>($, () => $.sessions.status({ names: (roster as { instances: Instance[] }).instances.map(i => i.name) }))
@@ -5043,7 +5049,7 @@ async function stoppedByRestart($: any): Promise<Instance[]> {
 async function restartLine($: any): Promise<string> {
   const gone = await stoppedByRestart($)
   if (!gone.length) return ''
-  return `${gone.length} stopped since a restart: /fleet up --wave ${Math.max(...gone.map(i => i.wave))}`
+  return `${gone.length} stopped since a restart: /fleet up --stopped`
 }
 
 /** An instance's cadence as its heartbeat tells it (the sweeper, status, the brief) */
@@ -5267,11 +5273,16 @@ async function nudgeTick($: any) {
   // journal, counts; not while it owns open board items: then only work landed elsewhere does, and the nudge names them)
   const owns = await ownedOpen($, inst)
   const c = cadenceOf({ cadenceH: inst.cadenceH, lastLanding: Math.max(carried.lastLanding, await read($, landedAt), journalAt ?? 0) || null, lastWork: Math.max(carried.lastWork, await read($, workLandedAt)) || null, ownsOpen: owns.length, startedAt: carried.startedAt || now, now })
-  const cadenceToday = mine?.cadenceDay === day ? (mine.cadenceCount ?? 0) : 0
-  if (c.due && mine?.cadenceKey !== c.key && cadenceToday < CADENCE_PER_DAY) {
+  // One count with the sweeper's cadence wakes, one period key; and no cadence nudge while its way forward is its own
+  // question to the person (it asked, nothing else came: a nudge would only make it ask again or say it waits)
+  const sweptHere = swept && swept.day === day ? swept.instances[inst.slug] : undefined
+  const ownCadence = mine?.cadenceDay === day ? (mine.cadenceCount ?? 0) : 0
+  const cadenceToday = ownCadence + (sweptHere?.cadenceCount ?? 0)
+  const waitsOwn = Object.keys(await read($, open)).length > 0
+  if (c.due && mine?.cadenceKey !== c.key && sweptHere?.cadenceKey !== c.key && cadenceToday < CADENCE_PER_DAY && !waitsOwn) {
     await update($, nudgeAt, () => now)
     log($, `cadence nudge to ${inst.name} (${hoursText(c.hours)} since its last landing${owns.length ? `, owns ${owns.length} open item(s)` : ''})`)
-    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: cadenceToday + 1 }), now)
+    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: ownCadence + 1 }), now)
     return
   }
   const d = await digestFor($, 'main', false)
@@ -6484,9 +6495,19 @@ async function rosterTick($: any) {
       continue
     }
     if (!retired || isDown || b?.state === 'over' || !hb?.ref || hb.ref !== retired.ref) continue
+    // Only one the service retired for being idle (or closed for memory, which sessions holds until memory is back) is
+    // woken by the sweeper: one a restart or a crash stopped waits for the person's /fleet up (an automatic wake after
+    // a restart is his call, #22), and one he stopped stays stopped
+    const why = stopReason(retired)
+    if (why === 'ended' || why === 'person') continue
     const had = swept.instances[inst.slug]
     const answered = records.some(r => r.asker.ref === retired.ref && knownKind(r) && progress(r.id, slots(r), present).complete)
-    const quiet = !!cad?.due && had?.cadenceKey !== cad.key && (had?.cadenceCount ?? 0) < CADENCE_PER_DAY
+    // The cadence counts the instance's own nudges too (one count, one period key): no wake for a period its own fleet
+    // already nudged, none past CADENCE_PER_DAY between them, and none while its way forward is its own open question
+    const nudges = await readWire<WakeCount & { cadenceKey?: string; cadenceDay?: string; cadenceCount?: number }>($, `${instDir(inst.slug)}/nudges.json`)
+    const cadenceToday = (had?.cadenceCount ?? 0) + (nudges?.cadenceDay === day ? (nudges.cadenceCount ?? 0) : 0)
+    const waitsOwn = (asking.get(retired.ref) ?? 0) > 0
+    const quiet = !!cad?.due && had?.cadenceKey !== cad.key && nudges?.cadenceKey !== cad.key && cadenceToday < CADENCE_PER_DAY && !waitsOwn
     const slot = granted.find(l => l.holder.ref === retired.ref && leaseKey(l) !== had?.slotFor)
     const stale = derived.find(d => ownsKind(d, inst) && quietEnough(d, now) && d.key !== had?.derivedFor)
     // Items from outside wake it only from a sender its platform verified as the person or a principal, or marked urgent
@@ -6495,7 +6516,6 @@ async function rosterTick($: any) {
     // The reviewer of the judges, with overrules to review it hasn't been woken for (within the wakes' caps)
     const review = reviews.length && (inst.name.toLowerCase() === reviewer || inst.role.toLowerCase() === reviewer) && reviews[reviews.length - 1] !== had?.reviewFor ? (reviews[reviews.length - 1] as string) : null
     if (!answered && !quiet && !slot && !stale && !pointed && !review && !(worldOn() && baselined && (await isBehind($, hb.sessionId)))) continue
-    const nudges = await readWire<WakeCount>($, `${instDir(inst.slug)}/nudges.json`)
     const others = nudges && nudges.day === day ? nudges.count : 0
     // Why a retired instance with something for it wasn't woken, kept for /fleet status (the wakes' caps, or sessions)
     const notWoken = (why: string) => {
@@ -6857,7 +6877,8 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: chosen.map(i => i.name) })) : null
   const plan = chosen.map(inst => {
     const { running, stopped: retired } = st?.ready ? rowsOf(inst, st.rows) : { running: null, stopped: null }
-    const action = down.has(inst.slug) && !c.names.length ? 'down' : running ? 'running' : retired ? 'wake' : 'start'
+    // --stopped (the band's line after a restart): wake the stopped ones, start none that was never started
+    const action = down.has(inst.slug) && !c.names.length ? 'down' : running ? 'running' : retired ? 'wake' : c.stopped ? 'unstarted' : 'start'
     return { inst, action, ref: (running ?? retired)?.ref ?? null, state: (running ?? retired)?.state ?? null, why: !running && retired ? stopReason(retired) : null }
   })
   const wakes = wakesOf(r.r)
@@ -6937,11 +6958,13 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
             ? p.why === 'person'
               ? 'stopped by you: not woken (Enter or u in the panel restarts it)'
               : p.why === 'memory'
-                ? 'closed for lack of memory: sessions reopens it once memory recovers'
+                ? 'closed for lack of memory: to wake (sessions holds it while memory is still short)'
                 : p.why === 'ended'
                   ? 'stopped by a restart: to wake'
                   : 'stopped: to wake'
-            : 'down: skipped (/fleet up <name> brings it back)'
+            : p.action === 'unstarted'
+              ? 'never started: left alone (--stopped wakes stopped ones only)'
+              : 'down: skipped (/fleet up <name> brings it back)'
     const m = modes.get(i)
     out.push(`  ${i.name} · ${i.role} (.claude/agents/${i.agent}.md) · ${where} · wave ${i.wave} · ${runs} · ${cost} · ${m ? `mode ${m.mode} · ` : ''}${now}`)
   }
@@ -6963,7 +6986,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (c.dryRun) return [...out, 'Nothing was started (--dry-run).'].join('\n')
   if (lint.errors.length) return [...out, 'Nothing was started: fix the errors, then /fleet up again.'].join('\n')
   await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
-  for (const p of plan) if (p.action !== 'down') await $.fs.write(settingsPath(p.inst.slug), settingsText(settingsFor(p.inst, root as string, deny)))
+  for (const p of plan) if (p.action !== 'down' && p.action !== 'unstarted') await $.fs.write(settingsPath(p.inst.slug), settingsText(settingsFor(p.inst, root as string, deny)))
   if (c.names.length) await setDown($, plan.map(p => p.inst.slug), false)
   const canStart = await has($, 'start')
   const canWake = await has($, 'wake')
@@ -6977,15 +7000,17 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
       const s = await race<Result>($, () => $.sessions.start!({ name: p.inst.name, cwd: root as string, agent: p.inst.agent, settings: settingsPath(p.inst.slug) }))
       results.push(s?.ok ? `  ${p.inst.name}: starting` : `  ${p.inst.name}: not started: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions didn't answer"}`)
       log($, `start ${p.inst.name}: ${s?.ok ? 'queued' : s && !s.ok ? s.reason : 'no answer'}`)
-    } else if (p.action === 'wake' && p.ref && (p.why === 'person' || p.why === 'memory')) {
-      // Left alone: the person stopped it (Enter or u restarts it), or sessions reopens it once memory recovers
-      results.push(`  ${p.inst.name}: ${p.why === 'person' ? 'stopped by you, left alone (Enter or u in the panel restarts it)' : 'closed for lack of memory: sessions reopens it once memory recovers'}`)
+    } else if (p.action === 'wake' && p.ref && p.why === 'person') {
+      // Left alone: the person stopped it (Enter or u restarts it)
+      results.push(`  ${p.inst.name}: stopped by you, left alone (Enter or u in the panel restarts it)`)
     } else if (p.action === 'wake' && p.ref) {
+      // A restart's, a crash's, an idle retire's, or a memory closure's (sessions refuses that one while memory is still
+      // short, and says so)
       const s = canWake ? await race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: p.ref as string, reason: 'fleet up' })) : null
       results.push(s?.ok ? `  ${p.inst.name}: waking` : `  ${p.inst.name}: not woken: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions can't wake it"} (u in the panel restarts it)`)
     }
   }
-  if (!results.length) return [...out, "Nothing to start: they're running. Their settings files were written again: one whose settings changed takes them when restarted (u)."].join('\n')
+  if (!results.length) return [...out, c.stopped ? 'Nothing stopped to wake.' : "Nothing to start: they're running. Their settings files were written again: one whose settings changed takes them when restarted (u)."].join('\n')
   return [...out, 'Now:', ...results, 'Each one binds and seeds itself within a minute (/fleet status shows them); a row marked ✗ has no fleet and needs a restart (u).'].join('\n')
 }
 
@@ -7157,7 +7182,7 @@ async function rosterStatus($: any): Promise<string[]> {
         : !row
           ? 'not started'
           : why === 'ended'
-            ? 'stopped since a restart (/fleet up wakes it)'
+            ? 'stopped since a restart (/fleet up --stopped wakes it)'
             : why === 'idle'
               ? 'retired for being idle (fleet wakes it when something is for it)'
               : why === 'person'
@@ -7178,6 +7203,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (hb.waitingOn?.kind === 'permission' && running.state === 'waiting') parts.push(`waiting on a permission prompt (${hb.waitingOn.tool}) since ${ago(now - hb.waitingOn.at)}: Enter in the panel answers it`)
         if (hb.remote) parts.push('Remote Control')
         if (typeof hb.model === 'string' && hb.model) parts.push(modelDiffers(inst.model, hb.model) ? `runs ${hb.model}, roster says ${inst.model} (a model the account lacks falls back)` : `runs ${hb.model}`)
+        if (hb.failed) parts.push(`last turn failed ${ago(now - hb.failed.at)} ago: ${hb.failed.why}`)
         if (hb.classicStart === false) parts.push('its classic hooks are sent on past fleet (a managed plugin): fleet tells it who it is in its prompts')
         if (hb.orgAsk?.length) parts.push(`asks you on every call to ${hb.orgAsk.join(', ')} (an organisation's setting: allow rules don't lift it)`)
         if (typeof hb.contextTokens === 'number' && hb.contextTokens > 0) parts.push(`context ${tokensText(hb.contextTokens)}`)
@@ -7198,7 +7224,14 @@ async function rosterStatus($: any): Promise<string[]> {
     const asked = hb?.ref ? records.filter(r => r.asker.ref === hb.ref && knownKind(r) && !progress(r.id, slots(r), present).complete).map(r => r.id) : []
     if (asked.length) next.push(`waits ${asked.join(', ')}`)
     const cad = hb && !down.has(inst.slug) && inst.cadenceH ? cadenceOfBeat(inst, hb, now) : null
-    if (cad) next.push(cad.due ? `cadence due: nothing landed in ${hoursText(cad.hours)}` : `next cadence in ${hoursText(Math.max(0, cad.nextMs ?? 0) / HOUR)}`)
+    // Today's cadence nudges and wakes are one count (CADENCE_PER_DAY): once used, nothing comes before tomorrow
+    const cadenceUsed = ((n as { cadenceDay?: string; cadenceCount?: number } | null)?.cadenceDay === day ? ((n as { cadenceCount?: number }).cadenceCount ?? 0) : 0) + (sw?.cadenceCount ?? 0)
+    if (cad) {
+      if (asked.length) next.push('cadence paused: it waits on its own question')
+      else if (cadenceUsed >= CADENCE_PER_DAY) next.push(`cadence nudges ${cadenceUsed}/${CADENCE_PER_DAY} today: none before tomorrow`)
+      else if (!running && w >= wakes.perDay) next.push(`next: tomorrow (wakes ${w}/${wakes.perDay} today)`)
+      else next.push(cad.due ? `cadence due: nothing landed in ${hoursText(cad.hours)}` : `next cadence in ${hoursText(Math.max(0, cad.nextMs ?? 0) / HOUR)}`)
+    }
     if (hb?.owns?.length && cad?.journalOnly) next.push(`owns ${hb.owns.length} open item(s) (${hb.owns.slice(0, 5).join(', ')}${hb.owns.length > 5 ? '…' : ''}), landed only its journal in ${hoursText((now - Math.max(hb.lastWork ?? 0, hb.startedAt ?? hb.at)) / HOUR)}`)
     if (sw?.notWoken && !running) next.push(`not woken ${ago(now - sw.notWoken.at)} ago: ${sw.notWoken.why}`)
     if (next.length) lines.push(`      ${next.join(' · ')}`)
@@ -9173,8 +9206,11 @@ export const register: Register = on => {
   // The model each main-loop request names, as the engine resolved it (the session's, or a fallback's): the heartbeat
   // reports it, and /fleet status and the dry run say when it isn't the roster's. Only watches: the stream passes as is
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId === undefined && typeof e.model === 'string' && e.model) stepModel = e.model
-    return yield* next(e)
+    const r = yield* next(e)
+    // The model that answered (usage.model, as the API reports it), else the one the request named
+    const m = (r as { usage?: { model?: string } | null } | undefined)?.usage?.model ?? e.model
+    if (e.agentId === undefined && typeof m === 'string' && m) stepModel = m
+    return r
   })
 
   on('turn.start', async ($, e, next) => {
@@ -9203,6 +9239,10 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       await update($, personTurn, () => null)
       await update($, fleetTurn, () => null)
+      // A turn an API error ended (a model the account lacks, retries exhausted) is said in status, not read as idle
+      const reason = (e as { reason?: string }).reason
+      if (reason === 'error') turnFailed = { at: await $.clock.now(), why: cut(String(e.answer ?? '').trim() || 'an API error ended it', 160) }
+      else if (reason === 'answer') turnFailed = null
     }
     if (e.agentId === undefined && permissionWait) bg(promptAnswered($))
     // Idle again whatever the timers are (a copy reloaded mid-turn starts them only later): a busy left set would hold

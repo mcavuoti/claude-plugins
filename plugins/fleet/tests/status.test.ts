@@ -10,6 +10,12 @@ test('a model the account lacks falls back: told apart from the roster, an alias
   expect(modelDiffers('opus', 'claude-opus-5-5')).toBe(false)
   expect(modelDiffers('claude-haiku-5-5', 'claude-haiku-5-5')).toBe(false)
   expect(modelDiffers('claude-haiku-5-5', 'claude-haiku-5-5-20260101')).toBe(false)
+  // Aliases that choose for themselves are never a fallback; a family alias is its family at any generation
+  expect(modelDiffers('opusplan', 'claude-sonnet-5-5')).toBe(false)
+  expect(modelDiffers('best', 'claude-opus-5-5')).toBe(false)
+  expect(modelDiffers('default', 'claude-sonnet-5-5')).toBe(false)
+  expect(modelDiffers('sonnet', 'claude-sonnet-4-6')).toBe(false)
+  expect(modelDiffers('opus', 'claude-sonnet-5-5')).toBe(true)
   expect(modelDiffers('sonnet', 'claude-sonnet-5-5[1m]')).toBe(false)
   expect(modelDiffers('claude-opus-4-1', 'claude-opus-5-5')).toBe(true)
   // Nothing configured (Claude's default) or nothing seen yet: nothing to say

@@ -253,7 +253,10 @@ test('wakes: at most one per window (an answer waits ten minutes at most) and a 
   expect(wakeVerdict(once, 0, now + 30 * 60000, '2026-11-02', wakes, true)).toBe('ok')
   expect(wakeVerdict(once, 0, now + 5 * 60000, '2026-11-02', wakes, true)).toBe('window')
   expect(wakeVerdict(once, 0, now + 61 * 60000, '2026-11-02', wakes, false)).toBe('ok')
-  expect(wakeVerdict(once, 2, now + 61 * 60000, '2026-11-02', wakes, true)).toBe('cap')
+  expect(wakeVerdict(once, 2, now + 61 * 60000, '2026-11-02', wakes, false)).toBe('cap')
+  // An answer (urgent) isn't held by the day's cap: cadence and digests can't spend the person's answer's wake
+  expect(wakeVerdict(once, 2, now + 61 * 60000, '2026-11-02', wakes, true)).toBe('ok')
+  expect(wakeVerdict(once, 2, now + 5 * 60000, '2026-11-02', wakes, true)).toBe('window')
   // A new day starts the count again
   expect(wakeVerdict({ ...once, count: 3 }, 0, now, '2026-11-03', wakes, false)).toBe('ok')
 })

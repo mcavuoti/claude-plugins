@@ -85,9 +85,10 @@ test('a resource is answered done or no, an outbound send (with its version afte
 })
 
 test("/fleet up, down, remove, budget, worktrees: their words and what's refused", () => {
-  expect(parseCommand('up')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [] })
-  expect(parseCommand('up --dry-run --wave 2')).toEqual({ kind: 'up', dryRun: true, wave: 2, names: [] })
-  expect(parseCommand('up "Area A" chief --wave=1')).toEqual({ kind: 'up', dryRun: false, wave: 1, names: ['Area A', 'chief'] })
+  expect(parseCommand('up')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [], stopped: false })
+  expect(parseCommand('up --dry-run --wave 2')).toEqual({ kind: 'up', dryRun: true, wave: 2, names: [], stopped: false })
+  expect(parseCommand('up --stopped')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [], stopped: true })
+  expect(parseCommand('up "Area A" chief --wave=1')).toEqual({ kind: 'up', dryRun: false, wave: 1, names: ['Area A', 'chief'], stopped: false })
   expect(parseCommand('up --wave').kind).toBe('bad')
   expect(parseCommand('up --wave 0').kind).toBe('bad')
   expect(parseCommand('up --force').kind).toBe('bad')

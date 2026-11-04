@@ -27,14 +27,17 @@ async function instance($: any, on: any, model: string, role: Record<string, unk
   })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
   on('classic.SessionStart', () => ({}))
-  // Beneath fleet: the model's answer to a step
+  // Beneath fleet: the model's answer to a step (usage.model: the model that answered, when a test sets one)
   on('turn.step', async function* (_$: any, e: any) {
-    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [] }
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], usage: answeredBy.value ? { model: answeredBy.value } : null }
   } as any)
   sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
   await startSession($, w)
   return w
 }
+
+// The model the API reports as having answered, when it isn't the one the request named
+const answeredBy: { value: string | null } = { value: null }
 
 async function step($: any, model: string) {
   const s = $.turn.step({ turnId: 't-1', index: 0, model, messageCount: 1 })
@@ -102,4 +105,31 @@ test('/fleet status --all lists each file; anything else after status is refused
   expect(parseCommand('status')).toEqual({ kind: 'status' })
   expect(parseCommand('status --all')).toEqual({ kind: 'status', all: true })
   expect(parseCommand('status everything')).toMatchObject({ kind: 'bad' })
+})
+
+test('the model that answered wins over the one the request named; an alias that picks for itself is never a fallback', WITH_SESSIONS, async ($, on) => {
+  answeredBy.value = 'claude-sonnet-5-5'
+  try {
+    const w = await instance($, on, 'fable')
+    // The request names the roster's model; the organisation's default answers it
+    await step($, 'fable')
+    await tick(w, 31000)
+    expect(json(w, `${FLEET}/instances/owner-a/state.json`).model).toBe('claude-sonnet-5-5')
+    expect(await fleet($, 'status')).toContain('runs claude-sonnet-5-5, roster says fable (a model the account lacks falls back)')
+  } finally {
+    answeredBy.value = null
+  }
+})
+
+test("an instance whose turns end on an API error isn't shown as idle: status says its last turn failed, until one answers", WITH_SESSIONS, async ($, on) => {
+  const w = await instance($, on, 'claude-nonexistent-1')
+  await $.turn.start({ text: 'go', turnId: 't-9' } as any)
+  await $.turn.complete({ answer: 'API Error: model not found', durationMs: 10, isAborted: false, turnId: 't-9', reason: 'error' } as any)
+  await tick(w, 31000)
+  expect(json(w, `${FLEET}/instances/owner-a/state.json`).failed).toMatchObject({ why: 'API Error: model not found' })
+  expect(await fleet($, 'status')).toContain('last turn failed')
+  await $.turn.start({ text: 'again', turnId: 't-10' } as any)
+  await $.turn.complete({ answer: 'done', durationMs: 10, isAborted: false, turnId: 't-10', reason: 'answer' } as any)
+  await tick(w, 31000)
+  expect(json(w, `${FLEET}/instances/owner-a/state.json`).failed).toBe(null)
 })

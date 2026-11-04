@@ -27,7 +27,8 @@ The chief fills this from the interview; until then these defaults hold.
   anything that leaves the project or touches its confidential material, and what can't be undone. Keep working on
   what doesn't depend on the answer.
 - Coordinate through the shared files. Message another session directly (SendMessage) only when it's urgent and can't
-  wait for its next step: it wakes that session at once and leaves nothing in the world.
+  wait for its next step: it reaches a session that's running (one that's stopped or retired never gets it) and
+  leaves nothing in the world, so put what matters in the shared files too.
 
 ## Constraints
 

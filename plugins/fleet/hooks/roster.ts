@@ -661,11 +661,12 @@ export type WakeCount = { day: string; count: number; last: number }
 /** An urgent wake (a decision's answer) waits this long at most after the last one */
 export const URGENT_GAP_MIN = 10
 
-/** Whether a wake may go now: at most one per everyMin (an urgent one, a decision's answer, waits URGENT_GAP_MIN at
- * most), and at most perDay a day in all */
+/** Whether a wake may go now: at most one per everyMin (an urgent one, a decision's answer or a slot given to it,
+ * waits URGENT_GAP_MIN at most), and at most perDay a day in all; an urgent one isn't held by the day's cap (the
+ * person's answer never waits for tomorrow because cadence and digests used the day's wakes) */
 export function wakeVerdict(mine: WakeCount | null, others: number, now: number, day: string, wakes: { everyMin: number; perDay: number }, urgent: boolean): 'ok' | 'window' | 'cap' {
   const today = mine && mine.day === day ? mine : null
-  if ((today?.count ?? 0) + others >= wakes.perDay) return 'cap'
+  if (!urgent && (today?.count ?? 0) + others >= wakes.perDay) return 'cap'
   const gap = urgent ? Math.min(URGENT_GAP_MIN, wakes.everyMin) : wakes.everyMin
   if (today && now - today.last < gap * 60000) return 'window'
   return 'ok'
@@ -711,9 +712,18 @@ export function boardItemOf(text: string): { owner: string | null; status: strin
   return { owner, status }
 }
 
-/** Whether a board item is one this instance owns and has yet to finish: its owner names it, its status open or started */
-export function ownsOpenItem(item: { owner: string | null; status: string | null }, name: string): boolean {
-  return !!item.owner && item.owner.toLowerCase() === name.toLowerCase() && (item.status === 'open' || item.status === 'started')
+/** Whether a board item is one this instance owns and has yet to finish: its owner names it (its name or its slug, in
+ * any case, alone or in a list like "PoC A, PoC B" or "Area A and Area B", a note in parentheses dropped), its status
+ * open or started */
+export function ownsOpenItem(item: { owner: string | null; status: string | null }, name: string, slug = slugOf(name)): boolean {
+  if (!item.owner || !(item.status === 'open' || item.status === 'started')) return false
+  const owners = item.owner
+    .replace(/\([^)]*\)/g, ' ')
+    .split(/\s*(?:,|;|&|\/|\+|\band\b|\by\b)\s*/i)
+    .map(o => o.trim())
+    .filter(Boolean)
+  const me = name.toLowerCase()
+  return owners.some(o => o.toLowerCase() === me || slugOf(o) === slug)
 }
 
 /** Hours as the person reads them: 20 min, 1 h, 7 h, 2 d */
@@ -1114,6 +1124,12 @@ export function pickInstances(words: readonly string[], instances: readonly Inst
  * (Claude's default) or nothing seen yet says nothing */
 export function modelDiffers(configured: string | null, actual: string | null): boolean {
   if (!configured || !actual) return false
+  const c = configured.trim().toLowerCase().replace(/\[[^\]]*\]$/, '')
+  // Aliases that pick a model by themselves (opusplan runs sonnet outside plan mode; best and default are the
+  // account's own choice): what answered is what they chose, never a fallback
+  if (c === 'default' || c === 'best' || c.startsWith('opusplan')) return false
+  // A family alias (opus, sonnet, haiku, fable) is that family, whatever generation answered
+  if (/^(opus|sonnet|haiku|fable)$/.test(c)) return !actual.toLowerCase().includes(c)
   return modelKey(configured) !== modelKey(actual)
 }
 

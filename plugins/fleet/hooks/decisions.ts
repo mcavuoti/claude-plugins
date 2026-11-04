@@ -449,7 +449,7 @@ export type Command =
   | { kind: 'init'; template: string; commitRegister: boolean }
   | { kind: 'world'; action: 'list' | 'add' | 'remove'; glob: string }
   | { kind: 'accept'; paths: string[] }
-  | { kind: 'up'; dryRun: boolean; wave: number | null; names: string[] }
+  | { kind: 'up'; dryRun: boolean; wave: number | null; names: string[]; stopped: boolean }
   | { kind: 'down'; names: string[] }
   | { kind: 'remove'; names: string[]; yes: boolean }
   | { kind: 'worktrees'; prune: boolean; yes: boolean }
@@ -541,15 +541,15 @@ export function parseCommand(args: string): Command {
       const names: string[] = []
       for (let i = 0; i < w.length; i++) {
         const x = w[i] as string
-        if (x === '--dry-run') continue
+        if (x === '--dry-run' || x === '--stopped') continue
         if (x === '--wave' || x.startsWith('--wave=')) {
           const v = x === '--wave' ? w[++i] : x.slice('--wave='.length)
           if (!v || !/^\d+$/.test(v) || Number(v) < 1) return { kind: 'bad', reason: 'write /fleet up --wave <n> (a wave of roster.json, from 1)' }
           wave = Number(v)
-        } else if (x.startsWith('--')) return { kind: 'bad', reason: `unknown option ${x} (there are --dry-run and --wave <n>)` }
+        } else if (x.startsWith('--')) return { kind: 'bad', reason: `unknown option ${x} (there are --dry-run, --wave <n> and --stopped)` }
         else names.push(x)
       }
-      return { kind: 'up', dryRun: w.includes('--dry-run'), wave, names }
+      return { kind: 'up', dryRun: w.includes('--dry-run'), wave, names, stopped: w.includes('--stopped') }
     }
     case 'down':
       return { kind: 'down', names: wordsOf(tail) }
@@ -651,7 +651,7 @@ export const HELP = [
   '/fleet judges          the live areas, the areas back in shadow, your taste; /fleet judges live <area> (its exact repeats answered at once), /fleet judges off <area>',
   '/fleet overrule D-7 b ["why"]  correct the judge\'s answer to D-7: its asker hears it, and the judges read it next time',
   '/fleet init [template] set fleet up in this project (.claude/fleet/): blank, solo, software or proposal',
-  '/fleet up [--dry-run] [--wave n] [name…]  start the roster\'s instances that aren\'t running (--dry-run: the plan, the lints, the cost)',
+  '/fleet up [--dry-run] [--wave n] [--stopped] [name…]  start the roster\'s instances that aren\'t running (--dry-run: the plan, the lints, the cost; --stopped: only wake the stopped ones, as after a restart, and start none)',
   '/fleet down [name…]    take instances down: no wakes or nudges, /fleet up skips them (s in the panel stops one)',
   '/fleet remove <name>   forget an instance\'s settings and state (it stays in roster.json); --yes to do it',
   '/fleet budget [name|project] [amount|+n]  today\'s budgets; set or raise one for today',
