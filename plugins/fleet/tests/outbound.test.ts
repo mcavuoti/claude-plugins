@@ -11,6 +11,7 @@ import {
   hostAllowed,
   hostOf,
   hostsNamed,
+  insideHost,
   mayReachNetwork,
   newOutbound,
   outboundDelivery,
@@ -36,7 +37,7 @@ const MINE_GH: OutboundConfig = { ...newOutbound(), hosts: ['github.com'] }
 
 test('outbound.json: its lists, a newer one left alone, junk said', () => {
   expect(parseOutbound(JSON.stringify({ outboundFormat: 1, hosts: ['devbox', 3], keep: true }))).toEqual({
-    outbound: { outboundFormat: 1, hosts: ['devbox'], remotes: [], recipients: [], tools: { outbound: [], free: [] }, commands: [], outside: [], keep: true },
+    outbound: { outboundFormat: 1, hosts: ['devbox'], remotes: [], recipients: [], tools: { outbound: [], free: [] }, commands: [], outside: [], calls: [], inside: [], keep: true },
   })
   expect(parseOutbound('{"outboundFormat": 2}')).toEqual({ problem: 'outbound.json is from a newer fleet (outboundFormat 2): restart this session (u) to load it' })
   expect(parseOutbound('nope')).toEqual({ problem: "outbound.json isn't valid JSON" })
@@ -334,4 +335,42 @@ test('mcp__fleet__send: its input, the draft fleet keeps and runs, the version t
   expect(outboundRefusal([{ what: 'curl sending data (notes/x.md)', to: ['example.invalid'], files: ['notes/x.md'] }], 'command')).toContain(
     "fleet: this command would send the project's content outside it (curl sending data (notes/x.md) to example.invalid), which needs the person's approval, so it was not run. If it should go out, draft it with mcp__fleet__send",
   )
+})
+
+test('a read verb wins over a leading noun: a search with a recipient filter reads, sends nothing', () => {
+  const c = (tool: string, input: Record<string, unknown> = {}) => classifyMcp(tool, input, NONE)
+  expect(c('mcp__claude_ai_Office__chat_message_search', { query: '*', recipient: 'someone@example.org' })).toEqual({ send: null, outside: true })
+  expect(c('mcp__claude_ai_Office__message_list', { from: 'someone@example.org' })).toEqual({ send: null, outside: true })
+  expect(c('mcp__discord__message', { to: 'someone@example.org' }).send).not.toBe(null)
+  expect(c('mcp__claude_ai_Office__send_chat_message', { chatId: '19:aaaa', body: 'hi' }).send).not.toBe(null)
+  expect(c('mcp__x__draft_email').send).not.toBe(null)
+})
+
+test('outbound.json calls: one chat of a sending tool passes, for the instances it names; the rest of the tool is held', () => {
+  const tool = 'mcp__claude_ai_Office__send_chat_message'
+  const parsed = parseOutbound(JSON.stringify({ outboundFormat: 1, calls: [{ tool: 'mcp__claude_ai_Office__send_*', match: { chatId: '19:aaaa*' }, instances: ['Liaison'] }, { tool: 'mcp__x__y' }, { tool: 'mcp__x__z', match: {} }] }))
+  if (!('outbound' in parsed)) throw new Error('no outbound')
+  const cfg = parsed.outbound
+  expect(cfg.calls).toEqual([{ tool: 'mcp__claude_ai_Office__send_*', match: { chatId: '19:aaaa*' }, instances: ['Liaison'] }])
+  expect(classifyMcp(tool, { chatId: '19:aaaa@thread', body: 'hi' }, cfg, 'Liaison').send).toBe(null)
+  expect(classifyMcp(tool, { chatId: '19:aaaa@thread', body: 'hi' }, cfg, 'liaison').send).toBe(null)
+  expect(classifyMcp(tool, { chatId: '19:aaaa@thread', body: 'hi' }, cfg, 'Owner A').send).not.toBe(null)
+  expect(classifyMcp(tool, { chatId: '19:aaaa@thread', body: 'hi' }, cfg, null).send).not.toBe(null)
+  expect(classifyMcp(tool, { chatId: '19:bbbb@thread', body: 'hi' }, cfg, 'Liaison').send).not.toBe(null)
+  expect(classifyMcp(tool, { body: 'hi' }, cfg, 'Liaison').send).not.toBe(null)
+  // None named: any session
+  const any: OutboundConfig = { ...newOutbound(), calls: [{ tool, match: { chatId: '19:aaaa' }, instances: [] }] }
+  expect(classifyMcp(tool, { chatId: '19:aaaa', body: 'hi' }, any, null).send).toBe(null)
+})
+
+test('outbound.json inside: the person’s own tools and hosts are no outside content', () => {
+  const cfg: OutboundConfig = { ...newOutbound(), inside: ['mcp__claude_ai_Office__search_people', '*.intranet.example', 'wiki.example.org'] }
+  expect(classifyMcp('mcp__claude_ai_Office__search_people', { query: 'x' }, cfg)).toEqual({ send: null, outside: false })
+  expect(classifyMcp('mcp__claude_ai_Office__read_resource', { url: 'https://docs.intranet.example/p' }, cfg)).toEqual({ send: null, outside: false })
+  expect(classifyMcp('mcp__claude_ai_Office__read_resource', { url: 'https://far.example/p' }, cfg)).toEqual({ send: null, outside: true })
+  expect(classifyMcp('mcp__claude_ai_Office__search_people', { query: 'x' }, NONE)).toEqual({ send: null, outside: true })
+  expect(insideHost('wiki.example.org', cfg)).toBe(true)
+  expect(insideHost('intranet.example', cfg)).toBe(true)
+  expect(insideHost('far.example', cfg)).toBe(false)
+  expect(insideHost('search_people', cfg)).toBe(false)
 })

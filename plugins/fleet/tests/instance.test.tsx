@@ -39,6 +39,8 @@ async function instance($: any, on: any, extra: { files?: Record<string, string>
   on('agent.spawn', () => ({ model: 'haiku', agentId: 'a9' }))
   sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle'), bbbbbbbb: row('bbbbbbbb', 'Owner B', 'idle') } })
   await startSession($, w)
+  // Its conversation starts: classic.SessionStart tells it who it is (as Claude does, when nothing sends it on past fleet)
+  await $.classic.SessionStart({ source: 'startup', agent_type: 'owner' } as any)
   return w
 }
 

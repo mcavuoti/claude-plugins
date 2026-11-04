@@ -41,8 +41,16 @@ export type OutboundConfig = {
   commands: string[]
   /** MCP tools (globs) whose results are outside content, besides the outside services' reads: they mark the context */
   outside: string[]
+  /** Calls that pass although their tool sends: one tool (a glob) with what its input must hold (each key's value, a
+   * glob), for the named instances only (none named: any session). One chat, not the whole tool */
+  calls?: OutboundCall[]
+  /** The person's own: MCP tools (globs) and hosts (or *.domain) whose content isn't outside content (his own tenant's
+   * directory, his own chat, his intranet): reading them doesn't mark the conversation */
+  inside?: string[]
   [key: string]: unknown
 }
+
+export type OutboundCall = { tool: string; match: Record<string, string>; instances: string[] }
 
 export function newOutbound(): OutboundConfig {
   return { outboundFormat: OUTBOUND_FORMAT, hosts: [], remotes: [], recipients: [], tools: { outbound: [], free: [] }, commands: [], outside: [] }
@@ -54,6 +62,23 @@ export function outboundText(c: OutboundConfig): string {
 
 function strings(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map(x => x.trim()) : []
+}
+
+/** calls: each entry with a tool and at least one input key to match (a call with nothing to match would free the whole
+ * tool: that's tools.free); the rest is left out */
+function callsOf(v: unknown): OutboundCall[] {
+  if (!Array.isArray(v)) return []
+  const out: OutboundCall[] = []
+  for (const x of v) {
+    if (!x || typeof x !== 'object') continue
+    const o = x as Record<string, unknown>
+    if (typeof o.tool !== 'string' || !o.tool.trim() || !o.match || typeof o.match !== 'object') continue
+    const match: Record<string, string> = {}
+    for (const [k, val] of Object.entries(o.match as Record<string, unknown>)) if (typeof val === 'string' || typeof val === 'number') match[k] = String(val)
+    if (!Object.keys(match).length) continue
+    out.push({ tool: o.tool.trim(), match, instances: strings(o.instances) })
+  }
+  return out
 }
 
 /** outbound.json: its lists, or why it can't be used (a newer fleet wrote it, or it isn't JSON) */
@@ -76,6 +101,8 @@ export function parseOutbound(text: string): { outbound: OutboundConfig } | { pr
       tools: { ...tools, outbound: strings(tools.outbound), free: strings(tools.free) },
       commands: strings(o.commands),
       outside: strings(o.outside),
+      calls: callsOf(o.calls),
+      inside: strings(o.inside),
     },
   }
 }
@@ -249,6 +276,40 @@ function toolListed(tool: string, globs: readonly string[]): boolean {
 
 const RECIPIENT_KEYS = ['to', 'cc', 'bcc', 'recipient', 'recipients', 'email', 'emails', 'attendees', 'address', 'addresses']
 
+/** A call outbound.json's calls let pass: its tool, every key it names holding that value (a glob), and this session one
+ * of the instances it names (or it names none). who: this session's instance, null for none */
+export function callAllowed(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null): boolean {
+  return (c.calls ?? []).some(k => {
+    if (!matches(tool, k.tool)) return false
+    if (k.instances.length && !(who && k.instances.some(i => i.toLowerCase() === who.toLowerCase()))) return false
+    return Object.entries(k.match).every(([key, want]) => {
+      const v = input[key]
+      return (typeof v === 'string' || typeof v === 'number') && matches(String(v), want)
+    })
+  })
+}
+
+/** A host of the person's own (outbound.json's inside: a host, or *.domain): what's read there isn't outside content */
+export function insideHost(host: string | null, c: OutboundConfig): boolean {
+  if (!host) return false
+  return (c.inside ?? []).some(entry => {
+    const e = entry.trim().toLowerCase()
+    if (e.startsWith('mcp__') || !e.includes('.')) return false
+    if (e.startsWith('*.')) return host === e.slice(2) || host.endsWith(e.slice(1))
+    return host === e
+  })
+}
+
+/** An MCP read of the person's own (outbound.json's inside: the tool, or the host of a url its input names) */
+export function insideCall(tool: string, input: Record<string, unknown>, c: OutboundConfig): boolean {
+  if ((c.inside ?? []).some(g => g.startsWith('mcp__') && matches(tool, g))) return true
+  for (const key of ['url', 'link', 'uri', 'href']) {
+    const v = input[key]
+    if (typeof v === 'string' && insideHost(hostOf(v), c)) return true
+  }
+  return false
+}
+
 /** The addresses an MCP call's input names (to, cc, bcc, attendees…), as text */
 export function recipientsOf(input: Record<string, unknown>): string[] {
   const out: string[] = []
@@ -270,18 +331,21 @@ export function recipientsOf(input: Record<string, unknown>): string[] {
  * context). An outside service's tool that doesn't read sends, unless it only moves or marks what's there; another
  * server's sends when its name has a verb that writes. The person's lists come first; a message whose every recipient
  * is on his list passes */
-export function classifyMcp(tool: string, input: Record<string, unknown>, c: OutboundConfig): { send: Send | null; outside: boolean } {
+export function classifyMcp(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null = null): { send: Send | null; outside: boolean } {
   const parts = mcpParts(tool)
   if (!parts || /^fleet$/i.test(parts.server)) return { send: null, outside: false }
   const words = nameWords(parts.name)
   const remote = outsideServer(parts.server)
   const verb = words.find(w => WRITES.has(w) || LEADING_WRITES.has(w) || READS.has(w) || NEUTRAL.has(w))
-  const writes = words.some(w => WRITES.has(w)) || (!!verb && LEADING_WRITES.has(verb))
+  // A verb that only reads wins over a leading word that is a noun there (chat_message_search searches messages): a
+  // recipient it names is a filter, nothing goes to it
+  const writes = words.some(w => WRITES.has(w)) || (!!verb && LEADING_WRITES.has(verb) && !words.some(w => READS.has(w)))
   const reads = !writes && words.some(w => READS.has(w))
   const neutral = !writes && !reads && words.some(w => NEUTRAL.has(w))
-  const outside = toolListed(tool, c.outside) || (remote && reads)
+  const outside = (toolListed(tool, c.outside) || (remote && reads)) && !insideCall(tool, input, c)
   const listed = toolListed(tool, c.tools.outbound)
   if (!listed && (toolListed(tool, c.tools.free) || claudeServer(parts.server))) return { send: null, outside }
+  if (callAllowed(tool, input, c, who)) return { send: null, outside }
   if (!listed && !writes && !(remote && !reads && !neutral)) return { send: null, outside }
   const to = recipientsOf(input)
   if (!listed && to.length && to.every(r => recipientAllowed(r, c))) return { send: null, outside }

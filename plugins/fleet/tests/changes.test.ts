@@ -4,6 +4,7 @@ import {
   acceptable,
   addGlob,
   ancestorsOf,
+  bashWritesNothing,
   bashReadTarget,
   caseProbe,
   changeLine,
@@ -230,4 +231,35 @@ test('the post-scan compares size and time; accept takes only a change nobody’
   expect(staleOf(threads, p => now[p])).toEqual([{ path: 'notes/plan.md', thread: 'main' }])
   expect(parseReads('{"format":1,"sessionId":"s","ref":null,"name":null,"at":1,"threads":{}}')).toMatchObject({ sessionId: 's' })
   expect(parseReads('{"format":9}')).toEqual({ otherFormat: 9 })
+})
+
+test('a command with no write syntax: reading programs, no redirection to a file; unsure counts as writing', () => {
+  for (const c of [
+    'grep -n x findings/F-1.md',
+    "sed -n '1,20p' notes/a.md | grep x | wc -l",
+    'git diff HEAD -- findings/F-2.md',
+    'git -C sub log --oneline -5',
+    'cat notes/a.md >/dev/null 2>&1',
+    'sleep 5; cat notes/plan.md >/dev/null',
+    'LC_ALL=C sort notes/a.md | uniq -c',
+    "grep 'a|b>c' notes/x.md",
+    'find notes -name "*.md" | head',
+    'ls -la notes && wc -l notes/*.md',
+  ]) {
+    expect([c, bashWritesNothing(c)]).toEqual([c, true])
+  }
+  for (const c of [
+    "sed -i '' 's/a/b/' notes/x.md",
+    'echo hi > notes/x.md',
+    'cat a.md >> b.md',
+    'python3 tool.py',
+    'find notes -name x -delete',
+    'git checkout notes/x.md',
+    'cat a.md | tee b.md',
+    'echo `date`',
+    "awk '{print}' a.md",
+    '',
+  ]) {
+    expect([c, bashWritesNothing(c)]).toEqual([c, false])
+  }
 })
