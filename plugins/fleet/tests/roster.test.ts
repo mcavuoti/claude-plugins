@@ -173,6 +173,13 @@ test("the settings fleet writes: the roster's, then its env, model, effort and t
     'Edit(//Users/x/proj/spec/a.md)',
     'Edit(//Users/x/proj/spec/b.md)',
     'Edit(//Users/x/proj/.claude/fleet/instances/**)',
+    // The person's own state: his stamps, budget lifts, downs, live areas
+    'Edit(//Users/x/proj/.claude/fleet/state/stamps.json)',
+    'Edit(//Users/x/proj/.claude/fleet/state/checks-stamp.json)',
+    'Edit(//Users/x/proj/.claude/fleet/state/channel-stamp.json)',
+    'Edit(//Users/x/proj/.claude/fleet/state/lifts.json)',
+    'Edit(//Users/x/proj/.claude/fleet/state/down.json)',
+    'Edit(//Users/x/proj/.claude/fleet/state/judges.json)',
   ])
   const a = instancesOf(roster({ settings: { enabledPlugins: { 'p@m': true }, permissions: { allow: ['Bash(make:*)'] } } }))[2]!
   const s = settingsFor({ ...a, permissions: { defaultMode: 'acceptEdits', deny: ['WebFetch'] }, settings: { ...a.settings, env: { ...(a.settings.env as object), FLEET_ROOT: '/elsewhere' } } }, ROOT, deny)

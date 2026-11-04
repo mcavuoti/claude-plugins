@@ -134,8 +134,22 @@ test('a command with no write syntax is never blamed for another session’s wri
   const r: any = await $.tool.call({ tool: 'Bash', command: 'grep -n plan notes/plan.md | wc -l' } as any)
   const said = (r.context ?? []).join('\n')
   expect(said).not.toContain('your command changed')
-  expect(said).toContain("fleet: notes/plan.md changed while your command ran (it changed at")
+  // Its v2 edit isn't who wrote v3: nobody is named until v3's event is out
+  expect(said).toContain("fleet: notes/plan.md changed while your command ran (by someone fleet hasn't seen yet: an editor, a script, or a session whose event is still coming)")
   expect(said).toContain("your command didn't change it. If your command read it, read it again.")
+  await tick(w)
+  await $.tool.call({ tool: 'Read', file_path: PLAN } as any)
+  // Its next edit and its event both land while the grep runs: that's B's landing, and the digest names it
+  w.bash.value = () => {
+    const t = w.clock.now() + 1
+    w.touch(PLAN, 'plan v4 from B\n')
+    w.touch(`${FLEET}/events/${hourFolder(t)}/${t}-bbbbbbbb-2.json`, JSON.stringify({ format: 1, at: t, path: 'notes/plan.md', from: hashText('plan v3 from B\n'), to: hashText('plan v4 from B\n'), via: 'tool', tool: 'Edit', blind: false, by: B }))
+    w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: `${t}-bbbbbbbb-2.json` }))
+  }
+  const r2: any = await $.tool.call({ tool: 'Bash', command: 'grep -n plan notes/plan.md | wc -l' } as any)
+  const said2 = (r2.context ?? []).join('\n')
+  expect(said2).toContain('- notes/plan.md: changed at 09:00 by TEST B (Edit)')
+  expect(said2).not.toContain('your command changed')
   const mine = [...w.files.keys()].filter(p => p.startsWith(`${FLEET}/events/`) && p.endsWith('.json') && !p.endsWith('latest')).map(p => JSON.parse(w.files.get(p) as string)).filter(e => e.by?.sessionId === SID)
   expect(mine).toEqual([])
 })

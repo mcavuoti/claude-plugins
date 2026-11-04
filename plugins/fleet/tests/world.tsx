@@ -1,6 +1,9 @@
 import type { EngineInterface, On } from 'claude-code'
 import { mock } from 'claude-code/testing'
 
+import { hashText } from '../hooks/changes'
+import { FORMAT } from '../hooks/decisions'
+
 // The world fleet sees in the tests, with the engine's own test kit: every hook here stands for the engine (files,
 // commands, the clock, the environment, the prompt). The project lives in memory; nothing touches the disk.
 
@@ -138,6 +141,9 @@ export type WorldOptions = {
   fleet?: boolean
   // world.json's globs, when the project has one (fleet only)
   worldPaths?: string[]
+  // The stamps /fleet init writes, of the config files the project has: false for a project whose stamps were taken
+  // away (the default: stamped, as every project fleet set up is)
+  stamps?: boolean
   // The volume ignores case (the real path has the disk's case, as on APFS)
   insensitive?: boolean
   // Symbolic links: link path → where it leads (absolute)
@@ -183,6 +189,15 @@ export function world(on: On, options: WorldOptions = {}): World {
     addFile(`${FLEET}/config.json`, '{ "configFormat": 1, "template": "blank", "commitRegister": false }\n')
     for (const d of ['queue', 'answers', 'register', 'tmp', 'prune']) dirs.add(`${DEC}/${d}`)
     if (options.worldPaths) addFile(`${FLEET}/world.json`, JSON.stringify({ worldFormat: 1, paths: options.worldPaths }))
+    // As /fleet init leaves them: each config file there stamped (outbound.json's text kept, which the gate trusts)
+    if (options.stamps !== false && !files.has(`${FLEET}/state/stamps.json`)) {
+      const config = ['charter.md', 'principles.md', 'verify.md', 'roster.json', 'world.json', 'outbound.json', 'slots.json'].map(n => `.claude/fleet/${n}`)
+      const roles = [...files.keys()].filter(p => p.startsWith(`${ROOT}/.claude/agents/`) && p.endsWith('.md')).map(p => p.slice(ROOT.length + 1))
+      const stamped: Record<string, string | null> = {}
+      for (const rel of [...config, ...roles]) stamped[rel] = files.has(`${ROOT}/${rel}`) ? hashText(files.get(`${ROOT}/${rel}`) as string) : null
+      const outbound = files.get(`${FLEET}/outbound.json`)
+      addFile(`${FLEET}/state/stamps.json`, JSON.stringify({ format: FORMAT, files: stamped, ...(outbound !== undefined ? { outbound } : {}) }))
+    }
   }
   // Where a path lands: . and .. folded, links followed, and on a volume that ignores case the disk's own spelling
   const links = options.links ?? {}

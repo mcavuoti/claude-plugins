@@ -5,6 +5,7 @@ import {
   addGlob,
   ancestorsOf,
   bashWritesNothing,
+  duringText,
   bashReadTarget,
   caseProbe,
   changeLine,
@@ -259,7 +260,50 @@ test('a command with no write syntax: reading programs, no redirection to a file
     'echo `date`',
     "awk '{print}' a.md",
     '',
+    // env runs the command after its options and assignments
+    'env rm notes/a.md',
+    "env sed -i '' s/a/b/ notes/a.md",
+    'env -i python3 tools/gen.py',
+    // Programs that read, given a flag or an operand that writes
+    'sort -o notes/list.md notes/list.md',
+    'sort --output=notes/l.md notes/l.md',
+    'sort -onotes/l.md notes/l.md',
+    'uniq notes/in.md notes/out.md',
+    'xxd -r in.hex out.bin',
+    'xxd notes/a.md notes/a.hex',
+    'tree -o notes/tree.txt',
+    'git diff --output=notes/x.patch',
+    'git log -p --output notes/x.patch',
+    'less -o log.txt notes/a.md',
+    'file -C -m notes/magic',
+    'rg --pre ./script.sh x notes',
+    'rg --pre=./script.sh x notes',
+    // Redirections the old reading missed
+    'cat a.md >& notes/b.md',
+    'echo hi >&notes/b.md',
+    "grep -n \"don't\" notes/a.md > notes/hits.md && sed -n '1,5p' notes/hits.md",
+    "sed -n '/x/w notes/out.md' notes/a.md",
+    "sed -n 's/a/b/w notes/out.md' notes/a.md",
+    'diff <(sort a.md) >(tee b.md)',
   ]) {
     expect([c, bashWritesNothing(c)]).toEqual([c, false])
   }
+  for (const c of ['env', 'printenv HOME', 'env LC_ALL=C grep x notes/a.md', 'env -u HOME cat notes/a.md', 'uniq notes/a.md', 'sort -r notes/a.md', 'tree notes', 'xxd notes/a.md', 'git diff HEAD', "grep -n \"don't\" notes/a.md", "sed -n '1,5p;/now/p' notes/a.md"]) {
+    expect([c, bashWritesNothing(c)]).toEqual([c, true])
+  }
+  // A write outside the shared world (the caller says what's in it) doesn't make the command a world writer; one it
+  // can't place does
+  const inWorld = (t: string) => !t.startsWith('/tmp/')
+  expect(bashWritesNothing('grep -n x notes/plan.md > /tmp/hits.txt', inWorld)).toBe(true)
+  expect(bashWritesNothing('sort -o /tmp/s.txt notes/plan.md', inWorld)).toBe(true)
+  expect(bashWritesNothing('grep -n x notes/plan.md > notes/hits.md', inWorld)).toBe(false)
+  expect(bashWritesNothing('grep -n x notes/plan.md > /tmp/hits.txt')).toBe(false)
+  expect(bashWritesNothing('cp notes/plan.md /tmp/x', inWorld)).toBe(false)
+})
+
+test('a world file that changed while a read-only command ran: the writer named only when its event is the version there now', () => {
+  const me = { sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', offsetMin: 0 }
+  expect(duringText('notes/a.md', null, me)).toBe(
+    "fleet: notes/a.md changed while your command ran (by someone fleet hasn't seen yet: an editor, a script, or a session whose event is still coming); your command didn't change it. If your command read it, read it again.",
+  )
 })

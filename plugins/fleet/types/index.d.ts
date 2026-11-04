@@ -11,7 +11,7 @@ export type FleetLate = { notes: { q: number; question: string; text: string }[]
 
 /** A Bash command run in the background (run_in_background, or moved there), until it completes: its thread, when it
  * started, and the world as it was then (path, time, size), to compare with when it's done */
-export type FleetBg = { thread: string; at: number; before: [string, number, number][] }
+export type FleetBg = { thread: string; at: number; before: [string, number, number][]; readOnly?: boolean }
 
 /** A world file as one thread last read it (or wrote it): the version, when, and the newest version it was told of;
  * for a record, the version number fleet gave what it read */
