@@ -271,7 +271,7 @@ test('the sweeper marks an instance that runs with no fleet, and one over its bu
   expect(status).toContain('roster: 3 instance(s) in 2 wave(s)')
   expect(status).toContain('  Owner A · owner · Owners · wave 1 · idle · no fleet (u restarts it) · $0.00 of $1.00 today')
   expect(status).toContain('  Owner B · owner · Owners under Owner A · wave 1 · working · no fleet (u restarts it) · $2.00 of $1.00 today (used up)')
-  expect(status).toContain('  Owner C · owner · Owners · wave 2 · stopped · $0.00 of $1.00 today · 1 wake(s) today')
+  expect(status).toContain('  Owner C · owner · Owners · wave 2 · stopped · job ccccccc1, session cccccccc · $0.00 of $1.00 today · wakes 1/8 today')
 })
 
 test("the marks keep within sessions' limits: a long name over budget keeps its $ row; a session that asks gets ?n and needs the person", WITH_SESSIONS, async ($, on) => {

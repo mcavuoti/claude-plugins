@@ -75,6 +75,9 @@ declare module 'claude-code' {
       conversationAt: number
       /** When this session last landed something in the shared world (an instance's cadence) */
       landedAt: number
+      /** When this session last landed something other than its own journal (an instance's cadence, while it owns open
+       * board items) */
+      workLandedAt: number
       /** When fleet last cleared this instance for a fresh period (0: never) */
       freshAt: number
       /** That fresh period's hand-off (its journal), until a turn carrying it starts: a dropped one is submitted again */

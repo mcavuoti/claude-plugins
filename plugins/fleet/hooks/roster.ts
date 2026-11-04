@@ -66,8 +66,11 @@ type Overrides = {
   effort?: string
   budget?: { usdDay?: number }
   cadenceH?: number
-  /** long: the instance keeps one context (leads, the integrator, the chief); fresh (the default): at each cadence
-   * boundary, idle and with its journal landed, fleet clears it and hands it its journal (decision 4a) */
+  /** The fresh period of a `fresh` context, in hours: how often fleet clears it and hands it its journal; cadenceH by
+   * default. Apart from cadenceH, so a short cadence (frequent nudges) needn't wipe the context as often */
+  freshH?: number
+  /** long: the instance keeps one context (leads, the integrator, the chief); fresh (the default): at each fresh
+   * period (freshH), idle and with its journal landed, fleet clears it and hands it its journal (decision 4a) */
   context?: string
   /** Its journal, relative to the project ({name}, {slug}); journals/{slug}.md by default */
   journal?: string
@@ -120,6 +123,8 @@ export type Instance = {
   effort: string | null
   usdDay: number | null
   cadenceH: number | null
+  /** The fresh period (a `fresh` context's /clear), cadenceH unless the roster says */
+  freshH: number | null
   context: 'long' | 'fresh'
   /** Its journal, relative to the project (it writes it with its own tools: a shared file, when the world has it) */
   journal: string
@@ -251,6 +256,7 @@ export function instancesOf(r: Roster): Instance[] {
       effort: pick(o => (typeof o.effort === 'string' && o.effort ? o.effort : undefined)) ?? null,
       usdDay: pick(o => num(o.budget?.usdDay) ?? undefined) ?? null,
       cadenceH: pick(o => num(o.cadenceH) ?? undefined) ?? null,
+      freshH: pick(o => num(o.freshH) ?? undefined) ?? pick(o => num(o.cadenceH) ?? undefined) ?? null,
       context: pick(o => (o.context === 'long' || o.context === 'fresh' ? (o.context as 'long' | 'fresh') : undefined)) ?? 'fresh',
       journal: fillName(journal, name, slugOf(name)),
       seed: pick(o => (typeof o.seed === 'string' && o.seed ? o.seed : undefined)) ?? `seeds/${spec.role}.md`,
@@ -673,11 +679,41 @@ export function countWake(mine: WakeCount | null, now: number, day: string): Wak
 
 const HOUR_MS = 3600000
 
-/** From when its period counts (its last landing, or when it started), and whether it's past it */
-export function cadenceOf(p: { cadenceH: number | null; lastLanding: number | null; startedAt: number; now: number }): { due: boolean; anchor: number; hours: number } {
-  const anchor = Math.max(p.lastLanding ?? 0, p.startedAt)
+/** Cadence nudges (and the sweeper's cadence wakes of a retired one) an instance gets a day while nothing lands: one
+ * each period, at most this many */
+export const CADENCE_PER_DAY = 3
+
+/** From when its period counts (its last landing, or when it started), whether it's past it, and which period it's in
+ * (one nudge each). While it owns open board items, only a landing other than its journal counts (lastWork): a
+ * journal line saying there's nothing to do doesn't satisfy it */
+export function cadenceOf(p: { cadenceH: number | null; lastLanding: number | null; startedAt: number; now: number; lastWork?: number | null; ownsOpen?: number }): { due: boolean; anchor: number; hours: number; key: string; nextMs: number | null; journalOnly: boolean } {
+  const owns = (p.ownsOpen ?? 0) > 0
+  const anchor = Math.max((owns ? p.lastWork : p.lastLanding) ?? 0, p.startedAt)
   const hours = (p.now - anchor) / HOUR_MS
-  return { due: p.cadenceH !== null && p.cadenceH > 0 && hours >= p.cadenceH, anchor, hours }
+  const on = p.cadenceH !== null && p.cadenceH > 0
+  const period = on ? Math.floor(hours / (p.cadenceH as number)) : 0
+  const nextMs = on ? anchor + (period + 1) * (p.cadenceH as number) * HOUR_MS - p.now : null
+  const journalOnly = owns && (p.lastLanding ?? 0) > Math.max(p.lastWork ?? 0, p.startedAt)
+  return { due: on && hours >= (p.cadenceH as number), anchor, hours, key: `${anchor}:${period}`, nextMs, journalOnly }
+}
+
+/** A board item's owner and status, from its first lines (`owner: <name>`, `status: <open|started|…>`, front matter or
+ * not) */
+export function boardItemOf(text: string): { owner: string | null; status: string | null } {
+  let owner: string | null = null
+  let status: string | null = null
+  for (const l of text.replace(/\r\n/g, '\n').split('\n').slice(0, 40)) {
+    const o = /^\s*[-*]?\s*\**owner\**\s*:\s*(.+?)\s*$/i.exec(l)
+    if (o && owner === null) owner = (o[1] as string).replace(/^["'`*\s]+|["'`*\s]+$/g, '').trim()
+    const st = /^\s*[-*]?\s*\**status\**\s*:\s*\**\s*([A-Za-z-]+)/i.exec(l)
+    if (st && status === null) status = (st[1] as string).toLowerCase()
+  }
+  return { owner, status }
+}
+
+/** Whether a board item is one this instance owns and has yet to finish: its owner names it, its status open or started */
+export function ownsOpenItem(item: { owner: string | null; status: string | null }, name: string): boolean {
+  return !!item.owner && item.owner.toLowerCase() === name.toLowerCase() && (item.status === 'open' || item.status === 'started')
 }
 
 /** Hours as the person reads them: 20 min, 1 h, 7 h, 2 d */
@@ -686,16 +722,20 @@ export function hoursText(h: number): string {
   return h >= 48 ? `${Math.floor(h / 24)} d` : `${Math.floor(h)} h`
 }
 
-export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number): string {
-  return `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. This is fleet's one nudge for this period.`
+export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number, items: readonly string[] = []): string {
+  if (items.length) {
+    const shown = items.slice(0, 8)
+    return `fleet: ${hoursText(hours)} since you last landed work in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}; a line in your journal doesn't count while you own open items). Your open items: ${shown.join(', ')}${items.length > shown.length ? ` and ${items.length - shown.length} more` : ''}. They're your work: take the first one that needs nobody's decision and land a step of it, or ask the person with mcp__fleet__decide what blocks it. fleet nudges once each period while nothing lands, at most ${CADENCE_PER_DAY} a day.`
+  }
+  return `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. fleet nudges once each period while nothing lands, at most ${CADENCE_PER_DAY} a day.`
 }
 
-/** Decision 4a: an instance that doesn't keep a long context starts each cadence period afresh. Due when its
- * conversation is a period old, it's idle, nothing of fleet's is on its way to it, and it wrote its journal since the
- * conversation started (that's what the next one is handed) */
-export function freshDue(p: { context: 'long' | 'fresh'; cadenceH: number | null; conversationAt: number; journalAt: number | null; now: number; idleMs: number; pending: boolean }): boolean {
-  if (p.context !== 'fresh' || p.cadenceH === null || p.cadenceH <= 0 || p.pending || p.idleMs < 60000) return false
-  if (p.now - p.conversationAt < p.cadenceH * HOUR_MS) return false
+/** Decision 4a: an instance that doesn't keep a long context starts each fresh period (freshH, cadenceH by default)
+ * afresh. Due when its conversation is a period old, it's idle, nothing of fleet's is on its way to it, and it wrote
+ * its journal since the conversation started (that's what the next one is handed) */
+export function freshDue(p: { context: 'long' | 'fresh'; freshH: number | null; conversationAt: number; journalAt: number | null; now: number; idleMs: number; pending: boolean }): boolean {
+  if (p.context !== 'fresh' || p.freshH === null || p.freshH <= 0 || p.pending || p.idleMs < 60000) return false
+  if (p.now - p.conversationAt < p.freshH * HOUR_MS) return false
   return p.journalAt !== null && p.journalAt > p.conversationAt
 }
 
@@ -714,9 +754,9 @@ export function journalTail(text: string, max = 4000): string {
 }
 
 /** fleet's own prompt to the cleared conversation: who it is, and its journal's last entries */
-export function handoffText(inst: Pick<Instance, 'name' | 'role' | 'cadenceH' | 'journal'>, root: string, tail: string, whole: boolean): string {
+export function handoffText(inst: Pick<Instance, 'name' | 'role' | 'freshH' | 'journal'>, root: string, tail: string, whole: boolean): string {
   return [
-    `You are ${inst.name}, the ${inst.role} of this project's fleet (the project folder is ${root}). This is a fresh period: fleet cleared your context after ${hoursText(inst.cadenceH ?? 0)}, as it does every period, and hands you your journal (${inst.journal}) to go on from.`,
+    `You are ${inst.name}, the ${inst.role} of this project's fleet (the project folder is ${root}). This is a fresh period: fleet cleared your context after ${hoursText(inst.freshH ?? 0)}, as it does every period, and hands you your journal (${inst.journal}) to go on from.`,
     `${whole ? 'Your journal' : "Your journal's last entries"}:\n\n${tail}`,
     'Read what it points to that you need (the charter, your claimed items, the records you cite) and continue. Keep your journal as you go: the next period starts from it.',
   ].join('\n\n')

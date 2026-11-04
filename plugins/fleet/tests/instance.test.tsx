@@ -61,7 +61,7 @@ test('an instance binds from its settings, writes a heartbeat with its spend, is
   expect(calls(w, 'assignSection')).toContainEqual({ source: 'fleet', ref: REF, section: 'fleet:owners' })
   const status = await fleet($, 'status')
   expect(status).toContain('this session: Owner A (owner); runs as owner')
-  expect(status).toContain('  Owner A · owner · Owners · wave 1 · idle · fleet ')
+  expect(status).toContain('  Owner A · owner · Owners · wave 1 · idle · job aaaaaaaa · fleet ')
   expect(status).toContain('· seeded · $0.25 of $1.00 today')
 })
 
