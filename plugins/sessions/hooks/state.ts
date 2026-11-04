@@ -413,7 +413,10 @@ export function adoptAutoPins(pins: readonly string[], remote: Readonly<Record<s
 // and closes idle ones when memory runs out ("retire <id>: … [low memory…]"); each retire is followed by the process
 // ending ("settled <id> (done)"). A process that ends with no retire before it was stopped some other way: by the
 // person (claude stop, the panel's s), or a crash. Starting again ("claimed-spare" or "spawned") clears the record
-export type StopReason = { at: number; why: 'idle' | 'low-memory' | 'stopped' }
+// A process that ends with no retire before it: `settled <id> (killed)` was killed by a claude stop (the person's: the
+// panel's s, or typed; a respawn's kill is followed by its claimed-spare, which clears it); any other end, `(done)` or
+// `(crashed)`, ended by itself. A machine that restarted, or a service that went down with its workers, leaves no line
+export type StopReason = { at: number; why: 'idle' | 'low-memory' | 'stopped' | 'ended' }
 export function stopReasons(log: string): Record<string, StopReason> {
   const out: Record<string, StopReason> = {}
   for (const line of log.split('\n')) {
@@ -422,10 +425,22 @@ export function stopReasons(log: string): Record<string, StopReason> {
     const [, when = '', event, id = '', rest = ''] = m
     const at = Date.parse(when) || 0
     if (event === 'retire') out[id] = { at, why: /\[low memory/.test(rest) ? 'low-memory' : 'idle' }
-    else if (event === 'settled') out[id] ??= { at, why: 'stopped' }
+    else if (event === 'settled') out[id] ??= { at, why: /^\s*\(killed\)/.test(rest) ? 'stopped' : 'ended' }
     else delete out[id]
   }
   return out
+}
+
+// Why a background session with no process is stopped ($.sessions' SessionsStopped): the service retired it for being
+// idle, or closed it for lack of memory; the person stopped it (a claude stop the log shows, or the panel's s this mod
+// remembers, personAt, unless the session was started again after it); else it ended by itself: a crash, or a machine
+// or service restart, which leave no line
+export function stoppedKind(reason: StopReason | undefined, personAt: unknown, startedAt: unknown): 'person' | 'idle' | 'memory' | 'ended' {
+  if (reason?.why === 'idle') return 'idle'
+  if (reason?.why === 'low-memory') return 'memory'
+  if (reason?.why === 'stopped') return 'person'
+  if (typeof personAt === 'number' && !(typeof startedAt === 'number' && startedAt > personAt)) return 'person'
+  return 'ended'
 }
 
 // The times the mod reopened a session in the last 2 h (so it doesn't insist if memory fills up again)

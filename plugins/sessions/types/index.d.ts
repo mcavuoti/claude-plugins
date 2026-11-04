@@ -114,6 +114,10 @@ export type SessionsCurrent = {
 /** working: in a turn; waiting: for the person (a permission, a question); idle; stopped: no process; gone: not in the
  * official list */
 export type SessionsState = 'working' | 'waiting' | 'idle' | 'stopped' | 'gone'
+/** 0.13.4. Why a stopped background session is stopped: person (the person stopped it: a claude stop, or the panel's s,
+ * until it's started again); idle (the background service retired it for being idle); memory (closed for lack of
+ * memory); ended (it ended by itself: a crash, or the machine or the background service restarted under it) */
+export type SessionsStopped = 'person' | 'idle' | 'memory' | 'ended'
 /** Another session, from the panel's last refresh (every 3 s) */
 export type SessionsStatus = {
   ref: SessionsRef
@@ -126,6 +130,8 @@ export type SessionsStatus = {
   root: string | null
   background: boolean
   agent: string | null
+  /** 0.13.4. Why it's stopped, for a background session with state stopped (absent otherwise, and from older copies) */
+  stopped?: SessionsStopped
 }
 /** A section a plugin defines: id `<plugin>:<name>` (`me:` and `sessions:` are reserved), a title (up to 60
  * characters, cut to fit when drawn) and an order (ascending; the person's sections default to 100, a plugin's to 200) */
@@ -161,9 +167,11 @@ export type Sessions = {
    * with status({ names }). Refused for a name already in that folder's project, a settings file outside `<cwd>/.claude/`
    * and the home folder; a folder Claude doesn't trust is said in this session when it's tried */
   start?: (input: { name: string; cwd: string; agent?: string; settings?: string }) => Promise<SessionsResult & { queued?: true }>
-  /** 0.12.0. Brings back a background session the background service retired for being idle (claude respawn, from
-   * sessions' own timer): `running` (nothing to do), `queued`, or `refused` with why: a regular session, one the person
-   * stopped, one closed for lack of memory while memory is still short. `reason` goes to the debug log */
+  /** 0.12.0. Brings back a stopped background session (claude respawn, from sessions' own timer): one the background
+   * service retired for being idle, and (0.13.4) one that ended by itself, after a crash or a restart of the machine or
+   * the service (status's `stopped: 'ended'`). `running` (nothing to do), `queued`, or `refused` with why: a regular
+   * session, one the person stopped (`stopped: 'person'`), one closed for lack of memory while memory is still short.
+   * `reason` goes to the debug log */
   wake?: (input: { ref: SessionsRef; reason: string }) => Promise<SessionsResult & { state?: 'running' | 'queued' | 'refused' }>
   /** 0.12.0. Marks rows in every session's panel for `ttlMs` (at most 600000, 10 minutes): call again to keep them.
    * Each call replaces the marks this session of `source` set before; empty `rows` clears them. rejected (0.13.1): the

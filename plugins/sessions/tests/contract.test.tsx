@@ -264,7 +264,7 @@ test('wake: only a background session the service retired for being idle is rest
   }
   expect(await refused(`sid:${REGULAR}`)).toBe('refused: “myapp-1f” is a regular session: it lives in its own window')
   expect(await refused('zzzzzzzz')).toBe("refused: zzzzzzzz isn't in the session list")
-  expect(await refused('eeeeeeee')).toContain("wasn't retired for being idle")
+  expect(await refused('eeeeeeee')).toBe('refused: “stopped one” was stopped by you: Enter or u restarts it')
   // Closed for lack of memory: not while memory is short; once it's normal, yes
   w.memory.value = '4'
   expect(await refused('ffffffff')).toContain('memory is still short')
@@ -278,6 +278,67 @@ test('wake: only a background session the service retired for being idle is rest
   expect(w.runs.slice(before).some(a => a[1] === 'respawn')).toBe(false)
   await w.clock.advance(600)
   expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['ffffffff', 'dddddddd'])
+})
+
+test("wake after a reboot or a crash: a background session that ended with no stop of the person's comes back; one the person stopped doesn't; status says why each is stopped", WITH_PROBE, async ($, on) => {
+  const at = Date.parse('2026-10-26T10:00:00.000Z')
+  const bg = (id: string, name: string, extra: Record<string, unknown> = {}) => ({ id, sessionId: `${id}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', name, ...extra })
+  const sessionsList = [
+    ...list(),
+    // The machine restarted: the process died with no line in the service's log
+    bg('dddddddd', 'rebooted', { startedAt: at - 3600000 }),
+    // Stopped with claude stop (the panel's s, or typed): its process was killed
+    bg('eeeeeeee', 'stopped by the person', { startedAt: at - 3600000 }),
+    // It crashed
+    bg('ffffffff', 'crashed', { startedAt: at - 3600000 }),
+    // Stopped from the panel's s long ago (the log no longer has it), and not started since
+    bg('11111111', 'stopped from the panel', { startedAt: at - 7200000 }),
+    // Stopped from the panel's s, then started again, then the machine restarted
+    bg('22222222', 'started again', { startedAt: at - 600000 }),
+    // Retired for being idle, and closed for lack of memory
+    bg('33333333', 'idle one', { startedAt: at - 7200000 }),
+    bg('44444444', 'memory one', { startedAt: at - 7200000 }),
+  ]
+  const w = world(on, {
+    list: sessionsList,
+    store: { 'personStop:11111111-0000-0000-0000-000000000000': at - 3600000, 'personStop:22222222-0000-0000-0000-000000000000': at - 3600000 },
+  })
+  w.memory.value = '1'
+  w.files.set(
+    '/Users/x/daemon.log',
+    [
+      '[2026-10-26T09:00:00.000Z] [bg] bg claimed-spare dddddddd (fleet)',
+      '[2026-10-26T09:00:00.000Z] [bg] bg claimed-spare eeeeeeee (fleet)',
+      '[2026-10-26T09:30:00.000Z] [bg] bg settled eeeeeeee (killed)',
+      '[2026-10-26T09:31:00.000Z] [bg] bg settled ffffffff (crashed): SIGKILL (137) before init',
+      '[2026-10-26T09:32:00.000Z] [bg] bg retire 33333333: settled, idle 61m',
+      '[2026-10-26T09:32:01.000Z] [bg] bg settled 33333333 (done)',
+      '[2026-10-26T09:33:00.000Z] [bg] bg retire 44444444: settled, idle 38h [low memory, pinned]',
+    ].join('\n'),
+  )
+  await startSession($, w)
+  const rows = (await call($, 'status', { refs: ['dddddddd', 'eeeeeeee', 'ffffffff', '11111111', '22222222', '33333333', '44444444', 'aaaaaaaa'] })).rows
+  expect(Object.fromEntries(rows.map((r: any) => [r.ref, r.stopped ?? null]))).toEqual({
+    dddddddd: 'ended',
+    eeeeeeee: 'person',
+    ffffffff: 'ended',
+    '11111111': 'person',
+    '22222222': 'ended',
+    '33333333': 'idle',
+    '44444444': 'memory',
+    aaaaaaaa: null,
+  })
+  const wake = async (ref: string) => {
+    const r = await call($, 'wake', { ref, reason: 'x' })
+    return r.ok ? r.state : `${r.state}: ${r.detail}`
+  }
+  expect(await wake('dddddddd')).toBe('queued')
+  expect(await wake('ffffffff')).toBe('queued')
+  expect(await wake('22222222')).toBe('queued')
+  expect(await wake('eeeeeeee')).toBe('refused: “stopped by the person” was stopped by you: Enter or u restarts it')
+  expect(await wake('11111111')).toBe('refused: “stopped from the panel” was stopped by you: Enter or u restarts it')
+  await w.clock.advance(600)
+  expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['dddddddd', 'ffffffff', '22222222'])
 })
 
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
