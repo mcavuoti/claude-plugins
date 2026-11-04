@@ -64,11 +64,12 @@ import {
   buildNotice,
   sparkline,
   stoppedKind,
+  stopLog,
   stopReasons,
   storeNamespace,
   shellQuote,
   isRef,
-  type StopReason,
+  type StopLog,
   colorOf,
   displayWidth,
   compareVersions,
@@ -919,23 +920,35 @@ async function reopenPass($: any) {
   }
 }
 
-// Why stopped sessions stopped, from the background service's log (stopReasons), read right then
-async function stopReasonsNow($: any): Promise<Record<string, StopReason>> {
-  if (!daemonLog) return {}
+// Why stopped sessions stopped, from the background service's log (stopLog), read right then. A log that can't be read
+// says nothing: no session reads as ended by itself (stoppedKind fails closed)
+async function stopLogNow($: any): Promise<StopLog> {
+  const none: StopLog = { reasons: {}, started: {}, deaths: [] }
+  if (!daemonLog) return none
   const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
-  return r.exitCode === 0 ? stopReasons(r.stdout) : {}
+  return r.exitCode === 0 ? stopLog(r.stdout) : none
 }
 
-// Why a background session of the list with no process is stopped (stoppedKind): the log's reasons, read once by the
-// caller, and the person's stop this mod remembers
-async function stoppedOf($: any, s: any, reasons: Record<string, StopReason>): Promise<'person' | 'idle' | 'memory' | 'ended'> {
-  return stoppedKind(typeof s.id === 'string' ? reasons[s.id] : undefined, await storeGet($, `personStop:${s.sessionId}`), s.startedAt)
+// Why a background session of the list with no process is stopped (stoppedKind): the log, read once by the caller; the
+// person's stop this mod remembers (a claude stop the log shows is remembered too, the first time it's seen, so it
+// outlives the log's tail); when it last ran (its last start in the log, or its mod's last heartbeat)
+async function stoppedOf($: any, s: any, log: StopLog): Promise<'person' | 'idle' | 'memory' | 'ended' | 'unknown'> {
+  const reason = typeof s.id === 'string' ? log.reasons[s.id] : undefined
+  let personAt = await storeGet($, `personStop:${s.sessionId}`)
+  if (reason?.why === 'stopped' && typeof personAt !== 'number') {
+    personAt = reason.at
+    await storeSet($, `personStop:${s.sessionId}`, reason.at)
+  }
+  const beatAt = (await readHeartbeats($, [s.sessionId]))[s.sessionId]?.at
+  const runs = [typeof s.id === 'string' ? log.started[s.id] : undefined, beatAt].filter((t): t is number => typeof t === 'number' && t > 0)
+  return stoppedKind(reason, personAt, runs.length ? Math.max(...runs) : undefined, log.deaths)
 }
 
 // Whether a session can be woken (another plugin's wake, ccc tell): running already, or stopped and wakeable. A
 // background session the service retired for being idle is woken, one that ended by itself (a crash, or the machine or
-// the service restarted under it), and one it closed for lack of memory once memory is normal again. Never a regular
-// session (it lives in its own window), one the person stopped, nor one closed for lack of memory while memory is short
+// the service restarted under it: on the log's evidence), and one it closed for lack of memory once memory is normal
+// again. Never a regular session (it lives in its own window), one the person stopped, one with no evidence of why it
+// stopped, nor one closed for lack of memory while memory is short
 type WakeVerdict = { state: 'running' } | { state: 'refused'; detail: string } | { state: 'wake'; id: string; name: string }
 async function wakeVerdict($: any, ref: string): Promise<WakeVerdict> {
   const s = lastList.find(x => refOf(x) === ref)
@@ -943,8 +956,9 @@ async function wakeVerdict($: any, ref: string): Promise<WakeVerdict> {
   const name = String(projectRows.find(f => f.sessionId === s.sessionId)?.title ?? (s.name || s.id || ref))
   if (s.kind !== 'background' || typeof s.id !== 'string') return { state: 'refused', detail: `“${name}” is a regular session: it lives in its own window` }
   if (s.pid) return { state: 'running' }
-  const why = await stoppedOf($, s, await stopReasonsNow($))
+  const why = await stoppedOf($, s, await stopLogNow($))
   if (why === 'person') return { state: 'refused', detail: `“${name}” was stopped by you: Enter or u restarts it` }
+  if (why === 'unknown') return { state: 'refused', detail: `nothing says why “${name}” stopped (not a crash or a restart the service's log shows): Enter or u restarts it` }
   if (why === 'memory' && (await platform.memoryNormal(sys($))) !== true) return { state: 'refused', detail: `Claude closed “${name}” for lack of memory, and memory is still short` }
   return { state: 'wake', id: s.id, name }
 }
@@ -2707,7 +2721,7 @@ async function ownVersion($: any): Promise<string> {
 
 // A session of the official list as another plugin sees it. reasons: the service log's stop reasons, read once by the
 // caller when a row it answers is stopped
-async function statusOf($: any, s: any, now: number, reasons: () => Promise<Record<string, StopReason>>): Promise<SessionsStatus> {
+async function statusOf($: any, s: any, now: number, reasons: () => Promise<StopLog>): Promise<SessionsStatus> {
   const e = await readState($, s.sessionId)
   const mine = s.sessionId === myId
   const hb = mine ? 'ok' : s.pid ? heartbeatStatus((await readHeartbeats($, [s.sessionId]))[s.sessionId] ?? null, s.pid, now) : 'missing'
@@ -2748,8 +2762,8 @@ function sessionsApi($: any): Sessions {
       const out: SessionsStatus[] = []
       const done = new Set<string>()
       // The service's log is read once, and only when a row is stopped
-      let log: Record<string, StopReason> | null = null
-      const reasons = async () => (log ??= await stopReasonsNow($))
+      let log: StopLog | null = null
+      const reasons = async () => (log ??= await stopLogNow($))
       for (const ref of strings(input?.refs)) {
         const s = lastList.find(x => refOf(x) === ref)
         if (done.has(s?.sessionId ?? `gone:${ref}`)) continue

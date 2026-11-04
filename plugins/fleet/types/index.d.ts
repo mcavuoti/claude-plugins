@@ -51,6 +51,7 @@ declare module 'claude-code' {
       ownTold: Record<string, number>
       /** The decisions of other sessions this one said its work waits on (decide kind wait), by id, when it said so: told once each closes */
       waitsOn: Record<string, number>
+      dialogNews: string[]
       /** The band's count of the roster's instances over their budget today */
       overBudget: number
       /** The short id this session's seed was submitted for (an instance is seeded once per session) */

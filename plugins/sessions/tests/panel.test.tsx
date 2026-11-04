@@ -6,6 +6,7 @@ import {
   reconcilePins,
   sparkline,
   stoppedKind,
+  stopLog,
   stopReasons,
   daysUpTo,
   paneWidth,
@@ -423,16 +424,36 @@ test('why a session stopped: retired for being idle, closed for lack of memory, 
   expect(stopReasons('[2026-10-26T15:00:00.000Z] [bg] bg settled cccccccc (crashed): SIGKILL (137) before init').cccccccc?.why).toBe('ended')
 })
 
-test('why a stopped session is stopped: retired, closed for memory, the person (logged, or remembered until it ran again), else it ended by itself', () => {
-  expect(stoppedKind({ at: 1, why: 'idle' }, 5, 0)).toBe('idle')
-  expect(stoppedKind({ at: 1, why: 'low-memory' }, undefined, 0)).toBe('memory')
-  expect(stoppedKind({ at: 1, why: 'stopped' }, undefined, 0)).toBe('person')
-  expect(stoppedKind({ at: 1, why: 'ended' }, undefined, 0)).toBe('ended')
-  // No line at all: a machine or service restart, unless the panel's s stopped it and it hasn't been started since
-  expect(stoppedKind(undefined, undefined, 100)).toBe('ended')
-  expect(stoppedKind(undefined, 200, 100)).toBe('person')
-  expect(stoppedKind(undefined, 200, undefined)).toBe('person')
-  expect(stoppedKind(undefined, 200, 300)).toBe('ended')
+test('why a stopped session is stopped: retired, closed for memory, the person (logged, or remembered until it ran again), ended on evidence, else unknown', () => {
+  expect(stoppedKind({ at: 1, why: 'idle' }, 5, 0, [])).toBe('idle')
+  expect(stoppedKind({ at: 1, why: 'low-memory' }, undefined, 0, [])).toBe('memory')
+  expect(stoppedKind({ at: 1, why: 'stopped' }, undefined, 0, [])).toBe('person')
+  expect(stoppedKind({ at: 1, why: 'ended' }, undefined, 0, [])).toBe('ended')
+  // No line for it: ended only when the service found workers dead after it last ran (a machine or service restart)
+  expect(stoppedKind(undefined, undefined, 100, [150])).toBe('ended')
+  expect(stoppedKind(undefined, undefined, 100, [50])).toBe('unknown')
+  // Nothing at all (the log rolled on, or can't be read): unknown, never ended (fail closed)
+  expect(stoppedKind(undefined, undefined, undefined, [150])).toBe('unknown')
+  expect(stoppedKind(undefined, undefined, 100, [])).toBe('unknown')
+  // The person's stop, remembered, until the session ran again after it
+  expect(stoppedKind(undefined, 200, 100, [250])).toBe('person')
+  expect(stoppedKind(undefined, 200, undefined, [250])).toBe('person')
+  expect(stoppedKind(undefined, 200, 300, [350])).toBe('ended')
+  expect(stoppedKind(undefined, 200, 300, [])).toBe('unknown')
+})
+
+test('the log: last starts and the service finding workers dead are kept', () => {
+  const l = stopLog(
+    [
+      '[2026-10-26T09:00:00.000Z] [bg] bg claimed-spare aaaaaaaa (fleet)',
+      '[2026-10-26T09:10:00.000Z] [bg] bg adopt: adopted=7 respawned=0 dead=0',
+      '[2026-10-26T09:20:00.000Z] [bg] bg spawned bbbbbbbb',
+      '[2026-10-26T09:30:00.000Z] [bg] bg adopt: adopted=0 respawned=0 dead=6',
+    ].join('\n'),
+  )
+  expect(l.started).toEqual({ aaaaaaaa: Date.parse('2026-10-26T09:00:00.000Z'), bbbbbbbb: Date.parse('2026-10-26T09:20:00.000Z') })
+  expect(l.deaths).toEqual([Date.parse('2026-10-26T09:30:00.000Z')])
+  expect(l.reasons).toEqual({})
 })
 
 test('reopen: only those from the last 2 h count towards the limit', () => {

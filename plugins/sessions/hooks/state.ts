@@ -411,36 +411,55 @@ export function adoptAutoPins(pins: readonly string[], remote: Readonly<Record<s
 // Why the background service's sessions that are still stopped stopped, and when (ms), from its log
 // (~/.claude/daemon.log). The service retires an idle session ("retire <id>: settled, idle 61m", or "idle-prompt"),
 // and closes idle ones when memory runs out ("retire <id>: … [low memory…]"); each retire is followed by the process
-// ending ("settled <id> (done)"). A process that ends with no retire before it was stopped some other way: by the
-// person (claude stop, the panel's s), or a crash. Starting again ("claimed-spare" or "spawned") clears the record
-// A process that ends with no retire before it: `settled <id> (killed)` was killed by a claude stop (the person's: the
-// panel's s, or typed; a respawn's kill is followed by its claimed-spare, which clears it); any other end, `(done)` or
-// `(crashed)`, ended by itself. A machine that restarted, or a service that went down with its workers, leaves no line
+// ending ("settled <id> (done)"). A process that ends with no retire before it: `settled <id> (killed)` was killed by
+// a claude stop (the person's: the panel's s, or typed; a respawn's kill is followed by its claimed-spare, which clears
+// it); any other end, `(done)` or `(crashed)`, ended by itself. Starting again ("claimed-spare" or "spawned") clears the
+// record and is kept as the session's last start. A machine that restarted, or a service that went down with its
+// workers, leaves no line for each session: the service's next start says how many it found dead ("adopt: … dead=3"),
+// and those times are kept as deaths
 export type StopReason = { at: number; why: 'idle' | 'low-memory' | 'stopped' | 'ended' }
-export function stopReasons(log: string): Record<string, StopReason> {
-  const out: Record<string, StopReason> = {}
+export type StopLog = { reasons: Record<string, StopReason>; started: Record<string, number>; deaths: number[] }
+export function stopLog(log: string): StopLog {
+  const reasons: Record<string, StopReason> = {}
+  const started: Record<string, number> = {}
+  const deaths: number[] = []
   for (const line of log.split('\n')) {
+    const adopt = line.match(/^\[([^\]]+)\] \[bg\] bg adopt: .*\bdead=(\d+)/)
+    if (adopt) {
+      if (Number(adopt[2]) > 0) deaths.push(Date.parse(adopt[1] ?? '') || 0)
+      continue
+    }
     const m = line.match(/^\[([^\]]+)\] \[bg\] bg (retire|settled|claimed-spare|spawned) ([0-9a-f]{8})\b(.*)$/)
     if (!m) continue
     const [, when = '', event, id = '', rest = ''] = m
     const at = Date.parse(when) || 0
-    if (event === 'retire') out[id] = { at, why: /\[low memory/.test(rest) ? 'low-memory' : 'idle' }
-    else if (event === 'settled') out[id] ??= { at, why: /^\s*\(killed\)/.test(rest) ? 'stopped' : 'ended' }
-    else delete out[id]
+    if (event === 'retire') reasons[id] = { at, why: /\[low memory/.test(rest) ? 'low-memory' : 'idle' }
+    else if (event === 'settled') reasons[id] ??= { at, why: /^\s*\(killed\)/.test(rest) ? 'stopped' : 'ended' }
+    else {
+      delete reasons[id]
+      started[id] = at
+    }
   }
-  return out
+  return { reasons, started, deaths }
+}
+export function stopReasons(log: string): Record<string, StopReason> {
+  return stopLog(log).reasons
 }
 
 // Why a background session with no process is stopped ($.sessions' SessionsStopped): the service retired it for being
-// idle, or closed it for lack of memory; the person stopped it (a claude stop the log shows, or the panel's s this mod
-// remembers, personAt, unless the session was started again after it); else it ended by itself: a crash, or a machine
-// or service restart, which leave no line
-export function stoppedKind(reason: StopReason | undefined, personAt: unknown, startedAt: unknown): 'person' | 'idle' | 'memory' | 'ended' {
+// idle, or closed it for lack of memory; the person stopped it (a claude stop the log shows, or one this mod remembers,
+// personAt, unless the session ran again after it: lastRun, its last start in the log or its mod's last heartbeat); it
+// ended by itself, on positive evidence only: the log says its process ended (a crash), or the service found workers
+// dead (a machine or service restart) after the session last ran. With no evidence either way, unknown: a plugin's
+// wake leaves it stopped, as one the person stopped (fail closed: the log's lines roll out, or it can't be read)
+export function stoppedKind(reason: StopReason | undefined, personAt: unknown, lastRun: number | undefined, deaths: readonly number[]): 'person' | 'idle' | 'memory' | 'ended' | 'unknown' {
   if (reason?.why === 'idle') return 'idle'
   if (reason?.why === 'low-memory') return 'memory'
   if (reason?.why === 'stopped') return 'person'
-  if (typeof personAt === 'number' && !(typeof startedAt === 'number' && startedAt > personAt)) return 'person'
-  return 'ended'
+  if (typeof personAt === 'number' && !(typeof lastRun === 'number' && lastRun > personAt)) return 'person'
+  if (reason?.why === 'ended') return 'ended'
+  if (typeof lastRun === 'number' && lastRun > 0 && deaths.some(t => t >= lastRun)) return 'ended'
+  return 'unknown'
 }
 
 // The times the mod reopened a session in the last 2 h (so it doesn't insist if memory fills up again)
