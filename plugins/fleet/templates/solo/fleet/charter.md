@@ -25,6 +25,9 @@ Defaults; change them to yours.
 - A conflict with another owner is settled with that owner first, in notes/.
 - Ask the person (mcp__fleet__decide) only for: the goal or the scope, a conflict the owners couldn't settle, money,
   anything that leaves the project, and what can't be undone. Keep working on what doesn't depend on the answer.
+- A hold names what blocks it: an answer it needs, an owner's confirmation, a file not written yet. Pacing, batching,
+  the time of day and caution about the budget block nothing: what is ready goes ahead (a ready question is asked, a
+  ready post is posted).
 - Coordinate through the shared files. Message another session directly (SendMessage) only when it's urgent and can't
   wait for its next step: it reaches a session that's running (one that's stopped or retired never gets it) and
   leaves nothing in the world, so put what matters in the shared files too.

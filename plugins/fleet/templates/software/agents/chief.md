@@ -27,12 +27,17 @@ change to a command-level file on your own (draft it, the person applies it).
 How the project works:
 - You run in the background and nobody watches you. Ask the person with mcp__fleet__decide (1 to 4 questions, each with
   2 to 4 options, the one you recommend and one line on why), never with AskUserQuestion or in your reply. The answers
-  come back later as a message from fleet that starts with [D-<n>]. Before you ask the person, settle what can be
+  come back later as a message from fleet that starts with [D-<n>], at your next step (while you work too). A D-<n> in
+  decisions/queue/ that has answers (decisions/answers/D-<n>.*.json) is answered, not open: its asker gets it at its
+  next step. Before you ask the person, settle what can be
   settled by running something or reading the world (the shared files, the code, .claude/fleet/verify.md): send the
   person only decisions of taste, product or priority.
 - The shared files (world.json lists them) are how the sessions coordinate. Read one before you write it. When fleet
   refuses a write because the file changed since you read it, read it again and redo the write so it agrees.
 - Cite the records you rely on by the version fleet tells you when you read them (S-3@2).
+- When fleet flags files of yours for citing an older version of a record and, once you've read the record, they still
+  hold, say so with mcp__fleet__confirm (of: its id): their flags clear with no new version of them, so nothing
+  cascades to whoever cites them. Re-pin (cite the new version) only in a file you're rewriting anyway.
 - Before you land, read .claude/fleet/verify.md (how this project proves something works) and do what it says.
 - Land what you have at the end of each turn: your journal says what you asked, what the person answered, what you
   filed.
@@ -44,6 +49,9 @@ How the project works:
   you've used before, not a new word) and say honestly whether it's reversible and whether it touchesMoney or
   reaches the outsideWorld: the project's judges apply the person's past answers to it, and never to one that spends
   money, reaches outside or can't be undone.
+- Nothing waits but on what blocks it. When you hold a question, a draft or a post, say on it what it waits on (an
+  answer, an owner's confirmation, a file not written yet); pacing, batches, the time of day or caution about the
+  budget aren't reasons: what is ready goes now.
 - When the person says no to something, reverts it or corrects it, even when it worked ("too complicated", "no
   stand-ins", a default changed back), record it with mcp__fleet__taste: what they said, what it was about, and the
   principle it suggests. That is how their taste reaches the judges.

@@ -41,7 +41,7 @@ test('a decision by its id needs no list; with one thing waiting, 1 is it; with 
   queued(w, 'D-4', B, [{ ...SPLIT, question: 'Which test runner?', options: [{ label: 'Fast' }, { label: 'Thorough' }], recommended: 'Fast' }])
   const byId = await fleet($, 'D-4 b')
   expect(byId).toContain('D-4: Which test runner? → b) Thorough')
-  expect(byId).toContain("D-4 goes to Owner B when it's idle")
+  expect(byId).toContain("D-4 goes to Owner B at its next step")
   expect(json(w, `${DEC}/answers/D-4.1.json`)).toMatchObject({ label: 'Thorough' })
   // One that's answered, or not there
   expect(await fleet($, 'D-3 a')).toBe('D-3: D-3 is answered already')
@@ -125,8 +125,8 @@ test('the same question from several askers is one item: one answer goes to each
   expect(await fleet($, 'status')).toContain('project: 3 question(s) for you')
   const said = await fleet($, '1c')
   expect(said).toContain('1: Which part of the site is yours? → c) Build (the same answer to D-11)')
-  expect(said).toContain("D-10 goes to Owner A when it's idle")
-  expect(said).toContain("D-11 goes to Owner B when it's idle")
+  expect(said).toContain("D-10 goes to Owner A at its next step")
+  expect(said).toContain("D-11 goes to Owner B at its next step")
   expect(json(w, `${DEC}/answers/D-10.1.json`)).toMatchObject({ label: 'Build' })
   expect(json(w, `${DEC}/answers/D-11.1.json`)).toMatchObject({ label: 'Build' })
   expect(w.files.has(`${DEC}/answers/D-12.1.json`)).toBe(false)
@@ -196,6 +196,38 @@ test('a change applied leaves the others to its file stale: the list says so, an
   expect(json(w, `${DEC}/answers/D-3.1.json`)).toMatchObject({ label: 'rejected' })
 })
 
+test('after send or apply a note goes in quotes: words in none refuse the whole line, nothing sent or applied; on a question they are its answer', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n', [`${ROOT}/notes/x.md`]: 'n\n' } })
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Owner A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
+  const runs: string[][] = []
+  w.exec.value = argv => {
+    if (argv[0] !== '/bin/sh') return undefined
+    runs.push(argv)
+    return { exitCode: 0, stdout: 'ok\n' }
+  }
+  await startSession($, w)
+  expect((await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'goal A', content: '# Charter\n\nGoal A.\n' })).result).toContain('Queued as D-1')
+  expect(((await $.tool.call({ tool: 'mcp__fleet__send', to: 'example.invalid', why: 'the vendor asked', command: 'curl -d @notes/x.md https://example.invalid/upload' } as any)) as any).result).toContain('Queued as D-2')
+  queued(w, 'D-3', A, [SPLIT])
+  const list = await fleet($, '')
+  expect(list).toContain('D-3')
+  for (const typed of ['D-2 send not yet', 'D-2 send?', 'D-2 send --allow just this once', 'D-1 apply but rename X first', 'D-1 apply no wait', 'D-3 a D-2 send, but only to the team chat']) {
+    const r = await fleet($, typed)
+    expect(r).toContain('Nothing was recorded')
+    expect(r).toContain(`You typed:\n/fleet ${typed}`)
+  }
+  expect(await fleet($, 'D-2 send not yet')).toContain('/fleet D-2 send "not yet" sends it as shown, your words its note\n/fleet D-2 reject "not yet" doesn\'t send it (its asker hears your words)\n/fleet note D-2 "not yet" adds your words and leaves it waiting')
+  expect(await fleet($, 'D-2 send --allow just this once')).toContain('/fleet D-2 send --allow "just this once" sends it')
+  expect(await fleet($, 'D-1 apply but rename X first')).toContain('/fleet D-1 edit changes the draft first')
+  expect(runs).toEqual([])
+  expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n')
+  expect(under(w, `${DEC}/answers`)).toEqual([])
+  // On a question, a verb then words is the person's answer
+  expect(await fleet($, 'D-3 send it to the docs team')).toContain('D-3: Which part of the site is yours? → "send it to the docs team"')
+  // In quotes it goes
+  expect(await fleet($, 'D-1 apply "goal A it is"')).toContain('applied D-1')
+})
+
 test('the person answers in the asker’s own session: the turn hears which question waits, and decide kind answered takes it off the queue with their words', WITH_SESSIONS, async ($, on) => {
   const w = world(on)
   w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: null }))
@@ -234,6 +266,16 @@ test('the person answers in the asker’s own session: the turn hears which ques
   expect(w.files.has(`${DEC}/answers/D-2.1.json`)).toBe(false)
   expect((await decide($, { kind: 'answered', id: 'D-2', q: 1 })).deny).toContain('was asked by another session (Owner A)')
   expect(w.files.has(`${DEC}/answers/D-2.1.json`)).toBe(false)
+  await $.turn.complete({ text: '' } as any)
+  // His words past what an answer keeps: never cut, the question stays for /fleet
+  expect((await decide($, { questions: [{ ...SPLIT, question: 'Which part is next?' }] })).result).toContain('Queued as D-3')
+  await $.turn.complete({ text: '' } as any)
+  await w.clock.advance(1000)
+  const long = `docs first, ${'x'.repeat(4100)}`
+  await $.prompt.submit({ text: long, origin: { kind: 'composer' }, wait: false } as any)
+  await $.turn.start({ text: long, turnId: 't-3' })
+  expect((await decide($, { kind: 'answered', id: 'D-3' })).deny).toBe('the person\'s words this turn are over 4000 characters, more than an answer keeps whole: leave D-3 open; it reaches them in their queue, to answer with /fleet D-3 "…". Nothing was changed.')
+  expect(w.files.has(`${DEC}/answers/D-3.1.json`)).toBe(false)
 })
 
 test('kind answered: one question at a time (q), the rest stay queued; once complete the result brings every answer; never a question asked after the prompt; a prompt typed into the turn adds to the words; from the phone too', WITH_SESSIONS, async ($, on) => {

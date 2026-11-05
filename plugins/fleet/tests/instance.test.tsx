@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
 import { dateLine } from '../hooks/roster'
-import { BAND, DEC, FAKE_LOG, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
+import { BAND, DEC, FAKE_LOG, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, under, world, type World, WITH_SESSIONS } from './world'
 import { OWNER, PROJECT } from './up.test'
 
 // The roster from an instance's side: this session is "Owner A" (its settings gave it FLEET_INSTANCE), a background
@@ -66,6 +66,28 @@ test('an instance binds from its settings, writes a heartbeat with its spend, is
   expect(status).toContain('this session: Owner A (owner); runs as owner')
   expect(status).toContain('  Owner A · owner · Owners · wave 1 · idle · job aaaaaaaa · fleet ')
   expect(status).toContain('· seeded · $0.25 of $1.00 today')
+})
+
+test('the person typing in an instance’s session hears whose instance it is: once, then again after half an hour', WITH_SESSIONS, async ($, on) => {
+  const w = await instance($, on)
+  await tick(w)
+  // He attached to it (a viewer): what he types there is his
+  w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: '2026-11-02T11:00:00Z' }))
+  const LINE = "fleet: you're typing to the Owner A instance (role owner): what you say here steers its work"
+  const typed = async (text: string, turnId: string) => {
+    await $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false } as any)
+    await $.turn.start({ text, turnId })
+    await $.turn.complete({ text: '' } as any)
+    await w.clock.settle()
+  }
+  // fleet's own prompt (its seed) isn't his
+  expect(w.logs.filter(l => l === LINE)).toEqual([])
+  await typed('How far along is the plan?', 't-1')
+  await typed('And the tests?', 't-2')
+  expect(w.logs.filter(l => l === LINE).length).toBe(1)
+  await tick(w, 31 * 60000)
+  await typed('Anything blocked?', 't-3')
+  expect(w.logs.filter(l => l === LINE).length).toBe(2)
 })
 
 test("a child sits under its parent once the parent's fleet runs; an instance the roster doesn't have isn't one", WITH_SESSIONS, async ($, on) => {
@@ -188,7 +210,9 @@ test('a change refused: its file moved since (stale, told), its draft swapped (u
   expect(w.files.get(`${ROOT}/req/R-1.md`)).toBe('R-1: the target is 8\n')
   // A shared file: its landing is the person's, through an answer
   const events = [...w.files.keys()].filter(p => p.startsWith(`${FLEET}/events/${hourFolder(w.clock.now())}/`)).map(p => JSON.parse(w.files.get(p) as string))
-  expect(events.find(e => e.via === 'answer')).toMatchObject({ path: 'req/R-1.md', from: hashText('R-1: the target is 10\n'), to: hashText('R-1: the target is 8\n'), by: { person: true }, id: 'R-1' })
+  expect(events.find(e => e.via === 'answer')).toMatchObject({ path: 'req/R-1.md', from: hashText('R-1: the target is 10\n'), to: hashText('R-1: the target is 8\n'), by: { person: true }, id: 'R-1', drafter: { ref: REF } })
+  // ... drafted by this session, which hears its flags (G20)
+  expect(json(w, `${FLEET}/state/revs/R-1/2.json`)).toMatchObject({ by: { person: true }, drafter: { ref: REF } })
   // D-2 was drafted on what's no longer there
   const stale = await fleet($, '2 apply')
   expect(stale).toContain('2: not applied: req/R-1.md changed at ')
@@ -210,7 +234,8 @@ test('a change refused: its file moved since (stale, told), its draft swapped (u
   expect(w.files.get(`${ROOT}/req/R-1.md`)).toBe('R-1: the target is 6\n')
   expect(await fleet($, '1 edit')).toContain(`1: edit the draft in your editor: ${FLEET}/decisions/drafts/D-3.md`)
   // Its file moved too (D-4 landed): with a note of his, a reject is his rejection (with none, it closes as stale)
-  expect(await fleet($, '1 reject "not 5"')).toBe('1: rejected D-3 (the change to req/R-1.md). Owner A hears it.')
+  // Typed in an instance's own session: said, whatever the kind (P13)
+  expect(await fleet($, '1 reject "not 5"')).toBe("1: rejected D-3 (the change to req/R-1.md). Owner A hears it.\n(typed in Owner A's session, an instance of the roster: recorded as your answers all the same)")
   await tick(w)
   const told = w.submits.join('\n\n')
   expect(told).toContain('[D-2] The person couldn\'t apply your change to req/R-1.md ("the target becomes 9"): req/R-1.md changed at')
@@ -218,15 +243,32 @@ test('a change refused: its file moved since (stale, told), its draft swapped (u
   expect(told).toContain('[D-4] The person applied your change to req/R-1.md ("the target becomes 7"): fleet wrote it, with edits of their own to the draft: read it before you rely on it.')
 })
 
+test('a new day after it stopped over its budget (B15): its next process hears once to resume, as a nudge', WITH_SESSIONS, async ($, on) => {
+  // Its last process wrote, yesterday, that it was over
+  const w = await instance($, on, { files: { [`${HB}/state.json`]: JSON.stringify({ format: 1, instance: 'Owner A', slug: 'owner-a', ref: REF, sessionId: SID, at: Date.UTC(2026, 10, 1, 23, 0, 0), cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: Date.UTC(2026, 10, 1, 20, 0, 0), budget: { day: '2026-11-01', usd: 1.2, cap: 1, state: 'over' } }), [`${HB}/seed-${REF}.json`]: JSON.stringify({ format: 1, ref: REF, at: 1 }) } })
+  for (let i = 0; i < 3; i++) await tick(w, 30000)
+  const resumed = w.submits.filter(s => s.includes('resume any work you stopped for the budget'))
+  expect(resumed.length).toBe(1)
+  expect(resumed[0]).toContain("fleet: a new day: this instance's budget ($1.00 a day) has room again: resume any work you stopped for the budget (your open items, a run to record, where your journal says you stopped).")
+  for (let i = 0; i < 3; i++) await tick(w, 30000)
+  expect(w.submits.filter(s => s.includes('resume any work you stopped for the budget')).length).toBe(1)
+  const r: any = await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/a.md` } as any)
+  expect((r.context ?? []).join('\n')).not.toContain('budget')
+})
+
 test('over its budget: told once, marked on the band, new helpers refused (nothing else); the person lifts it for the day', WITH_SESSIONS, async ($, on) => {
   const cost = { value: 0.85 }
   const w = await instance($, on, { cost, files: { [`${ROOT}/notes/a.md`]: 'a\n' } })
   await tick(w)
-  // At 85%: a line at the next step, once
+  // At 85%: the model hears nothing (B15: told to land what it had, instances wrapped up early); the band and status say it
   const read1: any = await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/a.md` } as any)
-  expect(read1.context.join('\n')).toContain("fleet: this instance's budget ($0.85 of $1.00 today, estimated at list price) is past 80%: land what you have")
-  const read2: any = await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/a.md` } as any)
-  expect((read2.context ?? []).join('\n')).not.toContain('budget')
+  expect((read1.context ?? []).join('\n')).not.toContain('budget')
+  await tick(w, 10100)
+  const near = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(JSON.stringify(await near.drawn())).toContain('! 1 past 80% of budget · /fleet status')
+  await near.unmount()
+  expect(await fleet($, 'status')).toContain('past 80%')
+  expect(w.submits.join('\n')).not.toContain('80%')
   expect(await $.agent.spawn({ prompt: 'help me' } as any)).toMatchObject({ agentId: 'a9' })
   // Past it
   cost.value = 1.1
@@ -251,6 +293,18 @@ test('over its budget: told once, marked on the band, new helpers refused (nothi
   await tick(w, 10100)
   expect(await fleet($, 'budget "Owner A" +1')).toContain('Owner A: $2.00 for today ($1.10 spent so far)')
   expect(await $.agent.spawn({ prompt: 'help me' } as any)).toMatchObject({ agentId: 'a9' })
+  // Raised: it hears once to resume what it stopped for the budget; idle, as a nudge of its own fleet (B15)
+  const before = w.submits.length
+  await tick(w, 40000)
+  const resumed = w.submits.slice(before)
+  expect(resumed.length).toBe(1)
+  expect(resumed[0]).toContain("fleet: this instance's budget was raised to $2.00: resume any work you stopped for the budget")
+  expect(resumed[0]).toContain('This is a nudge from fleet')
+  expect(resumed[0]).not.toContain('check whether your work still holds')
+  await tick(w, 40000)
+  expect(w.submits.length).toBe(before + 1)
+  const read4: any = await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/a.md` } as any)
+  expect((read4.context ?? []).join('\n')).not.toContain('budget')
 })
 
 test('a nudge: an idle instance whose shared file changed is prompted by its own fleet, once per window', WITH_SESSIONS, async ($, on) => {

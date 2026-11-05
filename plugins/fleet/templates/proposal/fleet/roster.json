@@ -10,22 +10,23 @@
     { "id": "checks", "title": "Checks", "order": 221 }
   ],
   "roles": {
-    "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24, "subscribe": { "kinds": ["resource"] } },
+    "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24, "subscribe": { "kinds": ["resource"] }, "settings": { "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000" } } },
     "requirements": { "agent": "requirements", "model": "opus", "budget": { "usdDay": 12 }, "cadenceH": 12, "subscribe": { "tags": ["requirements"], "kinds": ["command-claim"], "paths": ["req/**"] } },
-    "integrator": { "agent": "integrator", "context": "long", "model": "opus", "budget": { "usdDay": 15 }, "cadenceH": 12 },
+    "integrator": { "agent": "integrator", "context": "long", "model": "opus", "budget": { "usdDay": 15 }, "cadenceH": 12, "settings": { "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000" } } },
     "poc": { "agent": "poc", "model": "sonnet", "budget": { "usdDay": 12 }, "cadenceH": 6, "subscribe": { "tags": ["test"] }, "code": { "depot": { "client": "project-{slug}" } } },
     "researcher": { "agent": "researcher", "model": "sonnet", "budget": { "usdDay": 8 }, "cadenceH": 8 },
     "researcher-internal": { "agent": "researcher-internal", "model": "sonnet", "budget": { "usdDay": 8 }, "cadenceH": 8, "subscribe": { "tags": ["internal"] } },
     "tester": { "agent": "tester", "model": "haiku", "budget": { "usdDay": 3 }, "cadenceH": 6, "code": { "depot": { "client": "project-{slug}" } } },
     "verifier": { "agent": "verifier", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 12, "verifies": ["researcher", "researcher-internal", "tester", "PoC A", "PoC B"] },
     "janitor": { "agent": "janitor", "model": "haiku", "budget": { "usdDay": 2 }, "cadenceH": 12 },
-    "planner": { "agent": "planner", "model": "sonnet", "budget": { "usdDay": 6 }, "cadenceH": 24, "subscribe": { "tags": ["plan"] } }
+    "planner": { "agent": "planner", "model": "sonnet", "budget": { "usdDay": 6 }, "cadenceH": 24, "subscribe": { "tags": ["plan"] } },
+    "liaison": { "agent": "liaison", "model": "sonnet", "budget": { "usdDay": 3 }, "cadenceH": 6 }
   },
   "instances": [
     { "name": "Chief", "role": "chief", "section": "front", "wave": 1 },
     { "name": "Requirements", "role": "requirements", "section": "spec", "wave": 1 },
     { "name": "Integrator", "role": "integrator", "section": "integration", "wave": 1 },
-    { "name": "Lead PoC", "role": "poc", "context": "long", "model": "opus", "section": "work", "wave": 1, "brief": "You lead the proofs of concept: you hold their overall picture and split the work among the specialists." },
+    { "name": "Lead PoC", "role": "poc", "context": "long", "model": "opus", "section": "work", "wave": 1, "brief": "You lead the proofs of concept: you hold their overall picture and split the work among the specialists.", "settings": { "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000" } } },
     { "name": "PoC A", "role": "poc", "section": "work", "parent": "Lead PoC", "wave": 2, "subscribe": { "tags": ["area-a"] }, "brief": "You are the specialist for area A of the proof of concept, as the lead's plan draws it." },
     { "name": "PoC B", "role": "poc", "section": "work", "parent": "Lead PoC", "wave": 2, "subscribe": { "tags": ["area-b"] }, "brief": "You are the specialist for area B of the proof of concept, as the lead's plan draws it." },
     { "name": "Research Ext", "role": "researcher", "section": "research", "wave": 2, "subscribe": { "tags": ["technology"] }, "brief": "You research outside work: published approaches and technologies that bear on the requirements." },
@@ -37,7 +38,7 @@
     { "name": "Janitor", "role": "janitor", "section": "checks", "wave": 3 },
     { "name": "Business Plan", "role": "planner", "section": "integration", "wave": 3 }
   ],
-  "settings": { "permissions": { "defaultMode": "auto" }, "worktree": { "bgIsolation": "none" } },
+  "settings": { "permissions": { "defaultMode": "auto" }, "worktree": { "bgIsolation": "none" }, "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "300000" } },
   "budget": { "usdDay": 150 },
   "wakes": { "everyMin": 60, "perDay": 8 },
   "person": { "addresses": [], "principals": [], "front": "Chief", "channel": { "kind": "terminal" }, "perDay": 3, "waitingMin": 120 }

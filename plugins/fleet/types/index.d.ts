@@ -11,7 +11,7 @@ export type FleetLate = { notes: { q: number; question: string; text: string }[]
 
 /** A Bash command run in the background (run_in_background, or moved there), until it completes: its thread, when it
  * started, and the world as it was then (path, time, size), to compare with when it's done */
-export type FleetBg = { thread: string; at: number; before: [string, number, number][]; readOnly?: boolean }
+export type FleetBg = { thread: string; at: number; before: [string, number, number][]; readOnly?: boolean; command?: string }
 
 /** A world file as one thread last read it (or wrote it): the version, when, and the newest version it was told of;
  * for a record, the version number fleet gave what it read */
@@ -45,8 +45,11 @@ declare module 'claude-code' {
       /** What the gate told each thread once already: thread → path → the version it was refused at; 'pins:<path>'
        * → the pin problems it was told (one per line); 'copy:<path>' → 'told' (a write of a worktree's copy, once) */
       warned: Record<string, Record<string, string>>
-      /** What the band counts besides the questions: the project's suspect files and files failing a check */
+      /** What the band counts besides the questions: the project's suspect files and files failing a check (a file
+       * only behind a move aside) */
       flags: number
+      /** The band's line for the files only behind a move: "20 behind R-1@4", or '' */
+      behind: string
       /** What this session's model was told about the files it owns (suspects, failed checks): key → when */
       ownTold: Record<string, number>
       /** The decisions of other sessions this one said its work waits on (decide kind wait), by id, when it said so: told once each closes */
@@ -83,6 +86,17 @@ declare module 'claude-code' {
       workLandedAt: number
       /** When fleet last cleared this instance for a fresh period (0: never) */
       freshAt: number
+      /** The idle episode (its idleSince) fleet compacted this instance's conversation in (0: none) */
+      compactedFor: number
+      /** Until when the changes under the paths this instance watches were told (a nudge carried them) */
+      watchTold: number
+      /** The pending restart (instances/<slug>/restart.json's time) this instance asked sessions to carry out */
+      restartAsked: number
+      /** When this instance last asked sessions for that restart, and whether sessions queued it (a refusal is asked
+       * again after 2 min, a queued one that didn't happen after 5) */
+      restartAskedAt: { at: number; queued: boolean }
+      /** When this session's process started (its first heartbeat): a restart starts it over, a hot reload doesn't */
+      startedHere: number
       /** That fresh period's hand-off (its journal), until a turn carrying it starts: a dropped one is submitted again */
       handoff: { text: string; at: number } | null
       /** What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing) */
@@ -108,6 +122,16 @@ declare module 'claude-code' {
       /** Whether this conversation of an instance was told who it is (classic.SessionStart's context, or fleet's own
        * when that hook doesn't reach it); false again after /clear, resume and compaction */
       identityTold: boolean
+      /** What this instance was told of the work around it, by key (an open item offered, a run finished, its budget
+       * raised, what it had in flight after a restart or a compaction, the front's capacity note): key → when */
+      workTold: Record<string, number>
+      /** What it had in flight when its conversation was restarted or compacted, said at its next step ('' for none) */
+      inFlightNote: string
+      /** That note comes from fleet's own idle compaction: said at its next step, never a nudge of its own */
+      inFlightQuiet: boolean
+      /** The day this instance was told its budget is used up, until it's told to resume ('' for none; a /clear keeps
+       * it, so a new day or a raise tells it to resume) */
+      budgetOverDay: string
     }
   }
 }

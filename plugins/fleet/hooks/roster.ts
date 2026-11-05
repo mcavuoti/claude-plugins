@@ -88,6 +88,16 @@ type Overrides = {
   /** The roles or instances whose work it verifies: /fleet up --dry-run marks one that runs its model, since a
    * different model reads their work afresh */
   verifies?: string[]
+  /** Shared paths (globs) whose changes count for it like files it read: a nudge when running, a wake when retired
+   * (coalesced in the wakes); a role's and its instance's add up. For a scanner (a janitor) that reads with grep */
+  watch?: string[]
+  /** Ask sessions to pin its session, so the background service never retires it for being idle (more memory) */
+  pin?: boolean
+  /** A routine poll its own fleet sends it when idle, every everyMin (its own count, not the cadence's nor the wakes') */
+  poll?: { everyMin?: number; prompt?: string }
+  /** Its own fleet compacts its conversation once per idle episode, idle idleMin with at least minTokens in context
+   * (before the prompt cache runs out, so the next wake reloads less); false: never */
+  compact?: { idleMin?: number; minTokens?: number } | false
 }
 /** An instance's place in a repository fleet watches: its worktrees (git: paths or globs relative to the project, or
  * absolute on the repository's host; {slug} and {name} filled), its client workspace (Perforce; a command repository's
@@ -103,7 +113,12 @@ export type Roster = {
   roles: Record<string, RoleSpec>
   instances: InstanceSpec[]
   budget?: { usdDay?: number }
-  wakes?: { everyMin?: number; perDay?: number }
+  /** perDay null: no daily cap (one every everyMin) */
+  wakes?: { everyMin?: number; perDay?: number | null }
+  /** Cadence nudges and wakes a day while nothing lands (CADENCE_PER_DAY by default; null: no cap) */
+  cadence?: { perDay?: number | null }
+  /** The idle compaction's defaults for every instance (an instance or its role may say otherwise, or false) */
+  compact?: { idleMin?: number; minTokens?: number } | false
   settings?: Record<string, unknown>
   /** The person: his addresses, the principals who may ask for changes, the front door, and how alerts reach him
    * (channel.ts) */
@@ -139,7 +154,17 @@ export type Instance = {
   code: Record<string, { worktrees: string[]; client: string | null }>
   /** The roles or instances whose work it verifies */
   verifies: string[]
+  /** Shared paths (globs) it watches: their changes nudge or wake it like files it read */
+  watch: string[]
+  pin: boolean
+  /** Its routine poll (every everyMin, idle), or none */
+  poll: { everyMin: number; prompt: string } | null
+  /** Its idle compaction, or none */
+  compact: { idleMin: number; minTokens: number } | null
 }
+/** The idle compaction's defaults: idle this long (minutes) with this much in context. Before the prompt cache (an
+ * hour) runs out, so it costs a cached read */
+export const COMPACT_DEFAULTS = { idleMin: 45, minTokens: 200000 }
 export type Subscription = { tags: string[]; kinds: string[]; paths: string[] }
 
 // ---- roster.json ----
@@ -266,9 +291,29 @@ export function instancesOf(r: Roster): Instance[] {
       subscribe: mergeSubscriptions(role.subscribe, spec.subscribe),
       code: mergeCode(name, role.code, spec.code),
       verifies: [...new Set([...strings(role.verifies), ...strings(spec.verifies)].map(v => v.trim()).filter(Boolean))],
+      watch: [...new Set([...strings(role.watch), ...strings(spec.watch)].map(g => g.trim()).filter(g => g && !checkGlob(g)))],
+      pin: pick(o => (typeof o.pin === 'boolean' ? o.pin : undefined)) ?? false,
+      poll: pollOf(pick(o => (isObject(o.poll) ? o.poll : undefined))),
+      compact: compactOf(spec.compact !== undefined ? spec.compact : role.compact !== undefined ? role.compact : r.compact),
     })
   }
   return out
+}
+
+/** A poll as the roster gives it: every everyMin (at least one) with a prompt to send; none without both */
+function pollOf(p: Record<string, unknown> | undefined): Instance['poll'] {
+  if (!p) return null
+  const everyMin = num(p.everyMin)
+  const prompt = typeof p.prompt === 'string' ? p.prompt.trim() : ''
+  return everyMin && everyMin > 0 && prompt ? { everyMin: Math.max(1, everyMin), prompt } : null
+}
+
+/** The idle compaction as the roster gives it (an instance's, else its role's, else the roster's): false turns it off,
+ * missing fields take COMPACT_DEFAULTS */
+function compactOf(c: unknown): Instance['compact'] {
+  if (c === false) return null
+  const o = isObject(c) ? c : {}
+  return { idleMin: num(o.idleMin) ?? COMPACT_DEFAULTS.idleMin, minTokens: num(o.minTokens) ?? COMPACT_DEFAULTS.minTokens }
 }
 
 /** A role's subscription and its instance's, added up (tags and kinds lowercase) */
@@ -313,11 +358,33 @@ export function frontOf(r: Roster | null, instances: readonly Instance[]): Insta
   return instances.find(i => i.role === 'chief') ?? null
 }
 
+/** The wakes' pace: one every everyMin, at most perDay a day (Infinity: "perDay": null, no daily cap) */
 export function wakesOf(r: Roster | null): { everyMin: number; perDay: number } {
   const w = isObject(r?.wakes) ? (r?.wakes as Record<string, unknown>) : {}
   const everyMin = num(w.everyMin)
-  const perDay = num(w.perDay)
-  return { everyMin: everyMin !== null ? Math.max(1, everyMin) : DEFAULT_WAKES.everyMin, perDay: perDay !== null ? Math.floor(perDay) : DEFAULT_WAKES.perDay }
+  const perDay = w.perDay === null ? Infinity : num(w.perDay)
+  return { everyMin: everyMin !== null ? Math.max(1, everyMin) : DEFAULT_WAKES.everyMin, perDay: perDay === Infinity ? Infinity : perDay !== null ? Math.floor(perDay) : DEFAULT_WAKES.perDay }
+}
+
+/** The wakes a day can hold: perDay, and no more than one every everyMin allows (B21: the forecast counted perDay
+ * even when the gap between wakes made it impossible) */
+export function effectivePerDay(w: { everyMin: number; perDay: number }): number {
+  return Math.min(w.perDay, Math.floor(1440 / Math.max(1, w.everyMin)))
+}
+
+/** A daily cap as the person reads it */
+export function perDayText(n: number): string {
+  return Number.isFinite(n) ? String(n) : 'no cap'
+}
+
+/** Cadence nudges (and wakes) an instance may get a day while nothing lands: roster.json's "cadence": { "perDay" }
+ * (null: no cap), CADENCE_PER_DAY by default; none while it owns open board items (its open items are work to do) */
+export function cadencePerDayOf(r: Roster | null, ownsOpen = 0): number {
+  if (ownsOpen > 0) return Infinity
+  const c = isObject(r?.cadence) ? (r?.cadence as Record<string, unknown>) : {}
+  if (c.perDay === null) return Infinity
+  const n = num(c.perDay)
+  return n !== null ? Math.floor(n) : CADENCE_PER_DAY
 }
 
 export function projectCap(r: Roster | null): number | null {
@@ -365,7 +432,7 @@ const AGENT = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/
 const SECTION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/
 
 /** roleFiles: each agent's file text (null: missing) */
-export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | null>): Lint {
+export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | null>, sizes: Readonly<Record<string, number>> = {}): Lint {
   const errors: string[] = []
   const warnings: string[] = []
   const sectionIds = new Set<string>()
@@ -464,8 +531,21 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
   const cap = projectCap(r)
   const sum = instances.reduce((s, i) => s + (i.usdDay ?? 0), 0)
   if (cap !== null && sum > cap) warnings.push(`the instances' budgets add up to ${usd(sum)} a day, over the project's ${usd(cap)}: the project's cap stops them first`)
-  const f = forecastOf(instances, wakesOf(r))
-  if (cap !== null && f.wakesUsd > cap / 2) warnings.push(`the wake forecast (${usd(f.wakesUsd)} a day) is over half the project's budget`)
+  // The same forecast the plan prints (each running instance at its own context), so the two agree
+  const wakes = wakesOf(r)
+  const f = forecastOf(instances, wakes, sizes)
+  if (cap !== null && f.wakesUsd + f.pollsUsd > cap / 2) warnings.push(`the wake forecast (${usd(f.wakesUsd + f.pollsUsd)} a day${f.polls ? `, ${usd(f.pollsUsd)} of it the routine polls` : ''}) is over half the project's budget`)
+  // A poll more frequent than the idle compaction's wait starts a new idle spell each time: it never idle-compacts
+  for (const i of instances) {
+    if (i.poll && i.compact && i.poll.everyMin < i.compact.idleMin) warnings.push(`"${i.name}": its poll (every ${i.poll.everyMin} min) comes before its idle compaction's wait (${i.compact.idleMin} min), so it never idle-compacts and each poll reopens its whole context: a longer poll, or a shorter compact.idleMin`)
+  }
+  // A cadence the wakes can't carry: its nudges a day (at most the cadence's cap) past what everyMin and perDay allow
+  const room = effectivePerDay(wakes)
+  for (const i of instances) {
+    if (!i.cadenceH) continue
+    const wants = Math.min(cadencePerDayOf(r), Math.floor(24 / i.cadenceH))
+    if (wants > room) warnings.push(`"${i.name}": its cadence (every ${hoursText(i.cadenceH)}) asks for up to ${wants} nudges a day, and the wakes allow ${room} (one every ${wakes.everyMin} min, ${perDayText(wakes.perDay)} a day): raise wakes.perDay (null: no daily cap) or lower everyMin`)
+  }
   if (!r.instances.length) warnings.push('the roster has no instances yet: nothing to start')
   return { errors, warnings }
 }
@@ -574,18 +654,32 @@ export function wakeUsd(model: string | null, perDay: number, tokens: number = W
   return p ? (perDay * tokens * p.price.write) / 1e6 : null
 }
 
-/** sizes: a running instance's own context, by slug, from its heartbeat; WAKE_CONTEXT for the others */
-export function forecastOf(instances: readonly Instance[], wakes: { perDay: number }, sizes: Readonly<Record<string, number>> = {}): { caps: number; wakesUsd: number; unpriced: string[] } {
+/** sizes: a running instance's own context, by slug, from its heartbeat; WAKE_CONTEXT for the others. The wakes a day
+ * it counts are the ones everyMin and perDay both allow (effectivePerDay). pollsUsd: the routine polls (roster.json's
+ * poll), each a turn that reopens the instance's context as a wake does, pollsPerDay of them on their own count */
+export function forecastOf(instances: readonly Instance[], wakes: { everyMin: number; perDay: number }, sizes: Readonly<Record<string, number>> = {}): { caps: number; wakesUsd: number; pollsUsd: number; polls: number; unpriced: string[] } {
   let caps = 0
   let wakesUsd = 0
+  let pollsUsd = 0
+  let polls = 0
   const unpriced: string[] = []
+  const perDay = effectivePerDay(wakes)
   for (const i of instances) {
     caps += i.usdDay ?? 0
-    const w = wakeUsd(i.model, wakes.perDay, sizes[i.slug] ?? WAKE_CONTEXT)
+    const size = sizes[i.slug] ?? WAKE_CONTEXT
+    const w = wakeUsd(i.model, perDay, size)
     if (w === null) unpriced.push(i.name)
     else wakesUsd += w
+    if (!i.poll) continue
+    polls += pollsPerDay(i.poll)
+    pollsUsd += wakeUsd(i.model, pollsPerDay(i.poll), size) ?? 0
   }
-  return { caps, wakesUsd, unpriced }
+  return { caps, wakesUsd, pollsUsd, polls, unpriced }
+}
+
+/** The turns a day a routine poll takes (one every everyMin while idle) */
+export function pollsPerDay(p: { everyMin: number }): number {
+  return Math.floor(1440 / Math.max(1, p.everyMin))
 }
 
 /** Tokens as the person reads them: 41k, 1.2M */
@@ -698,22 +792,54 @@ export function cadenceOf(p: { cadenceH: number | null; lastLanding: number | nu
   const on = p.cadenceH !== null && p.cadenceH > 0
   const period = on ? Math.floor(hours / (p.cadenceH as number)) : 0
   const nextMs = on ? anchor + (period + 1) * (p.cadenceH as number) * HOUR_MS - p.now : null
-  const journalOnly = owns && (p.lastLanding ?? 0) > Math.max(p.lastWork ?? 0, p.startedAt)
-  return { due: on && hours >= (p.cadenceH as number), anchor, hours, key: `${anchor}:${period}`, nextMs, journalOnly }
+  const due = on && hours >= (p.cadenceH as number)
+  // Only its journal landed: a whole period with no work landed, and its journal since (every role writes its journal
+  // last, so a journal newer than the work alone says nothing)
+  const journalOnly = owns && due && (p.lastLanding ?? 0) > anchor
+  return { due, anchor, hours, key: `${anchor}:${period}`, nextMs, journalOnly }
 }
 
-/** A board item's owner and status, from its first lines (`owner: <name>`, `status: <open|started|…>`, front matter or
- * not) */
-export function boardItemOf(text: string): { owner: string | null; status: string | null } {
+/** A board item's owner, status and who it's for, from its first lines (`owner: <name>`, `status: <open|started|…>`,
+ * `for: <role or instance>`, front matter or not) */
+export function boardItemOf(text: string): { owner: string | null; status: string | null; for: string | null } {
   let owner: string | null = null
   let status: string | null = null
+  let forWho: string | null = null
+  const clean = (v: string) => v.replace(/^["'`*\s]+|["'`*\s]+$/g, '').trim()
   for (const l of text.replace(/\r\n/g, '\n').split('\n').slice(0, 40)) {
     const o = /^\s*[-*]?\s*\**owner\**\s*:\s*(.+?)\s*$/i.exec(l)
-    if (o && owner === null) owner = (o[1] as string).replace(/^["'`*\s]+|["'`*\s]+$/g, '').trim()
+    if (o && owner === null) owner = clean(o[1] as string)
     const st = /^\s*[-*]?\s*\**status\**\s*:\s*\**\s*([A-Za-z-]+)/i.exec(l)
     if (st && status === null) status = (st[1] as string).toLowerCase()
+    const f = /^\s*[-*]?\s*\**for\**\s*:\s*(.+?)\s*$/i.exec(l)
+    if (f && forWho === null) forWho = clean(f[1] as string) || null
   }
-  return { owner, status }
+  return { owner, status, for: forWho }
+}
+
+/** An open board item nobody owns: status open, and no owner, or an owner that says nobody (open, none, nobody,
+ * unassigned, tbd, -) */
+export function isUnowned(item: { owner: string | null; status: string | null }): boolean {
+  if (item.status !== 'open') return false
+  return !item.owner || /^(open|none|nobody|unassigned|tbd|n\/a|-+|—)$/i.test(item.owner.trim())
+}
+
+/** The instances an open item nobody owns is for: those its `for:` names (an instance by name or file name, or a role,
+ * singular or plural, several separated by commas or "and"/"or"), else the front door (the roster's person.front, or
+ * the chief role's instances) */
+export function candidatesFor<T extends { name: string; slug: string; role: string }>(forWho: string | null, instances: readonly T[], front: string | null): T[] {
+  const words = (forWho ?? '')
+    .replace(/\([^)]*\)/g, ' ')
+    .split(/\s*(?:,|;|&|\/|\+|\band\b|\bor\b)\s*/i)
+    .map(w => w.trim().toLowerCase())
+    .filter(Boolean)
+  const named = instances.filter(i => {
+    const role = i.role.toLowerCase()
+    return words.some(w => w === i.name.toLowerCase() || w === i.slug || w === role || w === `${role}s`)
+  })
+  if (named.length) return named
+  const f = (front ?? '').toLowerCase()
+  return instances.filter(i => (f ? i.name.toLowerCase() === f : i.role.toLowerCase() === 'chief'))
 }
 
 /** Whether a board item is one this instance owns and has yet to finish: its owner names it (its name or its slug, in
@@ -736,12 +862,19 @@ export function hoursText(h: number): string {
   return h >= 48 ? `${Math.floor(h / 24)} d` : `${Math.floor(h)} h`
 }
 
-export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number, items: readonly string[] = []): string {
+/** The cadence nudge: its own open items when it has some (then the cap doesn't apply), else the open items nobody owns
+ * that fit it, else land what it has. perDay: the roster's cadence.perDay (Infinity: no cap) */
+export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number, items: readonly string[] = [], perDay: number = CADENCE_PER_DAY, fits: readonly string[] = []): string {
+  const often = Number.isFinite(perDay) ? `fleet nudges once each period while nothing lands, at most ${perDay} a day.` : 'fleet nudges once each period while nothing lands.'
+  if (!items.length && fits.length) {
+    const shown = fits.slice(0, 8)
+    return `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}). Open items nobody owns fit you: ${shown.join(', ')}${fits.length > shown.length ? ` and ${fits.length - shown.length} more` : ''}. Take one (your name as its owner, status started) and land a step of it, or say in your journal why not. ${often}`
+  }
   if (items.length) {
     const shown = items.slice(0, 8)
-    return `fleet: ${hoursText(hours)} since you last landed work in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}; a line in your journal doesn't count while you own open items). Your open items: ${shown.join(', ')}${items.length > shown.length ? ` and ${items.length - shown.length} more` : ''}. They're your work: take the first one that needs nobody's decision and land a step of it, or ask the person with mcp__fleet__decide what blocks it. fleet nudges once each period while nothing lands, at most ${CADENCE_PER_DAY} a day.`
+    return `fleet: ${hoursText(hours)} since you last landed work in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}; a line in your journal doesn't count while you own open items). Your open items: ${shown.join(', ')}${items.length > shown.length ? ` and ${items.length - shown.length} more` : ''}. They're your work: take the first one that needs nobody's decision and land a step of it, or ask the person with mcp__fleet__decide what blocks it. ${often}`
   }
-  return `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. fleet nudges once each period while nothing lands, at most ${CADENCE_PER_DAY} a day.`
+  return `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. ${often}`
 }
 
 /** Decision 4a: an instance that doesn't keep a long context starts each fresh period (freshH, cadenceH by default)

@@ -25,9 +25,16 @@ leaves the charter or the roster unclear.
 13. The code to watch: the branch each code role's work is compared with (main, or origin/main fetched first) or the
     depot path, and each code role's worktree or client workspace. fleet tells a role at its next step when that
     branch changed a file it changed, or someone submitted a file it has open.
-14. Cadence: how often each owner lands something; quiet hours; time zone.
+14. Cadence: how often each owner lands something; quiet hours; time zone. And the pace: how often fleet may wake or nudge an idle instance (roster.json's "wakes"). The
+    template's, one every 60 min and at most 8 a day, keeps the cost low; offer `{ "everyMin": 20, "perDay": null }`
+    (one every 20 min, no daily cap: the dry run prices it) and recommend it when results are wanted within the day.
+    A role that checks something on a schedule (a mailbox, a queue) gets roster.json's `"poll": { "everyMin": n,
+    "prompt": "..." }`, which fleet sends while it's idle, rather than a CronCreate of its own.
 15. The roster: how many area owners, which instances start in the first wave.
-16. Deciding alone: what each role may decide without asking (by default, what is reversible inside its own area),
+16. Models and effort per role (roster.json's "model" and "effort", on a role or an instance): the strong model on
+    hands-on technical work. Recommend opus for the integrator, the area owners and the reviewer, haiku only for the
+    janitor, and effort xhigh for the reviewer and the integrator; the dry run prices each.
+17. Deciding alone: what each role may decide without asking (by default, what is reversible inside its own area),
     and what must reach the person (by default: the goal or the scope, a conflict the owners couldn't settle, money,
     anything that leaves the project or touches its confidential material, what can't be undone). It's the charter's
     "Deciding alone, and asking the person" section; the fewer questions reach the person, the faster the fleet goes.

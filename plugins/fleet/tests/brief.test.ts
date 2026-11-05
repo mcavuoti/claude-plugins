@@ -1,9 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
 import { checkResource, isAnswerOrigin, isLaunchPrompt, isPersonOrigin, levelOf, levelsText, markWhat, preAnswer, resourceDelivery } from '../hooks/authority'
-import { briefText, chiefLines, closedLine, type BriefFacts } from '../hooks/brief'
+import { briefText, chiefLines, closedLine, outcomeWords, type BriefFacts } from '../hooks/brief'
 import { globList, type ChangeEvent } from '../hooks/changes'
-import { boardItemOf, cadenceOf, freshDue, handoffText, hoursText, instancesOf, journalTail, lintRoster, ownsOpenItem } from '../hooks/roster'
+import { boardItemOf, cadenceNudgeText, cadenceOf, candidatesFor, freshDue, handoffText, hoursText, instancesOf, isUnowned, journalTail, lintRoster, ownsOpenItem } from '../hooks/roster'
 
 // Who may command (person origins, launch prompts, outside marks, levels, pre-answering, resources), the cadence and
 // fresh periods, and the brief: pure logic
@@ -63,6 +63,8 @@ test('cadence: from the last landing or the start, due past the period; fresh pe
   // While it owns open board items only work landed elsewhere counts: a journal line alone doesn't reset it
   const owning = cadenceOf({ cadenceH: 6, lastLanding: NOW - HOUR, lastWork: NOW - 8 * HOUR, ownsOpen: 2, startedAt: NOW - 9 * HOUR, now: NOW })
   expect(owning).toMatchObject({ due: true, anchor: NOW - 8 * HOUR, journalOnly: true })
+  // Its journal right after real work (every role writes it last): not "only its journal"
+  expect(cadenceOf({ cadenceH: 6, lastLanding: NOW - HOUR + 3000, lastWork: NOW - HOUR, ownsOpen: 2, startedAt: NOW - 9 * HOUR, now: NOW }).journalOnly).toBe(false)
   expect(cadenceOf({ cadenceH: 6, lastLanding: NOW - HOUR, lastWork: NOW - 8 * HOUR, ownsOpen: 0, startedAt: NOW - 9 * HOUR, now: NOW }).due).toBe(false)
   expect(cadenceOf({ cadenceH: 6, lastLanding: NOW - HOUR, startedAt: NOW - 7 * HOUR, now: NOW }).due).toBe(false)
   expect(cadenceOf({ cadenceH: null, lastLanding: null, startedAt: 0, now: NOW }).due).toBe(false)
@@ -79,8 +81,11 @@ test('cadence: from the last landing or the start, due past the period; fresh pe
   expect(journalTail('a\nb\nc\n', 3)).toBe('c')
   expect(handoffText({ name: 'Owner A', role: 'owner', freshH: 6, journal: 'journals/owner-a.md' }, '/Users/x/proj', 'c', false)).toContain("Your journal's last entries:\n\nc")
   // A board item's owner and status, front matter or plain lines; open and started are owned work
-  expect(boardItemOf('---\nowner: Area A\nstatus: started\n---\n# B-3\n')).toEqual({ owner: 'Area A', status: 'started' })
-  expect(boardItemOf('# B-4\n- **Owner:** Area A\n- **Status:** Open\n')).toEqual({ owner: 'Area A', status: 'open' })
+  expect(boardItemOf('---\nowner: Area A\nstatus: started\n---\n# B-3\n')).toEqual({ owner: 'Area A', status: 'started', for: null })
+  expect(boardItemOf('# B-4\n- **Owner:** Area A\n- **Status:** Open\n')).toEqual({ owner: 'Area A', status: 'open', for: null })
+  // Whom an item nobody owns is for (B14): front matter or a plain line
+  expect(boardItemOf('---\nowner: open\nstatus: open\nfor: tester\n---\n# B-5\n')).toEqual({ owner: 'open', status: 'open', for: 'tester' })
+  expect(boardItemOf('# B-6\n- **Owner:** open\n- **For:** PoC A, PoC B\n- **Status:** open\n')).toEqual({ owner: 'open', status: 'open', for: 'PoC A, PoC B' })
   expect(ownsOpenItem({ owner: 'area a', status: 'open' }, 'Area A')).toBe(true)
   expect(ownsOpenItem({ owner: 'Area A', status: 'done' }, 'Area A')).toBe(false)
   expect(ownsOpenItem({ owner: 'open', status: 'open' }, 'Area A')).toBe(false)
@@ -90,6 +95,28 @@ test('cadence: from the last landing or the start, due past the period; fresh pe
   expect(ownsOpenItem({ owner: 'Tester 1 (claimed 10:00)', status: 'open' }, 'Tester 1')).toBe(true)
   expect(ownsOpenItem({ owner: 'Area A and Area B', status: 'open' }, 'area b')).toBe(true)
   expect(ownsOpenItem({ owner: 'PoC AB', status: 'open' }, 'PoC A')).toBe(false)
+  // Nobody owns it: open, and no owner or one that says nobody; started or owned isn't
+  expect(isUnowned({ owner: 'open', status: 'open' })).toBe(true)
+  expect(isUnowned({ owner: null, status: 'open' })).toBe(true)
+  expect(isUnowned({ owner: 'None', status: 'open' })).toBe(true)
+  expect(isUnowned({ owner: 'open', status: 'started' })).toBe(false)
+  expect(isUnowned({ owner: 'Tester 1', status: 'open' })).toBe(false)
+  // Whom it's for: a role (singular or plural), names, else the front door (the roster's, or the chief role)
+  const insts = [
+    { name: 'Chief', slug: 'chief', role: 'chief' },
+    { name: 'Tester 1', slug: 'tester-1', role: 'tester' },
+    { name: 'Tester 2', slug: 'tester-2', role: 'tester' },
+    { name: 'PoC A', slug: 'poc-a', role: 'poc' },
+  ]
+  expect(candidatesFor('tester', insts, null).map(i => i.name)).toEqual(['Tester 1', 'Tester 2'])
+  expect(candidatesFor('testers', insts, null).map(i => i.name)).toEqual(['Tester 1', 'Tester 2'])
+  expect(candidatesFor('PoC A or tester-2', insts, null).map(i => i.name)).toEqual(['Tester 2', 'PoC A'])
+  expect(candidatesFor(null, insts, null).map(i => i.name)).toEqual(['Chief'])
+  expect(candidatesFor('somebody else', insts, 'PoC A').map(i => i.name)).toEqual(['PoC A'])
+  // An instance that owns nothing hears, at its cadence, the open items that fit it
+  expect(cadenceNudgeText({ cadenceH: 1, journal: 'journals/tester-1.md' }, 1, [], 3, ['B-4', 'B-7'])).toBe(
+    'fleet: 1 h since you last landed anything in the shared world (your cadence is 1 h). Open items nobody owns fit you: B-4, B-7. Take one (your name as its owner, status started) and land a step of it, or say in your journal why not. fleet nudges once each period while nothing lands, at most 3 a day.',
+  )
 })
 
 test('the roster: a role’s context and journal, by default fresh and journals/<slug>.md; a journal under .claude/ is refused', () => {
@@ -144,6 +171,9 @@ test('the brief: the five sections in order, provenance, levels, the window; and
     '   - Owner B: 2 blocked by auto mode today, the last at 11:00: ssh dev… ×2\n     ssh dev… [Remote Shell]: a host it needs throughout, trusted infrastructure: "settings": { "autoMode": { "environment": ["$defaults", "Trusted internal domains: dev"] } }\n     it goes in Owner B\'s entry in roster.json',
   )
   expect(t).not.toContain('blocked by auto mode')
+  // The files only behind a revision: one line a move, apart from the real flags (B23)
+  const behind = briefText({ ...facts, blocked: { ...facts.blocked, behind: ['20 file(s) behind R-1@4 (12:00), owners told: Owner A 12, Owner B 5'] } })
+  expect(behind).toContain('   - suspect: board/B-7.md (B-7) cites R-1@1, and R-1 is at v2 (written last by Owner B)\n   - behind: 20 file(s) behind R-1@4 (12:00), owners told: Owner A 12, Owner B 5')
   expect(t).toContain("4. Spend: $1.50 of $20.00 today (the project's cap), estimated at list price; budgets $10.00 a day, wakes ~$0.40 a day; this account's windows: 7d 12%")
   expect(t).toContain('5. Inputs and ideas: 1\n   - proposals/P-1.md (proposal): changed at 11:00 by Owner B (Edit)')
   expect(chiefLines('one\n\n two \nthree\nfour\nfive\nsix')).toEqual(['one', 'two', 'three', 'four', 'five'])
@@ -158,4 +188,10 @@ test('the brief: the five sections in order, provenance, levels, the window; and
   expect(closedLine({ id: 'D-3', kind: 'outbound', outbound: { what: 'scp', to: 'x' }, answers: [{ label: 'rejected' }] }, 'TEST A')).toBe(null)
   const both = briefText({ ...facts, closed: [{ id: 'D-7', at: NOW - HOUR, line: applied as string }, { id: 'D-1', at: NOW - 2 * HOUR, line: sent as string }] })
   expect(both).toContain('2. What changed: 2 shared files, 2 decisions carried out\n   - .claude/fleet/charter.md: D-7 applied as filed')
+})
+
+test('a withdrawn decision reads withdrawn, with its asker\'s why: never "not answered"', () => {
+  expect(outcomeWords({ state: 'withdrawn', why: 'the tests settled it', questions: [{ question: 'Which color?' }], answers: [null] })).toBe('withdrawn by its asker: the tests settled it')
+  expect(outcomeWords({ state: 'withdrawn', kind: 'change', questions: [], answers: [null] })).toBe('withdrawn by its asker')
+  expect(outcomeWords({ state: 'delivered', questions: [{ question: 'Which color?' }], answers: [null] })).toBe('"Which color?" → not answered')
 })

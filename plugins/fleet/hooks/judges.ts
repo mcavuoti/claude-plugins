@@ -128,11 +128,19 @@ export function gateOf(f: GateFacts, c: JudgeConfig): string | null {
   if (f.touchesMoney === true) return 'it touches money'
   if (f.outsideWorld === true) return 'it reaches outside the project'
   if (f.reversible === false) return "it can't be undone"
+  const who = [f.asker.name, f.asker.role].filter((x): x is string => !!x).map(x => x.toLowerCase())
+  if (c.skip.some(s => who.includes(s.toLowerCase()))) return "its asker is in world.json's judges.skip"
+  return null
+}
+
+/** Why a judge may only propose on a decision, never answer it live, or null: it was asked after reading outside content,
+ * or it matches a judges.hold pattern (the money pattern among them). In shadow it proposes all the same, labelled
+ * (the owner's 8a, 05/11: holding these before any call left the judges with nothing to show); a live area never acts on
+ * it. The asker's own flags (money, the outside world, irreversible) stay hard gates (gateOf) */
+export function softGateOf(f: GateFacts, c: JudgeConfig): string | null {
   if (f.outside) return `it was asked after reading outside content (${f.outside.what})`
   const p = c.hold.find(h => h.re.test(f.text))
   if (p) return `it matches world.json's judges.hold "${p.source}"`
-  const who = [f.asker.name, f.asker.role].filter((x): x is string => !!x).map(x => x.toLowerCase())
-  if (c.skip.some(s => who.includes(s.toLowerCase()))) return "its asker is in world.json's judges.skip"
   return null
 }
 
@@ -283,7 +291,10 @@ export type Precedent = {
   questions: { question: string; options: Option[]; label?: string; text?: string; note?: string; judged?: string }[]
   blocks?: string
   why?: string
-  taste?: { said: string; about: string; principle: string }
+  /** said: the person's words as code checked them against what he typed; about and principle: the asker's reading of
+   * them; outside: recorded in a conversation that had read outside content (his words all the same: outside content
+   * can't type in his composer), never support for a live answer */
+  taste?: { said: string; about: string; principle: string; outside?: true }
 }
 
 /** A correction of a judge's answer (0.7.0): per question, what the person answered instead (null: left as it was) */
@@ -299,7 +310,7 @@ export function precedentsOf(records: readonly RegisterLike[], corrections: read
   for (const r of records) {
     if (r.source === 'taste') {
       const t = r.taste
-      if (t && t.person && !t.outside) out.push({ id: r.id, at: r.at, area: r.area ?? null, kind: 'taste', questions: [], taste: { said: t.said, about: t.about, principle: t.principle } })
+      if (t && t.person) out.push({ id: r.id, at: r.at, area: r.area ?? null, kind: 'taste', questions: [], taste: { said: t.said, about: t.about, principle: t.principle, ...(t.outside ? { outside: true as const } : {}) } })
       continue
     }
     if (r.source === 'decide' && (r.kind === 'change' || r.kind === 'outbound')) {
@@ -425,12 +436,18 @@ export function statuteOf(files: readonly StatuteFile[]): { text: string; lines:
 }
 
 /** Why a call could only hold, so code holds with no call: nothing the person answered, corrected or said no to in the
- * question's area (a question with no area: in none), and no line of his in principles.md (fleet's own lines aren't in
- * the statute). The kickstart interview is such a time. Exact repeats are found all the same; null when there's a record */
-export function nothingOnRecord(area: string | null, ps: readonly Precedent[], statute: ReadonlyMap<string, string>): string | null {
+ * question's area (a question with no area: in none) nor in any area with words in common with it, and no line in the
+ * statute (the charter, his principles, the project's rules; fleet's own lines of principles.md aren't in it, nor the
+ * charter's lines /fleet init wrote, initCharter: a template's words say nothing of the project). The kickstart
+ * interview is such a time. Exact repeats are found all the same; null when there's a record */
+export function nothingOnRecord(area: string | null, ps: readonly Precedent[], statute: ReadonlyMap<string, string>, text = '', initCharter: ReadonlySet<string> = new Set()): string | null {
   if (ps.some(p => (p.area ?? null) === area)) return null
-  if ([...statute.keys()].some(k => k.startsWith(`${statuteLabel(PRINCIPLES)}:`))) return null
-  return `nothing on record yet: no answer of yours ${area ? `in area ${area}` : 'to a question with no area'}, and no principle of yours in principles.md`
+  // A line of the charter, his principles or the rules (a heading alone says nothing, nor a charter line init wrote)
+  if ([...statute.entries()].some(([k, l]) => !/^#{1,6}\s/.test(l) && !(k.startsWith('charter.md:') && initCharter.has(l)))) return null
+  // An answer in another area with a word in common that carries meaning (not the glue of a sentence)
+  const mine = contentWords(text, 4)
+  if (mine.size && ps.some(p => [...precedentWords(p)].some(x => mine.has(x)))) return null
+  return `nothing on record yet: no answer of yours ${area ? `in area ${area}` : 'to a question with no area'} or with words in common with it, and no line in the charter, principles.md or the rules`
 }
 
 // ---- The call ----
@@ -441,8 +458,9 @@ export const JUDGE_SYSTEM = [
   'For each question give one outcome:',
   '- decided: the record settles it. Give the option\'s letter, and cite the precedent ids (D-12, T-3, ask-…) or statute lines (principles.md:4) it rests on: only ones you were shown, and only ones that support that very option. A precedent you cite must have answered this same question with that option; a statute line you cite must name what sets that option apart from the others.',
   "- send-back: the question itself is wrong: its options overlap or miss the obvious one, or it can't be answered as asked (\"because\": \"malformed\"); or the statute already answers it so plainly that the session should have read it (\"because\": \"statute\", and cite those lines, as for decided). Say why in one line.",
-  "- hold: it needs the person's judgment: nothing on record settles it, or the record points both ways. When in doubt, hold.",
-  'Answer with one JSON object and nothing else: {"answers": [{"q": 1, "outcome": "decided" | "send-back" | "hold", "option": "a", "cites": ["D-12"], "because": "malformed" | "statute", "why": "one line"}]}',
+  "- suggest: nothing on record settles it, but what is on record (or the project's goal as the charter states it) leans to one option: give its letter, cite what leans if anything, and say why in one line. A suggestion is only shown to the person beside the question; it never answers it.",
+  "- hold: it needs the person's judgment: the record points both ways, or nothing leans either way. Between decided and suggest, suggest; hold only when you can't lean.",
+  'Answer with one JSON object and nothing else: {"answers": [{"q": 1, "outcome": "decided" | "suggest" | "send-back" | "hold", "option": "a", "cites": ["D-12"], "because": "malformed" | "statute", "why": "one line"}]}',
 ].join('\n')
 
 /** Markers a text can't close: they carry a hash of what's between them */
@@ -463,7 +481,7 @@ function optionsText(options: readonly Option[]): string {
 export function precedentText(p: Precedent): string {
   const head = `${p.id} (${day(p.at)}${p.area ? `, area ${p.area}` : ''})`
   if (p.kind === 'rejection' && p.taste) return `${head}, the person rejected ${p.taste.about}, saying: "${p.taste.said}"`
-  if (p.taste) return `${head}, the person said no: "${p.taste.said}" about ${p.taste.about}; the principle it suggests: ${p.taste.principle}`
+  if (p.taste) return `${head}, the person said no, in his words: "${p.taste.said}"; what it's about, as the asking session read it: ${p.taste.about}; the principle it suggests, as that session read it: ${p.taste.principle}${p.taste.outside ? ' (recorded after that session had read outside content)' : ''}`
   const qs = p.questions.map(q => {
     const said = q.label !== undefined ? `${letter(q.options.findIndex(o => norm(o.label) === norm(q.label as string)))}) ${q.label}` : `in his words: "${q.text ?? ''}"`
     const how = p.kind === 'correction' ? `a judge answered ${q.judged ?? '?'}; the person overruled it: ${said}${p.why ? ` (why: ${p.why})` : ''}` : `the person chose ${said}${q.note ? ` (his note: ${q.note})` : ''}`
@@ -499,7 +517,8 @@ export function judgePrompt(statute: string, caseLaw: string, question: string):
 
 // ---- The answer, checked by code ----
 
-export type VerdictOutcome = 'decided' | 'send-back' | 'hold'
+/** suggest (0.9.0): no precedent settles it, but the judge leans to an option: shown, counted apart, never acted on */
+export type VerdictOutcome = 'decided' | 'suggest' | 'send-back' | 'hold'
 export type Verdict = {
   q: number
   outcome: VerdictOutcome
@@ -523,6 +542,7 @@ function outcomeOf(v: unknown): VerdictOutcome {
     .toLowerCase()
     .replace(/[\s_]+/g, '-')
   if (s === 'decided' || s === 'decide' || s === 'answer' || s === 'answered') return 'decided'
+  if (s === 'suggest' || s === 'suggested' || s === 'suggestion' || s === 'lean' || s === 'leans') return 'suggest'
   if (s === 'send-back' || s === 'sendback' || s === 'back' || s === 'sent-back' || s === 'malformed') return 'send-back'
   return 'hold'
 }
@@ -560,8 +580,9 @@ export function parseVerdicts(reply: string, questions: readonly Question[], ask
     const why = line(x.why, 300)
     const because = /statute/i.test(String(x.because ?? '')) ? ('statute' as const) : /malformed/i.test(String(x.because ?? '')) ? ('malformed' as const) : undefined
     if (outcome === 'send-back') return { q: n, outcome, cites, why: why || 'the question is malformed', ...(because ? { because } : {}) }
-    if (outcome !== 'decided') return { q: n, outcome, cites, why: why || 'it needs the person' }
+    if (outcome !== 'decided' && outcome !== 'suggest') return { q: n, outcome, cites, why: why || 'it needs the person' }
     const option = optionOf(x.option, q)
+    if (outcome === 'suggest') return option ? { q: n, outcome, option, cites, why: why || 'it leans that way' } : { q: n, outcome: 'hold', cites: [], why: 'it needs the person', unchecked: { cites, problem: `it suggested no option of the question (${line(x.option, 40) || 'none'})` } }
     if (!option) return { q: n, outcome: 'hold', cites: [], why: 'it needs the person', unchecked: { cites, problem: `it named no option of the question (${line(x.option, 40) || 'none'})` } }
     return { q: n, outcome, option, cites, why }
   })
@@ -577,6 +598,7 @@ export function supportProblem(p: Precedent, option: Option, asked?: { question:
   const no = `${p.id} wasn't answered "${option.label}"`
   if (!label) return no
   if (p.taste) {
+    if (live && p.taste.outside) return `${p.id} was recorded after its session read outside content: a live answer doesn't rest on it`
     if (namesOption(p.taste.about, option.label)) return `${p.id} is the person's "no" to "${option.label}"`
     return namesOption(`${p.taste.said} ${p.taste.principle}`, option.label) ? null : no
   }
@@ -659,12 +681,36 @@ export function checkSendBack(v: Verdict, q: Question, statute: ReadonlyMap<stri
   return problems.length ? { ...v, cites, unchecked: { cites, problem: problems.join('; ') } } : { ...v, cites }
 }
 
+/** A suggestion, its citations checked as a decided verdict's are (each shown to the judge, and supporting that very
+ * option): those that don't check aren't shown as support; they're kept apart (unchecked), with why. One that names no
+ * option of the question holds */
+function checkSuggest(v: Verdict, q: Question, shown: ReadonlyMap<string, Precedent>, statute: ReadonlyMap<string, string>): Verdict {
+  const option = q.options.find(o => o.label === v.option)
+  if (!option) return { q: v.q, outcome: 'hold', cites: [], why: 'it needs the person', unchecked: { cites: v.cites, problem: 'it suggested no option of the question' } }
+  const kept: string[] = []
+  const dropped: string[] = []
+  const problems: string[] = []
+  for (const c of v.cites) {
+    const key = citeKey(c)
+    const p = shown.get(key)
+    const l = statute.get(key)
+    const why = p ? supportProblem(p, option, q) : l !== undefined ? (lineSpeaksTo(l, option, q.options) ? null : `${key} doesn't speak to "${option.label}"`) : `${key} isn't a precedent or a statute line it was shown`
+    if (why) {
+      dropped.push(key)
+      problems.push(why)
+    } else kept.push(key)
+  }
+  const { unchecked: _u, ...rest } = v
+  return { ...rest, cites: kept, ...(dropped.length ? { unchecked: { cites: dropped, problem: problems.join('; ') } } : {}) }
+}
+
 /** A decided verdict whose citations all check: each one shown to the judge, a precedent answering the asked question
  * with that very option (supportProblem) or a statute line that speaks to it (lineSpeaksTo). live: the verdict would be
  * the asker's answer, so a text answer doesn't count, and only charter.md and principles.md lines do. Anything else
  * holds, with what the judge proposed and why code didn't take it. A send-back is checked by checkSendBack */
 export function checkVerdict(v: Verdict, q: Question, shown: ReadonlyMap<string, Precedent>, statute: ReadonlyMap<string, string>, live = false): Verdict {
   if (v.outcome === 'send-back') return checkSendBack(v, q, statute, live)
+  if (v.outcome === 'suggest') return checkSuggest(v, q, shown, statute)
   if (v.outcome !== 'decided' || v.repeat) return v
   const option = q.options.find(o => o.label === v.option)
   const hold = (problem: string): Verdict => ({ q: v.q, outcome: 'hold', cites: [], why: 'it needs the person', unchecked: { ...(v.option ? { option: v.option } : {}), cites: v.cites, problem } })
@@ -707,6 +753,9 @@ export type JudgeFile = {
   /** Its area was live when it judged (0.7.0); liveWhy: why it didn't answer all the same (a flag, the cap) */
   live?: true
   liveWhy?: string
+  /** Why its verdicts are proposals only, never live answers (softGateOf, 0.9.0): asked after outside content, or a
+   * judges.hold pattern */
+  shadowOnly?: string
 }
 
 /** What the register keeps of it once the decision closes: the verdicts, per question whether the person agreed (null:
@@ -715,7 +764,7 @@ export type JudgeEntry = Omit<JudgeFile, 'format'> & { agreed: (boolean | null)[
 
 /** Whether the person's answer agrees with a decided verdict; null when there's nothing to compare */
 export function agreementOf(v: Verdict | undefined, o: Outcome | null): boolean | null {
-  if (!v || v.outcome !== 'decided' || v.option === undefined || !o || o.origin === 'judge') return null
+  if (!v || (v.outcome !== 'decided' && v.outcome !== 'suggest') || v.option === undefined || !o || o.origin === 'judge') return null
   if (o.label !== undefined) return norm(o.label) === norm(v.option)
   return o.text ? false : null
 }
@@ -745,8 +794,11 @@ export function proposalLine(f: JudgeFile | null, q: Question | undefined, n: nu
   if (f.gated) return `judge: held by a gate (${f.gated})`
   const v = f.verdicts.find(x => x.q === n)
   if (!v) return null
-  if (v.outcome === 'decided') return `judge: ${optionWords(q, v.option)}, citing ${v.cites.join(', ')}${v.repeat ? ' (the same question, answered so before)' : v.why ? `: ${v.why}` : ''}`
-  if (v.outcome === 'send-back') return `judge: send back: ${v.why}${v.cites.length ? `, citing ${v.cites.join(', ')}` : ''}${v.unchecked ? ` (which code didn't take: ${v.unchecked.problem})` : ''}`
+  // A proposal only (softGateOf): said with it, so the person reads it as that
+  const only = f.shadowOnly && v.outcome !== 'hold' ? ` (a proposal only: ${f.shadowOnly})` : ''
+  if (v.outcome === 'decided') return `judge: ${optionWords(q, v.option)}, citing ${v.cites.join(', ')}${v.repeat ? ' (the same question, answered so before)' : v.why ? `: ${v.why}` : ''}${only}`
+  if (v.outcome === 'suggest') return `judge suggests ${optionWords(q, v.option)}${v.cites.length ? `, citing ${v.cites.join(', ')}` : ''}: ${v.why} (nothing on record settles it: a suggestion, never answered for you)${v.unchecked ? ` (it also cited ${v.unchecked.cites.join(', ')}, which code didn't take: ${v.unchecked.problem})` : ''}${only}`
+  if (v.outcome === 'send-back') return `judge: send back: ${v.why}${v.cites.length ? `, citing ${v.cites.join(', ')}` : ''}${v.unchecked ? ` (which code didn't take: ${v.unchecked.problem})` : ''}${only}`
   if (v.unchecked) return `judge: hold, needs your call (it proposed ${v.unchecked.option ? optionWords(q, v.unchecked.option) : 'an answer'}${v.unchecked.cites.length ? ` citing ${v.unchecked.cites.join(', ')}` : ''}, which code didn't take: ${v.unchecked.problem})`
   return `judge: hold, needs your call${v.why && v.why !== 'it needs the person' ? `: ${v.why}` : ''}`
 }
@@ -771,6 +823,13 @@ export type AreaStats = {
   modelDisagreed: number
   sentBack: number
   held: number
+  /** Suggestions (0.9.0): no precedent settled it, the judge leaned; and whether the person's answer matched */
+  suggested: number
+  suggestAgreed: number
+  suggestDisagreed: number
+  /** What held its questions (a gate's words or a hold's reason, shortened), per question: /fleet stats names the main
+   * one when an area proposes nothing */
+  heldBy: Record<string, number>
   /** Decisions no judge looked at, held by a gate, and their questions */
   gated: number
   gatedQuestions: number
@@ -796,7 +855,7 @@ export const WINDOW = 10
 export const WINDOW_OVERRULES = 2
 
 export function emptyStats(area: string): AreaStats {
-  return { area, proposals: 0, questions: 0, decided: 0, repeats: 0, agreed: 0, disagreed: 0, repeatAgreed: 0, repeatDisagreed: 0, modelAgreed: 0, modelDisagreed: 0, sentBack: 0, held: 0, gated: 0, gatedQuestions: 0, live: 0, reviewed: 0, overruled: 0, usd: 0, calls: 0 }
+  return { area, proposals: 0, questions: 0, decided: 0, repeats: 0, agreed: 0, disagreed: 0, repeatAgreed: 0, repeatDisagreed: 0, modelAgreed: 0, modelDisagreed: 0, sentBack: 0, held: 0, suggested: 0, suggestAgreed: 0, suggestDisagreed: 0, heldBy: {}, gated: 0, gatedQuestions: 0, live: 0, reviewed: 0, overruled: 0, usd: 0, calls: 0 }
 }
 
 function tally(s: AreaStats, repeat: boolean, a: boolean | null) {
@@ -826,6 +885,8 @@ export function statsOf(entries: readonly StatsInput[]): Map<string, AreaStats> 
     if (j.gated) {
       s.gated++
       s.gatedQuestions += questions
+      const k = heldKey(j.gated)
+      s.heldBy[k] = (s.heldBy[k] ?? 0) + questions
       continue
     }
     s.proposals++
@@ -836,8 +897,16 @@ export function statsOf(entries: readonly StatsInput[]): Map<string, AreaStats> 
     const answered = new Set(j.answered ?? [])
     for (const v of j.verdicts) {
       if (v.outcome === 'send-back') s.sentBack++
-      else if (v.outcome === 'hold') s.held++
-      else {
+      else if (v.outcome === 'hold') {
+        s.held++
+        const k = heldKey(v.unchecked ? `code didn't take its proposal (${v.unchecked.problem})` : v.why)
+        s.heldBy[k] = (s.heldBy[k] ?? 0) + 1
+      } else if (v.outcome === 'suggest') {
+        s.suggested++
+        const a = j.agreed[v.q - 1] ?? null
+        if (a === true) s.suggestAgreed++
+        else if (a === false) s.suggestDisagreed++
+      } else {
         s.decided++
         if (v.repeat) s.repeats++
         if (answered.has(v.q)) {
@@ -863,6 +932,21 @@ export function statsOf(entries: readonly StatsInput[]): Map<string, AreaStats> 
     } else if (j.sentBack && e.seen) tally(s, false, true)
   }
   return out
+}
+
+/** A reason a question was held, shortened so alike ones count together: its words up to the first parenthesis or colon
+ * (the gate's own words, without the detail of this one) */
+export function heldKey(why: string): string {
+  const k = why.split(/[(:]/)[0]?.trim() ?? ''
+  return (k || why).slice(0, 80)
+}
+
+/** A warning for /fleet stats when an area's judges proposed nothing in at least `min` questions: what held them most */
+export function healthLine(s: AreaStats, min = 5): string | null {
+  const asked = s.questions + s.gatedQuestions
+  if (asked < min || s.decided + s.suggested + s.sentBack > 0) return null
+  const top = Object.entries(s.heldBy).sort((a, b) => b[1] - a[1])[0]
+  return `${s.area}: the judges proposed nothing in ${asked} question${asked === 1 ? '' : 's'}${top ? `: most were held by "${top[0]}" (${top[1]})` : ''}`
 }
 
 /** The agreement on what the judge decided: agreed out of what the person answered (or reviewed and let stand) */
@@ -895,6 +979,7 @@ export function statsLine(s: AreaStats): string {
   const of = (a: number, d: number) => `${a} of ${a + d} (${pct(rate(a, d))})`
   return [
     `${s.area}: ${count(s.proposals, 'decision')}, ${count(s.questions, 'question')}: ${s.decided} decided (${count(s.repeats, 'exact repeat')}), agreed ${s.agreed} of ${s.agreed + s.disagreed} (${pct(r)}): repeats ${of(s.repeatAgreed, s.repeatDisagreed)}, model verdicts ${of(s.modelAgreed, s.modelDisagreed)}`,
+    ...(s.suggested ? [`${s.suggested} suggested (you chose the suggestion ${of(s.suggestAgreed, s.suggestDisagreed)})`] : []),
     `${s.sentBack} sent back`,
     `${s.held} held`,
     s.gated ? `${count(s.gated, 'decision')} (${count(s.gatedQuestions, 'question')}) held by a gate` : '0 held by a gate',
@@ -976,6 +1061,11 @@ export const TASTE_DESCRIPTION =
 
 /** Checks and tidies taste's input */
 export function checkTaste(input: any): { ok: true; said: string; about: string; principle: string; area?: string } | { ok: false; reason: string } {
+  // Past a cap it's refused with the length, never cut: said is the person's words
+  for (const [k, max] of [['said', 300], ['about', 200], ['principle', 200]] as const) {
+    const t = typeof input?.[k] === 'string' ? input[k].replace(/\s+/g, ' ').trim() : ''
+    if (t.length > max) return { ok: false, reason: `${k} is ${t.length} characters, and fleet keeps at most ${max} whole: ${k === 'said' ? 'quote the part of their words that says no' : 'say it in one line'}` }
+  }
   const said = line(input?.said, 300)
   const about = line(input?.about, 200)
   const principle = line(input?.principle, 200)
@@ -1008,9 +1098,10 @@ export function nextTasteNumber(names: readonly string[]): number {
 
 /** What the session is told; notHeard: why it isn't the person's (default: he didn't type this turn) */
 export function tasteResult(id: string, t: TasteSpec, notHeard = "the person didn't type this turn"): string {
-  if (t.person && !t.outside) return `Recorded as ${id} in the register: a principle candidate ("${t.principle}") the project's judges read from now on. The person can promote it into .claude/fleet/principles.md (they edit it, or you draft a change with mcp__fleet__decide kind "change").`
-  const why = t.outside ? `this conversation read outside content (${t.outside.what})` : notHeard
-  return `Recorded as ${id} in the register, marked as not heard from the person directly (${why}): the judges don't read it until the person promotes it into .claude/fleet/principles.md.`
+  // His words code found in what he typed count as his even after outside content (outside content can't type in his
+  // composer): the mark stays as a note, and a live answer never rests on it (the owner's 9a, 05/11)
+  if (t.person) return `Recorded as ${id} in the register: a principle candidate ("${t.principle}") the project's judges read from now on${t.outside ? ` (noted: this conversation had read outside content, ${t.outside.what}; the words are the person's as typed, so it counts, but a live answer never rests on it)` : ''}. The person can promote it into .claude/fleet/principles.md (they edit it, or you draft a change with mcp__fleet__decide kind "change").`
+  return `Recorded as ${id} in the register, marked as not heard from the person directly (${notHeard}): the judges don't read it until the person promotes it into .claude/fleet/principles.md.`
 }
 
 // ---- Live areas (0.7.0): state/judges.json, written by the person's /fleet judges, by an overrule that brings an

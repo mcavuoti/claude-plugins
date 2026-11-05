@@ -31,6 +31,7 @@ import {
   type Records,
   type Rev,
 } from '../hooks/records'
+import { behindGroups, behindLine, bodyHashOf, confirmedBy, defaultKindOf, editorialText, elsewhereText, keptAt, movesOf, ownSuspectLines, parseConfirmation, quoteSources, suspectKey, withFix, type Suspect } from '../hooks/records'
 
 const ME = { sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', offsetMin: 0 }
 const AT = Date.UTC(2026, 10, 2, 14, 2, 0)
@@ -137,9 +138,9 @@ test('the gate asks for a read: a stale pin not read as it is, a new pin never r
   expect(text).toBe(
     [
       'fleet: this write cites records you need to read first (this write was not made):',
-      '- R-1@1: R-1 is at v2 now (a revision at 14:02 by TEST R). Read req/R-1.md, decide whether your work still holds, then cite R-1@2, or say in your record why v1 still holds.',
+      "- R-1@1: R-1 is at v2 now (a revision at 14:02 by TEST R). Read req/R-1.md, decide whether your work still holds, then cite R-1@2, or say in your record why v1 still holds (files of yours you aren't rewriting: once checked, mcp__fleet__confirm with of R-1 clears their flags with no new version).",
       "- R-2@1: you haven't read R-2 in this conversation. Read req/R-2.md first.",
-      'Then write again. If what changed contradicts your task, ask the person with mcp__fleet__decide.',
+      'A read is the Read tool or a plain cat of the file. Then write again. If what changed contradicts your task, ask the person with mcp__fleet__decide.',
     ].join('\n'),
   )
   expect(landedText('board/B-1.md', 'B-1', 3, [{ id: 'R-9', rev: 1 }], [])).toBe('fleet: board/B-1.md is now B-1@3; it cites R-9@1, which no shared file is (a record\'s file name starts with its id).')
@@ -258,4 +259,112 @@ test("the checks' stamp covers the code watch's commands too; with none, it is a
   const scripts = new Map([['checks/board.py', 'h1']])
   expect(checksKey(c.checks, scripts, [])).toBe(checksKey(c.checks, scripts))
   expect(checksKey(c.checks, scripts, [['bash', 'tools/up.sh', '{marker}']])).not.toBe(checksKey(c.checks, scripts))
+})
+
+test("G27: pins are read from everything but the change line, and only an id's highest version counts", () => {
+  const r = recs()
+  const text = '---\nchange: "revision: R-1@2 to R-1@4, F-7@2 dropped"\nrelies_on: [R-1@4]\n---\nWas R-1@2, now R-1@4; see R-2@3\n'
+  expect(pinsOf(text, r)).toEqual([
+    { id: 'R-1', rev: 4 },
+    { id: 'R-2', rev: 3 },
+  ])
+  // With no front matter, the change line among the first lines is left out too
+  expect(pinsOf('change: editorial: was F-7@2\nCites F-7@3.\n', r)).toEqual([{ id: 'F-7', rev: 3 }])
+})
+
+test('G19 and 11a: a landing that only moves pin numbers or its change line is editorial; a path with defaultKind editorial needs no change line', () => {
+  const r = recs({ defaultKind: { 'board/**': 'editorial' } })
+  const v1 = '---\nchange: "revision: first"\n---\nRests on R-1@2 and R-2@3.\n'
+  const repin = '---\nchange: "revision: re-pinned to R-1@4"\n---\nRests on R-1@4 and R-2@3.\n'
+  const real = '---\nchange: "revision: the rate is lower"\n---\nRests on R-1@4 and R-2@3, at a lower rate.\n'
+  expect(bodyHashOf(repin, r)).toBe(bodyHashOf(v1, r))
+  expect(bodyHashOf(real, r)).not.toBe(bodyHashOf(v1, r))
+  const prev = rev(3, 'revision', { changeHash: changeOf(v1, 'change')?.hash ?? null, bodyHash: bodyHashOf(v1, r) })
+  expect(landingKind(changeOf(repin, 'change'), prev, false, { bodyHash: bodyHashOf(repin, r) })).toBe('editorial')
+  expect(landingKind(changeOf(real, 'change'), prev, false, { bodyHash: bodyHashOf(real, r) })).toBe('revision')
+  // A retraction stays one, whatever its body
+  expect(landingKind({ kind: 'retraction', hash: 'hx' }, prev, false, { bodyHash: bodyHashOf(v1, r) })).toBe('retraction')
+  expect(defaultKindOf('board/B-1.md', r)).toBe('editorial')
+  expect(defaultKindOf('req/R-1.md', r)).toBe(null)
+  expect(landingKind(null, prev, false, { defaultKind: defaultKindOf('board/B-1.md', r) })).toBe('editorial')
+  expect(landingKind(null, prev, false, { defaultKind: defaultKindOf('req/R-1.md', r) })).toBe('revision')
+  for (const [bad, why] of [
+    [['board/**'], 'defaultKind is an object'],
+    [{ 'board/**': 'addition' }, 'is "editorial" or "revision"'],
+    [{ '/abs/**': 'editorial' }, 'defaultKind "/abs/**"'],
+  ] as const) {
+    const x = recordsOf({ worldFormat: 1, paths: ['board/**'], defaultKind: bad }, false)
+    expect('problem' in x ? x.problem : '').toContain(why)
+  }
+})
+
+test('B23: the suspects only behind moves group by the move; a real flag stands apart; files no session wrote are nobody to tell', () => {
+  const stale = (path: string, owner: string | null, of = 'R-1', now = 4) => ({ path, id: null, owner: owner === null ? null : { ...R, name: owner }, reasons: [{ why: 'stale', pin: `${of}@2`, of, now, moved: { rev: now, kind: 'revision', at: AT, by: R, hash: 'h' } }] }) as unknown as Suspect
+  const ahead = { path: 'notes/c.md', id: null, owner: R, reasons: [{ why: 'ahead', pin: 'R-1@99', of: 'R-1', now: 4 }] } as unknown as Suspect
+  const list = [stale('notes/a.md', 'TEST A'), stale('notes/b.md', 'TEST B'), stale('notes/d.md', 'TEST A'), stale('notes/e.md', 'TEST A', 'R-2', 3), ahead]
+  expect(movesOf(ahead)).toBe(null)
+  expect(movesOf(list[0] as Suspect)).toEqual([{ move: 'R-1@4', at: AT }])
+  const groups = behindGroups(list, s => s.owner?.name ?? '')
+  expect(groups).toEqual([
+    { move: 'R-1@4', at: AT, files: 3, owners: { 'TEST A': 2, 'TEST B': 1 }, nobody: [] },
+    { move: 'R-2@3', at: AT, files: 1, owners: { 'TEST A': 1 }, nobody: [] },
+  ])
+  expect(behindLine(groups[0] as any, ME)).toBe('3 file(s) behind R-1@4 (14:02), owners told: TEST A 2, TEST B 1')
+  // Written outside fleet: nobody is told, and the line says so (or names the janitor who is)
+  const orphans = behindGroups([...list, stale('notes/f.md', null), stale('notes/g.md', null)], s => s.owner?.name ?? null)
+  expect(orphans[0]).toMatchObject({ move: 'R-1@4', files: 5, nobody: ['notes/f.md', 'notes/g.md'] })
+  expect(behindLine(orphans[0] as any, ME)).toBe('5 file(s) behind R-1@4 (14:02), owners told: TEST A 2, TEST B 1; nobody to tell: 2 (notes/f.md, notes/g.md)')
+  expect(behindLine(orphans[0] as any, ME, 'Janitor')).toBe('5 file(s) behind R-1@4 (14:02), owners told: TEST A 2, TEST B 1; no writer to tell, so Janitor is told: 2 (notes/f.md, notes/g.md)')
+  expect(behindLine(behindGroups([stale('notes/f.md', null)], () => null)[0] as any, ME)).toBe('1 file(s) behind R-1@4 (14:02), nobody to tell: 1 (notes/f.md)')
+})
+
+test("G19: an owner's files only behind one move are one digest line, with the way to confirm them", () => {
+  const stale = (path: string, now = 4) => ({ path, id: null, owner: R, reasons: [{ why: 'stale', pin: 'R-1@2', of: 'R-1', now, moved: { rev: 4, kind: 'revision', at: AT, by: R, hash: 'h' } }] }) as unknown as Suspect
+  const blind = { path: 'notes/z.md', id: null, owner: R, reasons: [{ why: 'blind', pin: 'R-2@1', of: 'R-2', detail: 'unread' }] } as unknown as Suspect
+  const lines = ownSuspectLines([stale('notes/a.md'), stale('notes/b.md'), blind], ME)
+  expect(lines).toEqual([
+    { line: '- notes/z.md landed blind citing R-2@1, R-2 unread', keys: [suspectKey(blind)] },
+    {
+      line: '- 2 file(s) behind R-1@4 (a revision at 14:02 by TEST R): notes/a.md, notes/b.md. Read R-1, then re-pin them, or once checked say they still hold with mcp__fleet__confirm (of: R-1), with no new version',
+      keys: [suspectKey(stale('notes/a.md')), suspectKey(stale('notes/b.md'))],
+    },
+  ])
+  // One file alone keeps its own line
+  expect(ownSuspectLines([stale('notes/a.md')], ME)[0]?.line).toBe('- notes/a.md cites R-1@2, and R-1 is at v4 (a revision at 14:02 by TEST R)')
+  // An editorial version since the move isn't news: the same key
+  expect(suspectKey(stale('notes/a.md', 5))).toBe(suspectKey(stale('notes/a.md', 4)))
+})
+
+test('G19: a confirmation clears the stale pins of its record in the files it names, while each file is at the version checked and until the record is revised again (an editorial version spends nothing)', () => {
+  const c = parseConfirmation(JSON.stringify({ format: 1, at: AT, by: R, of: 'R-1', rev: 4, paths: ['notes/a.md', 7], versions: { 'notes/a.md': 'ha', 'notes/x.md': 3 } }))
+  expect(c?.paths).toEqual(['notes/a.md'])
+  expect(c?.versions).toEqual({ 'notes/a.md': 'ha' })
+  expect(parseConfirmation('{"format":1}')).toBe(null)
+  const confs = [c as NonNullable<typeof c>]
+  expect(confirmedBy('notes/a.md', 'ha', ['R-1@2', 'R-2@3'], confs)).toEqual(['R-1@2>4'])
+  // Edited since it was checked: its own check is needed
+  expect(confirmedBy('notes/a.md', 'hb', ['R-1@2'], confs)).toEqual([])
+  expect(confirmedBy('notes/b.md', 'ha', ['R-1@2'], confs)).toEqual([])
+  const files = [{ path: 'notes/a.md', id: null, pins: ['R-1@2'], owner: R, confirmed: confirmedBy('notes/a.md', 'ha', ['R-1@2'], confs) }]
+  const at = (...revs: Rev[]) => (p: { id: string; rev: number }) => pinState(p, revs)
+  expect(suspectsOf(files, at(rev(2), rev(4)))).toEqual([])
+  expect(suspectsOf(files, at(rev(2), rev(4), rev(5, 'editorial')))).toEqual([])
+  expect(suspectsOf(files, at(rev(2), rev(4), rev(5, 'editorial'), rev(6))).map(s => s.path)).toEqual(['notes/a.md'])
+  // A pin its writer kept after reading the record (the gate's confirmed) holds the same way
+  const kept = [{ path: 'notes/k.md', id: null, pins: ['R-1@2'], owner: R, confirmed: ['R-1@2>4'] }]
+  expect(keptAt(['R-1@2>4'], 'R-1@2', pinState({ id: 'R-1', rev: 2 }, [rev(2), rev(4), rev(5, 'editorial')]))).toBe(true)
+  expect(suspectsOf(kept, at(rev(2), rev(4), rev(5, 'editorial')))).toEqual([])
+  expect(suspectsOf(kept, at(rev(2), rev(4), rev(5)))).toHaveLength(1)
+  expect(editorialText('B-1', 3, 'change')).toBe('fleet: this is B-1@3 (cite it so). An edit of it is editorial unless its change: line says "revision: …" (what it says changed): only then does fleet tell whoever cites it.')
+})
+
+test("B24, G20, quotes: a version's author corrected; an Edit's note for pins it left; the sources a record's proofs quote", () => {
+  const blind = rev(4, 'revision', { via: 'bash', suspect: ['R-9@1:unread'] })
+  const fixed = withFix(blind, { format: 1, at: AT, by: { ...R, name: 'TEST T' }, via: 'tool', confirmed: ['R-2@1>2'] })
+  expect(fixed).toMatchObject({ rev: 4, via: 'tool', by: { name: 'TEST T' }, confirmed: ['R-2@1>2'] })
+  expect(fixed.suspect).toBe(undefined)
+  const p = { pin: { id: 'F-7', rev: 2 }, why: 'stale' as const, state: { pin: { id: 'F-7', rev: 2 }, state: 'stale' as const, now: 3, moved: rev(3) }, path: 'findings/F-7.md' }
+  expect(elsewhereText('notes/plan.md', [p])).toBe('fleet: notes/plan.md still cites F-7@2 (F-7 is at v3), outside what you edited. It stays flagged to you until that\'s checked: read what it cites, then re-pin it, or say it holds with mcp__fleet__confirm.')
+  expect(pinsText([p], ME, false)).toContain('A read is the Read tool or a plain cat of the file. Then write again.')
+  expect(quoteSources('---\nkind: finding\nsource: notes/sheet.md:12\nquote: "x"\nsource: https://example.invalid/a\nquote: "y"\nsource: ./notes/b.md\n---\n')).toEqual(['notes/sheet.md:12', 'notes/sheet.md', 'notes/b.md'])
 })

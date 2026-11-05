@@ -8,7 +8,7 @@
 // outside, costs him no tap: fleet applies it as it's filed.
 
 import { globRegex, type WorldConfig } from './changes'
-import { cut } from './decisions'
+import { FIELD_MAX, field } from './decisions'
 
 /** The origins that are the person's own word on the project: his Enter at a terminal (composer). Remote Control
  * (bridge) answers decisions (ANSWER_ORIGINS) but changes nothing of the project; anything else (a plugin's prompt, a
@@ -47,6 +47,17 @@ export const OUTSIDE_TOOLS: ReadonlySet<string> = new Set(['WebFetch', 'WebSearc
 /** A mark's words: "WebFetch of example.com at 14:02" (when given as a clock) */
 export function markWords(m: OutsideMark, clock: (ms: number) => string): string {
   return `${m.what} at ${clock(m.at)}`
+}
+
+/** For a mark left by an MCP service's read: the service, the tool that marked, and the exact line for outbound.json's
+ * "inside" that would make that tool's reads mark nothing (the person's own organisation's directory or files): the
+ * tool itself, never the whole server, whose other tools may read what outside senders wrote. messages: the tool reads
+ * mail or chat, where a message from an outside sender is outside content. Null for the web tools */
+export function insideOffer(m: OutsideMark): { server: string; tool: string; line: string; messages: boolean } | null {
+  const s = /mcp__([A-Za-z0-9_-]+?)__([A-Za-z0-9_-]+)/.exec(m.what)
+  if (!s) return null
+  const tool = `mcp__${s[1]}__${s[2]}`
+  return { server: s[1]!, tool, line: `"${tool}"`, messages: /mail|message|chat|inbox|thread|channel|conversation|comment/i.test(s[2]!) }
 }
 
 /** What an outside read is called in a mark: the tool, and the host or query it read (no content) */
@@ -109,22 +120,25 @@ export function preAnswer(p: { personTurn: boolean; mark: OutsideMark | null; ma
 
 export type ResourceSpec = { what: string; why: string; cost?: string; byWhen?: string; alternatives?: string }
 
-function line(v: unknown, max: number): string {
-  return typeof v === 'string' ? cut(v.trim().replace(/\s+/g, ' '), max) : ''
+/** A field on one line, whole; past its cap, refused (decisions.ts's field) */
+function line(v: unknown, name: keyof typeof FIELD_MAX): { text: string } | { reason: string } {
+  const f = field(typeof v === 'string' ? v.replace(/\s+/g, ' ') : v, FIELD_MAX[name], name)
+  return 'reason' in f ? f : { text: f.text }
 }
 
 export function checkResource(input: any): { ok: true; resource: ResourceSpec; blocks?: string } | { ok: false; reason: string } {
-  const what = line(input?.what, 200)
-  if (!what) return { ok: false, reason: 'what: say what you need (a license, an access, a machine, a budget…)' }
-  const why = line(input?.why, 300)
-  if (!why) return { ok: false, reason: 'why: say in one line what it is for' }
-  const r: ResourceSpec = { what, why }
-  for (const k of ['cost', 'byWhen', 'alternatives'] as const) {
-    const v = line(input?.[k], 200)
-    if (v) r[k] = v
+  const r: Partial<ResourceSpec> = {}
+  for (const k of ['what', 'why', 'cost', 'byWhen', 'alternatives'] as const) {
+    const v = line(input?.[k], k)
+    if ('reason' in v) return { ok: false, reason: v.reason }
+    if (v.text) r[k] = v.text
   }
-  const blocks = line(input?.blocks, 200)
-  return blocks ? { ok: true, resource: r, blocks } : { ok: true, resource: r }
+  if (!r.what) return { ok: false, reason: 'what: say what you need (a license, an access, a machine, a budget…)' }
+  if (!r.why) return { ok: false, reason: 'why: say in one line what it is for' }
+  const b = line(input?.blocks, 'blocks')
+  if ('reason' in b) return { ok: false, reason: b.reason }
+  const resource = { what: r.what, why: r.why, ...(r.cost ? { cost: r.cost } : {}), ...(r.byWhen ? { byWhen: r.byWhen } : {}), ...(r.alternatives ? { alternatives: r.alternatives } : {}) }
+  return b.text ? { ok: true, resource, blocks: b.text } : { ok: true, resource }
 }
 
 export function resourceTicket(id: string, r: ResourceSpec): string {

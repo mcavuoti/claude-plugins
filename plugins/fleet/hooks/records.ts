@@ -47,6 +47,9 @@ export type Records = {
   commitEveryMin: number | null
   /** world.json's proofs: the records that must carry a proof, by path or by their kind: line */
   proofs: Proofs | null
+  /** world.json's defaultKind: what a landing with no change line counts as under a glob (board items: editorial, so
+   * a status or an owner moving flags nobody who cites them); first match wins, revision elsewhere */
+  defaultKinds: { glob: string; re: RegExp; kind: ChangeKind }[]
 }
 /** Which records must carry a proof: those under these globs, and those whose kind: line names one of these kinds */
 export type Proofs = { globs: string[]; res: RegExp[]; kinds: string[] }
@@ -72,6 +75,30 @@ export type Rev = {
   /** Stale pins it kept on purpose: the writing thread had read the cited record as it was then ("R-1@1>3": R-1@1,
    * kept with R-1 read at v3). They don't make the file suspect until the record moves again */
   confirmed?: string[]
+  /** A hash of the text with its change line taken out and its pins' version numbers blanked (bodyHashOf): a landing
+   * whose body is the previous version's is editorial, whatever its change line says (a re-pin never cascades) */
+  bodyHash?: string
+  /** A change the person applied: by is the person, drafter the session that drafted it (its flags go to the drafter) */
+  drafter?: Who
+}
+
+/** <project>/.claude/fleet/state/revs/<id>/<n>.by.json: who really landed version n, written once (no-clobber) by the
+ * tool landing whose write a peer's post-scan took first as its own blind one (same text). revsOf applies it over the
+ * version: its by, its via, and the tool's pin marks in place of the blind claim's suspect ones */
+export type RevFix = { format: number; at: number; by: Who | null; via: Via; suspect?: string[]; confirmed?: string[] }
+
+export function parseRevFix(text: string): RevFix | null {
+  try {
+    const v = JSON.parse(text)
+    return v && v.format === FORMAT && typeof v.via === 'string' && 'by' in v ? (v as RevFix) : null
+  } catch {
+    return null
+  }
+}
+
+export function withFix(r: Rev, f: RevFix): Rev {
+  const { suspect: _s, confirmed: _c, ...rest } = r
+  return { ...rest, by: f.by, via: f.via, ...(f.suspect?.length ? { suspect: f.suspect } : {}), ...(f.confirmed?.length ? { confirmed: f.confirmed } : {}) }
 }
 
 // ---- world.json: idPattern, keys.change, strict, checks, commit ----
@@ -116,7 +143,22 @@ export function recordsOf(w: WorldConfig, insensitive: boolean): { records: Reco
   const commitEveryMin = typeof every === 'number' && every > 0 ? num(every, 1, 24 * 60, 60) : null
   const p = proofsOf(w, insensitive)
   if ('problem' in p) return p
-  return { records: { id, pin, changeKey, strict, checks, commitEveryMin, proofs: p.proofs } }
+  const defaultKinds: Records['defaultKinds'] = []
+  if (w.defaultKind !== undefined && w.defaultKind !== null) {
+    if (typeof w.defaultKind !== 'object' || Array.isArray(w.defaultKind)) return { problem: 'world.json: defaultKind is an object: { "board/**": "editorial" }' }
+    for (const [glob, kind] of Object.entries(w.defaultKind as Record<string, unknown>)) {
+      const bad = checkGlob(glob)
+      if (bad) return { problem: `world.json: defaultKind "${glob}" ${bad}` }
+      if (kind !== 'editorial' && kind !== 'revision') return { problem: `world.json: defaultKind "${glob}" is "editorial" or "revision"` }
+      defaultKinds.push({ glob, re: globRegex(glob, insensitive), kind })
+    }
+  }
+  return { records: { id, pin, changeKey, strict, checks, commitEveryMin, proofs: p.proofs, defaultKinds } }
+}
+
+/** What a landing with no change line counts as at this path (world.json's defaultKind), or null: a revision */
+export function defaultKindOf(rel: string, records: Records): ChangeKind | null {
+  return records.defaultKinds.find(d => d.re.test(rel))?.kind ?? null
 }
 
 function proofsOf(w: WorldConfig, insensitive: boolean): { proofs: Proofs | null } | { problem: string } {
@@ -183,35 +225,61 @@ export function parsePin(s: string): Pin | null {
   return m ? { id: m[1] as string, rev: Number(m[2]) } : null
 }
 
-/** Every ID@n a text cites, once each, in order of id and version */
+/** The pins a text cites: every ID@n outside its change line (the line names the move it made, "F-7@2 to F-7@3":
+ * history, not what the text rests on), and of each id only the highest version (an older one beside it is history
+ * too: "was R-1@2, now R-1@4"). In order of id */
 export function pinsOf(text: string, records: Records): Pin[] {
-  const seen = new Map<string, Pin>()
-  for (const m of text.matchAll(new RegExp(records.pin.source, 'g'))) {
+  const best = new Map<string, Pin>()
+  for (const m of withoutChangeLine(text, records.changeKey).matchAll(new RegExp(records.pin.source, 'g'))) {
     const p = { id: m[1] as string, rev: Number(m[2]) }
-    if (p.rev > 0) seen.set(pinKey(p), p)
+    const had = best.get(p.id)
+    if (p.rev > 0 && (!had || p.rev > had.rev)) best.set(p.id, p)
   }
-  return [...seen.values()].sort((a, b) => a.id.localeCompare(b.id) || a.rev - b.rev)
+  return [...best.values()].sort((a, b) => a.id.localeCompare(b.id))
+}
+
+/** A text with its change line taken out, and every pin's version number blanked (R-1@4 → R-1@), hashed: two
+ * versions with the same body hash differ only in which versions they cite and in their change line, so the second is
+ * editorial (a re-pin after a revision elsewhere doesn't cascade to whoever cites this one) */
+export function bodyHashOf(text: string, records: Records): string {
+  return hashText(withoutChangeLine(text, records.changeKey).replace(new RegExp(records.pin.source, 'g'), (_m, id: string) => `${id}@`))
+}
+
+/** Where a text's change line is: the index of its line among the text's lines (the front matter when there is one,
+ * else the first 30 lines), or -1 */
+function changeLineAt(lines: readonly string[], key: string): number {
+  let from = 0
+  let to = Math.min(lines.length, 30)
+  if (lines[0]?.trim() === '---') {
+    const end = lines.slice(1).findIndex(l => l.trim() === '---')
+    if (end >= 0) {
+      from = 1
+      to = end + 1
+    }
+  }
+  const re = new RegExp(`^\\s*${key}\\s*:\\s*(.*)$`)
+  for (let i = from; i < to; i++) if (re.test(lines[i] as string)) return i
+  return -1
+}
+
+/** A text without its change line (the rest as it is) */
+export function withoutChangeLine(text: string, key: string): string {
+  const lines = text.replace(/^﻿/, '').split(/\r?\n/)
+  const i = changeLineAt(lines, key)
+  return i < 0 ? text : [...lines.slice(0, i), ...lines.slice(i + 1)].join('\n')
 }
 
 /** The change line (`change: "revision: max rate revised down"`), from the front matter when there is one, else the
  * first lines: the kind it names, and a hash of it */
 export function changeOf(text: string, key: string): { kind: ChangeKind | null; hash: string } | null {
   const lines = text.replace(/^﻿/, '').split(/\r?\n/)
-  let scope = lines.slice(0, 30)
-  if (lines[0]?.trim() === '---') {
-    const end = lines.slice(1).findIndex(l => l.trim() === '---')
-    scope = end >= 0 ? lines.slice(1, end + 1) : scope
-  }
-  const re = new RegExp(`^\\s*${key}\\s*:\\s*(.*)$`)
-  for (const line of scope) {
-    const m = re.exec(line)
-    if (!m) continue
-    const value = (m[1] as string).trim().replace(/^["']|["']$/g, '').trim()
-    if (!value) return null
-    const word = /^([a-z]+)\s*:/i.exec(value)?.[1]?.toLowerCase() ?? ''
-    return { kind: (CHANGE_KINDS as readonly string[]).includes(word) ? (word as ChangeKind) : null, hash: hashText(value) }
-  }
-  return null
+  const i = changeLineAt(lines, key)
+  if (i < 0) return null
+  const m = new RegExp(`^\\s*${key}\\s*:\\s*(.*)$`).exec(lines[i] as string) as RegExpExecArray
+  const value = (m[1] as string).trim().replace(/^["']|["']$/g, '').trim()
+  if (!value) return null
+  const word = /^([a-z]+)\s*:/i.exec(value)?.[1]?.toLowerCase() ?? ''
+  return { kind: (CHANGE_KINDS as readonly string[]).includes(word) ? (word as ChangeKind) : null, hash: hashText(value) }
 }
 
 // ---- Proofs: a finding carries source: and quote:, a result run: and sha: ----
@@ -283,12 +351,15 @@ export const PROOF_HOW =
 export type Unproven = { path: string; id: string | null; owner: Who | null; why: string; v: string | null }
 
 /** What a landing counts as. A new file is an addition, a removed one a retraction; otherwise the change line's kind,
- * and a revision when there is none, it names no kind, or it was left as it was (the convention: rewrite it each time) */
-export function landingKind(change: { kind: ChangeKind | null; hash: string } | null, prev: Rev | null, removed: boolean): ChangeKind {
+ * and a revision when it names no kind or was left as it was (the convention: rewrite it each time). With no change
+ * line at all, the path's default kind (world.json's defaultKind: board items editorial), else a revision. A body
+ * that is the previous version's (bodyHashOf: only pins' numbers or the change line moved) is editorial */
+export function landingKind(change: { kind: ChangeKind | null; hash: string } | null, prev: Rev | null, removed: boolean, more: { defaultKind?: ChangeKind | null; bodyHash?: string } = {}): ChangeKind {
   if (removed) return 'retraction'
   if (!prev || prev.hash === null) return change?.kind && change.kind !== 'retraction' ? change.kind : 'addition'
-  if (!change || !change.kind || change.hash === prev.changeHash) return 'revision'
-  return change.kind
+  const kind = !change ? (more.defaultKind ?? 'revision') : !change.kind || change.hash === prev.changeHash ? 'revision' : change.kind
+  if (kind === 'revision' && more.bodyHash && prev.bodyHash && more.bodyHash === prev.bodyHash) return 'editorial'
+  return kind
 }
 
 export function parseRev(text: string): Rev | null {
@@ -352,9 +423,21 @@ export function pinProblems(
 
 /** What the gate remembers it told: one key per problem (a second try with nothing new passes) */
 /** The stale pins a write keeps although its thread read the record as it is now: it confirmed them, and the file
- * isn't suspect for them until the record moves again */
+ * isn't suspect for them until a revision or a retraction of the record lands past that version (an editorial one
+ * doesn't count: keptAt) */
 export function confirmedPins(states: readonly PinState[], readOf: (id: string) => ReadState): string[] {
   return states.filter(s => s.state === 'stale' && readOf(s.pin.id) === 'current').map(s => `${pinKey(s.pin)}>${s.now}`)
+}
+
+/** Whether a stale pin is kept: a confirmation of it ("<pin>><version>", by its writer's landing or mcp__fleet__confirm)
+ * at a version at or past the record's newest revision or retraction. An editorial version since spends nothing */
+export function keptAt(confirmed: readonly string[] | undefined, pin: string, st: PinState): boolean {
+  if (st.state !== 'stale' || !confirmed?.length) return false
+  const moved = st.moved?.rev ?? Infinity
+  return confirmed.some(c => {
+    const at = c.lastIndexOf('>')
+    return at > 0 && c.slice(0, at) === pin && Number(c.slice(at + 1)) >= moved
+  })
 }
 
 export function problemKeys(problems: readonly PinProblem[]): string[] {
@@ -373,7 +456,7 @@ function problemLine(p: PinProblem, me: Me): string {
   if (p.why === 'unread') return `- ${cite}: you haven't read ${p.pin.id} in this conversation. Read ${where} first.`
   if (p.why === 'ahead') return `- ${cite}: ${p.pin.id} is at v${p.state.now}; there's no v${p.pin.rev}. Read ${where} and cite the version you read.`
   const moved = p.state.moved as Rev
-  return `- ${cite}: ${p.pin.id} is at v${p.state.now} now (${revWords(moved, me)}). Read ${where}, decide whether your work still holds, then cite ${p.pin.id}@${p.state.now}, or say in your record why v${p.pin.rev} still holds.`
+  return `- ${cite}: ${p.pin.id} is at v${p.state.now} now (${revWords(moved, me)}). Read ${where}, decide whether your work still holds, then cite ${p.pin.id}@${p.state.now}, or say in your record why v${p.pin.rev} still holds (files of yours you aren't rewriting: once checked, mcp__fleet__confirm with of ${p.pin.id} clears their flags with no new version).`
 }
 
 /** The gate's words for the pins of a write it refuses */
@@ -381,8 +464,18 @@ export function pinsText(problems: readonly PinProblem[], me: Me, canDecide: boo
   const shown = problems.slice(0, MAX_LINES)
   const lines = [`fleet: this write cites records you need to read first (this write was not made):`, ...shown.map(p => problemLine(p, me))]
   if (problems.length > shown.length) lines.push(`- and ${problems.length - shown.length} more: ${problems.slice(MAX_LINES).map(p => pinKey(p.pin)).join(', ')}`)
-  lines.push(`Then write again.${canDecide ? ' If what changed contradicts your task, ask the person with mcp__fleet__decide.' : ''}`)
+  lines.push(`A read is the Read tool or a plain cat of the file. Then write again.${canDecide ? ' If what changed contradicts your task, ask the person with mcp__fleet__decide.' : ''}`)
   return lines.join('\n')
+}
+
+/** After an Edit that left pins elsewhere in the file needing a read (the gate refuses an Edit only for the pins it
+ * writes): the file stays flagged to its writer until they're checked */
+export function elsewhereText(rel: string, problems: readonly PinProblem[]): string {
+  const what = problems
+    .slice(0, MAX_LINES)
+    .map(p => (p.why === 'unread' ? `${pinKey(p.pin)} (you haven't read ${p.pin.id})` : `${pinKey(p.pin)} (${p.pin.id} is at v${p.state.now})`))
+    .join(', ')
+  return `fleet: ${rel} still cites ${what}, outside what you edited. It stays flagged to you until that's checked: read what it cites, then re-pin it, or say it holds with mcp__fleet__confirm.`
 }
 
 /** The post-scan's words when a command wrote a file whose pins its thread hadn't read as they are */
@@ -412,6 +505,12 @@ export function citeText(id: string, rev: number): string {
  * cites it at each edit (a journal never is: it's history) */
 export function uncitedText(id: string, rev: number, key: string): string {
   return `fleet: this is ${id}@${rev}. It has no ${key}: line, so every edit of it counts as a revision: cite it by version only where what you write rests on what it says now (a status or an owner isn't that).`
+}
+
+/** ... and with one whose path is editorial by default (world.json defaultKind): an edit tells whoever cites it only
+ * when its change line says it's a revision */
+export function editorialText(id: string, rev: number, key: string): string {
+  return `fleet: this is ${id}@${rev} (cite it so). An edit of it is editorial unless its ${key}: line says "revision: …" (what it says changed): only then does fleet tell whoever cites it.`
 }
 
 // ---- Suspects ----
@@ -444,7 +543,7 @@ export function suspectsOf(files: readonly Facts[], stateOf: (p: Pin) => PinStat
       const pin = parsePin(s)
       if (!pin) continue
       const st = stateOf(pin)
-      if (st.state === 'current' || (st.state === 'stale' && f.confirmed?.includes(`${s}>${st.now}`))) continue
+      if (st.state === 'current' || keptAt(f.confirmed, s, st)) continue
       const m = st.moved
       reasons.push({ why: st.state, pin: s, of: pin.id, ...(st.now ? { now: st.now } : {}), ...(m ? { moved: { rev: m.rev, kind: m.kind, at: m.at, by: m.by, hash: m.hash } } : {}), ...(st.firstAt !== undefined ? { first: st.firstAt } : {}) })
     }
@@ -500,9 +599,137 @@ export function suspectLine(s: Suspect, me: Me): string {
   return `${s.path}${s.id ? ` (${s.id})` : ''} ${parts.join('; ')}`
 }
 
-/** A key per suspect state: an owner hears each one once */
+/** An owner's lines for its suspects (the digest): a real flag one line each, and the files only behind one move one line
+ * a move ("- 12 file(s) behind R-1@4 (a revision at 12:00 by TEST R): notes/a.md, …. Read R-1, then re-pin them, or
+ * once checked say they hold with mcp__fleet__confirm (of: R-1), with no new version"). keys: the suspects each line
+ * covers (suspectKey), told once */
+export function ownSuspectLines(suspects: readonly Suspect[], me: Me): { line: string; keys: string[] }[] {
+  const out: { line: string; keys: string[] }[] = []
+  const groups = new Map<string, Suspect[]>()
+  for (const s of suspects) {
+    const m = movesOf(s)
+    if (m && m.length === 1) groups.set(m[0]?.move as string, [...(groups.get(m[0]?.move as string) ?? []), s])
+    else out.push({ line: `- ${suspectLine(s, me)}`, keys: [suspectKey(s)] })
+  }
+  for (const [move, list] of groups) {
+    if (list.length === 1) {
+      out.push({ line: `- ${suspectLine(list[0] as Suspect, me)}`, keys: [suspectKey(list[0] as Suspect)] })
+      continue
+    }
+    const r = (list[0] as Suspect).reasons[0] as Reason
+    const shown = list.slice(0, 6).map(s => s.path)
+    const more = list.length > shown.length ? `, and ${list.length - shown.length} more` : ''
+    out.push({
+      line: `- ${list.length} file(s) behind ${move}${r.moved ? ` (${revWords(r.moved, me)})` : ''}: ${shown.join(', ')}${more}. Read ${r.of}, then re-pin them, or once checked say they still hold with mcp__fleet__confirm (of: ${r.of}), with no new version`,
+      keys: list.map(suspectKey),
+    })
+  }
+  return out
+}
+
+/** A suspect that is only behind moves (every reason a stale pin): the moves, as "<id>@<version now>" with when the
+ * newest of them landed. null: a real flag (a pin ahead of its record, of no record, a blind landing) or indirect */
+export function movesOf(s: Suspect): { move: string; at: number }[] | null {
+  if (!s.reasons.length || s.reasons.some(r => r.why !== 'stale')) return null
+  return s.reasons.map(r => ({ move: `${r.of}@${r.now ?? 0}`, at: r.moved?.at ?? 0 }))
+}
+
+/** The suspects only behind moves, grouped by the move that caused them (one file behind two moves counts in each),
+ * biggest first: what a revision of R-1 made stale reads as one line, "20 behind R-1@4", so the real flags stand
+ * apart. owners: how many of each group's files each writer owns; nobody: the files no session is told of (ownerName
+ * null: written outside fleet, or by the person) */
+export type Behind = { move: string; at: number; files: number; owners: Record<string, number>; nobody: string[] }
+export function behindGroups(suspects: readonly Suspect[], ownerName: (s: Suspect) => string | null): Behind[] {
+  const groups = new Map<string, Behind>()
+  for (const s of suspects) {
+    for (const m of movesOf(s) ?? []) {
+      const g = groups.get(m.move) ?? { move: m.move, at: m.at, files: 0, owners: {}, nobody: [] }
+      g.files++
+      g.at = Math.max(g.at, m.at)
+      const o = ownerName(s)
+      if (o === null) g.nobody.push(s.path)
+      else g.owners[o] = (g.owners[o] ?? 0) + 1
+      groups.set(m.move, g)
+    }
+  }
+  return [...groups.values()].sort((a, b) => b.files - a.files || b.at - a.at || a.move.localeCompare(b.move))
+}
+
+/** A group of files behind one move, as status and the brief say it: "20 file(s) behind R-1@4 (12:00), owners told:
+ * TEST A 12, TEST B 5; nobody to tell: 3 (notes/x.md, …)". janitor: who hears the files nobody else is told of */
+export function behindLine(g: Behind, me: Me, janitor: string | null = null): string {
+  const owners = Object.entries(g.owners)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([o, n]) => `${o} ${n}`)
+  const told = owners.length ? `owners told: ${owners.slice(0, 6).join(', ')}${owners.length > 6 ? ', …' : ''}` : ''
+  const shown = g.nobody.slice(0, 3)
+  const nobody = g.nobody.length
+    ? `${janitor ? `no writer to tell, so ${janitor} is told` : 'nobody to tell'}: ${g.nobody.length} (${shown.join(', ')}${g.nobody.length > shown.length ? ', …' : ''})`
+    : ''
+  return `${g.files} file(s) behind ${g.move}${g.at ? ` (${clock(g.at, me.offsetMin)})` : ''}, ${[told, nobody].filter(Boolean).join('; ')}`
+}
+
+export const CONFIRM_SCHEMA = {
+  type: 'object',
+  required: ['of'],
+  properties: {
+    of: { type: 'string', maxLength: 80, description: 'The record, as it is now: its id (R-1) or its current version (R-1@4). Read it first' },
+    paths: { type: 'array', maxItems: 500, items: { type: 'string', maxLength: 500 }, description: "Optional: the shared files you checked against it (each one you didn't write last, read as it is now first); by default every shared file you wrote last that cites it" },
+    why: { type: 'string', maxLength: 300, description: 'Optional: why they still hold, in one line' },
+  },
+} as const
+
+export const CONFIRM_DESCRIPTION =
+  "Say that shared files you checked still hold against a record as it is now, after it was revised. Call it when fleet flags files of yours for citing an older version of a record (\"cites R-1@2, and R-1 is at v4\") and you read the record and found they still hold: their flags for it clear with no new version of them (no re-pin edit, so nothing cascades to whoever cites them). Name the files, or leave paths out for every shared file you wrote last that cites it. If the record is revised again, or a file is edited since, it's flagged again. When a file doesn't hold, fix it instead."
+
+/** The local sources a record's proofs quote (source: lines, a :12 or #part after a path also taken without it): when
+ * one lands, the record's quote is checked again */
+export function quoteSources(text: string): string[] {
+  const out = new Set<string>()
+  for (const [k, v] of proofLines(text)) {
+    const src = v.trim().replace(/^\.\//, '')
+    if (k !== 'source' || !src || /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(src)) continue
+    out.add(src)
+    const m = /^(.+?)(?::\d+(?:-\d+)?|#.*)$/.exec(src)
+    if (m) out.add(m[1] as string)
+  }
+  return [...out]
+}
+
+/** One session's word that files it checked still hold against a record as it is now (mcp__fleet__confirm):
+ * <project>/.claude/fleet/state/confirms/<name>.json, written once. It clears their stale pins of that record without
+ * a new version, while each file is at the version it checked (versions: path → its version then) and until a
+ * revision or a retraction of the record lands past rev */
+export type Confirmation = { format: number; at: number; by: Who; of: string; rev: number; paths: string[]; versions?: Record<string, string>; why?: string }
+
+export function parseConfirmation(text: string): Confirmation | null {
+  try {
+    const v = JSON.parse(text)
+    if (!v || v.format !== FORMAT || typeof v.of !== 'string' || typeof v.rev !== 'number' || !Array.isArray(v.paths) || !v.by) return null
+    const versions: Record<string, string> = {}
+    if (v.versions && typeof v.versions === 'object') for (const [p, x] of Object.entries(v.versions)) if (typeof x === 'string') versions[p] = x
+    return { ...v, paths: v.paths.filter((p: unknown): p is string => typeof p === 'string'), versions } as Confirmation
+  } catch {
+    return null
+  }
+}
+
+/** What confirmations make of a file's pins, as Facts.confirmed reads them: "<pin>><version>" for each pin of a
+ * confirmed record, while the file is at the version that was checked (v: its version now; an edit since needs its
+ * own check). suspectsOf passes it until the record is revised past that version */
+export function confirmedBy(path: string, v: string | null | undefined, pins: readonly string[], confs: readonly Confirmation[]): string[] {
+  const out: string[] = []
+  for (const c of confs) {
+    if (!c.paths.includes(path) || !v || c.versions?.[path] !== v) continue
+    for (const s of pins) if (parsePin(s)?.id === c.of) out.push(`${s}>${c.rev}`)
+  }
+  return out
+}
+
+/** A key per suspect state: an owner hears each one once (a stale pin by the move that made it stale: an editorial
+ * version since isn't news) */
 export function suspectKey(s: Suspect): string {
-  return `${s.path}|${s.reasons.map(r => `${r.why}:${r.pin}:${r.now ?? ''}`).join(',')}|${(s.via ?? []).join(',')}`
+  return `${s.path}|${s.reasons.map(r => `${r.why}:${r.pin}:${r.why === 'stale' ? (r.moved?.rev ?? r.now ?? '') : (r.now ?? '')}`).join(',')}|${(s.via ?? []).join(',')}`
 }
 
 // ---- Check scripts ----

@@ -111,17 +111,17 @@ test('shadow: gates and exact repeats with no model, one call for the rest, the 
   expect(await fleet($, 'status')).toContain('judges: on (haiku), in shadow: today 1 call, $0.')
 })
 
-test('nothing on record yet (no answer in the area, no principle of his): code holds with no call; exact repeats all the same', WITH_SESSIONS, async ($, on) => {
+test('nothing on record yet (no answer in the area or sharing its words, no line of the charter, principles or rules): code holds with no call; exact repeats all the same', WITH_SESSIONS, async ($, on) => {
   const asked = model(on, () => '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}')
-  const w = project(on, { files: { [`${FLEET}/principles.md`]: PRINCIPLES_TEXT } })
+  const w = project(on, { files: { [`${FLEET}/principles.md`]: PRINCIPLES_TEXT, [`${FLEET}/charter.md`]: '# Charter\n', [`${ROOT}/CLAUDE.md`]: '# Project\n' } })
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
   await startSession($, w)
   // The kickstart's interview: an area nobody answered in yet, and principles.md as fleet wrote it
   await decide($, { questions: [COLOR, { ...COLOR, question: 'Which color for the info band?' }], area: 'ui' })
   await tick(w)
   expect(asked.length).toBe(0)
-  expect(json(w, `${DEC}/judge/D-2.json`).verdicts).toEqual([1, 2].map(q => ({ q, outcome: 'hold', cites: [], why: 'nothing on record yet: no answer of yours in area ui, and no principle of yours in principles.md' })))
-  expect(await fleet($, '')).toContain('judge: hold, needs your call: nothing on record yet: no answer of yours in area ui, and no principle of yours in principles.md')
+  expect(json(w, `${DEC}/judge/D-2.json`).verdicts).toEqual([1, 2].map(q => ({ q, outcome: 'hold', cites: [], why: 'nothing on record yet: no answer of yours in area ui or with words in common with it, and no line in the charter, principles.md or the rules' })))
+  expect(await fleet($, '')).toContain('judge: hold, needs your call: nothing on record yet: no answer of yours in area ui or with words in common with it, and no line in the charter, principles.md or the rules')
   expect(w.logs.some(l => l.includes('D-2 judged: 1 hold; 2 hold; no model call (nothing on record yet)'))).toBe(true)
   // An exact repeat is found by code all the same; a new question in an area with an answer on record gets its call
   await decide($, { questions: [DB], area: 'storage' })
@@ -130,10 +130,61 @@ test('nothing on record yet (no answer in the area, no principle of his): code h
   expect(json(w, `${DEC}/judge/D-3.json`).verdicts[0]).toMatchObject({ outcome: 'decided', repeat: true, cites: ['D-1'] })
   expect(asked.length).toBe(1)
   expect(json(w, `${DEC}/judge/D-4.json`)).toMatchObject({ model: 'haiku', verdicts: [{ outcome: 'hold', why: 'taste' }] })
+  // An answer in another area sharing the question's words gets its call too (the owner's 8a)
+  await decide($, { questions: [{ ...DB, question: 'Which database for the band colors?' }], area: 'ui' })
+  await tick(w)
+  expect(asked.length).toBe(2)
 })
 
-test('a citation code can’t check makes the proposal a hold; outside content and world.json’s judges gate it', WITH_SESSIONS, async ($, on) => {
-  const asked = model(on, () => '{"answers": [{"q": 1, "outcome": "decided", "option": "b", "cites": ["D-1"], "why": "as before"}]}')
+test('an area whose judges proposed nothing in a while is a line of the brief, not only of /fleet stats', WITH_SESSIONS, async ($, on) => {
+  const held = (n: number) => [
+    `${DEC}/register/2026-11/D-${n}.json`,
+    JSON.stringify({ ...D1, id: `D-${n}`, area: 'mail', questions: [COLOR], answers: [{ label: 'Amber', origin: 'composer', session: 'TEST P', at: PAST }], judge: { id: `D-${n}`, at: PAST, area: 'mail', verdicts: [{ q: 1, outcome: 'hold', cites: [], why: 'it reaches outside the project' }], agreed: [null] } }),
+  ]
+  const w = project(on, { files: Object.fromEntries([2, 3, 4, 5, 6].map(held)) })
+  await startSession($, w)
+  expect(await fleet($, 'brief')).toContain('mail: the judges proposed nothing in 5 questions: most were held by "it reaches outside the project" (5): /fleet stats mail says what held them')
+})
+
+test("the charter as /fleet init wrote it puts nothing on record: the kickstart interview costs no judge call", WITH_SESSIONS, async ($, on) => {
+  const asked = model(on, () => '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}')
+  const CHARTER = '# Charter\n\nWhat the project must show, and to whom.\n\n## Goals\n\nDrafted by the chief from the kickstart interview.\n'
+  const w = world(on, {
+    templates: { kit: { 'template.json': JSON.stringify({ templateFormat: 1, description: 'a kit', folders: [] }), 'fleet/charter.md': CHARTER } },
+    files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], tags: ['ui'] }), [`${FLEET}/charter.md`]: CHARTER, [`${FLEET}/principles.md`]: PRINCIPLES_TEXT },
+  })
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
+  await startSession($, w)
+  await decide($, { questions: [COLOR], area: 'ui' })
+  await tick(w)
+  expect(asked.length).toBe(0)
+  expect(json(w, `${DEC}/judge/D-1.json`).verdicts[0]).toMatchObject({ outcome: 'hold', why: expect.stringContaining('nothing on record yet') })
+  // A line of the person's in it: the next question gets its call
+  w.touch(`${FLEET}/charter.md`, `${CHARTER}\nA small tool for one lab.\n`)
+  await decide($, { questions: [{ ...COLOR, question: 'Which color for the info band?' }], area: 'ui' })
+  await tick(w)
+  expect(asked.length).toBe(1)
+})
+
+test('a charter line is on record: the judge is called, and it may suggest where nothing settles it (shown, never answered for him)', WITH_SESSIONS, async ($, on) => {
+  const asked = model(on, () => '{"answers": [{"q": 1, "outcome": "suggest", "option": "a", "cites": ["charter.md:3"], "why": "a small tool stays quiet"}]}')
+  const w = project(on, { files: { [`${FLEET}/principles.md`]: PRINCIPLES_TEXT } })
+  sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
+  await startSession($, w)
+  await decide($, { questions: [COLOR], area: 'ui' })
+  await tick(w)
+  expect(asked.length).toBe(1)
+  // Its citation is checked as a decided one's would be: a line that names no option isn't shown as support
+  expect(json(w, `${DEC}/judge/D-2.json`).verdicts).toEqual([{ q: 1, outcome: 'suggest', option: 'Amber', cites: [], why: 'a small tool stays quiet', unchecked: { cites: ['charter.md:3'], problem: 'charter.md:3 doesn\'t speak to "Amber"' } }])
+  expect(await fleet($, '')).toContain('   judge suggests a) Amber: a small tool stays quiet (nothing on record settles it: a suggestion, never answered for you) (it also cited charter.md:3, which code didn\'t take: charter.md:3 doesn\'t speak to "Amber")')
+  await fleet($, '1a')
+  for (let i = 0; i < 3; i++) await tick(w)
+  expect(json(w, `${DEC}/register/2026-11/D-2.json`).judge).toMatchObject({ agreed: [true] })
+  expect(await fleet($, 'stats ui')).toContain('1 suggested (you chose the suggestion 1 of 1 (100%))')
+})
+
+test('a citation code can’t check makes the proposal a hold; after outside content the judge only proposes, labelled; world.json’s judges false gates it', WITH_SESSIONS, async ($, on) => {
+  const asked = model(on, text => (text.includes('warning band') ? '{"answers": [{"q": 1, "outcome": "decided", "option": "a", "cites": ["principles.md:3"], "why": "warnings are amber"}]}' : '{"answers": [{"q": 1, "outcome": "decided", "option": "b", "cites": ["D-1"], "why": "as before"}]}'))
   on('tool.call', { tool: 'WebFetch' }, () => ({ result: { bytes: 10, code: 200 }, text: 'a page' }) as any)
   const w = project(on)
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
@@ -145,25 +196,29 @@ test('a citation code can’t check makes the proposal a hold; outside content a
   expect(String(asked[0].promptBlocks[1].text)).toContain('D-1 (2026-11-01, area storage): "Which database for the cache?" a) SQLite b) Redis → the person chose a) SQLite')
   expect(json(w, `${DEC}/judge/D-2.json`).verdicts[0]).toMatchObject({ outcome: 'hold', unchecked: { option: 'Redis', cites: ['D-1'], problem: 'D-1 wasn\'t answered "Redis"' } })
   expect(await fleet($, '')).toContain('judge: hold, needs your call (it proposed b) Redis citing D-1, which code didn\'t take: D-1 wasn\'t answered "Redis")')
-  // After reading the web: no judge looks at what this conversation asks
+  // After reading the web: the judge proposes all the same (the owner's 8a), labelled as a proposal only
   await $.tool.call({ tool: 'WebFetch', url: 'https://example.invalid/x', prompt: 'p' } as any)
   await w.clock.settle()
   await decide($, { questions: [COLOR] })
   await tick(w)
   expect(json(w, `${DEC}/queue/D-3.json`).outside).toMatchObject({ what: 'WebFetch of example.invalid' })
-  expect(json(w, `${DEC}/judge/D-3.json`).gated).toBe('it was asked after reading outside content (WebFetch of example.invalid)')
+  expect(asked.length).toBe(2)
+  expect(json(w, `${DEC}/judge/D-3.json`)).toMatchObject({ shadowOnly: 'it was asked after reading outside content (WebFetch of example.invalid)', verdicts: [{ outcome: 'decided', option: 'Amber' }] })
+  expect(json(w, `${DEC}/judge/D-3.json`).gated).toBe(undefined)
+  expect(await fleet($, '')).toContain('judge: a) Amber, citing principles.md:3: warnings are amber (a proposal only: it was asked after reading outside content (WebFetch of example.invalid))')
   // "judges": false: none look at all
   w.touch(`${FLEET}/world.json`, JSON.stringify({ worldFormat: 1, paths: ['notes/**'], judges: false }))
   await tick(w)
   await decide($, { questions: [PAY] })
   await tick(w)
   expect(w.files.has(`${DEC}/judge/D-4.json`)).toBe(false)
-  expect(asked.length).toBe(1)
+  expect(asked.length).toBe(2)
   expect(await fleet($, 'stats')).toContain('Judges: off')
 })
 
 test('taste: the person’s "no", recorded in the register with its provenance; the judges read it next time', WITH_SESSIONS, async ($, on) => {
   const asked = model(on, () => '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}')
+  on('tool.call', { tool: 'WebFetch' }, () => ({ result: { bytes: 10, code: 200 }, text: 'a page' }) as any)
   const w = project(on)
   // The person is at this background session's viewer: what he types there is his
   w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: '2026-11-02T11:00:00Z' }))
@@ -185,12 +240,27 @@ test('taste: the person’s "no", recorded in the register with its provenance; 
   expect(r3.result).toContain("Recorded as T-3 in the register, marked as not heard from the person directly (what it says isn't in what the person typed this turn)")
   expect(json(w, `${DEC}/register/2026-11/T-3.json`).taste.person).toBe(false)
   expect(((await $.tool.call({ tool: 'mcp__fleet__taste', said: 'x' } as any)) as any).deny).toContain('about: say what it was about')
+  // After outside content his typed words are still his (the owner's 9a): counted, the mark kept as a note
+  await $.tool.call({ tool: 'WebFetch', url: 'https://example.invalid/x', prompt: 'p' } as any)
+  await w.clock.settle()
+  const r4: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'make it amber', about: 'a red warning band', principle: 'warnings are amber', area: 'ui' } as any)
+  expect(r4.result).toContain('Recorded as T-4 in the register: a principle candidate ("warnings are amber") the project\'s judges read from now on (noted: this conversation had read outside content, WebFetch of example.invalid;')
+  expect(json(w, `${DEC}/register/2026-11/T-4.json`).taste).toMatchObject({ person: true, outside: { what: 'WebFetch of example.invalid' } })
+  // The same words again within the hour (another session heard the same "no"): kept once
+  const again: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'The band is  too loud', about: 'the band', principle: 'calm bands', area: 'ui' } as any)
+  expect(again.result).toMatch(/^T-2 has these words already \(recorded at \d\d:\d\d\): nothing new was recorded\.$/)
+  expect(w.files.has(`${DEC}/register/2026-11/T-5.json`)).toBe(false)
+  // The brief lists his taste not in principles.md yet (T-4's principle is there already; T-1 and T-3 aren't his)
+  const brief = await fleet($, 'brief')
+  expect(brief).toContain('your taste not in principles.md yet, yours to promote or not: T-2 "warning colors stay calm" (you said "the band is too loud")')
+  expect(brief).not.toContain('T-4 "warnings are amber"')
   await $.turn.complete({ answer: 'ok', durationMs: 5, isAborted: false, turnId: 't-1', reason: 'answer' } as any)
   await w.clock.settle()
   await decide($, { questions: [COLOR], area: 'ui' })
   await tick(w)
   const law = String(asked[0].promptBlocks[1].text)
-  expect(law).toContain('T-2 (2026-11-02, area ui), the person said no: "the band is too loud" about a red warning band; the principle it suggests: warning colors stay calm')
+  expect(law).toContain('T-2 (2026-11-02, area ui), the person said no, in his words: "the band is too loud"; what it\'s about, as the asking session read it: a red warning band; the principle it suggests, as that session read it: warning colors stay calm')
+  expect(law).toContain('T-4 (2026-11-02, area ui), the person said no, in his words: "make it amber"; what it\'s about, as the asking session read it: a red warning band; the principle it suggests, as that session read it: warnings are amber (recorded after that session had read outside content)')
   expect(law).not.toContain('T-1')
   expect(law).not.toContain('T-3')
 })
@@ -220,9 +290,11 @@ test('taste in a turn fleet started to deliver his words: his when it says what 
   expect(not.result).toContain("(what it says isn't in the person's words fleet delivered this turn)")
   await $.turn.complete({ answer: 'ok', durationMs: 5, isAborted: false, turnId: 't-2', reason: 'answer' } as any)
   await w.clock.settle()
-  // The next turn isn't fleet's delivery: nothing of his to quote
-  const after: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'amber reads calmer next to the logo', about: 'a red warning band', principle: 'warnings stay calm', area: 'ui' } as any)
+  // The next turn isn't fleet's delivery: nothing of his to quote (and his own words of T-1 again add nothing)
+  const after: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'amber is calmer than red', about: 'a red warning band', principle: 'warnings stay calm', area: 'ui' } as any)
   expect(after.result).toContain("(the person didn't type this turn)")
+  const dup: any = await $.tool.call({ tool: 'mcp__fleet__taste', said: 'amber reads calmer next to the logo', about: 'a red warning band', principle: 'warnings stay calm', area: 'ui' } as any)
+  expect(dup.result).toContain('T-1 has these words already')
 })
 
 // ---- Live areas (0.7.0) ----
@@ -231,6 +303,7 @@ const FLAGS = { reversible: true, touchesMoney: false, outsideWorld: false }
 
 test('live: an area the person turns on goes live at once; an exact repeat answered by the judge, the model’s own verdicts only proposing, a money one held', WITH_SESSIONS, async ($, on) => {
   const asked = model(on, text => (text.includes('Which cache, the fast one or the quick one?') ? '{"answers": [{"q": 1, "outcome": "send-back", "why": "the two options are the same thing"}]}' : '{"answers": [{"q": 1, "outcome": "hold", "why": "taste"}]}'))
+  on('tool.call', { tool: 'WebFetch' }, () => ({ result: { bytes: 10, code: 200 }, text: 'a page' }) as any)
   const w = project(on)
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'TEST A', root: ROOT, background: true, agent: null }, rows: { [REF]: row(REF, 'TEST A', 'idle') } })
   await startSession($, w)
@@ -284,6 +357,14 @@ test('live: an area the person turns on goes live at once; an exact repeat answe
   await tick(w)
   expect(json(w, `${DEC}/judge/D-6.json`)).toMatchObject({ live: true, liveWhy: "today's 1 live answers in the project are used up", verdicts: [{ outcome: 'decided', repeat: true }] })
   expect(w.files.has(`${DEC}/answers/D-6.1.json`)).toBe(false)
+  // After outside content, even an exact repeat in a live area is only proposed (the owner's 8a)
+  w.touch(`${FLEET}/world.json`, JSON.stringify({ worldFormat: 1, paths: ['notes/**'], tags: ['storage', 'ui'] }))
+  await $.tool.call({ tool: 'WebFetch', url: 'https://example.invalid/x', prompt: 'p' } as any)
+  await tick(w)
+  await decide($, { questions: [DB], area: 'storage', ...FLAGS })
+  await tick(w)
+  expect(json(w, `${DEC}/judge/D-7.json`)).toMatchObject({ live: true, liveWhy: 'it was asked after reading outside content (WebFetch of example.invalid): it only proposes', verdicts: [{ outcome: 'decided', repeat: true }] })
+  expect(w.files.has(`${DEC}/answers/D-7.1.json`)).toBe(false)
 })
 
 // Two closed decisions of the area whose model verdicts the person agreed with: with promote.proposals at 2, the area

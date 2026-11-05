@@ -23,6 +23,10 @@ test("a change's input: path and summary, and edits or content, never both", () 
     blocks: 'B-1',
   })
   expect(checkChange({ path: 'a.md', summary: 's', content: '' })).toEqual({ ok: true, path: 'a.md', summary: 's', content: '' })
+  // Past a cap: refused with the length, never cut
+  expect(checkChange({ path: 'a.md', summary: 's', content: 'y', blocks: 'b'.repeat(501) })).toEqual({ ok: false, reason: 'blocks is 501 characters, and fleet keeps at most 500 whole: say in one line what waits on it' })
+  expect(checkChange({ path: 'a.md', summary: 's', content: 'y', blocks: 'b'.repeat(500) })).toMatchObject({ ok: true, blocks: 'b'.repeat(500) })
+  expect(checkChange({ path: 'a.md', summary: 's'.repeat(1001), content: 'y' })).toMatchObject({ ok: false, reason: expect.stringContaining('summary is 1001 characters, and fleet keeps at most 1000 whole') })
 })
 
 test('edits apply in order, as Edit does: found once, or every time with replace_all', () => {

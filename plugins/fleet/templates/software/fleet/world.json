@@ -1,6 +1,7 @@
 {
   "worldFormat": 1,
   "paths": ["spec/**", "board/**", "docs/**", "notes/**", "journals/**", "ideas/**"],
+  "defaultKind": { "board/**": "editorial" },
   "command": ["spec/**"],
   "proposal": ["ideas/**"],
   "tags": ["spec", "code", "tests", "process"],

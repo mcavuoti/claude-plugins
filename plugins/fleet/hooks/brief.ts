@@ -5,7 +5,7 @@
 // (/fleet brief --chief). No `$` here.
 
 import type { Level } from './authority'
-import { changeLine, clock, type ChangeEvent, type Me } from './changes'
+import { changeLine, clock, newer, type ChangeEvent, type Me } from './changes'
 import { ago, shown } from './decisions'
 import { blocksLines, hoursText, usd, usdOf, type BlocksFile } from './roster'
 
@@ -21,6 +21,8 @@ export type BriefFacts = {
   waiting: number
   /** Instances waiting on a permission prompt, with nobody at them (their tool, since when) */
   prompts?: { name: string; tool: string; at: number }[]
+  /** Open board items nobody owns that no instance can be offered (no for: that names one, no front door), and why */
+  forNobody?: { id: string; why: string }[]
   /** The landings of the window, any order (the newest per file is shown) */
   events: ChangeEvent[]
   /** The decisions closed in the window that changed something or sent something: a change applied, an outbound sent */
@@ -33,8 +35,12 @@ export type BriefFacts = {
     blocks: { id: string; who: string; at: number; blocks: string }[]
     /** One line each, as /fleet status says them (records.ts suspectLine) */
     suspects: { line: string; who: string | null }[]
+    /** The files only behind a move, one line a move (records.ts behindLine): apart, so the real flags stand out */
+    behind?: string[]
     failing: { path: string; check: string; message: string; who: string | null }[]
     cadence: { name: string; hours: number; cadenceH: number }[]
+    /** Running instances whose routine poll (roster.json's poll) is twice overdue: when it last ran (null: never) */
+    polls?: { name: string; last: number | null; everyMin: number }[]
     noFleet: string[]
     down: string[]
     /** Instances not running though nobody took them down: a restart stopped them (wave: the highest of them), or the
@@ -47,11 +53,14 @@ export type BriefFacts = {
     unproven?: { line: string; who: string | null }[]
     /** What moved upstream under an instance's own changes, one line each (code.ts codeBriefLines) */
     code?: string[]
+    /** The work waiting (the capacity line, idle instances beside open items nobody owns) and the runs in flight or
+     * finished and not recorded, one line each */
+    work?: string[]
   }
   spend: {
     project: { usd: number; cap: number | null } | null
     instances: { name: string; usd: number; cap: number | null; state: string }[]
-    forecast: { caps: number; wakesUsd: number } | null
+    forecast: { caps: number; wakesUsd: number; pollsUsd?: number } | null
     windows: { kind: string; percentUsed: number }[]
   }
   /** The intake records of the window: what each is, who sent it, who it reached (none: nobody subscribes, and there's
@@ -82,13 +91,13 @@ function eventLine(e: ChangeEvent, f: BriefFacts): string {
   return `   - ${e.path}${tags.length ? ` (${tags.join('; ')})` : ''}: ${changeLine(e, f.me)}`
 }
 
-/** The newest event per file, newest first; command-level ones first */
+/** The newest event per file (changes.ts newer: a tool's landing beats a blind one of the same version), newest first;
+ * command-level ones first */
 function newestPerFile(events: readonly ChangeEvent[], f: BriefFacts): ChangeEvent[] {
   const by = new Map<string, ChangeEvent>()
   for (const e of events) {
     if (e.at < f.since) continue
-    const had = by.get(e.path)
-    if (!had || e.at >= had.at) by.set(e.path, e)
+    if (newer(by.get(e.path), e)) by.set(e.path, e)
   }
   const rank = (e: ChangeEvent) => (f.levelOf(e.path) === 'command' ? 0 : 1)
   return [...by.values()].sort((a, b) => rank(a) - rank(b) || b.at - a.at || a.path.localeCompare(b.path))
@@ -109,6 +118,10 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   const prompts = f.prompts ?? []
   if (prompts.length && !f.needs.length) out[needsAt] = `1. Needs you: ${kindWords(prompts.length, 'permission prompt', 'permission prompts')}`
   for (const p of prompts) out.push(`   - ${p.name} waits on a permission prompt (${p.tool}) · ${ago(f.now - p.at)}: Enter on its row in the panel answers it`)
+  // Open items no instance can be offered: nobody takes them until the person says whom they're for
+  const nobody = f.forNobody ?? []
+  if (nobody.length && !f.needs.length && !prompts.length) out[needsAt] = `1. Needs you: ${kindWords(nobody.length, 'open item for nobody', 'open items for nobody')}`
+  for (const n of nobody) out.push(`   - ${n.id}: open, for nobody: ${n.why}`)
   if (f.waiting) out.push(`   ${f.waiting} answered, not delivered yet`)
   // Items from outside that reached nobody (no subscriber, no front door), and requests for a change nobody drafts
   const intake = (f.intake ?? []).filter(i => i.at >= f.since)
@@ -146,10 +159,13 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   const lines: string[] = [
     ...b.blocks.map(x => `   - ${x.id} (${x.who}, ${ago(f.now - x.at)}) holds up: ${x.blocks}`),
     ...b.suspects.map(x => `   - suspect: ${x.line}${x.who ? ` (written last by ${x.who})` : ''}`),
+    ...(b.behind ?? []).slice(0, SHOWN).map(x => `   - behind: ${x}`),
+    ...((b.behind ?? []).length > SHOWN ? [`   - and ${(b.behind ?? []).length - SHOWN} more moves: /fleet status lists them`] : []),
     ...b.failing.map(x => `   - ${x.path} fails the check ${x.check}: ${x.message}${x.who ? ` (written last by ${x.who})` : ''}`),
     ...(b.unproven ?? []).map(x => `   - unproven: ${x.line}${x.who ? ` (written last by ${x.who})` : ''}`),
     ...(b.code ?? []).map(x => `   - ${x}`),
     ...b.cadence.map(x => `   - ${x.name}: nothing landed in ${hoursText(x.hours)} (its cadence is ${hoursText(x.cadenceH)})`),
+    ...(b.polls ?? []).map(x => `   - ${x.name}: its routine poll is overdue (every ${x.everyMin} min; ${x.last !== null ? `last ${ago(f.now - x.last)} ago` : 'none yet'})`),
     ...b.stale.map(x => `   - ${x.name} read ${x.files} shared file${x.files === 1 ? '' : 's'} that changed since`),
     ...(b.autoMode ?? []).flatMap(x => blocksLines(x.name, x.blocks, f.me.offsetMin).map((l, i) => `${i ? '     ' : '   - '}${l}`)),
     ...b.noFleet.map(x => `   - ${x}: running with no fleet (u in the panel restarts it)`),
@@ -159,13 +175,14 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
     ...(b.stopped?.retired ?? []).map(x => `   - ${x.name}: retired for being idle${x.notWoken ? `; not woken: ${x.notWoken}` : ' (fleet wakes it when something is for it)'}`),
     ...(f.derived ?? []).map(d => `   - stale: ${d.path} (${d.kind}, owned by ${d.owner}): ${d.pins.join(', ')} moved since it cited them`),
     ...(f.slots ?? []).flatMap(x => x.waiting.map(w => `   - ${w.name} waits for the slot ${x.slot} (${ago(f.now - w.at)})`)),
+    ...(b.work ?? []).map(x => `   - ${x}`),
   ]
   out.push('', lines.length ? '3. Blocked and stale:' : '3. Nothing is blocked or stale.', ...lines)
   // 4. Spend, in both kinds of account
   const s = f.spend
   const parts: string[] = []
   if (s.project) parts.push(`${usdOf(s.project.usd, s.project.cap)} today${s.project.cap !== null ? " (the project's cap)" : ''}, estimated at list price`)
-  if (s.forecast) parts.push(`budgets ${usd(s.forecast.caps)} a day, wakes ~${usd(s.forecast.wakesUsd)} a day`)
+  if (s.forecast) parts.push(`budgets ${usd(s.forecast.caps)} a day, wakes ~${usd(s.forecast.wakesUsd)} a day${s.forecast.pollsUsd ? `, routine polls ~${usd(s.forecast.pollsUsd)} a day` : ''}`)
   if (s.windows.length) parts.push(`this account's windows: ${s.windows.map(w => `${windowName(w.kind)} ${w.percentUsed}%`).join(', ')}`)
   out.push('', parts.length ? `4. Spend: ${parts.join('; ')}` : '4. Spend: no roster, and no window reading yet')
   const heavy = s.instances.filter(i => i.state !== 'ok' || i.usd > 0).sort((a, c) => c.usd - a.usd)
@@ -203,9 +220,11 @@ export function closedLine(r: { id: string; kind?: string; change?: { path: stri
 
 /** A closed decision's outcome in words: for a choice, each question and what it was answered (a label, or the person's
  * words), or dropped; for a change, a resource or an outbound, what the person did with it and his words (applied,
- * rejected, stale; done, no; sent, done, rejected). For the brief, and for a session that waited on it */
-export function outcomeWords(r: { kind?: string; state?: string; questions: { question: string }[]; answers: ({ label?: string; text?: string; note?: string; origin?: string } | null)[] }): string {
+ * rejected, stale; done, no; sent, done, rejected); one its asker took back, withdrawn with why. For the brief, and for a
+ * session that waited on it */
+export function outcomeWords(r: { kind?: string; state?: string; why?: string; questions: { question: string }[]; answers: ({ label?: string; text?: string; note?: string; origin?: string } | null)[] }): string {
   if (r.state === 'dropped') return 'dropped, unanswered'
+  if (r.state === 'withdrawn') return `withdrawn by its asker${r.why ? `: ${shown(r.why, 200)}` : ''}`
   if (r.kind === 'change' || r.kind === 'resource' || r.kind === 'outbound') {
     const a = r.answers[0]
     const words = a?.note || a?.text

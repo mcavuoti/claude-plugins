@@ -1,6 +1,7 @@
 {
   "worldFormat": 1,
   "paths": ["req/**", "findings/**", "board/**", "poc/**/*.md", "poc/results/**", "proposal/**", "plan/**", "brief/**", "notes/**", "journals/**", "ideas/**", "inputs/**"],
+  "defaultKind": { "board/**": "editorial" },
   "command": ["req/**"],
   "proposal": ["ideas/**"],
   "information": ["inputs/**"],
