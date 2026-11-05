@@ -176,7 +176,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     if (!files.has(e.path)) throw new Error(`ENOENT: ${e.path}`)
     return { value: { kind: 'file' as const, size: size(e.path), mtimeMs: written.get(e.path) ?? clock.now(), isLink: false } }
   })
-  // A file written by someone else (Claude, another session) at the mocked time, so its time stays until it's written again
+  // A file someone else wrote (Claude, another session) at the mocked time: its time stays until it's written again
   const write = (path: string, text: string) => {
     files.set(path, text)
     written.set(path, clock.now())

@@ -2,8 +2,9 @@ import type { Color, Period, RateLimit, SessionsMark, SessionsMember, SessionsRe
 
 // The format of everything the mod shares outside one session: the files in its data folder (heartbeats, the panel
 // order, inbox requests, the launcher's window files, the mirrored settings, usage.py's summary, ccc's plugin lookup)
-// and the notices between sessions. Each one carries `format=<n>`. A reader that finds another format leaves it alone and says the sessions need a restart (u, or
-// claude respawn): sessions running another version of the mod never act on each other's data by mistake.
+// and the notices between sessions. Each one carries `format=<n>`. A reader that finds another format leaves it alone
+// and says the sessions need a restart (u, or claude respawn): sessions running another version of the mod never act on
+// each other's data by mistake.
 // The launcher (hooks/launcher.py, hooks/visor.sh, setup/ccc) reads and writes the same formats: change them together.
 export const FORMAT = 3
 

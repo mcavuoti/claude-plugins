@@ -110,7 +110,7 @@ test('a stored list holds while nothing moved, for 30 s; a change is listed, not
   expect(listHolds({ at: 1000 }, 4500, 3500, 'a')).toBe(false)
   expect(listHolds(c, 4499, 3500, null)).toBe(true)
   expect(listHolds(c, 4500, 3500, null)).toBe(false)
-  // A caller that wants it fresher than the panel's pace gets exactly that; a slow listing's push back holds for the rest
+  // A caller that wants it fresher than the panel's pace gets exactly that; a slow listing's push back holds otherwise
   expect(listHolds(c, 1500, 0, 'a')).toBe(false)
   expect(listHolds(c, 2500, 2000, 'a')).toBe(true)
   expect(listHolds({ ...c, until: 90000 }, 60000, 3500, 'b')).toBe(true)

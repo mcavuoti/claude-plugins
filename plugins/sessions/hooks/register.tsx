@@ -928,7 +928,8 @@ async function usablePython($: any): Promise<string | null> {
 
 // Every session with the panel open wants the same totals once a minute: usage.py leaves what it answered in
 // <data>/usage/summary.json (touched on every run, rewritten only when it changed), and a session finding one from the
-// last USAGE_SHARED_MS reads it instead of running usage.py. The panel's value is rewritten only when the totals changed
+// last USAGE_SHARED_MS reads it instead of running usage.py. The panel's value is rewritten only when the totals
+// changed
 const USAGE_SHARED_MS = 50000
 async function sharedUsage($: any): Promise<UsageSummary | null> {
   try {
@@ -1593,8 +1594,8 @@ async function notifySpend($: any) {
 }
 
 // The panel's rows, from the session list and what each session published. Every value the panel draws is written only
-// when it changed (put), and the rows' times are reckoned at the minute (labelMinute): a refresh that finds nothing new
-// draws nothing, and an idle panel is drawn about once a minute, for its times
+// when it changed (sameData), and the rows' times are reckoned at the minute (labelMinute): a refresh that finds
+// nothing new draws nothing, and an idle panel is drawn about once a minute, for its times
 async function refresh($: any) {
   const list = await officialList($)
   if (typeof list === 'string') {
