@@ -67,6 +67,9 @@ import {
   stopLog,
   stopReasons,
   storeNamespace,
+  wakeStagger,
+  afterTick,
+  rowsBelow,
   shellQuote,
   isRef,
   type StopLog,
@@ -326,6 +329,25 @@ function bg(work: Promise<unknown>) {
   work.catch(() => {})
 }
 
+// A timer's job runs once at a time: a tick that comes while its last run is still going is skipped. On a slow machine
+// (after a sleep, under an endpoint scanner) the ticks would otherwise pile up behind each other, each starting commands
+const runningJobs = new Set<string>()
+function solo(name: string, job: () => Promise<unknown>): Promise<unknown> {
+  if (runningJobs.has(name)) return Promise.resolve()
+  runningJobs.add(name)
+  return job().finally(() => runningJobs.delete(name))
+}
+
+// After a sleep every session's timers fire at once. A gap between two of this session's ticks longer than 30 s (afterTick)
+// is a sleep (or a stall): the list-reading jobs then wait this session's own offset (wakeStagger: 0-10 s, from its id)
+// before running, so the sessions don't all list together
+let ticks = { last: 0, quietUntil: 0 }
+async function justWoke($: any): Promise<boolean> {
+  const t = afterTick(ticks, await $.clock.now(), wakeStagger(myId))
+  ticks = { last: t.last, quietUntil: t.quietUntil }
+  return t.quiet
+}
+
 // A line in the debug log only (claude --debug, or --debug-file), when the option is on
 function debugLine($: any, text: string) {
   if (!debugLogs) return
@@ -337,7 +359,9 @@ function debugLine($: any, text: string) {
 // Data shared between sessions: the mod's official store ($.store), a JSON file managed by Claude. Keys:
 // state:<id> (SessionState: what each session publishes about itself), seen:<id> (seen at), title:<id> (title from the
 // first prompt), waiting:<id> (waiting since),
-// restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (cached session list),
+// restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (the cached session list: at,
+// when the listing came back; sessions; until, when a slow listing pushed the next one back; one listing at a time,
+// under the <data>/list.lock folder),
 // installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
 // autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
@@ -347,7 +371,8 @@ function debugLine($: any, text: string) {
 // at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
 // (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
-// and the window in front, shared for 1.5 s by the seen check: at, windows / tty), answer:<id> (the answer to a Stop or
+// and the window in front, shared for 1.5 s by the seen check: at, windows / tty; windowsList also pendingAt, a session
+// listing right now, and until, when a slow ps pushed the next one back), answer:<id> (the answer to a Stop or
 // Restart question that session asked, when the asked session couldn't send it as a notice: format, sessionId,
 // action, cameBack, at; that session's panel takes it and deletes it), personStop:<id> (when the person stopped that
 // session from a panel: a plugin's wake leaves it stopped until it's started again).
@@ -435,8 +460,15 @@ async function readState($: any, sessionId: string): Promise<SessionState | null
   return e && typeof e === 'object' ? (e as SessionState) : null
 }
 
-// Which terminal windows show each session: "claude attach <id>" viewers, agent views, and classic sessions by their pid
+// Which terminal windows show each session: "claude attach <id>" viewers, agent views, and classic sessions by their pid.
+// One ps at a time in a session: callers that come while one runs share it
+let windowsListing: Promise<Windows> | null = null
 async function windows($: any): Promise<Windows> {
+  if (!windowsListing) windowsListing = listWindows($).finally(() => (windowsListing = null))
+  return windowsListing
+}
+
+async function listWindows($: any): Promise<Windows> {
   // -A: every process, on macOS and on Linux (on macOS it's the same as -ax). One -o per column: a header runs to the end
   // of its -o argument (POSIX), so procps reads `-o pid=,tty=,command=` as the pid column alone
   return parseWindows((await run($, ['ps', '-A', '-o', 'pid=', '-o', 'tty=', '-o', 'command='])).stdout, platform.clientCommand)
@@ -499,14 +531,26 @@ async function myWindows($: any): Promise<string[]> {
 
 // The windows listing and the window in front, shared by every session for a moment: the seen check runs every 2 s in
 // each session with an answer nobody saw, and one ps and one question to Terminal then serve them all. Only for that
-// check: what acts on a window (closing a viewer, a switch) reads the listing right then
+// check: what acts on a window (closing a viewer, a switch) reads the listing right then. Like the session list: stamped
+// when ps came back; a session about to list says so (`pendingAt`), and the others use the stored windows meanwhile;
+// a ps that took longer than SHARED_MS pushes every session's next one back (twice its time, up to 30 s)
 const SHARED_MS = 1500
+const WINDOWS_PENDING_MS = 10000
+const WINDOWS_BACKOFF_MAX_MS = 30000
 async function sharedWindows($: any): Promise<Windows> {
   const now = await $.clock.now()
   const c = await storeGet($, 'windowsList')
-  if (c && now - Number(c.at) < SHARED_MS && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid) return c.windows as Windows
+  const stored = c && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid ? (c.windows as Windows) : null
+  if (stored) {
+    if (now - Number(c.at) < SHARED_MS) return stored
+    if (typeof c.until === 'number' && now < c.until) return stored
+    if (typeof c.pendingAt === 'number' && now - c.pendingAt < WINDOWS_PENDING_MS) return stored
+    await storeSet($, 'windowsList', { ...c, pendingAt: now })
+  }
   const v = await windows($)
-  await storeSet($, 'windowsList', { at: now, windows: v })
+  const at = await $.clock.now()
+  const took = at - now
+  await storeSet($, 'windowsList', { at, windows: v, ...(took > SHARED_MS ? { until: at + Math.min(WINDOWS_BACKOFF_MAX_MS, 2 * took) } : {}) })
   return v
 }
 
@@ -553,17 +597,90 @@ async function markSeenIfLooking($: any) {
   if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
 
-// A single query every 3.5 s for all sessions: the first one that finds it stale refreshes it
-async function officialList($: any): Promise<any[] | string> {
-  const now = await $.clock.now()
+// The official list (claude agents --json --all), shared by every session through the store ('list': { at, sessions,
+// until? }). One listing at a time: in a session, callers share the one in flight; across sessions, whoever takes
+// <data>/list.lock runs it, and the others read the stored list, however old, until it lands. `at` is when the listing
+// came back, never when it started. A listing that took longer than LIST_MS pushes every session's next one back
+// (`until`: twice its time, up to LIST_BACKOFF_MAX_MS): a slow machine (after a sleep, under an endpoint scanner that
+// checks every exec) isn't flooded with more listings, each slower than the last
+const LIST_MS = 3500
+const LIST_BACKOFF_MAX_MS = 60000
+const LIST_LOCK_STALE_MS = 30000
+const LIST_WAIT_MS = 15000
+type Listed = { sessions: any[]; at: number }
+let listing: Promise<Listed | string> | null = null
+
+async function officialList($: any, maxAge = LIST_MS): Promise<any[] | string> {
+  const r = await listWithAge($, maxAge)
+  return typeof r === 'string' ? r : r.sessions
+}
+
+async function storedList($: any): Promise<(Listed & { until?: number }) | null> {
   const c = await storeGet($, 'list')
-  if (c && now - c.at < 3500 && Array.isArray(c.sessions)) return c.sessions
-  const r = await run($, [claude, 'agents', '--json', '--all'])
-  if (r.exitCode !== 0) return "Couldn't read the session list (claude agents --json)"
-  const list = validateList(r.stdout)
-  if (typeof list === 'string') return list
-  await storeSet($, 'list', { at: now, sessions: list })
-  return list
+  return c && Array.isArray(c.sessions) && typeof c.at === 'number' ? (c as Listed & { until?: number }) : null
+}
+
+// The list with when it was read. maxAge: how old a stored one may be (0 for one read now, as a restart's question
+// wants); a caller that wants it fresh checks `at` itself, since another session's listing may be the one in flight
+async function listWithAge($: any, maxAge = LIST_MS): Promise<Listed | string> {
+  const now = await $.clock.now()
+  const c = await storedList($)
+  if (c && now - c.at < maxAge) return c
+  if (c && maxAge >= LIST_MS && typeof c.until === 'number' && now < c.until) return c
+  if (!listing) listing = fetchList($, maxAge).finally(() => (listing = null))
+  return listing
+}
+
+// One try at the machine-wide lock; a lock older than LIST_LOCK_STALE_MS was left by a session cut off mid-listing
+async function takeListLock($: any, lock: string): Promise<boolean> {
+  if ((await runSafe($, ['mkdir', lock])).exitCode === 0) return true
+  try {
+    const st = await $.fs.stat(lock)
+    if ((await $.clock.now()) - st.mtimeMs > LIST_LOCK_STALE_MS) {
+      await runSafe($, ['rmdir', lock])
+      return (await runSafe($, ['mkdir', lock])).exitCode === 0
+    }
+  } catch {}
+  return false
+}
+
+async function fetchList($: any, maxAge: number): Promise<Listed | string> {
+  const lock = dataDir ? `${dataDir}/list.lock` : ''
+  const holding = lock ? await takeListLock($, lock) : false
+  if (lock && !holding) {
+    // Another session is listing: its list, once stored, serves here too. Until then the stored one, however old; with
+    // none stored yet, wait for one a while, and only then list here without the lock
+    const c = await storedList($)
+    if (c) return c
+    for (let waited = 0; waited < LIST_WAIT_MS; waited += 500) {
+      await $.clock.sleep(500)
+      const again = await storedList($)
+      if (again) return again
+    }
+  }
+  try {
+    // Read again under the lock: the session that held it before may have just stored a fresh one
+    const started = await $.clock.now()
+    const c = await storedList($)
+    if (c && started - c.at < maxAge) return c
+    const r = await run($, [claude, 'agents', '--json', '--all'])
+    if (r.exitCode !== 0) return "Couldn't read the session list (claude agents --json)"
+    const list = validateList(r.stdout)
+    if (typeof list === 'string') return list
+    const at = await $.clock.now()
+    const took = at - started
+    await storeSet($, 'list', { at, sessions: list, ...(took > LIST_MS ? { until: at + Math.min(LIST_BACKOFF_MAX_MS, 2 * took) } : {}) })
+    return { sessions: list, at }
+  } finally {
+    if (holding) await runSafe($, ['rmdir', lock])
+  }
+}
+
+// After a start, a stop or a restart the list is out of date: the next caller reads it again (under the lock), and the
+// stored sessions still serve the others meanwhile
+async function invalidateList($: any) {
+  const c = await storedList($)
+  await storeSet($, 'list', c ? { at: 0, sessions: c.sessions } : {})
 }
 
 // The heartbeats of the sessions in a list, by sessionId (only the ones that exist and parse)
@@ -604,8 +721,8 @@ async function prune($: any) {
   const now = await $.clock.now()
   if (now - lastPrune < 600000) return
   lastPrune = now
-  const r = await run($, [claude, 'agents', '--json', '--all'])
-  const list = r.exitCode === 0 ? validateList(r.stdout) : 'failed'
+  // The shared list, at most 10 s old (one listing serves every session's prune: after a sleep they all come due at once)
+  const list = await officialList($, 10000)
   // A listing that lacks this very session (short, or empty) isn't trusted with deleting anything
   if (typeof list === 'string' || !list.some(s => s.sessionId === myId)) return
   const alive = new Set(list.map(s => String(s.sessionId)))
@@ -959,7 +1076,7 @@ async function reopenPass($: any) {
     const name = s.name && s.name !== s.id ? s.name : s.id
     const done = await run($, [claude, 'respawn', s.id])
     $.ui.toast(done.exitCode === 0 ? `Reopened “${name}”: Claude had closed it for lack of memory` : `Couldn't reopen “${name}”`)
-    await storeSet($, 'list', {})
+    await invalidateList($)
     return
   }
 }
@@ -1016,13 +1133,12 @@ async function runWakes($: any) {
   waking = true
   try {
     for (let w = wakes.shift(); w; w = wakes.shift()) {
-      const r = await run($, [claude, 'agents', '--json', '--all'])
-      const list = r.exitCode === 0 ? validateList(r.stdout) : []
+      const list = await officialList($, 2000)
       if (Array.isArray(list) && list.some(s => s.id === w.id && s.pid)) continue
       const done = await run($, [claude, 'respawn', w.id])
       debugLine($, `wake “${w.name}” (${w.reason || 'no reason given'}): ${done.exitCode === 0 ? 'restarted' : 'failed'}`)
       if (done.exitCode !== 0) $.ui.toast(`Couldn't wake “${w.name}”`)
-      await storeSet($, 'list', {})
+      await invalidateList($)
     }
   } finally {
     waking = false
@@ -1674,7 +1790,7 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
       if (e && installedVersion) await storeSet($, `state:${f.sessionId}`, { ...e, version: installedVersion })
       $.ui.toast(`“${f.title}” restarted${f.outdated && installedVersion ? ` on Claude ${installedVersion}` : ''}`)
     }
-    await storeSet($, 'list', {})
+    await invalidateList($)
     await refresh($)
     return
   }
@@ -1692,7 +1808,7 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
     const r = await run($, [claude, 'rm', f.id])
     if (r.exitCode !== 0) $.ui.toast(`Couldn't remove “${f.title}” from the list`)
   }
-  await storeSet($, 'list', {})
+  await invalidateList($)
   await refresh($)
   if (closeWindows && before.length) {
     await $.clock.sleep(1500)
@@ -1929,13 +2045,16 @@ async function restartSelf($: any, f: Row) {
   $.ui.toast(`Couldn't restart “${f.title}”`)
 }
 
-// What a session is doing right now (busy, waiting, idle; null if it isn't running), bypassing the shared list cache
+// What a session is doing right now (busy, waiting, idle; null if it isn't running): a list read now (through the lock:
+// another session's listing in flight serves too, once it lands). If it can't be known, it's treated as busy: ask
+// before cutting anything
 async function statusNow($: any, sessionId: string): Promise<string | null | undefined> {
-  const r = await run($, [claude, 'agents', '--json', '--all'])
-  if (r.exitCode !== 0) return 'busy'
-  const list = validateList(r.stdout)
-  // If it can't be known, it's treated as busy: ask before cutting anything
-  if (typeof list === 'string') return 'busy'
+  const asked = await $.clock.now()
+  const r = await listWithAge($, 0)
+  if (typeof r === 'string') return 'busy'
+  // Only a list from about now: an old one (another session held the lock and nothing newer landed) says nothing
+  if (r.at < asked - 5000) return 'busy'
+  const list = r.sessions
   const s = list.find(x => x.sessionId === sessionId)
   return s ? (s.status ?? null) : undefined
 }
@@ -1967,13 +2086,12 @@ async function runLaunches($: any) {
   launching = true
   try {
     for (let l = launches.shift(); l; l = launches.shift()) {
-      const r = await run($, [claude, 'agents', '--json', '--all'])
-      const list = r.exitCode === 0 ? validateList(r.stdout) : []
+      const list = await officialList($, 2000)
       const taken = Array.isArray(list) && list.some(s => s.name === l.name && inProject(String(s.cwd), l.root, home))
       const refusal = taken ? `a session named “${l.name}” is already in ${l.root}` : await launch($, l)
       debugLine($, `start “${l.name}” in ${l.cwd}: ${refusal || 'started'}`)
       if (refusal) $.ui.toast(`Couldn't start “${l.name}”: ${refusal}`)
-      else await storeSet($, 'list', {})
+      else await invalidateList($)
     }
   } finally {
     launching = false
@@ -2375,7 +2493,7 @@ async function checkInbox($: any) {
       else {
         const done = await run($, [claude, 'respawn', v.id])
         debugLine($, `wake “${v.name}” for ccc tell: ${done.exitCode === 0 ? 'restarted' : 'failed'}`)
-        await storeSet($, 'list', {})
+        await invalidateList($)
         await answer(done.exitCode === 0 ? 'ok' : 'failed', done.exitCode === 0 ? `woke “${v.name}”` : `couldn't wake “${v.name}”`, done.exitCode === 0 ? 'queued' : 'refused')
       }
     }
@@ -2592,7 +2710,7 @@ async function rebind($: any) {
   try {
     await beat($)
   } catch {}
-  await storeSet($, 'list', {})
+  await invalidateList($)
   bg(refresh($))
 }
 
@@ -2973,18 +3091,30 @@ async function start($: any) {
       await update($, usageView, () => ({ period: view.period, scope: view.scope }))
     }
     $.clock.every(500, () => {
-      bg(checkStoredAnswer($))
-      bg(checkInbox($))
+      bg(solo('answer', () => checkStoredAnswer($)))
+      bg(solo('inbox', () => checkInbox($)))
       bg(runLaunches($))
       bg(runWakes($))
-      bg(checkTells($))
+      bg(solo('tells', () => checkTells($)))
     })
-    // The person is told (pushWaits, notifySpend) from these timers only, never from a hook of a turn
+    // The person is told (pushWaits, notifySpend) from these timers only, never from a hook of a turn. Each runs once at
+    // a time, and after a sleep waits this session's own offset first (justWoke)
     $.clock.every(3000, () => {
-      bg(refresh($).then(() => pushWaits($)))
+      bg(
+        solo('refresh', async () => {
+          if (await justWoke($)) return
+          await refresh($)
+          await pushWaits($)
+        }),
+      )
     })
     $.clock.every(2000, () => {
-      bg(markSeenIfLooking($))
+      bg(
+        solo('seen', async () => {
+          if (await justWoke($)) return
+          await markSeenIfLooking($)
+        }),
+      )
     })
     $.clock.every(15000, () => {
       void (async () => {
@@ -3362,7 +3492,11 @@ export const register: Register = (on, options) => {
     // above them, as Text too
     const plan = drawPlan(list)
     const shownRows = list.filter(f => !f.folded)
-    const lines = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0)
+    // While the list doesn't fit, the status lines of rows that don't need you are left out (their badges stay), so more
+    // sessions fit; a row that waits for you, or that a plugin marked as needing you, keeps its line
+    const crowded = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0) + 6 + (note !== '' ? 1 : 0) > height
+    const keepsLine = (f: Row) => !!f.line && (!crowded || f.color === 'red' || f.needsPerson === true)
+    const lines = plan.length + shownRows.filter(keepsLine).length + (about.waitingOnly ? 1 : 0)
     const overflows = lines + 6 + (note !== '' ? 1 : 0) > height
     // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
@@ -3376,6 +3510,16 @@ export const register: Register = (on, options) => {
       e.props.placement === 'dock' &&
       lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
+    // How many sessions (or folded sections) don't fit below: said at the top, where it's always in view, so a running
+    // session past the bottom edge isn't taken for a missing one
+    const above = (inTerminal ? 1 : 0) + 1 + 1 + (note !== '' ? 1 : 0) + (about.waitingOnly ? 1 : 0)
+    const below = overflows
+      ? rowsBelow(
+          plan.map(it => (it.kind === 'header' ? { lines: 1, counts: false } : it.kind === 'fold' ? { lines: 1, counts: true } : { lines: keepsLine(it.row) ? 2 : 1, counts: true })),
+          room,
+          above,
+        )
+      : 0
     // Columns: [▌][● ][name…][↑][◆][ model  ctx  time][ spend]; in narrow panels the model is left out
     // Rows use only the width they need: in the box above the prompt (small windows or not fullscreen) the panel takes
     // the whole screen, and without this the model and time would end up far away from the name
@@ -3407,7 +3551,7 @@ export const register: Register = (on, options) => {
     // ⚙n: what the session runs in the background (⚙ takes one column: padded by hand, not by displayWidth)
     const helpers = (f: Row) => (helperWidth ? <Text dimColor>{(f.helpers > 0 ? ` ⚙${f.helpers}` : '').padEnd(helperWidth)}</Text> : null)
     const statusLine = (f: Row) =>
-      f.line ? (
+      keepsLine(f) ? (
         <Text key={`l:${f.sessionId}`} color={f.tint || undefined} dimColor={f.tint ? undefined : true}>
           {truncate(`${' '.repeat(3 + (f.depth > 0 ? INDENT : 0))}${f.line}`, total)}
         </Text>
@@ -3484,6 +3628,9 @@ export const register: Register = (on, options) => {
           </Box>
         )}
         <Text> </Text>
+        {below > 0 && (
+          <Text dimColor>{truncate(`↓ ${below} more below · ${e.props.isFocused ? '↑↓ scroll' : 'shift+→, then ↑↓'}`, total)}</Text>
+        )}
         {note !== '' && <Text color="warning">{note}</Text>}
         {about.waitingOnly && <Text dimColor>{truncate(`Waiting for you · ${list.length} of ${about.sessions}${inTerminal ? ' · f: all' : ''}`, total)}</Text>}
         {list.length === 0 && <Text dimColor>{about.waitingOnly ? 'Nobody is waiting for you.' : 'No other sessions in this folder.'}</Text>}
