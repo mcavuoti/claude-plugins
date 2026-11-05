@@ -311,3 +311,32 @@ test('usage: a summary another session left a moment ago is used as it is, and a
   await w.clock.advance(5000)
   expect(writes.count.usage).toBe(used! + 1)
 })
+
+test('Enter: one ps for the whole switch, and the viewer closed before the arrival notice goes', async ($, on) => {
+  const w = world(on, { list: list() })
+  w.files.set(`${DATA}/alive/${BRAVO}`, heartbeatText({ pid: 4243, at: w.clock.now() + 600000, version: '0.13.2', via: 'session.start' }))
+  w.ps.value = '  100 ttys001  bash /Users/x/p/hooks/visor.sh start\n  101 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = (args: string[]) => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  const notices: { kind: string; at: number }[] = []
+  on('session.send', (_: any, e: any) => {
+    const n = parseNotice(String(e.text))
+    if (n) notices.push({ kind: n.kind, at: w.runs.length })
+    return { isDelivered: true }
+  })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const pane = w.panes.find((p: any) => p.id === 'sessions')
+  pane.isFocused = true
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  const from = w.runs.length
+  await ui.press({ key: `s:${BRAVO}` })
+  await w.clock.settle()
+  await ui.unmount()
+  const kill = w.runs.findIndex((a, i) => i >= from && a[0] === 'kill')
+  expect(w.runs[kill]).toEqual(['kill', '-HUP', '101'])
+  expect(w.runs.slice(from, kill).filter(a => a[0] === 'ps')).toHaveLength(1)
+  expect(w.files.get(`${DATA}/windows/_dev_ttys001`)).toContain('id=bbbbbbbb\n')
+  const focus = notices.find(n => n.kind === 'focus')
+  expect(focus).toBeDefined()
+  expect(focus!.at).toBeGreaterThan(kill)
+})

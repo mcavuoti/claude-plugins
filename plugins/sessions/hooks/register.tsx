@@ -540,9 +540,9 @@ async function listWindows($: any): Promise<Windows> {
 }
 
 // The window this session's panel was just used from (macOS: the front Terminal window, if it shows this session;
-// Linux: the one whose launcher has it open)
-async function frontWindowShowingMe($: any): Promise<string | null> {
-  return platform.windowShowingMe(sys($), await windows($), me())
+// Linux: the one whose launcher has it open). v: a listing the caller already has, for the rest of the same action
+async function frontWindowShowingMe($: any, v?: Windows): Promise<string | null> {
+  return platform.windowShowingMe(sys($), v ?? (await windows($)), me())
 }
 
 // The launcher (hooks/visor.sh, next to this file) runs in each window opened with ccc and opens one session after
@@ -568,8 +568,8 @@ function agentsTarget(): WindowTarget {
 // A single window: if a viewer or the agent view (clients) is in front and the window runs the launcher, switch to the
 // target in that same tab: write it the target and close the viewer; the launcher opens the next one. A window that
 // wasn't opened with ccc has no launcher and can't be switched in place (false): the caller opens a new window
-async function switchInPlace($: any, target: WindowTarget, front: string): Promise<boolean> {
-  const v = await windows($)
+async function switchInPlace($: any, target: WindowTarget, front: string, listed?: Windows): Promise<boolean> {
+  const v = listed ?? (await windows($))
   const pid = v.clients[front]
   if (!pid || !v.launchers[front] || !dataDir) return false
   try {
@@ -1850,7 +1850,8 @@ async function focusSession($: any, sessionId: string | undefined) {
 }
 
 // Moves the panel's focus (it already has the keyboard or is about to) to an element: a session or a field. While
-// Claude is settling the focus it rejects another change ("the focus moved meanwhile"), so it retries a bit. The
+// Claude is settling the focus it rejects another change ("the focus moved meanwhile"), so it retries a bit (every
+// 50 ms, for 1.5 s at most: the sooner it lands, the less the highlight shows on the row it came in on). The
 // ui.focus hook doesn't hear about changes the mod itself requests: they're recorded here. If you moved with the arrows
 // meanwhile, the focus isn't fought over.
 // A field that appears with autoFocus does NOT take the focus if the panel already had the keyboard: the focus goes by
@@ -1858,7 +1859,7 @@ async function focusSession($: any, sessionId: string | undefined) {
 // why it's moved here
 async function focusElement($: any, key: string) {
   const moves = personMoves
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 30; i++) {
     if (personMoves !== moves) return
     let panes: any[] = []
     try {
@@ -1880,7 +1881,7 @@ async function focusElement($: any, key: string) {
         return
       }
     }
-    await $.clock.sleep(100)
+    await $.clock.sleep(50)
   }
 }
 
@@ -1965,41 +1966,47 @@ function peerRow(sessionId: string, carried: Record<string, unknown> = {}): Row 
 }
 
 // Switches the front window to another session. With notifyFocus set to false, the target doesn't take the keyboard
-// with its panel (when it's about to show a question, or when it'll do so itself afterwards)
+// with its panel (when it's about to show a question, or when it'll do so itself afterwards). One ps serves the whole
+// switch (which window is this one, which shows the target, the viewer to close), and nothing waits before the viewer
+// is closed: the notice that gives the target's panel the keyboard and this panel's release of it go once the window
+// went (the target takes the keyboard with no window attached too, and gets it when the window attaches)
 async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
   if (f.current) return false
   // If the jump was made with the keyboard in the panel, the target session receives you with the focus on its panel.
   // When leaving, this session's panel releases the keyboard
   const fromKeyboard = notifyFocus && !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
-  const notifyAndRelease = async () => {
-    if (fromKeyboard) await sendNotice($, f, 'focus')
-    await releaseFocus($)
+  const gone = (): true => {
+    bg(
+      (async () => {
+        if (fromKeyboard) await sendNotice($, f, 'focus')
+        await releaseFocus($)
+      })(),
+    )
+    return true
   }
+  const v = await windows($)
   // A regular session lives in its own window: bring that one forward, whichever is in front. If it runs where the
   // panel can't reach (another terminal app, tmux, an editor), say so instead of doing nothing
   if (!f.background) {
     const s = lastList.find(x => x.sessionId === f.sessionId)
-    const tty = s?.pid ? (await windows($)).byPid[String(s.pid)] : undefined
+    const tty = s?.pid ? v.byPid[String(s.pid)] : undefined
     if (!tty || !(await platform.bringWindow(sys($), tty, f.title))) {
       $.ui.toast(platform.text.regularUnreachable(f.title))
       return false
     }
-    await notifyAndRelease()
-    return true
+    return gone()
   }
-  const front = await frontWindowShowingMe($)
+  const front = await frontWindowShowingMe($, v)
   if (!front) {
     $.ui.toast(platform.text.switchNeedsWindow)
     return false
   }
-  await notifyAndRelease()
-  const v = await windows($)
   // If it's already open in another window, bring that one: never the same session in two windows. Look among the
   // viewers (claude attach <id>) and among the agent views, which don't say which session they show: read their
   // screen looking for its tag
   const target = (f.id ? v.byId[f.id]?.find(t => t !== front) : undefined) ?? (await agentsViewShowing($, v, f, front))
   if (target) {
-    if (await platform.bringWindow(sys($), target, f.title)) return true
+    if (await platform.bringWindow(sys($), target, f.title)) return gone()
     // Where it can't be brought forward (Linux without wmctrl/xdotool, or Wayland), show it in this window too
     if (!platform.showHereIfCantBring) {
       $.ui.toast(`Couldn't bring the window showing “${f.title}”`)
@@ -2010,12 +2017,12 @@ async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
     $.ui.toast(`Can't find the window for “${f.title}”`)
     return false
   }
-  if (await switchInPlace($, { command: 'attach', id: f.id, title: f.title }, front)) return true
+  if (await switchInPlace($, { command: 'attach', id: f.id, title: f.title }, front, v)) return gone()
   // This window can't switch (it wasn't opened with ccc): open another one next to it, same size and position, with
   // the launcher
   const opened = await platform.openWindow(sys($), front, `${DOT[f.color]} ${f.title}`, launcherCommand({ command: 'attach', id: f.id, title: f.title }))
   $.ui.toast(opened ? `Opened “${f.title}” in a new window: this one wasn't opened with ccc, so it can't switch` : platform.text.cantOpen(f.title))
-  return opened
+  return opened ? gone() : false
 }
 
 // What's being asked: stop a running session, remove a stopped one from the list, or restart one. The values are sent
