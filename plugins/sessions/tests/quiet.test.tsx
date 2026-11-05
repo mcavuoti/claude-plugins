@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { heartbeatText, labelMinute, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, sameData, usageSummaryOf } from '../hooks/state'
+import { heartbeatText, labelMinute, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, sameData, sessionTags, usageSummaryOf } from '../hooks/state'
 import { COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel costs while nothing happens: it draws only what changed, reads the session list again only when
@@ -244,6 +244,78 @@ test('seen: arriving (ccc) or a key in the panel marks it seen at once, with no 
   await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: `s:${BRAVO}`, origin: { kind: 'person' } } as any)
   await w.clock.settle()
   expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(seen)
+})
+
+const asked = (w: World) => w.runs.filter(a => a[0] === 'osascript').map(a => a[2])
+const VIEW_TEXT = '● bravo  idle  ⟨bbbbbbbb⟩\n● alpha  done  ⟨aaaaaaaa⟩ ⟨bbbbbbbb⟩'
+
+test('the sessions a window shows, by their ⟨id⟩ tags', () => {
+  expect(sessionTags(VIEW_TEXT)).toEqual(['bbbbbbbb', 'aaaaaaaa'])
+  expect(sessionTags('no tags ⟨⟩ ⟨two words⟩')).toEqual([])
+})
+
+test("seen with an agent view in front: one question to Terminal and one read of the view's text, shared as the tags it shows", async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  w.ps.value = '  101 ttys001  claude agents'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : args[0] === 'leer' ? VIEW_TEXT : '')
+  await startSession($, w)
+  await w.clock.advance(3000)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+  expect(asked(w)).toEqual(['frente', 'leer'])
+  expect(w.store.get('frontWindow')).toEqual({ at: expect.any(Number), tty: '/dev/ttys001', tags: ['bbbbbbbb', 'aaaaaaaa'] })
+})
+
+test("seen: another session's answer about an agent view in front serves this one with no question, unless it lacks the view's tags", async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  w.ps.value = '  101 ttys001  claude agents'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys002' : '')
+  await startSession($, w)
+  await w.clock.advance(6000)
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  const before = asked(w).length
+  // An answer a moment ago, the view showing this session: seen, nothing asked
+  w.store.set('frontWindow', { at: w.clock.now() + 1000, tty: '/dev/ttys001', tags: ['aaaaaaaa'] })
+  await w.clock.advance(2000)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+  expect(asked(w).length).toBe(before)
+  // A new answer of its own, and one from an older version with no tags: this session asks, and reads the view itself
+  w.store.set(`state:${SID}`, { finished: w.clock.now() + 1 })
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : args[0] === 'leer' ? 'nothing here' : '')
+  await w.clock.advance(100)
+  w.store.set('frontWindow', { at: w.clock.now(), tty: '/dev/ttys001' })
+  await w.clock.advance(2000)
+  expect(asked(w).slice(before)).toEqual(['frente', 'leer'])
+  expect((w.store.get('frontWindow') as any).tags).toEqual([])
+})
+
+test('seen: while another session asks Terminal (pendingAt), this one asks nothing; a marker older than 20 s is ignored', SLOW, async ($, on) => {
+  const now = 1_000_000_000
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: now - 1000 }, frontWindow: { at: now - 5000, tty: '/dev/ttys002', pendingAt: now } } })
+  w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  await startSession($, w)
+  await w.clock.advance(15000)
+  expect(asked(w)).toEqual([])
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  // Its answer never came (cut off): past 20 s this session asks, and its viewer is in front
+  await w.clock.advance(8000)
+  expect(asked(w)).toEqual(['frente'])
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+})
+
+test('seen: a slow Terminal\'s answer is stamped when it came back, and says meanwhile that a session is asking', async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys002' : '')
+  w.terminalLate.value = 3000
+  await startSession($, w)
+  // The first check, on the 2 s timer
+  await w.clock.advance(2100)
+  const asking = w.store.get('frontWindow') as any
+  expect(typeof asking?.pendingAt).toBe('number')
+  expect(asking.at).toBe(undefined)
+  await w.clock.advance(3000)
+  expect(w.store.get('frontWindow')).toEqual({ at: asking.pendingAt + 3000, tty: '/dev/ttys002' })
 })
 
 test('a failing claude --version or plugin list is tried again 5 minutes later, not at every refresh, keeping what it had', SLOW, async ($, on) => {

@@ -117,6 +117,12 @@ export function nextSeenCheck(finished: number, lastCheck: number): number {
   return lastCheck + (age < 60000 ? 2000 : age < 600000 ? 10000 : 30000)
 }
 
+// The sessions a window's text shows by their tag (⟨short id⟩, as each session's band ends): an agent view's, for the
+// seen check, which shares what it read as these and not the whole text
+export function sessionTags(text: string): string[] {
+  return [...new Set([...text.matchAll(/⟨([0-9A-Za-z_-]{1,64})⟩/g)].map(m => m[1]!))]
+}
+
 // How many of the panel's items don't fit: each item's lines in drawing order (a section title doesn't count, a session
 // row or a folded section does), the rows the panel has, and the lines drawn above the list
 export function rowsBelow(items: readonly { lines: number; counts: boolean }[], room: number, above: number): number {

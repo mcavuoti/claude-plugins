@@ -57,6 +57,8 @@ export type World = {
   // mode words (frente, leer, traer, cerrar, abrir: hooks/platform/macos.ts; '' by default)
   ps: { value: string }
   terminal: { value: (args: string[]) => string }
+  // How late Terminal's AppleScript answers, in ms (0: at once): a busy Terminal
+  terminalLate: { value: number }
   // What xprop answers (X11 on Linux), by its arguments; null: xprop fails, as without a display (the default)
   xprop: { value: (args: string[]) => string | null }
   // While set, `claude agents` answers only once it resolves (a slow listing)
@@ -117,6 +119,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const memory = { value: '1' }
   const ps = { value: '' }
   const terminal = { value: (_args: string[]) => '' }
+  const terminalLate = { value: 0 }
   const xprop = { value: (_args: string[]): string | null => null }
   const agentsGate: { value: Promise<void> | null } = { value: null }
   const agentsFail = { value: false }
@@ -252,7 +255,10 @@ export function world(on: On, options: WorldOptions = {}): World {
       const header = argv.find((a, i) => argv[i - 1] === '-o' && /=./.test(a))
       return ok(header ? [header.slice(header.indexOf('=') + 1), ...ps.value.split('\n').map(l => l.trim().split(/\s+/)[0])].join('\n') : ps.value)
     }
-    if (argv[0] === 'osascript') return ok(terminal.value(argv.slice(2)))
+    if (argv[0] === 'osascript') {
+      const answer = () => ok(terminal.value(argv.slice(2)))
+      return terminalLate.value > 0 ? clock.sleep(terminalLate.value).then(answer) : answer()
+    }
     if (argv[0] === 'xprop') {
       const answer = xprop.value(argv.slice(1))
       return answer === null ? failed() : ok(answer)
@@ -303,7 +309,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

@@ -158,6 +158,7 @@ import {
   listHolds,
   LIST_MS,
   nextSeenCheck,
+  sessionTags,
   usageSummaryOf,
   type ListedFile,
   nextLabelChange,
@@ -446,8 +447,9 @@ function debugLine($: any, text: string) {
 // at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
 // (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
-// and the window in front, shared by the seen check for SEEN_WINDOWS_MS and FRONT_SHARED_MS: at, windows / tty;
-// windowsList also pendingAt, a session listing right now, and until, when a slow ps pushed the next one back),
+// and the window in front, shared by the seen check for SEEN_WINDOWS_MS and FRONT_SHARED_MS: at, windows / tty, and
+// frontWindow's tags, the sessions an agent view in front shows; both also pendingAt, a session asking right now, and
+// windowsList until, when a slow ps pushed the next one back),
 // answer:<id> (the answer to a Stop or Restart question that session asked, when the asked session couldn't send it as
 // a notice: format, sessionId, action, cameBack, at; that session's panel takes it and deletes it), personStop:<id>
 // (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again).
@@ -679,6 +681,8 @@ const SHARED_MS = 1500
 const SEEN_WINDOWS_MS = 30000
 const FRONT_SHARED_MS = 1900
 const WINDOWS_PENDING_MS = 10000
+// Two questions to Terminal at most (the front window, an agent view's text), 8 s each at most
+const FRONT_PENDING_MS = 20000
 const WINDOWS_BACKOFF_MAX_MS = 30000
 async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<Windows> {
   const now = await $.clock.now()
@@ -697,13 +701,26 @@ async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<Windows>
   return v
 }
 
-async function sharedFront($: any, v: Windows): Promise<string | null> {
+// The window in front ('frontWindow': at, tty, and with an agent view in front, tags: the sessions it shows by their
+// ⟨id⟩ tag, sessionTags), the way the windows listing is shared: `at` is when Terminal answered; a session about to ask
+// says so (`pendingAt`) and the others skip their check meanwhile (the next one is at most a pace away). The session
+// that asks also reads the text of an agent view in front, so the sessions it shows don't each read it: however many
+// sessions are unseen, one question to Terminal (two with an agent view in front) per FRONT_SHARED_MS. null: another
+// session is asking
+type Front = { tty: string | null; tags?: string[] }
+async function sharedFront($: any, v: Windows): Promise<Front | null> {
   const now = await $.clock.now()
   const c = await storeGet($, 'frontWindow')
-  if (c && now - Number(c.at) < FRONT_SHARED_MS && (typeof c.tty === 'string' || c.tty === null)) return c.tty
+  const isView = (tty: unknown) => typeof tty === 'string' && v.agentsViews.some(a => a.tty === tty)
+  const answered = !!c && typeof c.at === 'number' && (typeof c.tty === 'string' || c.tty === null) && (!isView(c.tty) || Array.isArray(c.tags))
+  if (answered && now - c.at < FRONT_SHARED_MS) return { tty: c.tty, ...(Array.isArray(c.tags) ? { tags: c.tags.map(String) } : {}) }
+  if (c && typeof c.pendingAt === 'number' && now >= c.pendingAt && now - c.pendingAt < FRONT_PENDING_MS) return null
+  await storeSet($, 'frontWindow', { ...(c && typeof c === 'object' ? c : {}), pendingAt: now })
   const tty = await platform.windowInFront(sys($), await shownWindows($, v))
-  await storeSet($, 'frontWindow', { at: now, tty })
-  return tty
+  const tags = tty && isView(tty) ? sessionTags(await platform.readWindow(sys($), tty)) : undefined
+  const front: Front = { tty, ...(tags ? { tags } : {}) }
+  await storeSet($, 'frontWindow', { at: await $.clock.now(), ...front })
+  return front
 }
 
 // The viewers' windows, each with the name of the session it shows (its viewer titles the window with it), for a
@@ -743,12 +760,10 @@ async function markSeenIfLooking($: any) {
   const mine = myWindowsIn(v)
   seenQuietUntil = mine.length === 0 && v.agentsViews.length === 0 && age >= 60000 ? now + 60000 : 0
   if (mine.length === 0 && v.agentsViews.length === 0) return
-  const tty = await sharedFront($, v)
+  const front = await sharedFront($, v)
+  const tty = front?.tty
   if (!tty) return
-  let looking = mine.includes(tty)
-  if (!looking && v.agentsViews.some(c => c.tty === tty)) {
-    looking = (await platform.readWindow(sys($), tty)).includes(`⟨${myShortId()}⟩`)
-  }
+  const looking = mine.includes(tty) || (v.agentsViews.some(c => c.tty === tty) && !!front.tags?.includes(myShortId()))
   if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
 
