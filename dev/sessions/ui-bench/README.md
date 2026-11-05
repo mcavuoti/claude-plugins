@@ -80,3 +80,6 @@ average, how many other sessions were running), `scenarios` and `errors`. Times 
 - `bench.py`: the run.
 - `procs.py`: the process sampler and the CPU reading (`procs.py watch`, `procs.py cpu`).
 - `compare.py`: two results side by side.
+- `equivalence.py`: read only, on the real machine: whether reading Claude's files (`~/.claude/sessions/<pid>.json`
+  and each background session's `~/.claude/jobs/<id>/state.json`) gives the list `claude agents --json --all` gives,
+  every minute for as long as you let it run. It writes counts and field names only.
