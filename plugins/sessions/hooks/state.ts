@@ -22,6 +22,33 @@ export function storeNamespace(values: readonly (string | undefined)[]): string 
   return `@${h.toString(16).padStart(8, '0')}/`
 }
 
+// How many of the panel's items don't fit: each item's lines in drawing order (a section title doesn't count, a session
+// row or a folded section does), the rows the panel has, and the lines drawn above the list
+export function rowsBelow(items: readonly { lines: number; counts: boolean }[], room: number, above: number): number {
+  let used = above
+  let hidden = 0
+  for (const it of items) {
+    used += it.lines
+    if (used > room && it.counts) hidden++
+  }
+  return hidden
+}
+
+// A timer tick of a session's list-reading jobs: a gap since the last tick longer than gapMs is a sleep (every session's
+// timers fire at once after one), and the jobs keep quiet until this session's stagger has passed
+export function afterTick(t: { last: number; quietUntil: number }, now: number, stagger: number, gapMs = 30000): { last: number; quietUntil: number; quiet: boolean } {
+  const quietUntil = t.last > 0 && now - t.last > gapMs ? now + stagger : t.quietUntil
+  return { last: now, quietUntil, quiet: now < quietUntil }
+}
+
+// How long a session waits after a sleep before reading the session list again (0 to span-1 ms): its own share of the
+// span, from its id (FNV-1a), so the sessions that wake together list one after another
+export function wakeStagger(id: string, span = 10000): number {
+  let h = 0x811c9dc5
+  for (const c of new TextEncoder().encode(id)) h = Math.imul(h ^ c, 0x01000193) >>> 0
+  return span > 0 ? h % span : 0
+}
+
 // The first version of the mod that writes heartbeats: sessions started after this version was installed are
 // expected to have one
 export const HEARTBEAT_VERSION = '0.10.0'

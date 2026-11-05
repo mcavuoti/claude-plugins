@@ -54,6 +54,8 @@ export type World = {
   terminal: { value: (args: string[]) => string }
   // What xprop answers (X11 on Linux), by its arguments; null: xprop fails, as without a display (the default)
   xprop: { value: (args: string[]) => string | null }
+  // While set, `claude agents` answers only once it resolves (a slow listing)
+  agentsGate: { value: Promise<void> | null }
   // What the mod asked to tell the person: the PushNotification calls' messages and $.ui.notify's texts, and what each
   // answers (by default, what a session gets with nobody away from the computer and no notifying terminal)
   pushes: string[]
@@ -94,6 +96,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const ps = { value: '' }
   const terminal = { value: (_args: string[]) => '' }
   const xprop = { value: (_args: string[]): string | null => null }
+  const agentsGate: { value: Promise<void> | null } = { value: null }
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
@@ -196,7 +199,8 @@ export function world(on: On, options: WorldOptions = {}): World {
       files.delete(from)
       return ok()
     }
-    if (argv[0] === '/bin/claude' && argv[1] === 'agents') return ok(JSON.stringify(list))
+    // A slow `claude agents` (after a sleep, under an endpoint scanner): it answers once the test opens the gate
+    if (argv[0] === '/bin/claude' && argv[1] === 'agents') return agentsGate.value ? agentsGate.value.then(() => ok(JSON.stringify(list))) : ok(JSON.stringify(list))
     // The end of a file (the background service's log), as tail -n reads it
     if (argv[0] === 'tail') return files.has(argv.at(-1) ?? '') ? ok(files.get(argv.at(-1) ?? '')) : failed()
     if (argv[0] === 'sysctl') return ok(`${memory.value}\n`)
@@ -255,7 +259,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, agentsGate, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

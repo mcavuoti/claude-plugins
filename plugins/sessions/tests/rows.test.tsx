@@ -527,3 +527,73 @@ test("s from a session that can't send notices (no SendMessage): it asks here, w
   expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === 'stop' && a[2] === 'bbbbbbbb')).toBe(true)
   await ui.unmount()
 })
+
+// After a sleep, or under an endpoint scanner that checks every exec, `claude agents` can take longer than the panel's
+// refresh. Each refresh starting its own listing then piles them up in every session (B19): one listing at a time
+const listings = (w: any) => w.runs.filter((a: string[]) => a[0] === '/bin/claude' && a[1] === 'agents').length
+
+test('a slow session list: one listing at a time, the stored list serves meanwhile, and the next one waits twice its time', SLOW, async ($, on) => {
+  const w = world(on, { list: list() })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  let release = () => {}
+  w.agentsGate.value = new Promise<void>(r => (release = r))
+  const before = listings(w)
+  await w.clock.advance(30000)
+  // Ten refreshes came while it was held: one listing, not ten
+  expect(listings(w) - before).toBe(1)
+  w.agentsGate.value = null
+  release()
+  await w.clock.settle()
+  const stored: any = w.store.get('list')
+  // Stamped when it came back, and the next one pushed back by twice its time (it took about 28 s), never past 60 s
+  expect(stored.at).toBe(w.clock.now())
+  expect(stored.until - stored.at).toBeGreaterThanOrEqual(50000)
+  expect(stored.until - stored.at).toBeLessThanOrEqual(60000)
+  const after = listings(w)
+  await w.clock.advance(stored.until - w.clock.now() - 1000)
+  expect(listings(w)).toBe(after)
+  await w.clock.advance(5000)
+  expect(listings(w)).toBeGreaterThan(after)
+})
+
+test("another session's listing holds the lock: this one starts none and reads the stored list; a lock left 30 s is taken over", SLOW, async ($, on) => {
+  const w = world(on, { list: list() })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const lock = `${DATA}/list.lock`
+  w.dirs.add(lock)
+  w.made.set(lock, w.clock.now())
+  const before = listings(w)
+  await w.clock.advance(20000)
+  expect(listings(w)).toBe(before)
+  // The panel still has its rows from the stored list
+  const ui = await $.ui.mount(PANEL)
+  expect(JSON.stringify(await ui.drawn())).toContain('bravo')
+  await ui.unmount()
+  // Left by a session cut off mid-listing: after 30 s it's stale, taken over, and given back after the listing
+  await w.clock.advance(15000)
+  expect(listings(w)).toBeGreaterThan(before)
+  expect(w.dirs.has(lock)).toBe(false)
+})
+
+test('the panel overflows: a "more below" line at the top, and only the rows that need you keep their status lines', async ($, on) => {
+  const many = Array.from({ length: 40 }, (_, i) => {
+    const n = String(i).padStart(2, '0')
+    return { id: `dddddd${n}`, sessionId: `dddddd${n}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', status: 'idle', pid: 5000 + i, name: `session ${n}` }
+  })
+  const w = world(on, { list: [list()[0], ...many] })
+  w.store.set(`marks:probe:${SID}`, {
+    at: 1_000_000_000,
+    until: 1_000_000_000 + 600000,
+    rows: { dddddd01: { badge: '?1', line: 'asks you 1: /fleet', needsPerson: true }, dddddd02: { badge: '↻', line: 'main moved under 1 file' } },
+  })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const ui = await $.ui.mount(PANEL)
+  const text = JSON.stringify(await ui.drawn())
+  await ui.unmount()
+  expect(text).toMatch(/↓ \d+ more below · shift\+→, then ↑↓/)
+  expect(text).toContain('asks you 1: /fleet')
+  expect(text).not.toContain('main moved under 1 file')
+})

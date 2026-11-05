@@ -79,6 +79,9 @@ import {
   askRejection,
   UNSHOWN,
   worktreeBase,
+  wakeStagger,
+  afterTick,
+  rowsBelow,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -894,4 +897,38 @@ test('assignSection with a parent: kept with the member, cleared without one, re
   const p = personAssign(a.file, 'bbbbbbbb', 'Mine')
   if (!('file' in p)) throw new Error('should assign')
   expect(sectionsView(p.file).members.bbbbbbbb).toEqual({ section: 'me:mine', by: 'person' })
+})
+
+test('after a sleep a session waits its own share of 10 s before listing again; a normal tick never waits', () => {
+  const a = wakeStagger('aaaaaaaa-0000-0000-0000-000000000000')
+  expect(a).toBe(wakeStagger('aaaaaaaa-0000-0000-0000-000000000000'))
+  expect(a).toBeGreaterThanOrEqual(0)
+  expect(a).toBeLessThan(10000)
+  expect(new Set(['a', 'b', 'c', 'd', 'e', 'f'].map(c => wakeStagger(`${c.repeat(8)}-0000`))).size).toBeGreaterThan(1)
+  // Ticks 2-3 s apart: never quiet
+  let t = afterTick({ last: 0, quietUntil: 0 }, 1000, 5000)
+  expect(t.quiet).toBe(false)
+  t = afterTick(t, 4000, 5000)
+  expect(t.quiet).toBe(false)
+  // A gap of 10 minutes (a sleep): quiet for the stagger, then not
+  t = afterTick(t, 604000, 5000)
+  expect(t).toEqual({ last: 604000, quietUntil: 609000, quiet: true })
+  t = afterTick(t, 606000, 5000)
+  expect(t.quiet).toBe(true)
+  t = afterTick(t, 609000, 5000)
+  expect(t.quiet).toBe(false)
+})
+
+test('rows below the panel: the session rows and folded sections past its height, section titles not counted', () => {
+  const items = [
+    { lines: 1, counts: false },
+    { lines: 2, counts: true },
+    { lines: 1, counts: true },
+    { lines: 1, counts: false },
+    { lines: 2, counts: true },
+    { lines: 1, counts: true },
+  ]
+  expect(rowsBelow(items, 20, 3)).toBe(0)
+  expect(rowsBelow(items, 8, 3)).toBe(2)
+  expect(rowsBelow(items, 3, 3)).toBe(4)
 })
