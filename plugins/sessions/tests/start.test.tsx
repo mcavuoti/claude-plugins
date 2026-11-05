@@ -51,6 +51,22 @@ test("without session.start, the first draw starts the mod (the old pre-started 
   await ui.unmount()
 })
 
+// The first draw's timer can fire while that draw is still being dispatched (here the band beneath answers 5 ms late),
+// and the engine refuses a $.state write made with that draw's $ until it has settled: the start waits for it
+test("the first draw's start writes nothing while that draw is still being dispatched: no step fails", async ($, on) => {
+  const w = world(on)
+  w.bandLate.value = 5
+  const drawing = $.ui.mount({ ...BAND, surface: 'terminal' })
+  await w.clock.advance(50)
+  const ui = await drawing
+  expect(w.registered).toEqual(['sessions'])
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  expect(r.text).toContain('started 0 s ago by first draw')
+  expect(r.text).not.toContain('Start problems')
+  expect(JSON.stringify(await ui.drawn())).toContain('"aaaaaaaa"')
+  await ui.unmount()
+})
+
 test('a non-interactive run (claude -p) with nothing drawn does nothing', async ($, on) => {
   const w = world(on)
   await startSession($, w, false)

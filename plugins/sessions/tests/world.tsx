@@ -43,8 +43,10 @@ export type World = {
   toasts: string[]
   // What $.session.usage() answers
   usage: { value: any }
-  // What Claude (and the mods beneath this one) draw in the band above the prompt: nothing, or a line
+  // What Claude (and the mods beneath this one) draw in the band above the prompt: nothing, or a line; and how late
+  // they answer the next draw, in ms (0: at once): that draw held open that long, as a slow plugin beneath holds it
   band: { value: string }
+  bandLate: { value: number }
   // The start of the session's transcript (WorldOptions.transcript), which a test can change
   transcript: { value: string | undefined }
   // What claude --bg prints when it refuses to start a session ('': it starts it)
@@ -116,7 +118,11 @@ export function world(on: On, options: WorldOptions = {}): World {
   const agentsGate: { value: Promise<void> | null } = { value: null }
   const agentsFail = { value: false }
   const plugins = { value: '[]' }
-  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+  const bandLate = { value: 0 }
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
+    const late = bandLate.value
+    bandLate.value = 0
+    if (late > 0) await clock.sleep(late)
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
@@ -290,7 +296,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

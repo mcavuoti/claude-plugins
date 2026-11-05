@@ -4068,6 +4068,23 @@ function ensureStarted($: any, via: string): Promise<void> {
   return starting
 }
 
+// The first draw starts the mod from a timer it sets (a draw only draws), with that draw's $, and the timer can fire
+// before the draw has settled (the band's own reads, or the plugins beneath it, still answering). Until it has, the
+// engine refuses every $.state write made with that $ ("made while ui.render is being dispatched"), so the start's
+// first write is tried again 10 ms apart until it's taken, for 2 s at most; any other failure ends the wait. Once the
+// draw has settled no later write meets it
+async function afterDraw($: any, write: () => Promise<unknown>) {
+  for (let tries = 1; ; tries++) {
+    try {
+      await write()
+      return
+    } catch (err) {
+      if (tries >= 200 || !/while ui\.render is being dispatched/.test(String(err))) throw err
+      await $.clock.sleep(10)
+    }
+  }
+}
+
 async function start($: any) {
   try {
     startedAt = await $.clock.now()
@@ -4085,12 +4102,14 @@ async function start($: any) {
     myId = String(await $.session.id())
     // Another module drew in this session before this one: this one came in by a reload, and watches what that one
     // asked
-    reloadedInto = (await read($, shortId)) !== ''
+    const before = await read($, shortId)
+    reloadedInto = before !== ''
     live ||= (await read($, watching))?.set === WATCH_SET
-    {
-      const next = myId.slice(0, 8)
-      if (!sameData(await read($, shortId), next)) await update($, shortId, () => next)
-    }
+    // The start's first write: started by the first draw, it waits for that draw to settle (afterDraw), and is written
+    // even when it's the same, so that nothing after it writes before
+    const next = myId.slice(0, 8)
+    if (startedVia === 'first draw') await afterDraw($, () => $.state.set({ plugin: 'sessions', key: 'shortId' }, next))
+    else if (!sameData(before, next)) await update($, shortId, () => next)
   })
   await step('folders', async () => {
     home = (await $.env.get('HOME')) ?? ''
@@ -4479,7 +4498,7 @@ export const register: Register = (on, options) => {
   // isn't shown (with a button that opens it: shift+→ then Enter, or a click), the account's windows on a subscription,
   // and this session's short id. One row, with whatever other mods (and Claude) draw there after it: the band is
   // shared. Its first draw starts the mod when nothing else did (a session draws even with no window attached; a draw
-  // only draws, so the start runs from a timer)
+  // only draws, so the start runs from a timer, and its first write waits for the draw to settle: afterDraw)
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     if (!starting && !renderScheduled) {
