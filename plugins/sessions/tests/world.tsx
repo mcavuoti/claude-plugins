@@ -81,6 +81,8 @@ export type WorldOptions = {
   transcript?: string
   // What uname -s answers, which picks the platform (Darwin by default)
   system?: string
+  // What the plugins beneath answer to classic.SessionStart (nothing by default)
+  sessionStart?: Record<string, unknown>
 }
 
 // A session with an id and a root, an in-memory folder tree, a claude that lists one session
@@ -123,7 +125,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   mock.env(on, env)
   // The store, in memory (readable by the tests). These overrides put the mod's keys under a namespace of their own
   // (storeNamespace): the tests read and write them without it, and storeKeys keeps every key the mod used, as it used it
-  const namespace = storeNamespace(['SESSIONS_DATA_DIR', 'SESSIONS_JOBS_DIR', 'SESSIONS_DAEMON_LOG', 'SESSIONS_CLAUDE', 'SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE'].map(k => env[k]))
+  const namespace = storeNamespace(['SESSIONS_DATA_DIR', 'SESSIONS_JOBS_DIR', 'SESSIONS_DAEMON_LOG', 'SESSIONS_CLAUDE', 'SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE', 'SESSIONS_REGISTRY_DIR'].map(k => env[k]))
   const plain = (key: string) => (key.startsWith(namespace) ? key.slice(namespace.length) : key)
   const storeKeys = new Set<string>()
   const store = new Map<string, unknown>(Object.entries(options.store ?? {}))
@@ -151,6 +153,9 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('session.version', () => ({ value: { version: '2.1.316' } as any }))
   on('session.messages', () => ({ value: [] as any }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  // The classic hooks the engine raises (a test raises them with $.classic): nothing of Claude's own beneath
+  on('classic.SessionStart', () => (options.sessionStart ?? {}) as any)
+  on('classic.FileChanged', () => ({}) as any)
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('fs.read', (_, e) => {

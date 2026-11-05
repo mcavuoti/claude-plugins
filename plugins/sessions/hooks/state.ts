@@ -1,24 +1,27 @@
 import type { Color, Period, RateLimit, SessionsMark, SessionsMember, SessionsResult, SessionsSection, SessionsTint, UsageSummary } from '../types'
 
 // The format of everything the mod shares outside one session: the files in its data folder (heartbeats, the panel
-// order, inbox requests, the launcher's window files, the mirrored settings, usage.py's summary, ccc's plugin lookup)
-// and the notices between sessions. Each one carries `format=<n>`. A reader that finds another format leaves it alone
-// and says the sessions need a restart (u, or claude respawn): sessions running another version of the mod never act on
-// each other's data by mistake.
-// The launcher (hooks/launcher.py, hooks/visor.sh, setup/ccc) reads and writes the same formats: change them together.
+// order, inbox requests, the launcher's window files, the mirrored settings, usage.py's summary, ccc's plugin lookup,
+// the bells and the leader's record) and the notices between sessions. Each one carries `format=<n>`. A reader that
+// finds another format leaves it alone and says the sessions need a restart (u, or claude respawn): sessions running
+// another version of the mod never act on each other's data by mistake. The launcher (hooks/launcher.py,
+// hooks/visor.sh, setup/ccc) reads and writes the same formats: change them together.
 export const FORMAT = 3
 
 // Where a session keeps its keys in the shared store: '' for the sessions you use, and @<hash>/ for a test session, one
 // started with a location override (SESSIONS_DATA_DIR, SESSIONS_JOBS_DIR, SESSIONS_DAEMON_LOG, SESSIONS_CLAUDE: the
 // first four values, in that order), so test sessions never read nor write theirs: the session list they cache from a
-// stand-in claude, the pins they record, the notifications they count, their marks and the choices made in their panels,
-// nor the prune of keys of sessions missing from their list. SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the last
-// two) count only beside a location: ccc sets them for its launcher, and a background service a launcher before 0.13.6
-// brought up hands them on to every session it starts, which isn't a test session. The hash is FNV-1a of the values, one
-// per line
+// stand-in claude, the pins they record, the notifications they count, their marks and the choices made in their
+// panels, nor the prune of keys of sessions missing from their list. SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE
+// (the fifth and sixth) count only beside a location: ccc sets them for its launcher, and a background service a
+// launcher before 0.13.6 brought up hands them on to every session it starts, which isn't a test session.
+// SESSIONS_REGISTRY_DIR (the seventh, Claude's registry of running sessions) is a location too. The hash is FNV-1a of
+// the values, one per line
 export function storeNamespace(values: readonly (string | undefined)[]): string {
-  if (!values.slice(0, 4).some(v => v)) return ''
-  return `@${fnv1a(values.map(v => v ?? '').join('\n')).toString(16).padStart(8, '0')}/`
+  if (!values.slice(0, 4).some(v => v) && !values[6]) return ''
+  // A seventh value that isn't set leaves the hash as it was with six
+  const hashed = values.length > 6 && !values[6] ? values.slice(0, 6) : values
+  return `@${fnv1a(hashed.map(v => v ?? '').join('\n')).toString(16).padStart(8, '0')}/`
 }
 
 // FNV-1a (32 bits) of a text's UTF-8 bytes, from a starting basis (FNV's own by default)
@@ -43,6 +46,24 @@ export function sameData(a: unknown, b: unknown): boolean {
   const y = b as Record<string, unknown>
   const keys = Object.keys(x).filter(k => x[k] !== undefined)
   return keys.length === Object.keys(y).filter(k => y[k] !== undefined).length && keys.every(k => sameData(x[k], y[k]))
+}
+
+// When a row's time (timeSince at labelMinute) or its ⧗ next changes after now: the next minute for a row under an
+// hour old, the next whole hour of its age under a day, the next whole day after that; the minute a row turns stale
+// (staleFrom). Infinity when nothing will (no row has a time). The panel's one timer while nothing happens is set there
+export function nextLabelChange(rows: readonly { since?: number; staleFrom?: number }[], now: number): number {
+  const minute = labelMinute(now)
+  let next = Infinity
+  const atMinute = (t: number) => Math.ceil(t / 60000) * 60000
+  for (const r of rows) {
+    if (r.since !== undefined && r.since > 0) {
+      const age = Math.max(0, minute - r.since)
+      const step = age < 3600000 ? 60000 : age < 86400000 ? 3600000 : 86400000
+      next = Math.min(next, atMinute(r.since + (Math.floor(age / step) + 1) * step))
+    }
+    if (r.staleFrom !== undefined && r.staleFrom > minute) next = Math.min(next, atMinute(r.staleFrom))
+  }
+  return next <= minute ? minute + 60000 : next
 }
 
 // The moment the rows' times (3m, 2h) and ⧗ are reckoned at: now, down to the minute. Every row's label then changes
@@ -913,10 +934,17 @@ export type ReloadCheck = {
   tasks: number | null
   paneFocused: boolean
   fieldOpen: boolean
+  // The set of paths this copy watches (WATCH_SET in watch.ts) and the installed copy's (0: one from before the set had
+  // a number). Left out, not compared
+  watchSet?: number
+  installedWatchSet?: number
 }
 export function reloadDecision(c: ReloadCheck): 'reload' | 'wait' | 'no' {
   const v = c.installed
   if (!v || !parseVersion(v.version) || !parseVersion(c.running) || compareVersions(v.version, c.running) <= 0) return 'no'
+  // A reload raises no SessionStart, so the engine keeps watching what this copy asked for: never into a copy that
+  // watches another set of paths (its new ones would go unwatched until the session restarts)
+  if (c.watchSet !== undefined && c.installedWatchSet !== undefined && c.watchSet !== c.installedWatchSet) return 'no'
   const parent = (dir: string) => dir.replace(/\/+$/, '').replace(/\/[^/]+$/, '')
   if (!v.path || parent(v.path) !== parent(c.runningDir) || v.path === c.runningDir) return 'no'
   if (c.triedFor === v.version) return 'no'

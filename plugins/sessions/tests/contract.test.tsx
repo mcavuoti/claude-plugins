@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { keepPluginPins, pluginPinChange } from '../hooks/state'
+import { WATCH_SET } from '../hooks/watch'
 import { COMMAND, DATA, ROOT, SID, startSession, world } from './world'
 
 // $.sessions, the contract other plugins call (types/index.d.ts, docs/plugin-contract.md), seen from another plugin:
@@ -649,6 +650,37 @@ test("restart: a queued one waits for the background tasks the session has (as u
   expect(respawns()).toBe(1)
 })
 
+test('restart in a watched session: it runs at once with no short timer, from what Claude’s files say, and one waiting for its tasks is tried again every 2 s', { ...WITH_PROBE, timeoutMs: 30000 }, async ($, on) => {
+  const sessionsList = moreSessions()
+  const w = world(on, { list: sessionsList })
+  // Claude's registry of the running sessions: the list comes from these files, with no claude agents
+  for (const s of sessionsList.filter(x => x.pid)) {
+    const kind = s.kind === 'background' ? 'bg' : 'interactive'
+    const job = s.id ? { jobId: `${s.id}-0000-0000-0000-000000000000` } : {}
+    w.write(`/Users/x/.claude/sessions/${s.pid}.json`, JSON.stringify({ pid: s.pid, sessionId: s.sessionId, cwd: s.cwd, kind, status: s.status, statusUpdatedAt: 1, name: s.name, ...job, procStart: 'x' }))
+  }
+  const state = '/Users/x/jobs/dddddddd/state.json'
+  w.files.set(state, TASKS)
+  await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
+  await startSession($, w)
+  await w.clock.advance(100)
+  const respawns = () => w.runs.filter(a => a[1] === 'respawn').length
+  const listings = () => w.runs.filter(a => a[0] === '/bin/claude' && a[1] === 'agents').length
+  const before = listings()
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(1000)
+  expect(respawns()).toBe(0)
+  // Its task ends: the next try, 2 s after the last, restarts it, long before the pass
+  w.files.set(state, NO_TASKS)
+  await w.clock.advance(2000)
+  expect(respawns()).toBe(1)
+  expect(listings()).toBe(before)
+  // Idle with no task when asked: at once
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(100)
+  expect(respawns()).toBe(2)
+})
+
 test("a listing that fails or times out pushes every session's next one back, the stored sessions and when they were read kept", { timeoutMs: 30000 }, async ($, on) => {
   const w = world(on, { list: moreSessions() })
   await startSession($, w)
@@ -680,10 +712,12 @@ test("a listing that fails or times out pushes every session's next one back, th
   expect((w.store.get('list') as any).at).toBeGreaterThan(failedAt)
 })
 
-// A newer copy of the mod installed beside the running one (claude plugin list --json), as the in-place update looks for
-function newerInstalled(): string {
+// A newer copy of the mod installed beside the running one (claude plugin list --json), as the in-place update looks for,
+// watching the same paths as this one (its watch.ts)
+function installNewer(w: ReturnType<typeof world>) {
   const plugins = String((import.meta as any).dir).replace(/\/sessions\/tests$/, '')
-  return JSON.stringify([{ id: 'sessions@x', enabled: true, version: '0.10.1', installPath: `${plugins}/sessions-0.10.1`, lastUpdated: '2026-01-01T00:00:00Z' }])
+  w.plugins.value = JSON.stringify([{ id: 'sessions@x', enabled: true, version: '0.10.1', installPath: `${plugins}/sessions-0.10.1`, lastUpdated: '2026-01-01T00:00:00Z' }])
+  w.files.set(`${plugins}/sessions-0.10.1/hooks/watch.ts`, `export const WATCH_SET = ${WATCH_SET}\n`)
 }
 
 test('in-place update: no list read for a session the last list shows working; once it shows it idle, it reloads', { timeoutMs: 30000 }, async ($, on) => {
@@ -692,7 +726,7 @@ test('in-place update: no list read for a session the last list shows working; o
   own.status = 'busy'
   const w = world(on, { list: sessionsList })
   w.files.set('/Users/x/jobs/aaaaaaaa/state.json', NO_TASKS)
-  w.plugins.value = newerInstalled()
+  installNewer(w)
   await startSession($, w)
   for (const p of w.panes) p.isFocused = false
   const listings = () => w.runs.filter(a => a[0] === '/bin/claude' && a[1] === 'agents').length
@@ -719,7 +753,7 @@ test('in-place update: a restart queued while it checks (a list read takes secon
   w.files.set('/Users/x/jobs/aaaaaaaa/state.json', NO_TASKS)
   const other = '/Users/x/jobs/dddddddd/state.json'
   w.files.set(other, TASKS)
-  w.plugins.value = newerInstalled()
+  installNewer(w)
   await startSession($, w)
   for (const p of w.panes) p.isFocused = false
   await w.clock.advance(4000)
