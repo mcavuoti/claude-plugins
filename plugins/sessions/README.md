@@ -220,7 +220,7 @@ macOS stores a program's permission for protected folders (Desktop, Documents, D
 - the leader's reopen check, each pass while a pinned background session has no process: memory pressure has no event (`sysctl`, and the service's log read again only when it changed);
 - the seen check, only while this session's answer is unseen and a window could show it: mods get no event when a terminal window comes to the front;
 - one timer for the next change of a row's time or `⧗`: time passes with no event;
-- `claude --version` and `claude plugin list --json`, shared through the store, at most every 5 minutes: the installed versions, for `↑` and the update in place;
+- `claude --version` and `claude plugin list --json`, shared through the store, at most every 5 minutes: the installed versions, for `↑` and the update in place. While another session leads, only the leader runs them; a session about to run one says so in the store and the others use what's stored meanwhile, and one that fails keeps the answer before it and is tried again 5 minutes later;
 - a restart another plugin queued (`$.sessions.restart`), every 2 s while it waits for the session to be idle;
 - only while an action runs: an open New or Rename field, checked every 0.3 s (no event says Esc left it); Stop's 1.5 s pause before closing the stopped session's windows; "Restarted", once the window reattached (by process, since `session.attach` doesn't come for `claude attach`); and `ccc`'s short waits (an answer in `replies/` every 0.1 s for 3 s at most, a session it just created in `claude agents` every 0.3 s).
 

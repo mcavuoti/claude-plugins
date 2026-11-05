@@ -63,8 +63,11 @@ export type World = {
   agentsGate: { value: Promise<void> | null }
   // While true, `claude agents` fails (exit 127, as when run's timeout cuts it), after the gate if one is set
   agentsFail: { value: boolean }
-  // What `claude plugin list --json` answers (none installed by default)
+  // What `claude plugin list --json` answers (none installed by default); while installedFail is true it and `claude
+  // --version` fail (exit 127, as when run's timeout cuts them), and they answer installedLate ms late (0: at once)
   plugins: { value: string }
+  installedFail: { value: boolean }
+  installedLate: { value: number }
   // What the mod asked to tell the person: the PushNotification calls' messages and $.ui.notify's texts, and what each
   // answers (by default, what a session gets with nobody away from the computer and no notifying terminal)
   pushes: string[]
@@ -118,6 +121,8 @@ export function world(on: On, options: WorldOptions = {}): World {
   const agentsGate: { value: Promise<void> | null } = { value: null }
   const agentsFail = { value: false }
   const plugins = { value: '[]' }
+  const installedFail = { value: false }
+  const installedLate = { value: 0 }
   const bandLate = { value: 0 }
   on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
     const late = bandLate.value
@@ -253,8 +258,10 @@ export function world(on: On, options: WorldOptions = {}): World {
       return answer === null ? failed() : ok(answer)
     }
     if (argv[0] === '/bin/claude' && argv[1] === '--bg' && bgError.value) return { value: { exitCode: 1, stdout: '', stderr: bgError.value, isStdoutTruncated: false, isStderrTruncated: false } }
-    if (argv[0] === '/bin/claude' && argv[1] === '--version') return ok('2.1.316 (Claude Code)')
-    if (argv[0] === '/bin/claude' && argv[1] === 'plugin') return ok(plugins.value)
+    if (argv[0] === '/bin/claude' && (argv[1] === '--version' || argv[1] === 'plugin')) {
+      const answer = () => (installedFail.value ? { value: { exitCode: 127, stdout: '', stderr: 'timed out', isStdoutTruncated: false, isStderrTruncated: false } } : ok(argv[1] === '--version' ? '2.1.316 (Claude Code)' : plugins.value))
+      return installedLate.value > 0 ? clock.sleep(installedLate.value).then(answer) : answer()
+    }
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok(`${options.system ?? 'Darwin'}|`)
     // The transcript's first row (readAgent)
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('.jsonl')) return transcript.value === undefined ? failed() : ok(transcript.value)
@@ -296,7 +303,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

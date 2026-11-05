@@ -311,6 +311,8 @@ let slowList = false
 let ownJob: string | null = null
 // Whether this session leads the machine-wide work (leader.ts), and when it last did each part of it
 let leading = false
+// Another session leads, as this one's last turn saw it (it lists, reads the usage and runs the shared commands)
+let leaderElsewhere = false
 let reconciledAt = 0
 let usageRunAt = 0
 let leaderWrittenAt = 0
@@ -433,7 +435,8 @@ function debugLine($: any, text: string) {
 // agents gave: at, when the listing came back; sessions; sig, what Claude's registry and the service's folder looked
 // like just before; until, when a slow or failed listing pushed the next one back; one listing at a time, under the
 // <data>/list.lock folder),
-// installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
+// installed (installed Claude version: at, version) and plugin (the installed plugin: at, plugin), both also pendingAt,
+// a session running the command right now (sharedAnswer), usageView, pinPass (last auto-pin pass),
 // autoPins (AutoPins), pluginPins (PluginPins: the sessions other plugins keep pinned through $.sessions.pin),
 // reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
@@ -1253,6 +1256,7 @@ async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   const first = e.lead && !leading
   if (e.lead !== leading || e.takeover) debugLine($, e.lead ? `leader: this session (${why}${e.takeover ? `, in place of pid ${record?.pid}` : ''})` : `leader: pid ${e.leader}`)
   leading = e.lead
+  leaderElsewhere = !e.lead
   if (!e.lead) return
   if (first || record?.pid !== myPid || now - leaderWrittenAt >= PASS_MS / 2) {
     try {
@@ -1526,46 +1530,77 @@ async function chooseUsageView($: any, choice: Partial<UsageView>) {
   await storeSet($, 'usageView', next)
 }
 
-// What `claude --version` says, once every 5 minutes for all sessions (shared through the store)
-// What was read of it stays good here until its 5 minutes are up, with no store read meanwhile
+// What `claude --version` and `claude plugin list --json` say, shared by every session through the store for
+// INSTALLED_MS ('installed': at, version; 'plugin': at, plugin), like the windows listing: `at` is when the command came
+// back; a session about to run one says so (`pendingAt`), and the others use the stored answer meanwhile, however old
+// (none stored: what they'd answer without one). One that failed keeps the answer it had, stamped when it failed, so
+// it's tried again INSTALLED_MS later, not at every refresh of every session. While another session leads (leader.ts:
+// as this session last saw it, a sleep in between or not) only the leader runs them, at its own refresh, a pass apart
+// at most, and the others read what it stored, unless nothing is or it's INSTALLED_ORPHAN_MS old (a leader that doesn't
+// keep it: one of another version, or one with a store of its own). In this session, callers share the run in flight.
+// What was read stays good here until its INSTALLED_MS are up, with no store read meanwhile
+const INSTALLED_MS = 300000
+const INSTALLED_PENDING_MS = 30000
+const INSTALLED_ORPHAN_MS = 3 * INSTALLED_MS
+type Answer = { at?: number; pendingAt?: number; [field: string]: unknown }
+const answering = new Map<string, Promise<Answer | null>>()
+async function sharedAnswer($: any, key: 'installed' | 'plugin', ask: () => Promise<Record<string, unknown> | null>): Promise<Answer | null> {
+  const now = await $.clock.now()
+  const c = await storeGet($, key)
+  const stored: Answer | null = c && typeof c === 'object' ? (c as Answer) : null
+  const at = typeof stored?.at === 'number' ? stored.at : null
+  const age = at === null || now < at ? Infinity : now - at
+  if (age < INSTALLED_MS) return stored
+  const pendingAt = typeof stored?.pendingAt === 'number' ? stored.pendingAt : null
+  if (pendingAt !== null && now >= pendingAt && now - pendingAt < INSTALLED_PENDING_MS) return stored
+  if (leaderElsewhere && age < INSTALLED_ORPHAN_MS) return stored
+  let inFlight = answering.get(key)
+  if (!inFlight) {
+    inFlight = (async () => {
+      await storeSet($, key, { ...(stored ?? {}), pendingAt: now })
+      const got = await ask()
+      const back = await $.clock.now()
+      const kept: Answer = { ...(stored ?? {}), at: back }
+      delete kept.pendingAt
+      const next = got ? { at: back, ...got } : kept
+      await storeSet($, key, next)
+      return next
+    })().finally(() => answering.delete(key))
+    answering.set(key, inFlight)
+  }
+  return inFlight
+}
+
 let installedHeld: { at: number; version: string } | null = null
 async function readInstalledVersion($: any): Promise<string> {
   const now = await $.clock.now()
-  if (installedHeld && now - installedHeld.at < 300000 && now >= installedHeld.at) return installedHeld.version
-  const c = await storeGet($, 'installed')
-  if (c && now - c.at < 300000 && typeof c.version === 'string') {
-    installedHeld = { at: Number(c.at), version: c.version }
-    return c.version
-  }
-  const r = await run($, [claude, '--version'])
-  const v = r.exitCode === 0 ? parseVersion(r.stdout) : null
-  if (v) {
-    await storeSet($, 'installed', { at: now, version: v })
-    installedHeld = { at: now, version: v }
-  }
-  return v ?? (typeof c?.version === 'string' ? c.version : '')
+  if (installedHeld && now - installedHeld.at < INSTALLED_MS && now >= installedHeld.at) return installedHeld.version
+  const c = await sharedAnswer($, 'installed', async () => {
+    const r = await run($, [claude, '--version'])
+    const version = r.exitCode === 0 ? parseVersion(r.stdout) : null
+    return version ? { version } : null
+  })
+  const version = typeof c?.version === 'string' ? c.version : ''
+  if (typeof c?.at === 'number' && now - c.at < INSTALLED_MS) installedHeld = { at: c.at, version }
+  return version
 }
 
-// The installed plugin (`claude plugin list --json`), once every 5 minutes for all sessions: which version of the mod
-// sessions start with, and since when, to tell which sessions should have a heartbeat. SESSIONS_PLUGIN_VERSION and
-// SESSIONS_PLUGIN_SINCE (ms) stand in for it in a test session only (a location override beside them); elsewhere they're
-// ccc's, handed on by a background service, and stale after the next update, so the real one is read
+// The installed plugin (`claude plugin list --json`), shared as above: which version of the mod sessions start with,
+// and since when, to tell which sessions should have a heartbeat. SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE
+// (ms) stand in for it in a test session only (a location override beside them); elsewhere they're ccc's, handed on by
+// a background service, and stale after the next update, so the real one is read
 let pluginHeld: { at: number; plugin: InstalledPlugin | null } | null = null
 async function installedPlugin($: any): Promise<InstalledPlugin | null> {
   const version = (await isTestSession($)) ? await $.env.get('SESSIONS_PLUGIN_VERSION') : ''
   if (version) return { path: '', version, since: Number(await $.env.get('SESSIONS_PLUGIN_SINCE')) || 0 }
   const now = await $.clock.now()
-  if (pluginHeld && now - pluginHeld.at < 300000 && now >= pluginHeld.at) return pluginHeld.plugin
-  const c = await storeGet($, 'plugin')
-  if (c && now - c.at < 300000) {
-    pluginHeld = { at: Number(c.at), plugin: c.plugin ?? null }
-    return c.plugin ?? null
-  }
-  const r = await run($, [claude, 'plugin', 'list', '--json'])
-  if (r.exitCode !== 0) return c?.plugin ?? null
-  const plugin = parsePluginList(r.stdout)
-  await storeSet($, 'plugin', { at: now, plugin })
-  pluginHeld = { at: now, plugin }
+  if (pluginHeld && now - pluginHeld.at < INSTALLED_MS && now >= pluginHeld.at) return pluginHeld.plugin
+  const c = await sharedAnswer($, 'plugin', async () => {
+    const r = await run($, [claude, 'plugin', 'list', '--json'])
+    return r.exitCode === 0 ? { plugin: parsePluginList(r.stdout) } : null
+  })
+  const plugin = (c?.plugin as InstalledPlugin | null | undefined) ?? null
+  if (typeof c?.at === 'number' && now - c.at < INSTALLED_MS) pluginHeld = { at: c.at, plugin }
   return plugin
 }
 

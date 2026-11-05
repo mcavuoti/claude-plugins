@@ -357,6 +357,34 @@ test('live: the lowest pid leads, writes the record and lists once a pass; the n
   expect(parseLeader(w.files.get(`${DATA}/leader.json`) ?? '')?.pid).toBe(4242)
 })
 
+test('live: while another session leads, it alone runs claude --version and plugin list; this one runs them only if it keeps them no more', SLOW, async ($, on) => {
+  const sessions: Session[] = [{ pid: 4200, sessionId: CHARLIE, id: 'cccccccc', status: 'idle', name: 'charlie' }, ...SESSIONS]
+  const now = 1_000_000_000
+  const w = world(on, { list: listed(sessions), store: { installed: { at: now - 4 * MIN, version: '2.1.300' }, plugin: { at: now - 4 * MIN, plugin: null } } })
+  for (const s of sessions) registryFile(w, s)
+  const charlieRuns = () => {
+    heartbeat(w, CHARLIE, 4200)
+    w.write(`${DATA}/leader.json`, leaderText({ pid: 4200, sessionId: CHARLIE, at: w.clock.now() }))
+  }
+  charlieRuns()
+  await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
+  await startSession($, w)
+  // Eight minutes: what's stored goes stale after one, and Charlie, leading, would run them
+  for (let i = 0; i < 16; i++) {
+    await w.clock.advance(30000)
+    charlieRuns()
+  }
+  expect(runsOf(w, '/bin/claude', '--version')).toBe(0)
+  expect(runsOf(w, '/bin/claude', 'plugin')).toBe(0)
+  // Charlie doesn't keep them (15 minutes old): this session runs each once
+  for (let i = 0; i < 8; i++) {
+    await w.clock.advance(30000)
+    charlieRuns()
+  }
+  expect(runsOf(w, '/bin/claude', '--version')).toBe(1)
+  expect(runsOf(w, '/bin/claude', 'plugin')).toBe(1)
+})
+
 test('live: a leader that crashed (its file stays, its heartbeat stops) is replaced and its row cleared within 3 minutes', SLOW, async ($, on) => {
   const sessions: Session[] = [{ pid: 4200, sessionId: CHARLIE, id: 'cccccccc', status: 'idle', name: 'charlie' }, ...SESSIONS]
   const list = listed(sessions)

@@ -246,6 +246,53 @@ test('seen: arriving (ccc) or a key in the panel marks it seen at once, with no 
   expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(seen)
 })
 
+test('a failing claude --version or plugin list is tried again 5 minutes later, not at every refresh, keeping what it had', SLOW, async ($, on) => {
+  const now = 1_000_000_000
+  const plugin = { path: '/Users/x/plugins/sessions', version: '0.14.0', since: 1 }
+  const w = world(on, { list: list(), store: { installed: { at: now - 6 * MIN, version: '2.1.300' }, plugin: { at: now - 6 * MIN, plugin } } })
+  w.installedFail.value = true
+  await startSession($, w)
+  await w.clock.advance(2 * MIN)
+  // Every 3 s before: about 40 of each in these two minutes
+  expect(runsOf(w, '/bin/claude', '--version')).toBe(1)
+  expect(runsOf(w, '/bin/claude', 'plugin')).toBe(1)
+  expect(w.store.get('installed')).toEqual({ at: expect.any(Number), version: '2.1.300' })
+  expect(w.store.get('plugin')).toEqual({ at: expect.any(Number), plugin })
+  expect((w.store.get('installed') as any).at).toBeGreaterThanOrEqual(now)
+  await w.clock.advance(4 * MIN)
+  expect(runsOf(w, '/bin/claude', '--version')).toBe(2)
+  expect(runsOf(w, '/bin/claude', 'plugin')).toBe(2)
+  // Working again: the next one stores what it says
+  w.installedFail.value = false
+  await w.clock.advance(5 * MIN)
+  expect((w.store.get('installed') as any).version).toBe('2.1.316')
+})
+
+test('while another session runs claude --version or plugin list (pendingAt), this one runs neither and uses what is stored', SLOW, async ($, on) => {
+  const now = 1_000_000_000
+  const w = world(on, { list: list(), store: { installed: { at: now - 6 * MIN, version: '2.1.300', pendingAt: now - 1000 }, plugin: { pendingAt: now - 1000 } } })
+  await startSession($, w)
+  await w.clock.advance(20000)
+  expect(runsOf(w, '/bin/claude', '--version')).toBe(0)
+  expect(runsOf(w, '/bin/claude', 'plugin')).toBe(0)
+  // That session's version lands; its plugin list never does (it was cut off): past 30 s this one lists
+  w.store.set('installed', { at: w.clock.now(), version: '2.1.320' })
+  await w.clock.advance(15000)
+  expect(runsOf(w, '/bin/claude', '--version')).toBe(0)
+  expect(runsOf(w, '/bin/claude', 'plugin')).toBe(1)
+})
+
+test("claude plugin list's answer is stamped when it came back, and says meanwhile that a session runs it", async ($, on) => {
+  const w = world(on, { list: list() })
+  w.installedLate.value = 4000
+  await startSession($, w)
+  await w.clock.advance(100)
+  const running = w.store.get('plugin') as any
+  expect(typeof running?.pendingAt).toBe('number')
+  await w.clock.advance(4000)
+  expect(w.store.get('plugin')).toEqual({ at: running.pendingAt + 4000, plugin: null })
+})
+
 test('the pins pass takes no lock when nothing is to pin, unpin or record', SLOW, async ($, on) => {
   const w = world(on, { list: list() })
   w.files.set('/Users/x/jobs/pins.json', '[]')
