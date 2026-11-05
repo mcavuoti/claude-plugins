@@ -33,7 +33,7 @@ cached_lookup() {
     for f in "$d/.claude/settings.json" "$d/.claude/settings.local.json"; do
       [ ! -e "$f" ] || [ "$cache" -nt "$f" ] || return 1
     done
-    [ -n "$d" ] && [ "$d" != / ] || break
+    if [ -z "$d" ] || [ "$d" = / ]; then break; fi
     d=${d%/*}
   done
   while IFS='=' read -r k v; do
@@ -45,7 +45,7 @@ cached_lookup() {
       since) since=$v ;;
     esac
   done < "$cache"
-  [ "$format" = "$FORMAT" ] && [ "$who" = "$claude" ] && [ -f "$path/hooks/visor.sh" ] || return 1
+  if [ "$format" != "$FORMAT" ] || [ "$who" != "$claude" ] || [ ! -f "$path/hooks/visor.sh" ]; then return 1; fi
   printf '%s\t%s\t%s\n' "$path" "$version" "$since"
 }
 
