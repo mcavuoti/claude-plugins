@@ -259,10 +259,38 @@ sed "s|^SETUP_ROOT=''|SETUP_ROOT=/nowhere|" "$root/plugins/sessions/setup/ccc" >
 printf 'n\n' | (cd "$proj" && /bin/bash "$work/ccc") > "$work/out.txt" 2>&1 || true
 grep -q "^attach aaaaaaaa" "$fix/calls.log" || fail "ccc" "didn't open the top session: $(cat "$work/out.txt")"
 grep -q "Restart it first" "$work/out.txt" || fail "ccc" "the installed version wasn't passed on (no heartbeat expected)"
+grep -q "^plugin list --json" "$fix/calls.log" || fail "ccc" "didn't ask claude for the enabled plugin"
+# What claude answered is kept for this folder: the next ccc here asks nothing and runs the same copy, the same version
+lookup="$data/lookup/${proj//\//_}"
+grep -q "^path=$root/plugins/sessions$" "$lookup" || fail "ccc" "the answer wasn't kept: $(cat "$lookup" 2>&1)"
+mkdir -p "$HOME/.claude/plugins" "$proj/.claude"
+touch -t 202001010000 "$HOME/.claude/plugins/installed_plugins.json" "$proj/.claude/settings.local.json"
+: > "$fix/calls.log"
+printf 'n\n' | (cd "$proj" && /bin/bash "$work/ccc") > "$work/out.txt" 2>&1 || true
+grep -q "^plugin list" "$fix/calls.log" && fail "ccc" "asked claude again with nothing changed"
+grep -q "^attach aaaaaaaa" "$fix/calls.log" || fail "ccc" "didn't open the top session from the kept answer: $(cat "$work/out.txt")"
+grep -q "Restart it first" "$work/out.txt" || fail "ccc" "the kept version wasn't passed on"
+# An install or update since (Claude's record of installed plugins is newer): asked again
 echo '[]' > "$fix/plugins.json"
+touch -t 203001010000 "$HOME/.claude/plugins/installed_plugins.json"
 (cd "$proj" && /bin/bash "$work/ccc") > "$work/out.txt" 2>&1 || true
-grep -q "can't find the sessions plugin" "$work/out.txt" || fail "ccc" "no message without a plugin"
-pass "ccc: finds the enabled plugin"
+grep -q "can't find the sessions plugin" "$work/out.txt" || fail "ccc" "no message without a plugin (an update wasn't noticed)"
+# The project's settings changed (a plugin enabled or disabled there): asked again
+printf '[{"id":"sessions@m","version":"0.10.0","enabled":true,"installPath":"%s","lastUpdated":"2026-01-01T00:00:00.000Z"}]' "$root/plugins/sessions" > "$fix/plugins.json"
+touch -t 202001010000 "$HOME/.claude/plugins/installed_plugins.json"
+(cd "$proj" && printf 'n\n' | /bin/bash "$work/ccc") > /dev/null 2>&1 || true
+echo '[]' > "$fix/plugins.json"
+touch -t 203001010000 "$proj/.claude/settings.local.json"
+(cd "$proj" && /bin/bash "$work/ccc") > "$work/out.txt" 2>&1 || true
+grep -q "can't find the sessions plugin" "$work/out.txt" || fail "ccc" "a change of the project's settings wasn't noticed"
+# A kept folder that no longer has the plugin (an old version removed): asked again
+printf 'format=3\nclaude=%s\npath=/nowhere\nversion=0.10.0\nsince=0\n' "$SESSIONS_CLAUDE" > "$lookup"
+touch -t 202001010000 "$proj/.claude/settings.local.json"
+: > "$fix/calls.log"
+(cd "$proj" && /bin/bash "$work/ccc") > "$work/out.txt" 2>&1 || true
+grep -q "^plugin list" "$fix/calls.log" || fail "ccc" "used a kept folder that's gone"
+rm -rf "$proj/.claude" "$HOME/.claude/plugins"
+pass "ccc: finds the enabled plugin, keeps the answer per folder, asks again after an install or a settings change"
 
 # 11. ccc tell: needs no terminal and no project folder; refused without the session's opt-in, over 4 KB, for a regular
 #     session, for an ambiguous name and for a session whose panel isn't running; otherwise a request and its status
