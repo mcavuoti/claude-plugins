@@ -179,6 +179,23 @@ export type Sessions = {
    * rows left out for breaking a limit (a key that isn't a ref, a badge over 3 columns, a status line over 60
    * characters…), by ref, with why; the call's other rows are set and it answers ok */
   setMarks?: (input: { source: string; rows: Record<SessionsRef, SessionsMark>; ttlMs: number }) => Promise<SessionsResult & { rejected?: Record<SessionsRef, string> }>
+  /** 0.13.8. Pins (`pinned: true`) or unpins a background session in the background service's pins.json, as Ctrl+T in
+   * claude agents does, so the service doesn't retire it for being idle: under the same lock Claude takes. A session
+   * already pinned stays as it is; a session a plugin keeps pinned stays pinned when its Remote Control goes off.
+   * Unpinning takes out only a pin a plugin's call put there: one the person pinned is refused with why, and
+   * Remote Control's automatic pin stays its own. `busy` when the lock wasn't taken; refused for a regular session or
+   * one not in the list. `reason` goes to the debug log */
+  pin?: (input: { ref: SessionsRef; pinned: boolean; reason: string }) => Promise<SessionsResult>
+  /** 0.13.8. Restarts a running background session (claude respawn, from sessions' own timer): the same conversation in
+   * a new process running the installed versions, with its settings read again; the windows opened with ccc that show
+   * it reopen it. `queued`, or `refused` with why: a regular session, one that isn't running (wake brings a stopped one
+   * back), one working or waiting for the person (ask again once it's idle), and the caller's own session when a window
+   * not opened with ccc shows it. When its turn comes, sessions checks again, on a list read then: one working or
+   * waiting by then is dropped (ask again once it's idle). While that can't be read yet (another session's listing
+   * still running, a back-off), or the session has background tasks (a subagent, a Monitor: as u, a restart would cut
+   * them) or they can't be read, it waits, up to 5 minutes after the last call for it, then it's dropped. Each drop is
+   * said in the debug log, never to the caller: a caller that still wants it asks again. `reason` goes to the debug log */
+  restart?: (input: { ref: SessionsRef; reason: string }) => Promise<SessionsResult & { state?: 'queued' | 'refused' }>
 }
 export type SessionsMethod = keyof Sessions
 

@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
+import { keepPluginPins, pluginPinChange } from '../hooks/state'
 import { COMMAND, DATA, ROOT, SID, startSession, world } from './world'
 
 // $.sessions, the contract other plugins call (types/index.d.ts, docs/plugin-contract.md), seen from another plugin:
@@ -21,6 +22,8 @@ const PROBE = {
         else if (m === 'start') out = await $.sessions.start(input)
         else if (m === 'wake') out = await $.sessions.wake(input)
         else if (m === 'setMarks') out = await $.sessions.setMarks(input)
+        else if (m === 'pin') out = await $.sessions.pin(input)
+        else if (m === 'restart') out = await $.sessions.restart(input)
         return { text: JSON.stringify({ out }) }
       } catch (err) {
         return { text: JSON.stringify({ threw: String(err) }) }
@@ -56,7 +59,7 @@ test('contract: api 1 and its methods, also before the mod has started here', WI
   expect(c.api).toBe(1)
   expect(c.format).toBe(3)
   expect(typeof c.version).toBe('string')
-  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks'])
+  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart'])
 })
 
 test('current and status: not ready before the start, then this session and the others from the official list', WITH_PROBE, async ($, on) => {
@@ -443,4 +446,336 @@ test('marks: the f filter shows the rows marked as needing the person, and a sta
   // Its text changes in place, focused or not
   expect(JSON.stringify(await ui.drawn())).toContain('doing the changelog')
   await ui.unmount()
+})
+
+const PINS = '/Users/x/jobs/pins.json'
+// A session's state in the background service (jobs/<id>/state.json): no task in the background, or some
+const NO_TASKS = JSON.stringify({ inFlight: { tasks: 0, queued: 0, kinds: [] } })
+const TASKS = JSON.stringify({ inFlight: { tasks: 1, queued: 0, kinds: ['local_agent'] } })
+function moreSessions(): any[] {
+  return [
+    ...list(),
+    { id: 'dddddddd', sessionId: 'dddddddd-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'idle', pid: 4245, name: 'three' },
+    { id: 'eeeeeeee', sessionId: 'eeeeeeee-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', name: 'stopped one' },
+    { id: 'ffffffff', sessionId: 'ffffffff-0000-0000-0000-000000000000', cwd: ROOT, kind: 'background', status: 'busy', pid: 4246, name: 'busy one' },
+  ]
+}
+
+test("pin: a background session is pinned in pins.json under its lock, and only a plugin's own pin is ever unpinned, never the person's", WITH_PROBE, async ($, on) => {
+  const w = world(on, { list: moreSessions() })
+  // The person pinned “two” themself (Ctrl+T)
+  w.files.set(PINS, '[\n  "bbbbbbbb"\n]')
+  expect((await call($, 'pin', { ref: 'dddddddd', pinned: true, reason: 'x' })).reason).toBe('not-ready')
+  await startSession($, w)
+  const said = async (input: unknown) => {
+    const r = await call($, 'pin', input)
+    return r.ok ? 'ok' : `${r.reason}: ${r.detail}`
+  }
+  const before = w.runs.length
+  expect(await call($, 'pin', { ref: 'dddddddd', pinned: true, reason: 'fleet: an instance' })).toEqual({ ok: true })
+  // Written as Claude writes it, under the same lock
+  expect(w.files.get(PINS)).toBe('[\n  "bbbbbbbb",\n  "dddddddd"\n]')
+  expect(w.runs.slice(before).filter(a => a[1] === `${PINS}.lock`).map(a => a[0])).toEqual(['mkdir', 'rmdir'])
+  expect(w.runs.slice(before).some(a => a[0] === 'mv' && a.at(-1) === PINS)).toBe(true)
+  expect(w.store.get('pluginPins')).toEqual({ ids: ['dddddddd'], added: ['dddddddd'] })
+  // Again: nothing to change
+  expect(await said({ ref: 'dddddddd', pinned: true, reason: 'again' })).toBe('ok')
+  expect(w.files.get(PINS)).toBe('[\n  "bbbbbbbb",\n  "dddddddd"\n]')
+  // The person's pin: wanted by the plugin too, never counted as its own
+  expect(await said({ ref: 'bbbbbbbb', pinned: true, reason: 'x' })).toBe('ok')
+  expect(w.store.get('pluginPins')).toEqual({ ids: ['dddddddd', 'bbbbbbbb'], added: ['dddddddd'] })
+  expect(await said({ ref: 'bbbbbbbb', pinned: false, reason: 'x' })).toBe('refused: “two”: it was pinned before a plugin asked: it stays pinned')
+  expect(await said({ ref: 'bbbbbbbb', pinned: false, reason: 'x' })).toBe('refused: “two”: it was pinned by the person, not by a plugin: it stays pinned')
+  expect(w.files.get(PINS)).toBe('[\n  "bbbbbbbb",\n  "dddddddd"\n]')
+  // The plugin's own pin goes, with its place among the pinned ones (as Claude unpins)
+  const unpinning = w.runs.length
+  expect(await said({ ref: 'dddddddd', pinned: false, reason: 'x' })).toBe('ok')
+  expect(w.files.get(PINS)).toBe('[\n  "bbbbbbbb"\n]')
+  expect(w.runs.slice(unpinning)).toContainEqual(['rm', '-f', '/Users/x/jobs/dddddddd/order'])
+  expect(w.store.get('pluginPins')).toEqual({ ids: [], added: [] })
+  // One that isn't pinned: nothing to unpin
+  expect(await said({ ref: 'dddddddd', pinned: false, reason: 'x' })).toBe('ok')
+  // Refusals
+  expect(await said({ ref: `sid:${REGULAR}`, pinned: true, reason: 'x' })).toBe('refused: “myapp-1f” is a regular session: only a background session is pinned')
+  expect(await said({ ref: 'zzzzzzzz', pinned: true, reason: 'x' })).toBe("refused: zzzzzzzz isn't in the session list")
+  expect(await said({ ref: 1, pinned: true, reason: 'x' })).toContain('invalid')
+  expect(await said({ ref: 'dddddddd', pinned: 'yes', reason: 'x' })).toBe('invalid: pinned is true or false')
+  // A pins.json that isn't a list of ids is left as it is
+  w.files.set(PINS, '{"later": true}')
+  expect(await said({ ref: 'dddddddd', pinned: true, reason: 'x' })).toBe("refused: pins.json couldn't be read as a list of ids: left as it is")
+  expect(w.files.get(PINS)).toBe('{"later": true}')
+  // The lock held by another process: busy after a few 50 ms beats, and nothing is written
+  w.files.set(PINS, '[]')
+  w.dirs.add(`${PINS}.lock`)
+  w.made.set(`${PINS}.lock`, w.clock.now())
+  const pending = call($, 'pin', { ref: 'dddddddd', pinned: true, reason: 'x' })
+  await w.clock.advance(400)
+  expect(await pending).toEqual({ ok: false, reason: 'busy', detail: 'another session is changing pins.json: try again' })
+  expect(w.files.get(PINS)).toBe('[]')
+})
+
+test("pin and Remote Control: a session a plugin keeps pinned stays pinned when its Remote Control goes off, and leaves the record once it's gone", WITH_PROBE, async ($, on) => {
+  const sessionsList = list()
+  const w = world(on, { list: sessionsList, store: { autoPins: { ids: ['bbbbbbbb'], released: [] } } })
+  // Pinned by Remote Control's automatic pin
+  w.files.set(PINS, '[\n  "bbbbbbbb"\n]')
+  w.files.set('/Users/x/jobs/aaaaaaaa/state.json', '{}')
+  w.files.set('/Users/x/jobs/bbbbbbbb/state.json', '{"bridgeSessionId": "x"}')
+  await startSession($, w)
+  await w.clock.advance(100)
+  expect(await call($, 'pin', { ref: 'bbbbbbbb', pinned: true, reason: 'x' })).toEqual({ ok: true })
+  expect(w.store.get('pluginPins')).toEqual({ ids: ['bbbbbbbb'], added: [] })
+  // Remote Control goes off: its automatic pin would go, the plugin keeps it, and it becomes the plugin's own
+  w.files.set('/Users/x/jobs/bbbbbbbb/state.json', '{}')
+  await w.clock.advance(20000)
+  expect(w.files.get(PINS)).toBe('[\n  "bbbbbbbb"\n]')
+  expect(w.store.get('autoPins')).toEqual({ ids: [], released: [] })
+  expect(w.store.get('pluginPins')).toEqual({ ids: ['bbbbbbbb'], added: ['bbbbbbbb'] })
+  // Deleted: its pin goes with it, and the record forgets it
+  sessionsList.splice(1, 1)
+  await w.clock.advance(20000)
+  expect(w.files.get(PINS)).toBe('[]')
+  expect(w.store.get('pluginPins')).toEqual({ ids: [], added: [] })
+})
+
+test("restart: a running background session that's idle is restarted from the mod's own timer, checked again then; the rest is refused with why", WITH_PROBE, async ($, on) => {
+  const sessionsList = moreSessions()
+  const w = world(on, { list: sessionsList, env: { SESSIONS_PLUGIN_VERSION: '0.13.2', SESSIONS_PLUGIN_SINCE: '1' } })
+  w.files.set('/Users/x/jobs/dddddddd/state.json', NO_TASKS)
+  expect((await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).reason).toBe('not-ready')
+  await startSession($, w)
+  const refused = async (ref: unknown) => {
+    const r = await call($, 'restart', { ref, reason: 'x' })
+    expect(r.state).toBe(r.reason === 'invalid' ? undefined : 'refused')
+    return `${r.reason}: ${r.detail}`
+  }
+  expect(await refused(`sid:${REGULAR}`)).toBe('refused: “myapp-1f” is a regular session: it lives in its own window (/exit and claude -c)')
+  expect(await refused('zzzzzzzz')).toBe("refused: zzzzzzzz isn't in the session list")
+  expect(await refused('eeeeeeee')).toBe("refused: “stopped one” isn't running: $.sessions.wake brings back a stopped one")
+  expect(await refused('ffffffff')).toBe("refused: “busy one” is working: ask again once it's idle")
+  expect(await refused('bbbbbbbb')).toBe("refused: “two” is waiting for the person: ask again once it's idle")
+  expect(await refused(1)).toContain('invalid')
+  const before = w.runs.length
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'fleet: a pending restart' })).toEqual({ ok: true, state: 'queued' })
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'again' })).toEqual({ ok: true, state: 'queued' })
+  // Nothing ran inside the call: the mod's timer restarts it, once, without what ccc hands its launcher
+  expect(w.runs.slice(before).some(a => a[1] === 'respawn')).toBe(false)
+  await w.clock.advance(600)
+  const respawns = w.runs.map((argv, i) => ({ argv, env: w.envs[i] })).filter(r => r.argv[1] === 'respawn')
+  expect(respawns.map(r => r.argv)).toEqual([['/bin/claude', 'respawn', 'dddddddd']])
+  expect(respawns[0]?.env).toMatchObject({ SESSIONS_PLUGIN_VERSION: '', SESSIONS_PLUGIN_SINCE: '' })
+  expect(w.toasts).toEqual([])
+  // Working by the time the timer gets to it: dropped (its caller asks again once it's idle)
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  const three = sessionsList.find(s => s.id === 'dddddddd')
+  three.status = 'busy'
+  await w.clock.advance(600)
+  expect(w.runs.filter(a => a[1] === 'respawn').length).toBe(1)
+})
+
+test("restart: a queued one waits while what the session is doing can't be read yet (another session holds the list's lock), then goes", { ...WITH_PROBE, timeoutMs: 30000 }, async ($, on) => {
+  const w = world(on, { list: moreSessions() })
+  w.files.set('/Users/x/jobs/dddddddd/state.json', NO_TASKS)
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const respawns = () => w.runs.filter(a => a[1] === 'respawn').length
+  // Another session takes the lock and its listing runs long: the stored list here gets older than a restart trusts
+  const lock = `${DATA}/list.lock`
+  w.dirs.add(lock)
+  w.made.set(lock, w.clock.now())
+  await w.clock.advance(6000)
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(10000)
+  expect(respawns()).toBe(0)
+  // Its listing lands (the stored list, fresh) and the lock goes: the restart, still queued, goes on the next try
+  const stored: any = w.store.get('list')
+  w.store.set('list', { ...stored, at: w.clock.now() })
+  w.dirs.delete(lock)
+  await w.clock.advance(2500)
+  expect(w.runs.filter(a => a[1] === 'respawn')).toEqual([['/bin/claude', 'respawn', 'dddddddd']])
+})
+
+test('restart: a queued one waits while the listing fails, up to 5 minutes after the last call for it, then is dropped', { ...WITH_PROBE, timeoutMs: 30000 }, async ($, on) => {
+  const w = world(on, { list: moreSessions() })
+  w.files.set('/Users/x/jobs/dddddddd/state.json', NO_TASKS)
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const respawns = () => w.runs.filter(a => a[1] === 'respawn').length
+  w.agentsFail.value = true
+  await w.clock.advance(6000)
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(240000)
+  // Asked again while it waits: 5 more minutes from now
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(240000)
+  expect(respawns()).toBe(0)
+  w.agentsFail.value = false
+  await w.clock.advance(3000)
+  expect(respawns()).toBe(1)
+  // Once more, and the listing keeps failing past the 5 minutes (the last list it read, older by then than a restart
+  // trusts): dropped, so a listing that works later restarts nothing
+  w.agentsFail.value = true
+  await w.clock.advance(6000)
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(310000)
+  w.agentsFail.value = false
+  await w.clock.advance(5000)
+  expect(respawns()).toBe(1)
+})
+
+test("restart: a queued one waits for the background tasks the session has (as u warns of), and for state that can't be read", { ...WITH_PROBE, timeoutMs: 30000 }, async ($, on) => {
+  const w = world(on, { list: moreSessions() })
+  const state = '/Users/x/jobs/dddddddd/state.json'
+  w.files.set(state, TASKS)
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const respawns = () => w.runs.filter(a => a[1] === 'respawn').length
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(10000)
+  expect(respawns()).toBe(0)
+  // No state to read: still waiting
+  w.files.delete(state)
+  await w.clock.advance(10000)
+  expect(respawns()).toBe(0)
+  w.files.set(state, NO_TASKS)
+  await w.clock.advance(2500)
+  expect(respawns()).toBe(1)
+  // Tasks that outlast the 5 minutes: dropped
+  w.files.set(state, TASKS)
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(305000)
+  w.files.set(state, NO_TASKS)
+  await w.clock.advance(5000)
+  expect(respawns()).toBe(1)
+})
+
+test("a listing that fails or times out pushes every session's next one back, the stored sessions and when they were read kept", { timeoutMs: 30000 }, async ($, on) => {
+  const w = world(on, { list: moreSessions() })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const listings = () => w.runs.filter(a => a[0] === '/bin/claude' && a[1] === 'agents').length
+  const before: any = w.store.get('list')
+  // A listing that hangs for 16 s, then fails (run's timeout)
+  w.agentsFail.value = true
+  let release = () => {}
+  w.agentsGate.value = new Promise<void>(r => (release = r))
+  await w.clock.advance(16000)
+  w.agentsGate.value = null
+  release()
+  await w.clock.settle()
+  const failedAt = w.clock.now()
+  const after: any = w.store.get('list')
+  expect(after.at).toBe(before.at)
+  expect(after.sessions).toEqual(before.sessions)
+  // Twice its time (it started at the first refresh after the gate closed, up to 3 s in)
+  expect(after.until).toBeGreaterThanOrEqual(failedAt + 26000)
+  expect(after.until).toBeLessThanOrEqual(failedAt + 32000)
+  // Nobody lists again until then
+  const n = listings()
+  await w.clock.advance(after.until - w.clock.now() - 1000)
+  expect(listings()).toBe(n)
+  w.agentsFail.value = false
+  await w.clock.advance(8000)
+  expect(listings()).toBeGreaterThan(n)
+  expect((w.store.get('list') as any).at).toBeGreaterThan(failedAt)
+})
+
+// A newer copy of the mod installed beside the running one (claude plugin list --json), as the in-place update looks for
+function newerInstalled(): string {
+  const plugins = String((import.meta as any).dir).replace(/\/sessions\/tests$/, '')
+  return JSON.stringify([{ id: 'sessions@x', enabled: true, version: '0.10.1', installPath: `${plugins}/sessions-0.10.1`, lastUpdated: '2026-01-01T00:00:00Z' }])
+}
+
+test('in-place update: no list read for a session the last list shows working; once it shows it idle, it reloads', { timeoutMs: 30000 }, async ($, on) => {
+  const sessionsList = moreSessions()
+  const own = sessionsList.find(s => s.id === 'aaaaaaaa')
+  own.status = 'busy'
+  const w = world(on, { list: sessionsList })
+  w.files.set('/Users/x/jobs/aaaaaaaa/state.json', NO_TASKS)
+  w.plugins.value = newerInstalled()
+  await startSession($, w)
+  for (const p of w.panes) p.isFocused = false
+  const listings = () => w.runs.filter(a => a[0] === '/bin/claude' && a[1] === 'agents').length
+  // A list always fresh in the store (as when other sessions keep listing): only a list read now runs claude agents
+  const fresh = async (ms: number) => {
+    for (let t = 0; t < ms; t += 1000) {
+      w.store.set('list', { at: w.clock.now(), sessions: sessionsList })
+      await w.clock.advance(1000)
+    }
+  }
+  await fresh(2000)
+  const n = listings()
+  await fresh(31000)
+  expect(listings()).toBe(n)
+  expect(w.store.has(`reloaded:${SID}`)).toBe(false)
+  own.status = 'idle'
+  await fresh(31000)
+  expect(listings()).toBeGreaterThan(n)
+  expect(w.store.has(`reloaded:${SID}`)).toBe(true)
+})
+
+test('in-place update: a restart queued while it checks (a list read takes seconds) keeps it from reloading', { ...WITH_PROBE, timeoutMs: 30000 }, async ($, on) => {
+  const w = world(on, { list: moreSessions() })
+  w.files.set('/Users/x/jobs/aaaaaaaa/state.json', NO_TASKS)
+  const other = '/Users/x/jobs/dddddddd/state.json'
+  w.files.set(other, TASKS)
+  w.plugins.value = newerInstalled()
+  await startSession($, w)
+  for (const p of w.panes) p.isFocused = false
+  await w.clock.advance(4000)
+  // A slow listing: the update's own check (a list read now) waits on it
+  let release = () => {}
+  w.agentsGate.value = new Promise<void>(r => (release = r))
+  await w.clock.advance(16000)
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(600)
+  w.agentsGate.value = null
+  release()
+  await w.clock.advance(1000)
+  expect(w.store.has(`reloaded:${SID}`)).toBe(false)
+  // Its tasks done, the restart goes; then the update reloads
+  w.files.set(other, NO_TASKS)
+  await w.clock.advance(31000)
+  expect(w.runs.filter(a => a[1] === 'respawn')).toEqual([['/bin/claude', 'respawn', 'dddddddd']])
+  expect(w.store.has(`reloaded:${SID}`)).toBe(true)
+})
+
+test("restart of the caller's own session: refused while a window not opened with ccc shows it; else run detached, and its ccc windows reopen it", WITH_PROBE, async ($, on) => {
+  const w = world(on, { list: list() })
+  w.files.set('/Users/x/jobs/aaaaaaaa/state.json', NO_TASKS)
+  await startSession($, w)
+  w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
+  const r = await call($, 'restart', { ref: 'aaaaaaaa', reason: 'x' })
+  expect(`${r.state} ${r.detail}`).toBe("refused a window that wasn't opened with ccc shows “one” (/dev/ttys001): it wouldn't come back by itself after the restart; u in the panel restarts it")
+  w.ps.value = '  100 ttys001  bash /Users/x/p/hooks/visor.sh start\n  101 ttys001  claude attach aaaaaaaa'
+  expect(await call($, 'restart', { ref: 'aaaaaaaa', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  expect(w.runs.some(a => a[0] === 'perl')).toBe(false)
+  await w.clock.advance(600)
+  const perl = w.runs.find(a => a[0] === 'perl')
+  expect(perl?.slice(-3)).toEqual(['/bin/claude', 'respawn', 'aaaaaaaa'])
+  // The ccc window is told to reopen it
+  const windowFiles = [...w.files.keys()].filter(p => p.startsWith(`${DATA}/windows/`))
+  expect(windowFiles.length).toBe(1)
+  expect(w.files.get(windowFiles[0] ?? '')).toContain('aaaaaaaa')
+  // Still here 15 s later: it wasn't restarted, the window file goes and the person is told
+  await w.clock.advance(16000)
+  expect(w.files.has(windowFiles[0] ?? '')).toBe(false)
+  expect(w.toasts).toContain("Couldn't restart “one”")
+})
+
+test("a plugin's pins: it unpins only what it pinned, Remote Control's own pin stays its own, and a session that's gone leaves the record", () => {
+  const none = { ids: [], added: [] }
+  expect(pluginPinChange(['a'], none, [], 'b', true)).toEqual({ pins: ['a', 'b'], plugin: { ids: ['b'], added: ['b'] }, changed: true })
+  // Already pinned (the person's, or Remote Control's): wanted, never added
+  expect(pluginPinChange(['a'], none, [], 'a', true)).toEqual({ pins: ['a'], plugin: { ids: ['a'], added: [] }, changed: false })
+  expect(pluginPinChange(['a', 'b'], { ids: ['b'], added: ['b'] }, [], 'b', false)).toEqual({ pins: ['a'], plugin: none, changed: true })
+  // Remote Control's automatic pin holds it: it stays, and the plugin no longer wants it
+  expect(pluginPinChange(['b'], { ids: ['b'], added: [] }, ['b'], 'b', false)).toEqual({ pins: ['b'], plugin: none, changed: false })
+  expect(pluginPinChange(['a'], none, [], 'a', false).refused).toBe('it was pinned by the person, not by a plugin: it stays pinned')
+  // Unpinned meanwhile by the person: nothing to do
+  expect(pluginPinChange([], { ids: ['b'], added: ['b'] }, [], 'b', false)).toEqual({ pins: [], plugin: none, changed: false })
+  // Remote Control off for b and c: b, kept by a plugin, stays pinned and becomes its own; c goes
+  expect(keepPluginPins({ pins: ['a'], toUnpin: ['b', 'c'] }, { ids: ['b'], added: [] }, new Set(['a', 'b', 'c']))).toEqual({ pins: ['a', 'b'], toUnpin: ['c'], plugin: { ids: ['b'], added: ['b'] } })
+  // Gone from the list: the record forgets them, and the pin a plugin added goes (never the person's)
+  expect(keepPluginPins({ pins: ['a', 'd'], toUnpin: [] }, { ids: ['a', 'd'], added: ['d'] }, new Set())).toEqual({ pins: ['a'], toUnpin: ['d'], plugin: none })
 })

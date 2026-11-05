@@ -430,6 +430,74 @@ export function reconcilePins(
   }
 }
 
+// The sessions other plugins asked to keep pinned ($.sessions.pin), stored under `pluginPins`: ids, the ones wanted
+// pinned; added, the ones whose pin a plugin's call (or Remote Control's automatic pin it kept) put in pins.json, the
+// only ones a plugin's unpin takes out. A pin that was already there (the person's own) is wanted but never added
+export type PluginPins = { ids: string[]; added: string[] }
+
+export function emptyPluginPins(): PluginPins {
+  return { ids: [], added: [] }
+}
+
+// A stored record as it is, or an empty one for a missing or broken value
+export function pluginPinsOf(value: unknown): PluginPins {
+  const v = value as Partial<PluginPins> | null | undefined
+  const ids = (x: unknown) => (Array.isArray(x) ? x.filter((s): s is string => typeof s === 'string') : [])
+  return { ids: ids(v?.ids), added: ids(v?.added) }
+}
+
+// A plugin's pin or unpin of one session, on pins.json as it is: what to write and the record after it. auto: the ids
+// Remote Control's automatic pin put there (its own to take out). Pin: a session not pinned is pinned and counts as
+// added; one already pinned stays as it is (the person's, or Remote Control's, which stays theirs). Unpin: only a pin a
+// plugin added goes, and not while Remote Control's automatic pin holds it; one the person pinned is refused
+export function pluginPinChange(
+  pins: readonly string[],
+  plugin: PluginPins,
+  auto: readonly string[],
+  id: string,
+  pinned: boolean,
+): { pins: string[]; plugin: PluginPins; changed: boolean; refused?: string } {
+  const ids = new Set(plugin.ids)
+  const added = new Set(plugin.added)
+  const now = new Set(pins)
+  if (pinned) {
+    ids.add(id)
+    if (now.has(id)) return { pins: [...pins], plugin: { ids: [...ids], added: [...added] }, changed: false }
+    added.add(id)
+    return { pins: [...pins, id], plugin: { ids: [...ids], added: [...added] }, changed: true }
+  }
+  const wanted = ids.delete(id)
+  const ours = added.delete(id)
+  const record = { ids: [...ids], added: [...added] }
+  if (!now.has(id)) return { pins: [...pins], plugin: record, changed: false }
+  if (auto.includes(id)) return { pins: [...pins], plugin: record, changed: false }
+  if (!ours) return { pins: [...pins], plugin: record, changed: false, refused: wanted ? 'it was pinned before a plugin asked: it stays pinned' : 'it was pinned by the person, not by a plugin: it stays pinned' }
+  return { pins: pins.filter(p => p !== id), plugin: record, changed: true }
+}
+
+// After reconcilePins (Remote Control's automatic pins): a session a plugin keeps pinned isn't unpinned when its Remote
+// Control goes off, and the pin becomes the plugin's to take out (added). A session gone from the list leaves the
+// record, and its pin goes too when a plugin added it. listed: the background sessions the list has
+export function keepPluginPins(
+  r: { pins: string[]; toUnpin: string[] },
+  plugin: PluginPins,
+  listed: ReadonlySet<string>,
+): { pins: string[]; toUnpin: string[]; plugin: PluginPins } {
+  const ids = new Set(plugin.ids)
+  const added = new Set(plugin.added)
+  const toUnpin = r.toUnpin.filter(id => !ids.has(id) || !listed.has(id))
+  const kept = r.toUnpin.filter(id => ids.has(id) && listed.has(id))
+  for (const id of kept) added.add(id)
+  const pins = [...r.pins, ...kept.filter(id => !r.pins.includes(id))]
+  for (const id of [...ids, ...added]) {
+    if (listed.has(id)) continue
+    if (added.has(id) && pins.includes(id) && !toUnpin.includes(id)) toUnpin.push(id)
+    ids.delete(id)
+    added.delete(id)
+  }
+  return { pins: pins.filter(id => !toUnpin.includes(id)), toUnpin, plugin: { ids: [...ids], added: [...added] } }
+}
+
 // When the store has no auto-pin record (a new store, or it was lost), the mod rebuilds one: every pinned session that
 // has Remote Control on counts as pinned by the mod, so it gets unpinned when its Remote Control goes off. A session
 // you pinned by hand with Remote Control on counts as the mod's too: the record can't tell them apart
