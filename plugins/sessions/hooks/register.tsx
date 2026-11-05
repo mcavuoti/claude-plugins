@@ -429,11 +429,13 @@ function debugLine($: any, text: string) {
 // Data shared between sessions: the mod's official store ($.store), a JSON file managed by Claude. Keys:
 // state:<id> (SessionState: what each session publishes about itself), seen:<id> (seen at), title:<id> (title from the
 // first prompt), waiting:<id> (waiting since),
-// restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (the cached session list: at,
-// when the listing came back; sessions; until, when a slow listing pushed the next one back; one listing at a time,
-// under the <data>/list.lock folder),
+// restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (the session list claude
+// agents gave: at, when the listing came back; sessions; sig, what Claude's registry and the service's folder looked
+// like just before; until, when a slow or failed listing pushed the next one back; one listing at a time, under the
+// <data>/list.lock folder),
 // installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
-// autoPins (AutoPins), pluginPins (PluginPins: the sessions other plugins keep pinned through $.sessions.pin), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
+// autoPins (AutoPins), pluginPins (PluginPins: the sessions other plugins keep pinned through $.sessions.pin),
+// reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
 // session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
 // marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts), collapsed (the
@@ -441,11 +443,11 @@ function debugLine($: any, text: string) {
 // at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
 // (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
-// and the window in front, shared for 1.5 s by the seen check: at, windows / tty; windowsList also pendingAt, a session
-// listing right now, and until, when a slow ps pushed the next one back), answer:<id> (the answer to a Stop or
-// Restart question that session asked, when the asked session couldn't send it as a notice: format, sessionId,
-// action, cameBack, at; that session's panel takes it and deletes it), personStop:<id> (when the person stopped that
-// session from a panel: a plugin's wake leaves it stopped until it's started again).
+// and the window in front, shared by the seen check for SEEN_WINDOWS_MS and FRONT_SHARED_MS: at, windows / tty;
+// windowsList also pendingAt, a session listing right now, and until, when a slow ps pushed the next one back),
+// answer:<id> (the answer to a Stop or Restart question that session asked, when the asked session couldn't send it as
+// a notice: format, sessionId, action, cameBack, at; that session's panel takes it and deletes it), personStop:<id>
+// (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
