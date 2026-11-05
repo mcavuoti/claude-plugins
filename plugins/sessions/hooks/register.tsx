@@ -164,7 +164,7 @@ import {
   nextLabelChange,
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
-import { bellFrom, bellOfKey, bellText, classify, jobIds, listDrift, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchSetOf, type Locations, type RegistryNews } from './watch'
+import { bellFrom, bellOfKey, bellText, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchSetOf, type Locations, type RegistryNews } from './watch'
 import { electLeader, LEADER_STALE_MS, leaderText, leads, parseLeader, PASS_MS, type Candidate } from './leader'
 
 const PANE = 'sessions'
@@ -1115,7 +1115,7 @@ async function pass($: any) {
   if (!live) return
   // The requests and the queues another plugin fills, as the short timer would (a missed event, or a queue whose kick
   // never came, waits a pass at most)
-  quickTick($)
+  quickTick($, true)
   bg(readUsage($, USAGE_FOLLOWER_MS))
   await chores($)
   bg(scheduleSeen($))
@@ -1180,10 +1180,11 @@ function setPace($: any) {
   }
 }
 
-// The requests the short timer looks for, and the queues other plugins fill (also run at once when filled: kickQueue)
-function quickTick($: any) {
+// The requests the short timer looks for, and the queues other plugins fill (also run at once when filled: kickQueue).
+// byPass: from the pass, in a watched session
+function quickTick($: any, byPass = false) {
   bg(solo('answer', () => checkStoredAnswer($)))
-  bg(solo('inbox', () => checkInbox($)))
+  bg(solo('inbox', () => checkInbox($, byPass)))
   bg(runLaunches($))
   bg(runWakes($))
   bg(runRestarts($))
@@ -1334,12 +1335,16 @@ async function ownJobOf($: any, l: Locations, sessionId: string): Promise<string
 
 // classic.SessionStart (a start, /clear, a compaction, a resume): the paths for the engine to watch, from now on in
 // this session (watchPaths in watch.ts), and it's live: the short timer stops. After /clear or a resume the session's
-// new id comes with it, which the mod follows at once
+// new id comes with it, which the mod follows at once. The mod's own folders are made first, where missing (a new data
+// folder: the first session there): a folder missing when the list goes may never be watched (see watch.ts)
 async function watchFor($: any, sessionId: string, source: string): Promise<string[]> {
   const l = await locationsOf($)
   if (!l.registry || !l.data) return []
   ownJob = (await ownJobOf($, l, sessionId)) ?? ownJob
   const paths = watchPaths(l, ownJob)
+  const missing: string[] = []
+  for (const dir of ownWatchedFolders(l)) if (!(await exists($, dir))) missing.push(dir)
+  if (missing.length && (await runSafe($, ['mkdir', '-p', ...missing])).exitCode !== 0) debugLine($, `couldn't make ${missing.join(', ')}: their file events may never come`)
   const was = live
   live = true
   {
@@ -3435,9 +3440,18 @@ async function recordTitle($: any) {
   if (first) await storeSet($, `title:${myId}`, first.text.trim().split('\n')[0].slice(0, 50))
 }
 
-// A request from the launcher in this session's inbox (see InboxRequest): consumed once, then acted on
+// A request from the launcher in this session's inbox (see InboxRequest): consumed once, then acted on.
+// One with a reply is acted on only while ccc still waits for the answer (REPLY_WAIT_MS, ask_helpers in launcher.py):
+// later it would bring a window or wake a session for nobody, and its answer would stay in replies/ for good.
+// One the pass finds, written a while after this session's watch began (INBOX_EVENT_MS: its event comes in about 0.7
+// s), came with no file event: the inbox isn't watched (a folder missed when the watch began, or removed since), and
+// the engine won't watch it again in this process. From then on the inbox is read every 0.5 s (inboxTimer), so the
+// next request is answered within ccc's wait
+const REPLY_WAIT_MS = 3000
+const INBOX_EVENT_MS = 2000
+let inboxTimer: { cancel: () => void } | null = null
 let checkingInbox = false
-async function checkInbox($: any) {
+async function checkInbox($: any, byPass = false) {
   if (checkingInbox || !dataDir || !myId) return
   const path = `${dataDir}/inbox/${myId}`
   checkingInbox = true
@@ -3461,7 +3475,19 @@ async function checkInbox($: any) {
       await answer('failed', 'another version')
       return
     }
-    if ((await $.clock.now()) - r.at > 30000) return
+    const now = await $.clock.now()
+    const since = (await read($, watching))?.at
+    if (byPass && live && !inboxTimer && since && r.at > since + 1000 && now - r.at > INBOX_EVENT_MS) {
+      inboxTimer = $.clock.every(500, () => {
+        bg(solo('inbox', () => checkInbox($)))
+      })
+      debugLine($, `inbox: a request from ${Math.round((now - r.at) / 1000)} s ago came with no file event: the inbox is read every 0.5 s from now on`)
+    }
+    if (now - r.at > 30000) return
+    if (r.reply && now - r.at > REPLY_WAIT_MS) {
+      debugLine($, `inbox: ${r.action} from ${Math.round((now - r.at) / 1000)} s ago, after ccc stopped waiting: dropped`)
+      return
+    }
     debugLine($, `inbox: ${r.action}`)
     if (r.action === 'focus') {
       await focusPanel($)
@@ -3829,7 +3855,7 @@ async function statusText($: any): Promise<string> {
 async function liveText($: any, now: number): Promise<string> {
   const w = await read($, watching)
   const how = live
-    ? `Live: the engine watches Claude's registry and the panel's files (set ${WATCH_SET}${w ? `, since ${Math.max(0, Math.round((now - w.at) / 1000))} s ago` : ''})`
+    ? `Live: the engine watches Claude's registry and the panel's files (set ${WATCH_SET}${w ? `, since ${Math.max(0, Math.round((now - w.at) / 1000))} s ago` : ''})${inboxTimer ? ', but not the inbox (a request came with no file event): read every 0.5 s' : ''}`
     : reloadedInto
       ? 'Not live: this session was updated in place from a version that watched other files; it reads them every 3 s until it restarts (u) or is cleared (/clear)'
       : 'Not live: no SessionStart reached the panel in this session; it reads the files every 3 s'

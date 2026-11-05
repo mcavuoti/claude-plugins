@@ -333,6 +333,71 @@ test('live: a ccc request in the inbox is taken on its file event, not on a 0.5 
   expect(w.opens.slice(opens).some((o: any) => o.focus === true)).toBe(true)
 })
 
+test("SessionStart makes the mod's watched folders before it answers, in a new data folder too, and none of Claude's", async ($, on) => {
+  const w = world(on, { list: listed(SESSIONS) })
+  for (const s of SESSIONS) registryFile(w, s)
+  const own = [`${DATA}/bell`, `${DATA}/inbox`, `${DATA}/tell`]
+  // A new data folder, and SessionStart before the mod's start: none of them there yet. A missing one may never be
+  // watched (several missing under one folder: the engine watches only one of them)
+  expect(own.filter(d => w.dirs.has(d))).toEqual([])
+  const start: any = await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
+  expect(own.every(d => start.watchPaths.includes(d))).toBe(true)
+  expect(own.filter(d => !w.dirs.has(d))).toEqual([])
+  // Claude's own paths are Claude's: no pins.json, no service folder made for it
+  expect(start.watchPaths).toContain(`${JOBS}/pins.json`)
+  expect(w.files.has(`${JOBS}/pins.json`)).toBe(false)
+  expect(w.dirs.has(JOBS)).toBe(false)
+  // Once they're there a later SessionStart (a /clear) makes nothing; one removed since is made again
+  await startSession($, w)
+  const makes = () => w.runs.filter(a => a[0] === 'mkdir' && own.some(d => a.includes(d))).length
+  const made = makes()
+  await $.classic.SessionStart({ source: 'clear', session_id: SID } as any)
+  expect(makes()).toBe(made)
+  w.dirs.delete(`${DATA}/inbox`)
+  await $.classic.SessionStart({ source: 'compact', session_id: SID } as any)
+  expect(w.dirs.has(`${DATA}/inbox`)).toBe(true)
+})
+
+test('live: an inbox request no file event announced is found by the pass, dropped once ccc stopped waiting, and then the inbox is read every 0.5 s', SLOW, async ($, on) => {
+  const { w } = await liveSession($, on)
+  // Past the first pass (this session's offset is at most 10 s)
+  await w.clock.advance(15000)
+  const inbox = `${DATA}/inbox/${SID}`
+  const bring = (reply: string) => `format=3\naction=bring\nat=${w.clock.now()}\ntty=/dev/ttys009\ntitle=nowhere\nreply=${DATA}/replies/${reply}\n`
+  // ccc's bring, and no event: the engine doesn't watch the inbox
+  w.write(inbox, bring('1-1'))
+  await w.clock.advance(2000)
+  expect(w.files.has(inbox)).toBe(true)
+  // The pass takes it, long after ccc's 3 s: not acted on, and no answer left in replies/ for nobody
+  await w.clock.advance(PASS_MS)
+  expect(w.files.has(inbox)).toBe(false)
+  expect(w.files.has(`${DATA}/replies/1-1`)).toBe(false)
+  // The next one, still with no event, is answered within ccc's wait
+  w.write(inbox, bring('1-2'))
+  await w.clock.advance(600)
+  expect(w.files.has(inbox)).toBe(false)
+  expect(w.files.get(`${DATA}/replies/1-2`)).toContain('result=')
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as any)
+  expect(r.text).toContain('but not the inbox')
+})
+
+test('an inbox request with a reply is acted on only while ccc waits for the answer', async ($, on) => {
+  const { w } = await liveSession($, on)
+  await w.clock.advance(1000)
+  const inbox = `${DATA}/inbox/${SID}`
+  // Written 4 s ago (a session busy elsewhere): ccc gave up after 3 s
+  w.write(inbox, `format=3\naction=bring\nat=${w.clock.now() - 4000}\ntty=/dev/ttys009\ntitle=nowhere\nreply=${DATA}/replies/2-1\n`)
+  await $.classic.FileChanged({ file_path: inbox, event: 'add' })
+  await w.clock.advance(100)
+  expect(w.files.has(inbox)).toBe(false)
+  expect(w.files.has(`${DATA}/replies/2-1`)).toBe(false)
+  // Within the wait: answered
+  w.write(inbox, `format=3\naction=bring\nat=${w.clock.now() - 1000}\ntty=/dev/ttys009\ntitle=nowhere\nreply=${DATA}/replies/2-2\n`)
+  await $.classic.FileChanged({ file_path: inbox, event: 'add' })
+  await w.clock.advance(100)
+  expect(w.files.get(`${DATA}/replies/2-2`)).toContain('result=')
+})
+
 test('live: the lowest pid leads, writes the record and lists once a pass; the next takes over when it ends', SLOW, async ($, on) => {
   const sessions: Session[] = [{ pid: 4200, sessionId: CHARLIE, id: 'cccccccc', status: 'idle', name: 'charlie' }, ...SESSIONS]
   const list = listed(sessions)

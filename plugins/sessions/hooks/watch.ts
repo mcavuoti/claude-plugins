@@ -21,6 +21,18 @@
 //   session (its tasks, its Remote Control). Never the service's whole folder: it holds hundreds of folders, and a
 //   watched folder is watched to every depth.
 //
+// A path that's missing when the list goes is watched only in the simplest case. The engine (chokidar) then waits on
+// its parent folder for that name, and the waits on one parent share one read of it: when the parent changes, only one
+// of them reads it. So one missing name under a folder that exists is watched once it's made; of several missing under
+// one parent only one ever is (in 0.14.0 a new data folder's bell, inbox and tell: the first session there never heard
+// of its inbox); and one whose parent is missing too waits for the wrong name and never is. A SessionStart that hands
+// the same list again (a /clear, a compaction) leaves the watch as it is: what was missed stays missed until the session
+// restarts. So the mod's own folders (ownWatchedFolders) are made before the list goes, and the pass looks for an
+// inbox request no event announced (checkInbox). Claude's paths aren't made by the mod: the registry is there while a
+// session runs; a missing pins.json is the one name waited for in the service's folder (watched once the service or the
+// mod writes it; with that folder missing too, only the pass reads it); so is a background session's own state.json in
+// its job's folder, which the service makes before the session starts.
+//
 // The list itself is read from those files (directList): the same list `claude agents --json --all` prints, as far as
 // the panel uses it. Only the elected leader (leader.ts) still runs that command, once a pass: it sweeps the files of
 // sessions that crashed, which no file event reports.
@@ -40,9 +52,14 @@ export function watchSetOf(source: string | null): number {
 
 export type Locations = { registry: string; data: string; jobs: string }
 
+// The mod's own folders among the watched paths: made, where missing, before the list goes to the engine
+export function ownWatchedFolders(l: Locations): string[] {
+  return [`${l.data}/bell`, `${l.data}/inbox`, `${l.data}/tell`]
+}
+
 // What a session asks the engine to watch: its own background job's state only when it's one (ownJob: its short id)
 export function watchPaths(l: Locations, ownJob: string | null): string[] {
-  const out = [l.registry, `${l.data}/bell`, `${l.data}/inbox`, `${l.data}/tell`]
+  const out = [l.registry, ...ownWatchedFolders(l)]
   if (l.jobs) out.push(`${l.jobs}/pins.json`)
   if (l.jobs && ownJob && /^[A-Za-z0-9_-]+$/.test(ownJob)) out.push(`${l.jobs}/${ownJob}/state.json`)
   return out
