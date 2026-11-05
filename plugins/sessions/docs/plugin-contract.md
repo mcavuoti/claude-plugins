@@ -33,7 +33,7 @@ From 0.11.0 the `sessions` mod adds a noun to `$` that other plugins call: what 
 |---|---|
 | `contract()` | the api number, `sessions`' version and wire format, and the methods this copy serves |
 | `current()` | this session from memory: its ref, session id, name as the panel shows it, project root, whether it's a background session, and the agent it runs as (`claude --agent`) |
-| `status({ refs, names })` | other sessions from the panel's last refresh (every 3 s): by ref (one not in the official list comes back `gone`) and by exact name (every session with that name, in any project), once each; a stopped background session says why (0.13.4, `stopped`) |
+| `status({ refs, names })` | other sessions from the panel's list (Claude's files, read again on their events; 0.14.0): by ref (one not in the official list comes back `gone`) and by exact name (every session with that name, in any project), once each; a stopped background session says why (0.13.4, `stopped`) |
 | `sections()` | every section and who's in which |
 | `defineSection({ source, spec })` | creates or updates one of your sections |
 | `assignSection({ source, ref, section, parent })` | puts a session in one of your sections, or takes it out of it (`null`); from 0.12.0 under a parent session |
