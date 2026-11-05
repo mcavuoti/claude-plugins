@@ -1093,8 +1093,9 @@ async function pass($: any) {
   await requestRefresh($)
   await solo('leader', () => leaderTurn($, 'pass'))
   if (!live) return
-  bg(solo('inbox', () => checkInbox($)))
-  bg(solo('tells', () => checkTells($)))
+  // The requests and the queues another plugin fills, as the short timer would (a missed event, or a queue whose kick
+  // never came, waits a pass at most)
+  quickTick($)
   bg(readUsage($, USAGE_FOLLOWER_MS))
   await chores($)
   bg(scheduleSeen($))
