@@ -6,6 +6,7 @@ after the same way. README.md in this folder says what each number means and how
                                 [--label TEXT] [--sessions 6] [--scenarios idle,propagation,switch,ccc]
                                 [--idle-seconds 120] [--rounds 5] [--warmup 30] [--platform portable|macos]
                                 [--model haiku] [--env KEY=VALUE]... [--keep] [--reload-from <older copy>]
+                                [--inbox-target B]
 
 Two more scenarios, run only when named: crash (the session that leads the machine-wide work is killed, SIGKILL: how
 long until another one leads and the killed one's row is gone from a panel) and reload (two more sessions start on
@@ -613,9 +614,10 @@ class Bench:
                 'note': "from the hidden terminal starting the copy's setup/ccc (claude's plugin lookup included) to the first frame of the opened session's panel with its current row; toAttach: to Claude Code's header; toFocus: to the panel holding the keyboard (ccc's focus request, through the session's inbox)"}
 
     # ccc's requests to a running session (its inbox, as the launcher writes them): a bring of a window that isn't
-    # there, which the session answers in replies/ (failed, at once): from the request written to the answer
+    # there, which the session answers in replies/ (failed, at once): from the request written to the answer. The
+    # target is TEST B unless --inbox-target names another (A: the first session to start in the new data folder)
     def inbox(self):
-        target = self.by_name('B')
+        target = self.by_name(self.a.inbox_target)
         times, results = [], []
         for i in range(self.a.rounds):
             reply = os.path.join(self.data, 'replies', 'bench-%d-%d' % (os.getpid(), i))
@@ -646,8 +648,17 @@ class Bench:
             except OSError:
                 pass
             time.sleep(random.uniform(1.0, 2.0))
-        return {'toAnswer': stats(times), 'results': results,
-                'note': "a bring request in TEST B's inbox (as ccc writes it, for a window that isn't there) to its answer in replies/; ccc waits up to 3 s for one"}
+        # What that session's engine reported of the data folder's watched folders, and when the mod made them: its
+        # first mkdir of several folders against the engine's "watching" line (negative: made before the list went)
+        lines = list(log_lines(target.log))
+        events = {d: sum(1 for _, text in lines if text.startswith('FileChanged: ') and os.path.join(self.data, d) + '/' in text)
+                  for d in ('bell', 'inbox', 'tell')}
+        watched = next((t for t, text in lines if text.startswith('FileChanged: watching')), None)
+        made = next((t for t, text in lines for m in [SPAWN.search(text)]
+                     if m and os.path.basename(m.group(1)) == 'mkdir' and int(m.group(2)) > 2), None)
+        return {'target': target.name, 'toAnswer': stats(times), 'results': results, 'dataFolderEvents': events,
+                'foldersMadeAfterWatch': round(made - watched, 3) if made and watched else None,
+                'note': "a bring request in %s's inbox (as ccc writes it, for a window that isn't there) to its answer in replies/; ccc waits up to 3 s for one. dataFolderEvents: the engine's FileChanged lines for bell/, inbox/ and tell/ in that session's debug log, over the whole run; foldersMadeAfterWatch: from the engine's watching line to the mod's first mkdir of several folders, in s" % target.name}
 
     # ---- terminals ---------------------------------------------------------------------------------------------------
 
@@ -1111,10 +1122,13 @@ def main(argv):
     p.add_argument('--env', action='append', default=[], help='KEY=VALUE added to every test session (a counter the copy exposes)')
     p.add_argument('--keep', action='store_true', help='leave the sessions, their transcripts and the temporary folder')
     p.add_argument('--reload-from', help='the reload scenario: an older copy of plugins/sessions the sessions start on')
+    p.add_argument('--inbox-target', default='B', help="the inbox scenario's target, by letter (A: the first session in the new data folder)")
     a = p.parse_args(argv)
     scenarios = [s for s in a.scenarios.split(',') if s]
     if a.sessions < 2:
         p.error('--sessions must be 2 or more')
+    if not re.match(r'^[A-Z]$', a.inbox_target) or ord(a.inbox_target) - ord('A') >= a.sessions:
+        p.error('--inbox-target must be the letter of one of the --sessions test sessions')
     if a.platform == 'macos' and set(scenarios) & {'switch', 'ccc', 'crash', 'reload'}:
         p.error("--platform macos runs only idle and propagation: an Enter in a panel there could open a Terminal window")
     if not os.path.isfile(os.path.join(a.plugin, '.claude-plugin', 'plugin.json')):
