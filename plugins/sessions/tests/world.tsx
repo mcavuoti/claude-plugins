@@ -18,6 +18,9 @@ export const SLOW = { timeoutMs: 30000 } as const
 
 export type World = {
   files: Map<string, string>
+  // A file written by someone else (Claude's registry, another session) now, by the mocked clock: its time stays put
+  // until it's written again, as a real file's does
+  write: (path: string, text: string) => void
   opens: any[]
   registered: string[]
   clock: ReturnType<typeof mock.clock>
@@ -82,7 +85,15 @@ export type WorldOptions = {
 
 // A session with an id and a root, an in-memory folder tree, a claude that lists one session
 export function world(on: On, options: WorldOptions = {}): World {
-  const files = new Map<string, string>()
+  // When each file was written (fs.list's and fs.stat's mtimeMs): by the mod, or by a test through write. One a test
+  // set directly (files.set) counts as just written, whenever it's looked at
+  const written = new Map<string, number>()
+  const files = new (class extends Map<string, string> {
+    override set(path: string, text: string) {
+      written.delete(path)
+      return super.set(path, text)
+    }
+  })()
   const dirs = new Set(['/', '/Users', '/Users/x', ROOT])
   const made = new Map<string, number>()
   const root = { value: ROOT }
@@ -148,22 +159,28 @@ export function world(on: On, options: WorldOptions = {}): World {
     if (text === undefined) throw new Error(`no such file: ${e.path}`)
     return { value: text }
   })
-  // When each file was written (fs.list's mtimeMs); one a test set directly counts as just written
-  const written = new Map<string, number>()
   on('fs.write', (_, e) => {
     files.set(e.path, e.text)
     written.set(e.path, clock.now())
     return { value: undefined }
   })
   on('fs.exists', (_, e) => ({ value: files.has(e.path) || dirs.has(e.path) }))
+  // A file's size and time, as fs.list and fs.stat give them: what it holds, and when it was last written (by the mod,
+  // or by a test through write; one a test set directly counts as just written)
+  const size = (p: string) => new TextEncoder().encode(files.get(p) ?? '').length
   on('fs.list', (_, e) => ({
-    value: [...files.keys()].filter(p => p.startsWith(`${e.path}/`)).map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: written.get(p) ?? clock.now(), isLink: false })),
+    value: [...files.keys()].filter(p => p.startsWith(`${e.path}/`)).map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: size(p), mtimeMs: written.get(p) ?? clock.now(), isLink: false })),
   }))
   on('fs.stat', (_, e) => {
     if (dirs.has(e.path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: made.get(e.path) ?? 0, isLink: false } }
     if (!files.has(e.path)) throw new Error(`ENOENT: ${e.path}`)
-    return { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }
+    return { value: { kind: 'file' as const, size: size(e.path), mtimeMs: written.get(e.path) ?? clock.now(), isLink: false } }
   })
+  // A file written by someone else (Claude, another session) at the mocked time, so its time stays until it's written again
+  const write = (path: string, text: string) => {
+    files.set(path, text)
+    written.set(path, clock.now())
+  }
   const runs: string[][] = []
   const cwds: (string | undefined)[] = []
   const envs: (Record<string, string> | undefined)[] = []
@@ -268,7 +285,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

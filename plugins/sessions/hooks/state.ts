@@ -1,10 +1,10 @@
 import type { Color, Period, RateLimit, SessionsMark, SessionsMember, SessionsResult, SessionsSection, SessionsTint, UsageSummary } from '../types'
 
 // The format of everything the mod shares outside one session: the files in its data folder (heartbeats, the panel
-// order, inbox requests, the launcher's window files, the mirrored settings) and the notices between sessions. Each one
-// carries `format=<n>`. A reader that finds another format leaves it alone and says the sessions need a restart (u, or
+// order, inbox requests, the launcher's window files, the mirrored settings, usage.py's summary, ccc's plugin lookup)
+// and the notices between sessions. Each one carries `format=<n>`. A reader that finds another format leaves it alone and says the sessions need a restart (u, or
 // claude respawn): sessions running another version of the mod never act on each other's data by mistake.
-// The launcher (hooks/launcher.py, hooks/visor.sh) reads and writes the same formats: change them together.
+// The launcher (hooks/launcher.py, hooks/visor.sh, setup/ccc) reads and writes the same formats: change them together.
 export const FORMAT = 3
 
 // Where a session keeps its keys in the shared store: '' for the sessions you use, and @<hash>/ for a test session, one
@@ -17,9 +17,82 @@ export const FORMAT = 3
 // per line
 export function storeNamespace(values: readonly (string | undefined)[]): string {
   if (!values.slice(0, 4).some(v => v)) return ''
-  let h = 0x811c9dc5
-  for (const c of new TextEncoder().encode(values.map(v => v ?? '').join('\n'))) h = Math.imul(h ^ c, 0x01000193) >>> 0
-  return `@${h.toString(16).padStart(8, '0')}/`
+  return `@${fnv1a(values.map(v => v ?? '').join('\n')).toString(16).padStart(8, '0')}/`
+}
+
+// FNV-1a (32 bits) of a text's UTF-8 bytes, from a starting basis (FNV's own by default)
+export function fnv1a(text: string, basis = 0x811c9dc5): number {
+  let h = basis >>> 0
+  for (const c of new TextEncoder().encode(text)) h = Math.imul(h ^ c, 0x01000193) >>> 0
+  return h
+}
+
+// Whether two values hold the same data, as JSON would write them: objects by their keys in any order (a key holding
+// undefined is no key), arrays in order. The engine redraws every reader of a $.state value on every write, equal or
+// not, so the mod writes one only when this says it changed
+export function sameData(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return Number.isNaN(a) && Number.isNaN(b)
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a)) {
+    const other = b as unknown[]
+    return a.length === other.length && a.every((x, i) => sameData(x, other[i]))
+  }
+  const x = a as Record<string, unknown>
+  const y = b as Record<string, unknown>
+  const keys = Object.keys(x).filter(k => x[k] !== undefined)
+  return keys.length === Object.keys(y).filter(k => y[k] !== undefined).length && keys.every(k => sameData(x[k], y[k]))
+}
+
+// The moment the rows' times (3m, 2h) and ⧗ are reckoned at: now, down to the minute. Every row's label then changes
+// on the same minute, so the list is rewritten (and the panel redrawn) for them at most once a minute, however many
+// rows it has
+export function labelMinute(now: number): number {
+  return Math.floor(now / 60000) * 60000
+}
+
+// The session list (claude agents --json --all) is made of Claude's registry of running sessions
+// (~/.claude/sessions/<pid>.json, which Claude rewrites in place when a session's status, name or id changes, and
+// removes when it ends), the background service's job folders (one per background session, running or stopped) and
+// the service's own list. listSignature sums up the first two as `fs.list` shows them, with no command: a stored list
+// read under the same signature still holds, since nothing it's made of moved. A session that crashed keeps its
+// registry file until a listing sweeps it, so a list holds that way for LIST_QUIET_MS at most. null when the registry
+// isn't what this expects (no <pid>.json at all, or none for this very session's process): the list then goes by its
+// age alone
+export type ListedFile = { name: string; mtimeMs: number; size: number }
+export function listSignature(registry: readonly ListedFile[], jobs: readonly { name: string }[], myPid: number): string | null {
+  const files = registry.filter(f => /^\d+\.json$/.test(f.name))
+  if (files.length === 0 || (myPid > 0 && !files.some(f => f.name === `${myPid}.json`))) return null
+  const text = [...files.map(f => `${f.name}:${f.mtimeMs}:${f.size}`).sort(), '|', ...jobs.map(j => j.name).sort()].join('\n')
+  return `${files.length}.${fnv1a(text).toString(16)}.${fnv1a(text, 0x050c5d1f).toString(16)}`
+}
+
+// Whether the stored session list (`list` in the store: at, when the listing came back; sig, the signature it was read
+// under; until, when a slow listing pushed the next one back) serves a caller, or the list is read again. A caller
+// asking for one at most maxAge old below the panel's own pace (LIST_MS) gets exactly that. At that pace or slower:
+// none before `until`; the stored one while nothing it's made of moved (the same signature), for LIST_QUIET_MS (or
+// maxAge, if longer); once something moved, a new one, but not twice within LIST_MIN_MS; and with no signature to go
+// by (a list stored without one, or a registry that can't be read), by age
+export const LIST_MS = 3500
+export const LIST_QUIET_MS = 30000
+export const LIST_MIN_MS = 1000
+export function listHolds(c: { at: number; sig?: unknown; until?: unknown } | null, now: number, maxAge: number, sig: string | null): boolean {
+  if (!c) return false
+  if (maxAge < LIST_MS) return now - c.at < maxAge
+  if (typeof c.until === 'number' && now < c.until) return true
+  if (sig !== null && typeof c.sig === 'string') return now - c.at < (c.sig === sig ? Math.max(maxAge, LIST_QUIET_MS) : LIST_MIN_MS)
+  return now - c.at < maxAge
+}
+
+// The seen check's pace in a session whose last answer nobody saw (its row yellow), and only while one of its windows
+// (or an agent view) is open: the first check right after the finish, then every 2 s for a minute (the person is
+// likely about to look), every 10 s up to 10 minutes, then every 30 s. Typing in the session, a key in its panel or
+// arriving there (Enter in another panel, or ccc) marks it seen at once, with no check. When the next check is due,
+// after one at lastCheck
+export function nextSeenCheck(finished: number, lastCheck: number): number {
+  if (lastCheck < finished) return finished
+  const age = lastCheck - finished
+  return lastCheck + (age < 60000 ? 2000 : age < 600000 ? 10000 : 30000)
 }
 
 // How many of the panel's items don't fit: each item's lines in drawing order (a section title doesn't count, a session
@@ -44,9 +117,7 @@ export function afterTick(t: { last: number; quietUntil: number }, now: number, 
 // How long a session waits after a sleep before reading the session list again (0 to span-1 ms): its own share of the
 // span, from its id (FNV-1a), so the sessions that wake together list one after another
 export function wakeStagger(id: string, span = 10000): number {
-  let h = 0x811c9dc5
-  for (const c of new TextEncoder().encode(id)) h = Math.imul(h ^ c, 0x01000193) >>> 0
-  return span > 0 ? h % span : 0
+  return span > 0 ? fnv1a(id) % span : 0
 }
 
 // The first version of the mod that writes heartbeats: sessions started after this version was installed are
@@ -314,6 +385,15 @@ export function daysUpTo(today: string, n: number): string[] {
     list.push(`${t.getFullYear()}-${two(t.getMonth() + 1)}-${two(t.getDate())}`)
   }
   return list
+}
+
+// usage.py's answer (what it prints, or the summary it leaves in <data>/usage/summary.json for the other sessions) as
+// the panel keeps it: the totals, in this format, without `generated` (the moment it ran, which differs on every run
+// and would redraw the panel every minute with nothing new). null for anything else
+export function usageSummaryOf(d: any): UsageSummary | null {
+  if (!d || typeof d !== 'object' || d.format !== FORMAT || typeof d.today !== 'string' || typeof d.hour !== 'string') return null
+  if (!d.days || typeof d.days !== 'object' || !d.hours || typeof d.hours !== 'object') return null
+  return { today: d.today, hour: d.hour, days: d.days, hours: d.hours }
 }
 
 // The chosen period, for the folders that are included: one total per bar (today: per hour, up to the current one;

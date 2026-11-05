@@ -151,6 +151,14 @@ import {
   type Wait,
   FORMAT,
   NOTICE_MARKER,
+  sameData,
+  labelMinute,
+  listSignature,
+  listHolds,
+  LIST_MS,
+  nextSeenCheck,
+  usageSummaryOf,
+  type ListedFile,
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
 
@@ -193,6 +201,10 @@ const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingO
 // The ccc tell request on its way to a turn (checkTells): in $.state, which a reload of the mod's code keeps
 const tellInFlight = atom({ plugin: 'sessions', key: 'tellInFlight' } as const, null as TellInFlight)
 
+// Every write of a value the panel or the band reads draws them again, equal or not (the engine compares nothing): so
+// each one is written only when its data changed (sameData), and a refresh that finds nothing new draws nothing. The
+// engine's scan wants each value named where it's read or written, hence the same comparison at every write
+
 let claude = 'claude'
 let myId = ''
 let myPid = 0
@@ -232,7 +244,10 @@ let currentFocus: string | undefined
 let requestedWidth = 0
 let defaultWidth = 0
 let defaultWindowWidth = 0
-let remeasure = false
+// What the panel's last draw saw, fullscreen: its width, the window's (conversation + panel + border) and the width the
+// mod had asked for then (0: none). The draw only notes it, and when it differs from the one before has adjustWidth run
+// from a timer: nothing is decided or written while drawing
+let paneSeen: { body: number; window: number; asked: number } | null = null
 // The session that was asked whether to stop: only its answer is accepted, and only for a while. fallback is the row
 // that stays selected if it leaves the list: its neighbor in the list you were looking at when you pressed Stop
 let pendingAsk: { sessionId: string; at: number; fallback?: string; topic: Topic; detail: string; target: Row } | undefined
@@ -308,6 +323,26 @@ async function exists($: any, path: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+// A small file that changes now and then (pins.json, sections.json, a background session's state in the service's
+// folder), read again only when it changed: one stat (its time and size) where there was an exists and a read, and the
+// text kept from the last read when it didn't move. null when it isn't there; a read that fails throws
+const fileCache = new Map<string, { mtimeMs: number; size: number; text: string }>()
+async function readIfChanged($: any, path: string): Promise<string | null> {
+  let st: any
+  try {
+    st = await $.fs.stat(path)
+  } catch {
+    fileCache.delete(path)
+    return null
+  }
+  const held = fileCache.get(path)
+  if (held && held.mtimeMs === st.mtimeMs && held.size === st.size) return held.text
+  const text = String(await $.fs.read(path))
+  if (fileCache.size > 200) fileCache.clear()
+  fileCache.set(path, { mtimeMs: Number(st.mtimeMs), size: Number(st.size), text })
+  return text
 }
 
 // The platform's commands run through runSafe, with this hook's $
@@ -420,6 +455,11 @@ async function apartText($: any): Promise<string> {
   return `${launcherOnly.join(', ')}: set in this session's environment and ignored (they count only beside a location override, in a test session). ccc sets them for its launcher; a background service that a launcher before sessions 0.13.6 brought up hands them on to every session it starts. Harmless now: nothing to do`
 }
 
+// Each store read reads and parses Claude's whole store file (and touches it). So a refresh reads the store's keys once
+// and then only the keys that are there, what can't change for a while is kept in memory (a session's first-prompt
+// title, the installed versions until their 5 minutes are up), and what only this session writes (when it last
+// finished, when it was last seen) is kept as it reads and writes it (own): the 2 s seen check reads nothing between
+// its checks
 async function storeGet($: any, key: string): Promise<any> {
   try {
     return await $.store.get(`${await storeNamespaceOf($)}${key}`)
@@ -431,6 +471,7 @@ async function storeGet($: any, key: string): Promise<any> {
 async function storeSet($: any, key: string, value: unknown): Promise<boolean> {
   try {
     await $.store.set(`${await storeNamespaceOf($)}${key}`, value)
+    noteOwn(key, value)
     return true
   } catch {
     return false
@@ -440,7 +481,28 @@ async function storeSet($: any, key: string, value: unknown): Promise<boolean> {
 async function storeDelete($: any, key: string) {
   try {
     await $.store.delete(`${await storeNamespaceOf($)}${key}`)
+    noteOwn(key, undefined)
   } catch {}
+}
+
+// This session's last finish (its state's `finished`) and when it was last seen (seen:<id>): only it writes either, so
+// what it read or wrote last is what's there. null: not known yet (read it)
+let selfSeen: { id: string; finished: number; seen: number } | null = null
+function noteOwn(key: string, value: unknown) {
+  if (!myId || (key !== `state:${myId}` && key !== `seen:${myId}`)) return
+  if (!selfSeen || selfSeen.id !== myId) {
+    selfSeen = null
+    return
+  }
+  if (key === `seen:${myId}`) selfSeen.seen = Number(value) || 0
+  else selfSeen.finished = Number((value as SessionState | undefined)?.finished) || 0
+}
+
+async function ownSeenState($: any): Promise<{ finished: number; seen: number }> {
+  if (selfSeen && selfSeen.id === myId) return selfSeen
+  const next = { id: myId, finished: (await readState($, myId))?.finished ?? 0, seen: await seenAt($, myId) }
+  selfSeen = next
+  return next
 }
 
 // The keys of this session's namespace, without it
@@ -532,20 +594,24 @@ async function myWindows($: any): Promise<string[]> {
   return myWindowsIn(await windows($))
 }
 
-// The windows listing and the window in front, shared by every session for a moment: the seen check runs every 2 s in
-// each session with an answer nobody saw, and one ps and one question to Terminal then serve them all. Only for that
-// check: what acts on a window (closing a viewer, a switch) reads the listing right then. Like the session list: stamped
-// when ps came back; a session about to list says so (`pendingAt`), and the others use the stored windows meanwhile;
-// a ps that took longer than SHARED_MS pushes every session's next one back (twice its time, up to 30 s)
+// The windows listing and the window in front, shared by every session for the seen check: one ps then serves every
+// session for SEEN_WINDOWS_MS (5 s in the first minute after a finish; which windows are open changes rarely, and
+// arriving in a session marks it seen without it), and one question to Terminal for FRONT_SHARED_MS, a little under
+// the fastest pace of the check. Only for that
+// check: what acts on a window (closing a viewer, a switch) reads the listing right then. Like the session list:
+// stamped when ps came back; a session about to list says so (`pendingAt`), and the others use the stored windows
+// meanwhile; a ps that took longer than SHARED_MS pushes every session's next one back (twice its time, up to 30 s)
 const SHARED_MS = 1500
+const SEEN_WINDOWS_MS = 30000
+const FRONT_SHARED_MS = 1900
 const WINDOWS_PENDING_MS = 10000
 const WINDOWS_BACKOFF_MAX_MS = 30000
-async function sharedWindows($: any): Promise<Windows> {
+async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<Windows> {
   const now = await $.clock.now()
   const c = await storeGet($, 'windowsList')
   const stored = c && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid ? (c.windows as Windows) : null
   if (stored) {
-    if (now - Number(c.at) < SHARED_MS) return stored
+    if (now - Number(c.at) < maxAge) return stored
     if (typeof c.until === 'number' && now < c.until) return stored
     if (typeof c.pendingAt === 'number' && now - c.pendingAt < WINDOWS_PENDING_MS) return stored
     await storeSet($, 'windowsList', { ...c, pendingAt: now })
@@ -560,7 +626,7 @@ async function sharedWindows($: any): Promise<Windows> {
 async function sharedFront($: any, v: Windows): Promise<string | null> {
   const now = await $.clock.now()
   const c = await storeGet($, 'frontWindow')
-  if (c && now - Number(c.at) < SHARED_MS && (typeof c.tty === 'string' || c.tty === null)) return c.tty
+  if (c && now - Number(c.at) < FRONT_SHARED_MS && (typeof c.tty === 'string' || c.tty === null)) return c.tty
   const tty = await platform.windowInFront(sys($), await shownWindows($, v))
   await storeSet($, 'frontWindow', { at: now, tty })
   return tty
@@ -580,15 +646,21 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
 }
 
 // Are you looking at me? Someone at the computer (the platform can tell on macOS: screen unlocked, recent input) and a
-// window in front with one of my viewers, or an agent view showing my tag. A session shown in no window (most
-// background sessions) asks nothing: no question to Terminal, which a quit Terminal would also take as a reason to
-// start. Where the front window can't be known (Linux without X11), a session counts as seen only when you type in it
+// window in front with one of my viewers, or an agent view showing my tag. Only while this session's last answer is
+// unseen, at the pace nextSeenCheck sets (the 2 s timer does nothing between checks), and only a session shown in some
+// window (one of its viewers, or an agent view) asks which window is in front: most background sessions are shown in
+// none, and ask Terminal nothing, which a quit Terminal would also take as a reason to start. Where the front window
+// can't be known (Linux without X11), a session counts as seen only when you type in it, use its panel or arrive there
+let seenCheckedAt = 0
 async function markSeenIfLooking($: any) {
   if (!platform.frontKnown) return
-  const finished = (await readState($, myId))?.finished ?? 0
-  const seen = await seenAt($, myId)
+  const { finished, seen } = await ownSeenState($)
   if (finished <= seen) return
-  const v = await sharedWindows($)
+  const now = await $.clock.now()
+  if (now < nextSeenCheck(finished, seenCheckedAt)) return
+  seenCheckedAt = now
+  // In the first minute after a finish the person may well be opening a window on it: a listing at most 5 s old then
+  const v = await sharedWindows($, now - finished < 60000 ? 5000 : SEEN_WINDOWS_MS)
   const mine = myWindowsIn(v)
   if (mine.length === 0 && v.agentsViews.length === 0) return
   const tty = await sharedFront($, v)
@@ -600,17 +672,28 @@ async function markSeenIfLooking($: any) {
   if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
 
+// The person is at this session right now (arrived from another panel or with ccc, or pressing keys in its panel):
+// what it last answered is seen, with no check
+async function seenNow($: any) {
+  if (!myId) return
+  const { finished, seen } = await ownSeenState($)
+  if (finished > seen) await storeSet($, `seen:${myId}`, await $.clock.now())
+}
+
 // The official list (claude agents --json --all), shared by every session through the store ('list': { at, sessions,
-// until? }). One listing at a time: in a session, callers share the one in flight; across sessions, whoever takes
+// sig?, until? }). One listing at a time: in a session, callers share the one in flight; across sessions, whoever takes
 // <data>/list.lock runs it, and the others read the stored list, however old, until it lands. `at` is when the listing
-// came back, never when it started. A listing that took longer than LIST_MS, or failed, pushes every session's next one
+// came back, never when it started; `sig`, what Claude's registry and the service's folder looked like just before it
+// started (listSignature). A stored list serves while nothing it's made of moved (listHolds: up to LIST_QUIET_MS), so
+// an idle machine lists about twice a minute, and a change (a session turning busy or idle, starting, ending, renamed)
+// is listed at the next refresh. A listing that took longer than LIST_MS, or failed, pushes every session's next one
 // back (`until`: twice its time, up to LIST_BACKOFF_MAX_MS): a slow machine (after a sleep, under an endpoint scanner
 // that checks every exec) isn't flooded with more listings, each slower than the last
-const LIST_MS = 3500
 const LIST_BACKOFF_MAX_MS = 60000
 const LIST_LOCK_STALE_MS = 30000
 const LIST_WAIT_MS = 15000
 type Listed = { sessions: any[]; at: number }
+type Stored = Listed & { sig?: string; until?: number }
 let listing: Promise<Listed | string> | null = null
 
 async function officialList($: any, maxAge = LIST_MS): Promise<any[] | string> {
@@ -618,9 +701,26 @@ async function officialList($: any, maxAge = LIST_MS): Promise<any[] | string> {
   return typeof r === 'string' ? r : r.sessions
 }
 
-async function storedList($: any): Promise<(Listed & { until?: number }) | null> {
+async function storedList($: any): Promise<Stored | null> {
   const c = await storeGet($, 'list')
-  return c && Array.isArray(c.sessions) && typeof c.at === 'number' ? (c as Listed & { until?: number }) : null
+  return c && Array.isArray(c.sessions) && typeof c.at === 'number' ? (c as Stored) : null
+}
+
+// What the session list is made of, as Claude's files show it right now (listSignature): its registry folder
+// (~/.claude/sessions, read only) and the service's job folders, one fs.list each. null when it can't tell
+async function registrySignature($: any): Promise<string | null> {
+  if (!home) return null
+  let registry: ListedFile[]
+  try {
+    registry = (await $.fs.list(`${home}/.claude/sessions`)).map((f: any) => ({ name: String(f.name), mtimeMs: Number(f.mtimeMs), size: Number(f.size) }))
+  } catch {
+    return null
+  }
+  let jobs: { name: string }[] = []
+  try {
+    if (jobsDir) jobs = (await $.fs.list(jobsDir)).map((f: any) => ({ name: String(f.name) }))
+  } catch {}
+  return listSignature(registry, jobs, myPid)
 }
 
 // The list with when it was read. maxAge: how old a stored one may be (0 for one read now, as a restart's question
@@ -628,8 +728,7 @@ async function storedList($: any): Promise<(Listed & { until?: number }) | null>
 async function listWithAge($: any, maxAge = LIST_MS): Promise<Listed | string> {
   const now = await $.clock.now()
   const c = await storedList($)
-  if (c && now - c.at < maxAge) return c
-  if (c && maxAge >= LIST_MS && typeof c.until === 'number' && now < c.until) return c
+  if (listHolds(c, now, maxAge, c && maxAge >= LIST_MS && typeof c.sig === 'string' ? await registrySignature($) : null)) return c as Stored
   if (!listing) listing = fetchList($, maxAge).finally(() => (listing = null))
   return listing
 }
@@ -662,10 +761,12 @@ async function fetchList($: any, maxAge: number): Promise<Listed | string> {
     }
   }
   try {
-    // Read again under the lock: the session that held it before may have just stored a fresh one
+    // Read again under the lock: the session that held it before may have just stored a fresh one. The signature is
+    // taken before the listing starts, so a change while it runs is listed again next time
     const started = await $.clock.now()
+    const sig = await registrySignature($)
     const c = await storedList($)
-    if (c && started - c.at < maxAge) return c
+    if (listHolds(c, started, maxAge, sig)) return c as Stored
     const r = await run($, [claude, 'agents', '--json', '--all'])
     const list = r.exitCode !== 0 ? "Couldn't read the session list (claude agents --json)" : validateList(r.stdout)
     if (typeof list === 'string') {
@@ -677,7 +778,7 @@ async function fetchList($: any, maxAge: number): Promise<Listed | string> {
     }
     const at = await $.clock.now()
     const took = at - started
-    await storeSet($, 'list', { at, sessions: list, ...(took > LIST_MS ? { until: at + Math.min(LIST_BACKOFF_MAX_MS, 2 * took) } : {}) })
+    await storeSet($, 'list', { at, sessions: list, ...(sig ? { sig } : {}), ...(took > LIST_MS ? { until: at + Math.min(LIST_BACKOFF_MAX_MS, 2 * took) } : {}) })
     return { sessions: list, at }
   } finally {
     if (holding) await runSafe($, ['rmdir', lock])
@@ -691,20 +792,30 @@ async function invalidateList($: any) {
   await storeSet($, 'list', c ? { at: 0, sessions: c.sessions } : {})
 }
 
-// The heartbeats of the sessions in a list, by sessionId (only the ones that exist and parse)
+// The heartbeats of the sessions in a list, by sessionId (only the ones that exist and parse). The folder's listing
+// gives each file's time and size: a heartbeat that didn't move since the last read isn't read again
+const beatCache = new Map<string, { mtimeMs: number; size: number; beat: Heartbeat | null }>()
 async function readHeartbeats($: any, ids: string[]): Promise<Record<string, Heartbeat>> {
   const out: Record<string, Heartbeat> = {}
   if (!dataDir) return out
-  let names: Set<string>
+  let files: Map<string, { mtimeMs: number; size: number }>
   try {
-    names = new Set((await $.fs.list(`${dataDir}/alive`)).map((f: any) => String(f.name)))
+    files = new Map((await $.fs.list(`${dataDir}/alive`)).map((f: any) => [String(f.name), { mtimeMs: Number(f.mtimeMs), size: Number(f.size) }]))
   } catch {
     return out
   }
   for (const id of ids) {
-    if (!names.has(id)) continue
+    const f = files.get(id)
+    if (!f) continue
+    const held = beatCache.get(id)
+    if (held && held.mtimeMs === f.mtimeMs && held.size === f.size) {
+      if (held.beat) out[id] = held.beat
+      continue
+    }
     try {
       const h = parseHeartbeat(await $.fs.read(`${dataDir}/alive/${id}`))
+      if (beatCache.size > 500) beatCache.clear()
+      beatCache.set(id, { ...f, beat: h })
       if (h) out[id] = h
     } catch {}
   }
@@ -815,44 +926,71 @@ async function usablePython($: any): Promise<string | null> {
   return (python = path)
 }
 
+// Every session with the panel open wants the same totals once a minute: usage.py leaves what it answered in
+// <data>/usage/summary.json (touched on every run, rewritten only when it changed), and a session finding one from the
+// last USAGE_SHARED_MS reads it instead of running usage.py. The panel's value is rewritten only when the totals changed
+const USAGE_SHARED_MS = 50000
+async function sharedUsage($: any): Promise<UsageSummary | null> {
+  try {
+    const path = `${dataDir}/usage/summary.json`
+    const st = await $.fs.stat(path)
+    if ((await $.clock.now()) - Number(st.mtimeMs) > USAGE_SHARED_MS) return null
+    return usageSummaryOf(JSON.parse(String(await $.fs.read(path))))
+  } catch {
+    return null
+  }
+}
+
 let readingUsage = false
 async function readUsage($: any) {
   if (readingUsage || !home || !dataDir) return
   if (!(await $.ui.panes()).some((p: any) => p.id === PANE)) return
   readingUsage = true
   try {
-    const py = await usablePython($)
-    if (!py) {
-      await update($, usage, () => ({ summary: null, note: 'Token usage needs python3' }))
-      return
+    const before = await read($, usage)
+    let next: Usage
+    const shared = await sharedUsage($)
+    const py = shared ? null : await usablePython($)
+    if (shared) next = { summary: shared, note: '' }
+    else if (!py) next = { summary: null, note: 'Token usage needs python3' }
+    else {
+      const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`], { timeoutMs: 120000 })
+      let summary: UsageSummary | null = null
+      try {
+        if (r.exitCode === 0) summary = usageSummaryOf(JSON.parse(r.stdout))
+      } catch {}
+      next = summary ? { summary, note: '' } : { summary: before.summary, note: before.summary ? '' : "Couldn't read token usage" }
     }
-    const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`], { timeoutMs: 120000 })
-    let summary: UsageSummary | null = null
-    try {
-      const d = JSON.parse(r.stdout)
-      if (r.exitCode === 0 && d?.format === FORMAT && typeof d?.today === 'string' && typeof d?.hour === 'string' && d.days && d.hours) summary = d
-    } catch {}
-    await update($, usage, previous => (summary ? { summary, note: '' } : { summary: previous.summary, note: previous.summary ? '' : "Couldn't read token usage" }))
+    if (!sameData(await read($, usage), next)) await update($, usage, () => next)
   } finally {
     readingUsage = false
   }
 }
 
 // The chosen period and scope are remembered (and apply to all sessions)
-async function chooseUsageView($: any, change: Partial<UsageView>) {
-  const next = { ...(await read($, usageView)), ...change }
-  await update($, usageView, () => next)
+async function chooseUsageView($: any, choice: Partial<UsageView>) {
+  const next = { ...(await read($, usageView)), ...choice }
+  if (!sameData(await read($, usageView), next)) await update($, usageView, () => next)
   await storeSet($, 'usageView', next)
 }
 
 // What `claude --version` says, once every 5 minutes for all sessions (shared through the store)
+// What was read of it stays good here until its 5 minutes are up, with no store read meanwhile
+let installedHeld: { at: number; version: string } | null = null
 async function readInstalledVersion($: any): Promise<string> {
   const now = await $.clock.now()
+  if (installedHeld && now - installedHeld.at < 300000 && now >= installedHeld.at) return installedHeld.version
   const c = await storeGet($, 'installed')
-  if (c && now - c.at < 300000 && typeof c.version === 'string') return c.version
+  if (c && now - c.at < 300000 && typeof c.version === 'string') {
+    installedHeld = { at: Number(c.at), version: c.version }
+    return c.version
+  }
   const r = await run($, [claude, '--version'])
   const v = r.exitCode === 0 ? parseVersion(r.stdout) : null
-  if (v) await storeSet($, 'installed', { at: now, version: v })
+  if (v) {
+    await storeSet($, 'installed', { at: now, version: v })
+    installedHeld = { at: now, version: v }
+  }
   return v ?? (typeof c?.version === 'string' ? c.version : '')
 }
 
@@ -860,16 +998,22 @@ async function readInstalledVersion($: any): Promise<string> {
 // sessions start with, and since when, to tell which sessions should have a heartbeat. SESSIONS_PLUGIN_VERSION and
 // SESSIONS_PLUGIN_SINCE (ms) stand in for it in a test session only (a location override beside them); elsewhere they're
 // ccc's, handed on by a background service, and stale after the next update, so the real one is read
+let pluginHeld: { at: number; plugin: InstalledPlugin | null } | null = null
 async function installedPlugin($: any): Promise<InstalledPlugin | null> {
   const version = (await isTestSession($)) ? await $.env.get('SESSIONS_PLUGIN_VERSION') : ''
   if (version) return { path: '', version, since: Number(await $.env.get('SESSIONS_PLUGIN_SINCE')) || 0 }
   const now = await $.clock.now()
+  if (pluginHeld && now - pluginHeld.at < 300000 && now >= pluginHeld.at) return pluginHeld.plugin
   const c = await storeGet($, 'plugin')
-  if (c && now - c.at < 300000) return c.plugin ?? null
+  if (c && now - c.at < 300000) {
+    pluginHeld = { at: Number(c.at), plugin: c.plugin ?? null }
+    return c.plugin ?? null
+  }
   const r = await run($, [claude, 'plugin', 'list', '--json'])
   if (r.exitCode !== 0) return c?.plugin ?? null
   const plugin = parsePluginList(r.stdout)
   await storeSet($, 'plugin', { at: now, plugin })
+  pluginHeld = { at: now, plugin }
   return plugin
 }
 
@@ -879,10 +1023,14 @@ function pinsPath(): string {
   return `${jobsDir}/pins.json`
 }
 
-async function pinsFromFile($: any): Promise<string[] | null> {
+async function pinsFromFile($: any, fresh = false): Promise<string[] | null> {
   try {
-    if (!(await $.fs.exists(pinsPath()))) return []
-    return parsePins(await $.fs.read(pinsPath()))
+    if (fresh) {
+      if (!(await $.fs.exists(pinsPath()))) return []
+      return parsePins(await $.fs.read(pinsPath()))
+    }
+    const text = await readIfChanged($, pinsPath())
+    return text === null ? [] : parsePins(text)
   } catch {
     return null
   }
@@ -920,14 +1068,18 @@ async function dataFolder($: any): Promise<string> {
 }
 
 // sections.json (see SECTIONS_FORMAT in state.ts): missing is empty; one that can't be read, or from a newer sessions,
-// is a problem and is never rewritten
-async function readSectionsFile($: any): Promise<{ file: SectionsFile } | { problem: string }> {
+// is a problem and is never rewritten. Read again only when it changed, except under its lock (fresh)
+async function readSectionsFile($: any, fresh = false): Promise<{ file: SectionsFile } | { problem: string }> {
   const dir = await dataFolder($)
   if (!dir) return { file: emptySectionsFile() }
   const path = `${dir}/sections.json`
-  if (!(await exists($, path))) return { file: emptySectionsFile() }
   try {
-    return parseSectionsFile(await $.fs.read(path))
+    if (fresh) {
+      if (!(await exists($, path))) return { file: emptySectionsFile() }
+      return parseSectionsFile(await $.fs.read(path))
+    }
+    const text = await readIfChanged($, path)
+    return text === null ? { file: emptySectionsFile() } : parseSectionsFile(text)
   } catch {
     return { problem: "Couldn't read sections.json" }
   }
@@ -949,7 +1101,7 @@ async function changeSections(
     $,
     path,
     async () => {
-      const current = await readSectionsFile($)
+      const current = await readSectionsFile($, true)
       if ('problem' in current) {
         result = { ok: false, reason: 'refused', detail: current.problem }
         return
@@ -978,7 +1130,9 @@ async function changeSections(
 // (bridgeSessionId) while it's on, also during a relaunch, and deletes it when it's turned off. null if it couldn't be read
 async function hasRemoteControl($: any, id: string): Promise<boolean | null> {
   try {
-    const e = JSON.parse(await $.fs.read(`${jobsDir}/${id}/state.json`))
+    const text = await readIfChanged($, `${jobsDir}/${id}/state.json`)
+    if (text === null) return null
+    const e = JSON.parse(text)
     return typeof e?.bridgeSessionId === 'string' && e.bridgeSessionId !== ''
   } catch {
     return null
@@ -1001,7 +1155,8 @@ async function writePins($: any, file: string, pins: readonly string[], unpinned
 // Background sessions with Remote Control get pinned automatically, so the service doesn't close them after 8 idle
 // hours while you drive them from your phone; when their Remote Control is turned off they get unpinned (only the ones
 // the mod pinned: reconcilePins). Across all folders. Only one session does it every 20 s, the first one that finds the
-// previous pass stale
+// previous pass stale. What's to change is worked out first from the files as they are; only a pass with something to
+// pin, unpin or record takes the pins lock and works it out again under it (an idle machine runs no command for it)
 let pinning = false
 async function pinRemoteSessions($: any) {
   if (pinning || !jobsDir) return
@@ -1020,8 +1175,18 @@ async function pinRemoteSessions($: any) {
       remote[s.id] = await hasRemoteControl($, s.id)
     }
     const file = pinsPath()
+    const pinsNow = await pinsFromFile($)
+    if (!pinsNow) return
+    const recordNow = await storeGet($, 'autoPins')
+    if (recordNow && Array.isArray(recordNow.ids) && Array.isArray(recordNow.released)) {
+      const kept: AutoPins = { ids: recordNow.ids, released: recordNow.released }
+      const r = reconcilePins(pinsNow, remote, kept)
+      const pluginNow = pluginPinsOf(await storeGet($, 'pluginPins'))
+      const k = keepPluginPins(r, pluginNow, new Set(Object.keys(remote)))
+      if (sameData(k.pins, pinsNow) && sameData(r.auto, kept) && sameData(k.plugin, pluginNow)) return
+    }
     await withLock($, file, async () => {
-      const pins = await pinsFromFile($)
+      const pins = await pinsFromFile($, true)
       if (!pins) return
       // With no record of what the mod pinned (a new store, or a lost one), it's rebuilt from what's there: the pinned
       // sessions with Remote Control on count as the mod's (adoptAutoPins)
@@ -1050,12 +1215,19 @@ async function pinRemoteSessions($: any) {
 // log: one you stopped, unpinned (Ctrl+T) or that closed for another reason isn't reopened. Only one session does it
 // every 20 s, the first one that finds the previous pass stale, under a lock (<data>/reopen.lock): two sessions whose
 // timers fired together would both respawn the same session, the second cutting the first restart short
+// With no pinned background session lacking a process there's nothing it could reopen: no pass at all then (no memory
+// reading, no lock). Memory counts as normal since the first pass that found it so, among passes no more than a minute
+// apart (one that comes after a longer gap starts the count again)
 const NORMAL_BEFORE_REOPEN = 180000
 let reopening = false
 async function reopenRetiredSessions($: any) {
   if (reopening || !daemonLog || !dataDir) return
   const first = await storeGet($, 'reopenPass')
   if (first && (await $.clock.now()) - first.at < 15000) return
+  const pinned = new Set((await pinsFromFile($)) ?? [])
+  if (pinned.size === 0) return
+  const list = await officialList($)
+  if (typeof list === 'string' || !list.some(s => s.kind === 'background' && !s.pid && pinned.has(s.id))) return
   reopening = true
   try {
     await withLock($, `${dataDir}/reopen`, () => reopenPass($), 10)
@@ -1070,12 +1242,13 @@ async function reopenPass($: any) {
   const c = await storeGet($, 'reopenPass')
   if (c && now - c.at < 15000) return
   const normal = await platform.memoryNormal(sys($))
-  const normalSince = normal ? (typeof c?.normalSince === 'number' ? c.normalSince : now) : undefined
+  const counting = typeof c?.normalSince === 'number' && now - Number(c.at) <= 60000
+  const normalSince = normal ? (counting ? c.normalSince : now) : undefined
   await storeSet($, 'reopenPass', { at: now, normalSince })
   if (normalSince === undefined || now - normalSince < NORMAL_BEFORE_REOPEN) return
-  const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
-  if (r.exitCode !== 0) return
-  const closed = stopReasons(r.stdout)
+  const r = await daemonLogTail($)
+  if (r === null) return
+  const closed = stopReasons(r)
   if (!Object.values(closed).some(c => c.why === 'low-memory')) return
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const list = await officialList($)
@@ -1103,8 +1276,27 @@ async function reopenPass($: any) {
 async function stopLogNow($: any): Promise<StopLog> {
   const none: StopLog = { reasons: {}, started: {}, deaths: [] }
   if (!daemonLog) return none
+  const text = await daemonLogTail($)
+  return text === null ? none : stopLog(text)
+}
+
+// The end of the background service's log (its last 4000 lines), read with tail only when the log changed (its time
+// and size) since the last read here: $.sessions.status and the reopen pass ask for it often, and it rarely moves.
+// null when it can't be read
+let logTail: { mtimeMs: number; size: number; text: string } | null = null
+async function daemonLogTail($: any): Promise<string | null> {
+  let st: any = null
+  try {
+    st = await $.fs.stat(daemonLog)
+  } catch {}
+  if (st && logTail && logTail.mtimeMs === Number(st.mtimeMs) && logTail.size === Number(st.size)) return logTail.text
   const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
-  return r.exitCode === 0 ? stopLog(r.stdout) : none
+  if (r.exitCode !== 0) {
+    logTail = null
+    return null
+  }
+  logTail = st ? { mtimeMs: Number(st.mtimeMs), size: Number(st.size), text: r.stdout } : null
+  return r.stdout
 }
 
 // Why a background session of the list with no process is stopped (stoppedKind): the log, read once by the caller; the
@@ -1239,8 +1431,8 @@ async function writeOrder($: any, list: Row[], now: number) {
 // every session. An expired one is deleted by whichever session finds it
 let marksNow: Record<string, RowMark> = {}
 let markSources: { source: string; rows: number; until: number }[] = []
-async function readMarks($: any, now: number) {
-  const keys = (await storeKeys($)).filter(k => k.startsWith('marks:'))
+async function readMarks($: any, now: number, all: readonly string[]) {
+  const keys = all.filter(k => k.startsWith('marks:'))
   const slots: MarkSlot[] = []
   const sources: typeof markSources = []
   for (const k of keys) {
@@ -1400,21 +1592,30 @@ async function notifySpend($: any) {
   }
 }
 
+// The panel's rows, from the session list and what each session published. Every value the panel draws is written only
+// when it changed (put), and the rows' times are reckoned at the minute (labelMinute): a refresh that finds nothing new
+// draws nothing, and an idle panel is drawn about once a minute, for its times
 async function refresh($: any) {
   const list = await officialList($)
   if (typeof list === 'string') {
-    await update($, notice, () => list)
+    if (!sameData(await read($, notice), list)) await update($, notice, () => list)
     return
   }
   lastList = list
   listedAt = await $.clock.now()
   const own = list.find(s => s.sessionId === myId)
   if (own?.pid) myPid = own.pid
-  if (myShortId() !== (await read($, shortId))) await update($, shortId, () => myShortId())
+  {
+    const next = myShortId()
+    if (!sameData(await read($, shortId), next)) await update($, shortId, () => next)
+  }
   await followFolder($)
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const now = await $.clock.now()
-  await readMarks($, now)
+  const minute = labelMinute(now)
+  // One read of the store's keys, and then only the keys that are there: most rows have no title, wait or needs record
+  const keys = new Set(await storeKeys($))
+  await readMarks($, now, [...keys])
   // The project's sessions, and this one always, wherever it is
   const project = list.filter(s => typeof s.sessionId === 'string' && (s.sessionId === myId || (typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home))))
   const beats = await readHeartbeats($, project.map(s => s.sessionId))
@@ -1427,13 +1628,14 @@ async function refresh($: any) {
   // The usual hours the project's other sessions published, for a session with none of its own yet
   const usuals: number[] = []
   for (const s of project) {
-    const e = await readState($, s.sessionId)
+    const e = keys.has(`state:${s.sessionId}`) ? await readState($, s.sessionId) : null
     if (s.sessionId !== myId && typeof e?.usualHour === 'number' && e.usualHour > 0) usuals.push(e.usualHour)
-    const seen = await seenAt($, s.sessionId)
+    const seen = keys.has(`seen:${s.sessionId}`) ? await seenAt($, s.sessionId) : 0
+    if (s.sessionId === myId) selfSeen = { id: myId, finished: e?.finished ?? 0, seen }
     const unnamed = !s.name || s.name === s.id
-    const ownTitle = String((await storeGet($, `title:${s.sessionId}`)) ?? '')
+    const ownTitle = unnamed && keys.has(`title:${s.sessionId}`) ? String((await storeGet($, `title:${s.sessionId}`)) ?? '') : ''
     // Since when it's been waiting for you: the panel records it the first time it sees it "waiting"
-    let waitingSince = Number(await storeGet($, `waiting:${s.sessionId}`)) || undefined
+    let waitingSince = keys.has(`waiting:${s.sessionId}`) ? Number(await storeGet($, `waiting:${s.sessionId}`)) || undefined : undefined
     if (s.status === 'waiting' && !waitingSince) {
       waitingSince = now
       await storeSet($, `waiting:${s.sessionId}`, now)
@@ -1460,7 +1662,7 @@ async function refresh($: any) {
     // fresh for a minute is a wait that ended
     let needsSince: number | undefined
     if (marked.needsPerson && color !== 'gray') {
-      const n = await storeGet($, `needsSince:${s.sessionId}`)
+      const n = keys.has(`needsSince:${s.sessionId}`) ? await storeGet($, `needsSince:${s.sessionId}`) : undefined
       const kept = n && now - Number(n.at) < 60000 && Number(n.since) > 0 ? Number(n.since) : undefined
       needsSince = kept ?? now
       if (!kept || now - Number(n.at) > 20000) await storeSet($, `needsSince:${s.sessionId}`, { since: needsSince, at: now })
@@ -1474,7 +1676,7 @@ async function refresh($: any) {
       id: s.id ?? null,
       title,
       color,
-      time: since ? timeSince(since, now) : '',
+      time: since ? timeSince(since, minute) : '',
       model: e?.model ?? '',
       context: typeof e?.context === 'number' ? `${Math.round(e.context)}%` : '',
       current,
@@ -1494,7 +1696,7 @@ async function refresh($: any) {
       depth: 0,
       folded: false,
       helpers,
-      stale: isStale({ color, background: s.kind === 'background' }, since, now, staleMs),
+      stale: isStale({ color, background: s.kind === 'background' }, since, minute, staleMs),
     })
   }
   waitsNow = waits
@@ -1516,13 +1718,12 @@ async function refresh($: any) {
   const focused = !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
   // The filter and the folds changed in another session apply here too, once the panel doesn't have the keyboard
   if (!focused) {
-    waitingOnly = (await storeGet($, 'waitingOnly')) === true
-    collapsed = await readCollapsed($)
+    waitingOnly = keys.has('waitingOnly') && (await storeGet($, 'waitingOnly')) === true
+    collapsed = keys.has('collapsed') ? await readCollapsed($) : new Set()
   }
   await layout($, focused)
-  await update($, notice, () => sectionsProblem)
+  if (!sameData(await read($, notice), sectionsProblem)) await update($, notice, () => sectionsProblem)
   await paneState($)
-  await adjustWidth($)
   await prune($)
 }
 
@@ -1545,7 +1746,11 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
   const kept = keepPlaces(foldRows(grouped, collapsed, !!members), shownBefore, frozen)
   // A fold the person made: the rows stay put, and only the folds are taken anew, over the sections as they're drawn
   const shown = reflow === 'fold' ? foldRows(kept, collapsed, !!members) : kept
-  await update($, rows, () => shown)
+  // The width the panel asks for follows what its rows hold (names, spend, marks): worked out again when they changed
+  if (!sameData(shownBefore, shown)) {
+    await update($, rows, () => shown)
+    bg(adjustWidth($))
+  }
   const spends = projectRows.filter(f => f.usd !== null)
   const others = projectRows.filter(f => !f.current)
   const next: PanelSummary = {
@@ -1555,7 +1760,7 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     unseen: others.filter(f => f.color === 'yellow').length,
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
-  if (JSON.stringify(next) !== JSON.stringify(await read($, summary))) await update($, summary, () => next)
+  if (!sameData(await read($, summary), next)) await update($, summary, () => next)
   if (!focused || reflow) return
   const target = refocusTarget(ringKeys(shownBefore), ringKeys(shown), currentFocus)
   if (target) bg(focusElement($, target))
@@ -1581,7 +1786,7 @@ async function paneState($: any) {
     const pane = (await $.ui.panes()).find((p: any) => p.id === PANE)
     note = !pane ? 'closed' : pane.isPlaced === false ? 'narrow' : ''
   } catch {}
-  if (note !== (await read($, paneNote))) await update($, paneNote, () => note)
+  if (!sameData(await read($, paneNote), note)) await update($, paneNote, () => note)
 }
 
 // When leaving a session, its panel releases the keyboard: when you come back, the text box receives you
@@ -1592,18 +1797,21 @@ async function releaseFocus($: any) {
   await $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined })
 }
 
-// Asks Claude for the docked panel's width (it's a request: if the person dragged it, their width wins).
-// Never reopens a panel the person closed.
+// Asks Claude for the docked panel's width (it's a request: if the person dragged it, their width wins), from what the
+// panel's last draw saw (paneSeen): run when that changed, and when the rows changed. A draw with no width asked is
+// Claude's own width for the window, the cap; a window whose width changed is measured again by opening the panel
+// without asking for one, whose draw comes back here. Never reopens a panel the person closed.
 async function adjustWidth($: any) {
   if (!(await $.ui.panes()).some((p: any) => p.id === PANE)) return
-  if (remeasure) {
-    // The window changed: reopen without asking for a width to measure "the default one" again (the render records it)
-    // and adjust right away
-    remeasure = false
+  const seen = paneSeen
+  if (seen && seen.asked === 0) {
+    defaultWidth = seen.body
+    defaultWindowWidth = seen.window
+  } else if (seen && defaultWindowWidth && seen.window !== defaultWindowWidth) {
     requestedWidth = 0
-    const before = defaultWindowWidth
+    defaultWindowWidth = seen.window
     await $.ui.open({ id: PANE, title: 'Sessions' })
-    for (let i = 0; i < 10 && defaultWindowWidth === before; i++) await $.clock.sleep(100)
+    return
   }
   if (defaultWidth === 0) return
   const shown = await read($, rows)
@@ -1614,8 +1822,9 @@ async function adjustWidth($: any) {
 }
 
 // You arrived from another session's panel, or with ccc: the panel takes the keyboard, on the session next to this one,
-// so you can keep going through them
+// so you can keep going through them. You're looking at this session: what it answered is seen
 async function focusPanel($: any) {
+  bg(seenNow($))
   // A panel you closed stays closed: you land on the prompt, and the line above it says how to open it
   if (await closedByYou($)) return
   const list = (await read($, rows)).filter(f => !f.folded)
@@ -1911,7 +2120,8 @@ async function focusRow($: any, sessionId: string, fallback: string | undefined)
 async function backgroundTasks($: any, id: string): Promise<{ count: number; kinds: string[] } | null> {
   if (!jobsDir) return null
   try {
-    return realTasks(JSON.parse(await $.fs.read(`${jobsDir}/${id}/state.json`))?.inFlight)
+    const text = await readIfChanged($, `${jobsDir}/${id}/state.json`)
+    return text === null ? null : realTasks(JSON.parse(text)?.inFlight)
   } catch {
     return null
   }
@@ -2219,7 +2429,7 @@ async function createSession($: any, name: string) {
     bg(focusElement($, 'name'))
     return
   }
-  await update($, askingName, () => false)
+  if (!sameData(await read($, askingName), false)) await update($, askingName, () => false)
   if (!myCwd || !(await exists($, myCwd))) {
     $.ui.toast(`Can't create a session: this session's folder no longer exists${myCwd ? ` (${myCwd})` : ''}`)
     return
@@ -2254,8 +2464,8 @@ async function createSession($: any, name: string) {
 // mod gets no event for it, so a short watcher closes the field as soon as the pane loses the keyboard; otherwise the
 // field stayed open, the next visit to the pane landed in it, and every key (r included) was typed into it
 async function closeFields($: any) {
-  await update($, askingName, () => false)
-  await update($, renaming, () => null)
+  if (!sameData(await read($, askingName), false)) await update($, askingName, () => false)
+  if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
 }
 
 let fieldWatch = 0
@@ -2288,7 +2498,7 @@ async function watchField($: any) {
 // the end
 async function toggleRename($: any) {
   if (await read($, renaming)) {
-    await update($, renaming, () => null)
+    if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
     return
   }
   const list = await read($, rows)
@@ -2301,17 +2511,20 @@ async function toggleRename($: any) {
     $.ui.toast(`“${f.title}” is stopped: open it and use /rename there`)
     return
   }
-  await update($, askingName, () => false)
-  await update($, renaming, () => ({ sessionId: f.sessionId, title: f.title }))
+  if (!sameData(await read($, askingName), false)) await update($, askingName, () => false)
+  {
+    const next = { sessionId: f.sessionId, title: f.title }
+    if (!sameData(await read($, renaming), next)) await update($, renaming, () => next)
+  }
   bg(focusElement($, 'rename-input'))
   bg(watchField($))
 }
 
 // The n key: opens the field for the new session's name and moves the focus to it
 async function toggleNew($: any) {
-  await update($, renaming, () => null)
+  if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
   const open = !(await read($, askingName))
-  await update($, askingName, () => open)
+  if (!sameData(await read($, askingName), open)) await update($, askingName, () => open)
   if (open) {
     bg(focusElement($, 'name'))
     bg(watchField($))
@@ -2384,7 +2597,7 @@ async function unfold($: any, section: string) {
 // (it runs it when it finishes what it's doing)
 async function rename($: any, text: string) {
   const r = await read($, renaming)
-  await update($, renaming, () => null)
+  if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
   // The focus goes back to the renamed session's row (the field that had it is gone)
   if (r && r.sessionId !== myId) bg(focusSession($, r.sessionId))
   const name = text.trim().replace(/\s+/g, ' ').slice(0, 80)
@@ -2512,7 +2725,7 @@ async function publishUsage($: any) {
   } catch {
     return
   }
-  if (JSON.stringify(spend.limits) !== JSON.stringify(await read($, limits))) await update($, limits, () => spend.limits)
+  if (!sameData(await read($, limits), spend.limits)) await update($, limits, () => spend.limits)
   const agent = agentFor === myId ? myAgent : undefined
   const root = myCwd
   const previous = (await readState($, myId)) ?? {}
@@ -2703,9 +2916,12 @@ async function tellOne($: any, dir: string, names: string[], next: string) {
   if (new TextEncoder().encode(text).length > TELL_MAX_BYTES) return refuse('longer than 4 KB')
   // On its way before it's taken: a reload in between finds it in $.state, and its file still in line
   const at = await $.clock.now()
-  await update($, tellInFlight, () => ({ id, at }))
+  {
+    const next = { id, at }
+    if (!sameData(await read($, tellInFlight), next)) await update($, tellInFlight, () => next)
+  }
   if ((await runSafe($, ['mv', '-f', `${dir}/${next}`, `${dir}/${id}.taken`])).exitCode !== 0) {
-    await update($, tellInFlight, () => null)
+    if (!sameData(await read($, tellInFlight), null)) await update($, tellInFlight, () => null)
     return
   }
   debugLine($, `ccc tell ${id} from ${req.from}: submitted`)
@@ -2713,7 +2929,7 @@ async function tellOne($: any, dir: string, names: string[], next: string) {
   try {
     r = await $.prompt.submit({ text: tellPrompt(id, req.from, text) })
   } catch (err) {
-    await update($, tellInFlight, () => null)
+    if (!sameData(await read($, tellInFlight), null)) await update($, tellInFlight, () => null)
     const failures = (tellFailures.get(id) ?? 0) + 1
     tellFailures.set(id, failures)
     if (failures > 1) return refuse(`couldn't be submitted: ${String(err).slice(0, 120)}`)
@@ -2722,7 +2938,7 @@ async function tellOne($: any, dir: string, names: string[], next: string) {
     return
   }
   if (r?.drop) {
-    await update($, tellInFlight, () => null)
+    if (!sameData(await read($, tellInFlight), null)) await update($, tellInFlight, () => null)
     await runSafe($, ['mv', '-f', `${dir}/${id}.taken`, `${dir}/${id}.held`])
     await tellStatus($, dir, id, 'held', `${r.drop}: it goes once the person types in the session`)
     debugLine($, `ccc tell ${id}: held (${r.drop})`)
@@ -3220,7 +3436,10 @@ async function start($: any) {
   }
   await step('session id', async () => {
     myId = String(await $.session.id())
-    await update($, shortId, () => myId.slice(0, 8))
+    {
+      const next = myId.slice(0, 8)
+      if (!sameData(await read($, shortId), next)) await update($, shortId, () => next)
+    }
   })
   await step('folders', async () => {
     home = (await $.env.get('HOME')) ?? ''
@@ -3271,7 +3490,10 @@ async function start($: any) {
     collapsed = await readCollapsed($)
     const view = await storeGet($, 'usageView')
     if (view && ['day', 'week', 'month'].includes(view.period) && ['all', 'project'].includes(view.scope)) {
-      await update($, usageView, () => ({ period: view.period, scope: view.scope }))
+      {
+        const next = { period: view.period, scope: view.scope }
+        if (!sameData(await read($, usageView), next)) await update($, usageView, () => next)
+      }
     }
     $.clock.every(500, () => {
       bg(solo('answer', () => checkStoredAnswer($)))
@@ -3539,7 +3761,7 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     if (e.id === PANE && e.origin.kind === 'person') {
       await storeSet($, 'panelClosed', true)
-      await update($, paneNote, () => 'closed')
+      if (!sameData(await read($, paneNote), 'closed')) await update($, paneNote, () => 'closed')
     }
     return r
   })
@@ -3559,6 +3781,8 @@ export const register: Register = (on, options) => {
       return r
     }
     personMoves++
+    // Keys in this session's panel: the person is at this session
+    bg(seenNow($))
     // With the New or Rename field open, Tab and the arrows stay in it (Enter or Esc get you out)
     const field = (await read($, askingName)) ? 'name' : (await read($, renaming)) ? 'rename-input' : null
     if (field) return e.element === field ? next(e) : next({ ...e, element: field })
@@ -3655,15 +3879,14 @@ export const register: Register = (on, options) => {
     // One line per session. If it still doesn't fit, Claude uses ↑↓ to scroll instead of moving the focus: say so
     const height = (e.viewport?.rows ?? 40) - 6
     // Window width = conversation (viewport.columns) + panel + border. With no requested width, the panel has "the
-    // default one": it's recorded as the cap. If the window changes later, adjustWidth measures it again (it runs on
-    // every refresh, every 3 s)
+    // default one", the cap. What this draw saw is noted, and a change has adjustWidth work the width out again
     if (e.viewport?.isFullscreen && e.viewport.columns && e.props.bodyColumns) {
-      const windowWidth = e.viewport.columns + e.props.bodyColumns + 1
-      if (requestedWidth === 0) {
-        defaultWidth = e.props.bodyColumns
-        defaultWindowWidth = windowWidth
-      } else if (windowWidth !== defaultWindowWidth) {
-        remeasure = true
+      const seen = { body: e.props.bodyColumns, window: e.viewport.columns + e.props.bodyColumns + 1, asked: requestedWidth }
+      if (!paneSeen || seen.body !== paneSeen.body || seen.window !== paneSeen.window || seen.asked !== paneSeen.asked) {
+        paneSeen = seen
+        $.clock.after(0, () => {
+          bg(adjustWidth($))
+        })
       }
     }
     const marks = list.some(f => f.noPanel || f.otherFormat)
@@ -3686,13 +3909,14 @@ export const register: Register = (on, options) => {
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
     // and a flexible spacer pushes the block down
     const view = await read($, usageView)
-    const usageData = await read($, usage)
     const bodyRows: number | undefined = e.props.scroll?.bodyRows
     const room = bodyRows ?? height
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
       lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
+    // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
+    const usageData = showUsage ? await read($, usage) : null
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
     // How many sessions (or folded sections) don't fit below: said at the top, where it's always in view, so a running
     // session past the bottom edge isn't taken for a missing one
@@ -3874,9 +4098,9 @@ export const register: Register = (on, options) => {
             />
           </Box>
         )}
-        {showUsage && !usageData.summary && <Text dimColor>{usageData.note || 'Reading token usage…'}</Text>}
+        {showUsage && !usageData?.summary && <Text dimColor>{usageData?.note || 'Reading token usage…'}</Text>}
         {showUsage &&
-          usageData.summary &&
+          usageData?.summary &&
           (() => {
             const includes = view.scope === 'all' ? () => true : (cwd: string) => inProject(cwd, myCwd, home)
             const w = usageWindow(usageData.summary, view.period, includes)
