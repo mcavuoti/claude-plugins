@@ -56,6 +56,10 @@ export type World = {
   xprop: { value: (args: string[]) => string | null }
   // While set, `claude agents` answers only once it resolves (a slow listing)
   agentsGate: { value: Promise<void> | null }
+  // While true, `claude agents` fails (exit 127, as when run's timeout cuts it), after the gate if one is set
+  agentsFail: { value: boolean }
+  // What `claude plugin list --json` answers (none installed by default)
+  plugins: { value: string }
   // What the mod asked to tell the person: the PushNotification calls' messages and $.ui.notify's texts, and what each
   // answers (by default, what a session gets with nobody away from the computer and no notifying terminal)
   pushes: string[]
@@ -97,6 +101,8 @@ export function world(on: On, options: WorldOptions = {}): World {
   const terminal = { value: (_args: string[]) => '' }
   const xprop = { value: (_args: string[]): string | null => null }
   const agentsGate: { value: Promise<void> | null } = { value: null }
+  const agentsFail = { value: false }
+  const plugins = { value: '[]' }
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
@@ -200,7 +206,10 @@ export function world(on: On, options: WorldOptions = {}): World {
       return ok()
     }
     // A slow `claude agents` (after a sleep, under an endpoint scanner): it answers once the test opens the gate
-    if (argv[0] === '/bin/claude' && argv[1] === 'agents') return agentsGate.value ? agentsGate.value.then(() => ok(JSON.stringify(list))) : ok(JSON.stringify(list))
+    if (argv[0] === '/bin/claude' && argv[1] === 'agents') {
+      const answer = () => (agentsFail.value ? { value: { exitCode: 127, stdout: '', stderr: 'timed out', isStdoutTruncated: false, isStderrTruncated: false } } : ok(JSON.stringify(list)))
+      return agentsGate.value ? agentsGate.value.then(answer) : answer()
+    }
     // The end of a file (the background service's log), as tail -n reads it
     if (argv[0] === 'tail') return files.has(argv.at(-1) ?? '') ? ok(files.get(argv.at(-1) ?? '')) : failed()
     if (argv[0] === 'sysctl') return ok(`${memory.value}\n`)
@@ -217,7 +226,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     }
     if (argv[0] === '/bin/claude' && argv[1] === '--bg' && bgError.value) return { value: { exitCode: 1, stdout: '', stderr: bgError.value, isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === '/bin/claude' && argv[1] === '--version') return ok('2.1.316 (Claude Code)')
-    if (argv[0] === '/bin/claude' && argv[1] === 'plugin') return ok('[]')
+    if (argv[0] === '/bin/claude' && argv[1] === 'plugin') return ok(plugins.value)
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok(`${options.system ?? 'Darwin'}|`)
     // The transcript's first row (readAgent)
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('.jsonl')) return transcript.value === undefined ? failed() : ok(transcript.value)
@@ -259,7 +268,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, agentsGate, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

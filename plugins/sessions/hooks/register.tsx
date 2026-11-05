@@ -60,6 +60,9 @@ import {
   UNSHOWN,
   reconcilePins,
   adoptAutoPins,
+  keepPluginPins,
+  pluginPinChange,
+  pluginPinsOf,
   paneWidth,
   buildNotice,
   sparkline,
@@ -363,7 +366,7 @@ function debugLine($: any, text: string) {
 // when the listing came back; sessions; until, when a slow listing pushed the next one back; one listing at a time,
 // under the <data>/list.lock folder),
 // installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
-// autoPins (AutoPins), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
+// autoPins (AutoPins), pluginPins (PluginPins: the sessions other plugins keep pinned through $.sessions.pin), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
 // session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
 // marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts), collapsed (the
@@ -600,9 +603,9 @@ async function markSeenIfLooking($: any) {
 // The official list (claude agents --json --all), shared by every session through the store ('list': { at, sessions,
 // until? }). One listing at a time: in a session, callers share the one in flight; across sessions, whoever takes
 // <data>/list.lock runs it, and the others read the stored list, however old, until it lands. `at` is when the listing
-// came back, never when it started. A listing that took longer than LIST_MS pushes every session's next one back
-// (`until`: twice its time, up to LIST_BACKOFF_MAX_MS): a slow machine (after a sleep, under an endpoint scanner that
-// checks every exec) isn't flooded with more listings, each slower than the last
+// came back, never when it started. A listing that took longer than LIST_MS, or failed, pushes every session's next one
+// back (`until`: twice its time, up to LIST_BACKOFF_MAX_MS): a slow machine (after a sleep, under an endpoint scanner
+// that checks every exec) isn't flooded with more listings, each slower than the last
 const LIST_MS = 3500
 const LIST_BACKOFF_MAX_MS = 60000
 const LIST_LOCK_STALE_MS = 30000
@@ -664,9 +667,14 @@ async function fetchList($: any, maxAge: number): Promise<Listed | string> {
     const c = await storedList($)
     if (c && started - c.at < maxAge) return c
     const r = await run($, [claude, 'agents', '--json', '--all'])
-    if (r.exitCode !== 0) return "Couldn't read the session list (claude agents --json)"
-    const list = validateList(r.stdout)
-    if (typeof list === 'string') return list
+    const list = r.exitCode !== 0 ? "Couldn't read the session list (claude agents --json)" : validateList(r.stdout)
+    if (typeof list === 'string') {
+      // Failed or timed out: the next listing is pushed back as after a slow one, the stored sessions and `at` kept
+      const failedAt = await $.clock.now()
+      const last = await storedList($)
+      if (last) await storeSet($, 'list', { ...last, until: failedAt + Math.min(LIST_BACKOFF_MAX_MS, 2 * (failedAt - started)) })
+      return list
+    }
     const at = await $.clock.now()
     const took = at - started
     await storeSet($, 'list', { at, sessions: list, ...(took > LIST_MS ? { until: at + Math.min(LIST_BACKOFF_MAX_MS, 2 * took) } : {}) })
@@ -977,6 +985,19 @@ async function hasRemoteControl($: any, id: string): Promise<boolean | null> {
   }
 }
 
+// pins.json written the way Claude writes it: the list indented by 2, in a separate file that then replaces the original;
+// unpinning also deletes the position the session had among the pinned ones, as Claude does. Under the pins lock
+async function writePins($: any, file: string, pins: readonly string[], unpinned: readonly string[]): Promise<boolean> {
+  const temporary = `${file}.sessions-${myPid || 'mod'}-${await $.clock.now()}.tmp`
+  await $.fs.write(temporary, JSON.stringify(pins, null, 2))
+  if ((await runSafe($, ['mv', '-f', temporary, file])).exitCode !== 0) {
+    await runSafe($, ['rm', '-f', temporary])
+    return false
+  }
+  for (const id of unpinned) await runSafe($, ['rm', '-f', `${jobsDir}/${id}/order`])
+  return true
+}
+
 // Background sessions with Remote Control get pinned automatically, so the service doesn't close them after 8 idle
 // hours while you drive them from your phone; when their Remote Control is turned off they get unpinned (only the ones
 // the mod pinned: reconcilePins). Across all folders. Only one session does it every 20 s, the first one that finds the
@@ -1008,18 +1029,14 @@ async function pinRemoteSessions($: any) {
       const recorded = !!previous && Array.isArray(previous.ids) && Array.isArray(previous.released)
       const auto: AutoPins = recorded ? { ids: previous.ids, released: previous.released } : adoptAutoPins(pins, remote)
       const r = reconcilePins(pins, remote, auto)
-      if (r.toPin.length || r.toUnpin.length) {
-        // The way Claude writes it: the list indented by 2, in a separate file that then replaces the original
-        const temporary = `${file}.sessions-${myPid || 'mod'}.tmp`
-        await $.fs.write(temporary, JSON.stringify(r.pins, null, 2))
-        if ((await runSafe($, ['mv', '-f', temporary, file])).exitCode !== 0) {
-          await runSafe($, ['rm', '-f', temporary])
-          return
-        }
-        // When unpinning, Claude also deletes the position it had among the pinned ones
-        for (const id of r.toUnpin) await runSafe($, ['rm', '-f', `${jobsDir}/${id}/order`])
+      // A session another plugin keeps pinned ($.sessions.pin) stays pinned when its Remote Control goes off
+      const pluginBefore = pluginPinsOf(await storeGet($, 'pluginPins'))
+      const k = keepPluginPins(r, pluginBefore, new Set(Object.keys(remote)))
+      if (JSON.stringify(k.pins) !== JSON.stringify(pins)) {
+        if (!(await writePins($, file, k.pins, k.toUnpin))) return
       }
       if (!recorded || JSON.stringify(r.auto) !== JSON.stringify(auto)) await storeSet($, 'autoPins', r.auto)
+      if (JSON.stringify(k.plugin) !== JSON.stringify(pluginBefore)) await storeSet($, 'pluginPins', k.plugin)
     })
   } finally {
     pinning = false
@@ -1142,6 +1159,65 @@ async function runWakes($: any) {
     }
   } finally {
     waking = false
+  }
+}
+
+// The sessions other plugins asked to restart ($.sessions.restart), from this mod's own 0.5 s timer: claude respawn of a
+// running background session once it's idle with no background task (what u checks too), this very session through
+// respawnSelf. One working or waiting for the person by then is dropped, said in the debug log: its caller asks again
+// once it's idle. While that can't be known yet (no list read in the last few seconds: another session's listing still
+// running, a back-off, a listing that failed), or it has background tasks (or they can't be read), it waits, tried
+// again every RESTART_RETRY_MS, up to RESTART_WAIT_MS after the last ask; then it's dropped, said in the debug log
+const RESTART_RETRY_MS = 2000
+const RESTART_WAIT_MS = 300000
+type QueuedRestart = { id: string; sessionId: string; name: string; reason: string; until: number; next: number; waiting?: string }
+let restarts: QueuedRestart[] = []
+let restarting = false
+async function runRestarts($: any) {
+  if (restarting || restarts.length === 0) return
+  restarting = true
+  try {
+    for (const r of [...restarts]) {
+      const now = await $.clock.now()
+      if (now < r.next) continue
+      const why = r.reason || 'no reason given'
+      const drop = (text: string) => {
+        restarts = restarts.filter(x => x !== r)
+        debugLine($, `restart “${r.name}” (${why}): ${text}`)
+      }
+      const wait = (text: string) => {
+        if (now >= r.until) return drop(`dropped: ${text} after ${howLong(RESTART_WAIT_MS)} of trying`)
+        r.next = now + RESTART_RETRY_MS
+        if (r.waiting !== text) debugLine($, `restart “${r.name}” (${why}): waiting, ${text}`)
+        r.waiting = text
+      }
+      const status = await restartStatus($, r.sessionId)
+      if (status === 'unknown') {
+        wait("what it's doing can't be read yet")
+        continue
+      }
+      if (status !== 'idle') {
+        drop(`not now, it's ${status === undefined ? 'gone from the list' : status === null ? 'stopped' : status}`)
+        continue
+      }
+      const tasks = await backgroundTasks($, r.id)
+      if (!tasks || tasks.count > 0) {
+        wait(tasks ? `it has ${tasks.count === 1 ? '1 task' : `${tasks.count} tasks`} in the background` : "its background tasks can't be read")
+        continue
+      }
+      restarts = restarts.filter(x => x !== r)
+      if (r.sessionId === myId) {
+        debugLine($, `restart of this session, “${r.name}” (${why})`)
+        await respawnSelf($, r.id, r.name)
+        continue
+      }
+      const ok = await respawnWithWindows($, r.id, r.name)
+      debugLine($, `restart “${r.name}” (${why}): ${ok ? 'restarted' : 'failed'}`)
+      if (!ok) $.ui.toast(`Couldn't restart “${r.name}”`)
+      await invalidateList($)
+    }
+  } finally {
+    restarting = false
   }
 }
 
@@ -1763,6 +1839,24 @@ async function askDialog($: any, title: string, topic: Topic, detail = ''): Prom
   return r.action
 }
 
+// claude respawn of another session: the windows with a launcher (opened with ccc) that show it are told to reopen it,
+// so their viewers come back to it once its new process runs. False if the respawn failed (its window files go: left
+// behind, a later close would reattach instead of leaving the shell)
+async function respawnWithWindows($: any, id: string, title: string): Promise<boolean> {
+  const v = await windows($)
+  const written: string[] = []
+  for (const tty of v.byId[id] ?? []) {
+    if (!v.launchers[tty] || !dataDir) continue
+    try {
+      await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id, title }))
+      written.push(windowFile(tty))
+    } catch {}
+  }
+  const r = await run($, [claude, 'respawn', id])
+  if (r.exitCode !== 0 && written.length) await runSafe($, ['rm', '-f', ...written])
+  return r.exitCode === 0
+}
+
 // Does what was chosen to another session. Stop and Remove: stops it and/or removes it from the list, and closes the
 // windows that showed it (never one showing this session; with closeWindows false, none: that's when the window you're
 // in still shows that session). Restart: claude respawn, the same session with its conversation in a process running
@@ -1770,19 +1864,7 @@ async function askDialog($: any, title: string, topic: Topic, detail = ''): Prom
 async function perform($: any, f: Row, action: Action, closeWindows = true) {
   if (!f.id) return
   if (action === 'restart') {
-    const v = await windows($)
-    const written: string[] = []
-    for (const tty of v.byId[f.id] ?? []) {
-      if (!v.launchers[tty] || !dataDir) continue
-      try {
-        await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id: f.id, title: f.title }))
-        written.push(windowFile(tty))
-      } catch {}
-    }
-    const r = await run($, [claude, 'respawn', f.id])
-    if (r.exitCode !== 0) {
-      // Its viewers weren't closed: the window files go, or leaving one later would reattach instead of the shell
-      if (written.length) await runSafe($, ['rm', '-f', ...written])
+    if (!(await respawnWithWindows($, f.id, f.title))) {
       $.ui.toast(`Couldn't restart “${f.title}”`)
     } else {
       // The ↑ mark goes away right away, without waiting for the new session to record its version
@@ -2016,13 +2098,21 @@ async function restartSelf($: any, f: Row) {
     await focusRow($, f.sessionId, undefined)
     return
   }
+  await respawnSelf($, id, f.title)
+}
+
+// The restart itself, also for another plugin's $.sessions.restart of this session (from the mod's own timer, with no
+// question: its caller checked the windows first)
+async function respawnSelf($: any, id: string, title: string) {
+  const v = await windows($)
+  const returning = (v.byId[id] ?? []).filter(tty => v.launchers[tty])
   // The ↑ mark goes away right away, and the new process announces on startup that it was restarted
   const e = await readState($, myId)
   if (e && installedVersion) await storeSet($, `state:${myId}`, { ...e, version: installedVersion })
   await storeSet($, `restarted:${myId}`, await $.clock.now())
   for (const tty of returning) {
     try {
-      await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id, title: f.title }))
+      await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id, title }))
     } catch {}
   }
   // claude respawn ends this process. Run as a child of this session, it went away with it before starting it again
@@ -2042,7 +2132,7 @@ async function restartSelf($: any, f: Row) {
   await $.clock.sleep(15000)
   for (const tty of returning) await runSafe($, ['rm', '-f', windowFile(tty)])
   await storeDelete($, `restarted:${myId}`)
-  $.ui.toast(`Couldn't restart “${f.title}”`)
+  $.ui.toast(`Couldn't restart “${title}”`)
 }
 
 // What a session is doing right now (busy, waiting, idle; null if it isn't running): a list read now (through the lock:
@@ -2056,6 +2146,25 @@ async function statusNow($: any, sessionId: string): Promise<string | null | und
   if (r.at < asked - 5000) return 'busy'
   const list = r.sessions
   const s = list.find(x => x.sessionId === sessionId)
+  return s ? (s.status ?? null) : undefined
+}
+
+// What a session is doing, for a queued restart: from a list read in the last RESTART_FRESH_MS, whoever read it
+// (another session's listing serves once it lands), else one read now (through the lock), unless a back-off holds.
+// 'unknown' when there's none that fresh yet (another session holds the lock, a back-off, the listing failed): the
+// restart waits
+const RESTART_FRESH_MS = 5000
+async function restartStatus($: any, sessionId: string): Promise<string | null | undefined> {
+  const now = await $.clock.now()
+  const stored = await storedList($)
+  let fresh: Listed | null = stored && now - stored.at < RESTART_FRESH_MS ? stored : null
+  if (!fresh) {
+    if (stored && typeof stored.until === 'number' && now < stored.until) return 'unknown'
+    const r = await listWithAge($, 0)
+    if (typeof r === 'string' || r.at < now - RESTART_FRESH_MS) return 'unknown'
+    fresh = r
+  }
+  const s = fresh.sessions.find(x => x.sessionId === sessionId)
   return s ? (s.status ?? null) : undefined
 }
 
@@ -2714,14 +2823,19 @@ async function rebind($: any) {
   bg(refresh($))
 }
 
+// Starts, wakes and restarts other plugins asked for, queued or running in this module: a reload now would drop them
+// after they were told queued
+function queuedHere(): boolean {
+  return launching || waking || restarting || launches.length > 0 || wakes.length > 0 || restarts.length > 0
+}
+
 // A newer version of this mod is installed: update this session's in place with /reload-plugins, when that cuts
 // nothing (reloadDecision). The new copy says so when it starts ("Panel updated"). /reload-plugins reloads every
 // plugin of the session; a Claude update, settings and MCP servers still need u (a restart). If the update doesn't
 // take, the ↑ mark stays and u is the way
 async function updateInPlace($: any) {
   if (!active || !myId) return
-  // Starts and wakes other plugins queued live in this module: a reload now would drop them after they were told queued
-  if (launching || waking || launches.length || wakes.length) return
+  if (queuedHere()) return
   const plugin = await installedPlugin($)
   const own = lastList.find(s => s.sessionId === myId)
   const quick = reloadDecision({
@@ -2735,6 +2849,9 @@ async function updateInPlace($: any) {
     fieldOpen: false,
   })
   if (quick !== 'reload' || !plugin) return
+  // Not idle in the last list (working, waiting, not in it): no reload now, and no list read just to see that (one
+  // every 15 s from each busy session would keep the list's lock taken)
+  if (own?.status !== 'idle') return
   const panes = await $.ui.panes()
   const tasks = own?.id ? ((await backgroundTasks($, own.id))?.count ?? null) : 0
   const decision = reloadDecision({
@@ -2747,7 +2864,8 @@ async function updateInPlace($: any) {
     paneFocused: !!panes.find((p: any) => p.id === PANE)?.isFocused,
     fieldOpen: (await read($, askingName)) || !!(await read($, renaming)),
   })
-  if (decision !== 'reload') return
+  // Again: the checks above take seconds (a list read now), and a start, wake or restart may have been queued meanwhile
+  if (decision !== 'reload' || queuedHere()) return
   reloadTriedFor = plugin.version
   await storeSet($, `reloaded:${myId}`, { from: modVersion, to: plugin.version, at: await $.clock.now() })
   debugLine($, `updating in place: ${modVersion} → ${plugin.version}`)
@@ -2864,7 +2982,7 @@ async function sectionsList($: any): Promise<string> {
 // here: current and status answer ready: false, and the section methods find the data folder from the environment
 const SESSIONS_API: SessionsApi = 1
 // The methods this copy serves: a key missing from Sessions, or one too many, fails the type check
-const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1, setMarks: 1 } satisfies Record<SessionsMethod, 1>
+const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1, setMarks: 1, pin: 1, restart: 1 } satisfies Record<SessionsMethod, 1>
 // How long another plugin's call waits for the sections lock before answering busy (6 × 50 ms)
 const CALL_LOCK_TRIES = 6
 
@@ -3008,6 +3126,71 @@ function sessionsApi($: any): Sessions {
       }
       return Object.keys(v.rejected).length ? { ok: true, rejected: v.rejected } : { ok: true }
     },
+    pin: async input => {
+      const ref = input?.ref
+      if (!isRef(ref)) return { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' }
+      if (typeof input?.pinned !== 'boolean') return { ok: false, reason: 'invalid', detail: 'pinned is true or false' }
+      if (!ready() || !jobsDir) return { ok: false, reason: 'not-ready', detail: "sessions hasn't read the session list in this session yet: try again in a few seconds" }
+      const s = lastList.find(x => refOf(x) === ref)
+      if (!s) return { ok: false, reason: 'refused', detail: `${ref} isn't in the session list` }
+      const name = String(projectRows.find(f => f.sessionId === s.sessionId)?.title ?? (s.name || s.id || ref))
+      if (s.kind !== 'background' || typeof s.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(s.id)) return { ok: false, reason: 'refused', detail: `“${name}” is a regular session: only a background session is pinned` }
+      const id = s.id
+      const pinned = input.pinned
+      const reason = typeof input?.reason === 'string' ? input.reason.trim().replace(/\s+/g, ' ').slice(0, 120) : ''
+      const file = pinsPath()
+      let result: SessionsResult = { ok: false, reason: 'busy', detail: 'another session is changing pins.json: try again' }
+      await withLock(
+        $,
+        file,
+        async () => {
+          const pins = await pinsFromFile($)
+          if (!pins) {
+            result = { ok: false, reason: 'refused', detail: "pins.json couldn't be read as a list of ids: left as it is" }
+            return
+          }
+          const plugin = pluginPinsOf(await storeGet($, 'pluginPins'))
+          const autoIds = (await storeGet($, 'autoPins'))?.ids
+          const c = pluginPinChange(pins, plugin, Array.isArray(autoIds) ? autoIds : [], id, pinned)
+          if (c.changed && !(await writePins($, file, c.pins, pinned ? [] : [id]))) {
+            result = { ok: false, reason: 'busy', detail: "couldn't write pins.json: try again" }
+            return
+          }
+          await storeSet($, 'pluginPins', c.plugin)
+          debugLine($, `${pinned ? 'pin' : 'unpin'} “${name}” (${reason || 'no reason given'}): ${c.refused ?? (c.changed ? 'done' : 'nothing to change')}`)
+          result = c.refused ? { ok: false, reason: 'refused', detail: `“${name}”: ${c.refused}` } : { ok: true }
+        },
+        CALL_LOCK_TRIES,
+      )
+      return result
+    },
+    restart: async input => {
+      const ref = input?.ref
+      if (!isRef(ref)) return { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' }
+      if (!ready()) return { ok: false, reason: 'not-ready', detail: "sessions hasn't read the session list in this session yet: try again in a few seconds" }
+      const refused = (detail: string) => ({ ok: false as const, reason: 'refused' as const, detail, state: 'refused' as const })
+      const s = lastList.find(x => refOf(x) === ref)
+      if (!s) return refused(`${ref} isn't in the session list`)
+      const name = String(projectRows.find(f => f.sessionId === s.sessionId)?.title ?? (s.name || s.id || ref))
+      if (s.kind !== 'background' || typeof s.id !== 'string') return refused(`“${name}” is a regular session: it lives in its own window (/exit and claude -c)`)
+      if (!s.pid) return refused(`“${name}” isn't running: $.sessions.wake brings back a stopped one`)
+      if (s.status === 'busy') return refused(`“${name}” is working: ask again once it's idle`)
+      if (s.status === 'waiting') return refused(`“${name}” is waiting for the person: ask again once it's idle`)
+      // This very session: the windows showing it must come back by themselves (opened with ccc), since no question is
+      // asked; one opened another way would be left at the shell
+      if (s.sessionId === myId) {
+        const v = await windows($)
+        const stranded = (v.byId[s.id] ?? []).filter(tty => !v.launchers[tty])
+        if (stranded.length) return refused(`a window that wasn't opened with ccc shows “${name}” (${stranded.join(', ')}): it wouldn't come back by itself after the restart; u in the panel restarts it`)
+      }
+      const reason = typeof input?.reason === 'string' ? input.reason.trim().replace(/\s+/g, ' ').slice(0, 120) : ''
+      // Asked again while it waits: it waits RESTART_WAIT_MS from now
+      const until = (await $.clock.now()) + RESTART_WAIT_MS
+      const queued = restarts.find(r => r.id === s.id)
+      if (queued) queued.until = until
+      else restarts.push({ id: s.id, sessionId: s.sessionId, name, reason, until, next: 0 })
+      return { ok: true, state: 'queued' as const }
+    },
   }
 }
 
@@ -3095,6 +3278,7 @@ async function start($: any) {
       bg(solo('inbox', () => checkInbox($)))
       bg(runLaunches($))
       bg(runWakes($))
+      bg(runRestarts($))
       bg(solo('tells', () => checkTells($)))
     })
     // The person is told (pushWaits, notifySpend) from these timers only, never from a hook of a turn. Each runs once at
