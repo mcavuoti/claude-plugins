@@ -18,6 +18,9 @@ export const SLOW = { timeoutMs: 30000 } as const
 
 export type World = {
   files: Map<string, string>
+  // A file written by someone else (Claude's registry, another session) now, by the mocked clock: its time stays put
+  // until it's written again, as a real file's does
+  write: (path: string, text: string) => void
   opens: any[]
   registered: string[]
   clock: ReturnType<typeof mock.clock>
@@ -40,8 +43,10 @@ export type World = {
   toasts: string[]
   // What $.session.usage() answers
   usage: { value: any }
-  // What Claude (and the mods beneath this one) draw in the band above the prompt: nothing, or a line
+  // What Claude (and the mods beneath this one) draw in the band above the prompt: nothing, or a line; and how late
+  // they answer the next draw, in ms (0: at once): that draw held open that long, as a slow plugin beneath holds it
   band: { value: string }
+  bandLate: { value: number }
   // The start of the session's transcript (WorldOptions.transcript), which a test can change
   transcript: { value: string | undefined }
   // What claude --bg prints when it refuses to start a session ('': it starts it)
@@ -52,14 +57,19 @@ export type World = {
   // mode words (frente, leer, traer, cerrar, abrir: hooks/platform/macos.ts; '' by default)
   ps: { value: string }
   terminal: { value: (args: string[]) => string }
+  // How late Terminal's AppleScript answers, in ms (0: at once): a busy Terminal
+  terminalLate: { value: number }
   // What xprop answers (X11 on Linux), by its arguments; null: xprop fails, as without a display (the default)
   xprop: { value: (args: string[]) => string | null }
   // While set, `claude agents` answers only once it resolves (a slow listing)
   agentsGate: { value: Promise<void> | null }
   // While true, `claude agents` fails (exit 127, as when run's timeout cuts it), after the gate if one is set
   agentsFail: { value: boolean }
-  // What `claude plugin list --json` answers (none installed by default)
+  // What `claude plugin list --json` answers (none installed by default); while installedFail is true it and `claude
+  // --version` fail (exit 127, as when run's timeout cuts them), and they answer installedLate ms late (0: at once)
   plugins: { value: string }
+  installedFail: { value: boolean }
+  installedLate: { value: number }
   // What the mod asked to tell the person: the PushNotification calls' messages and $.ui.notify's texts, and what each
   // answers (by default, what a session gets with nobody away from the computer and no notifying terminal)
   pushes: string[]
@@ -78,11 +88,21 @@ export type WorldOptions = {
   transcript?: string
   // What uname -s answers, which picks the platform (Darwin by default)
   system?: string
+  // What the plugins beneath answer to classic.SessionStart (nothing by default)
+  sessionStart?: Record<string, unknown>
 }
 
 // A session with an id and a root, an in-memory folder tree, a claude that lists one session
 export function world(on: On, options: WorldOptions = {}): World {
-  const files = new Map<string, string>()
+  // When each file was written (fs.list's and fs.stat's mtimeMs): by the mod, or by a test through write. One a test
+  // set directly (files.set) counts as just written, whenever it's looked at
+  const written = new Map<string, number>()
+  const files = new (class extends Map<string, string> {
+    override set(path: string, text: string) {
+      written.delete(path)
+      return super.set(path, text)
+    }
+  })()
   const dirs = new Set(['/', '/Users', '/Users/x', ROOT])
   const made = new Map<string, number>()
   const root = { value: ROOT }
@@ -99,11 +119,18 @@ export function world(on: On, options: WorldOptions = {}): World {
   const memory = { value: '1' }
   const ps = { value: '' }
   const terminal = { value: (_args: string[]) => '' }
+  const terminalLate = { value: 0 }
   const xprop = { value: (_args: string[]): string | null => null }
   const agentsGate: { value: Promise<void> | null } = { value: null }
   const agentsFail = { value: false }
   const plugins = { value: '[]' }
-  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+  const installedFail = { value: false }
+  const installedLate = { value: 0 }
+  const bandLate = { value: 0 }
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
+    const late = bandLate.value
+    bandLate.value = 0
+    if (late > 0) await clock.sleep(late)
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
@@ -112,7 +139,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   mock.env(on, env)
   // The store, in memory (readable by the tests). These overrides put the mod's keys under a namespace of their own
   // (storeNamespace): the tests read and write them without it, and storeKeys keeps every key the mod used, as it used it
-  const namespace = storeNamespace(['SESSIONS_DATA_DIR', 'SESSIONS_JOBS_DIR', 'SESSIONS_DAEMON_LOG', 'SESSIONS_CLAUDE', 'SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE'].map(k => env[k]))
+  const namespace = storeNamespace(['SESSIONS_DATA_DIR', 'SESSIONS_JOBS_DIR', 'SESSIONS_DAEMON_LOG', 'SESSIONS_CLAUDE', 'SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE', 'SESSIONS_REGISTRY_DIR'].map(k => env[k]))
   const plain = (key: string) => (key.startsWith(namespace) ? key.slice(namespace.length) : key)
   const storeKeys = new Set<string>()
   const store = new Map<string, unknown>(Object.entries(options.store ?? {}))
@@ -140,6 +167,9 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('session.version', () => ({ value: { version: '2.1.316' } as any }))
   on('session.messages', () => ({ value: [] as any }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  // The classic hooks the engine raises (a test raises them with $.classic): nothing of Claude's own beneath
+  on('classic.SessionStart', () => (options.sessionStart ?? {}) as any)
+  on('classic.FileChanged', () => ({}) as any)
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('fs.read', (_, e) => {
@@ -148,22 +178,28 @@ export function world(on: On, options: WorldOptions = {}): World {
     if (text === undefined) throw new Error(`no such file: ${e.path}`)
     return { value: text }
   })
-  // When each file was written (fs.list's mtimeMs); one a test set directly counts as just written
-  const written = new Map<string, number>()
   on('fs.write', (_, e) => {
     files.set(e.path, e.text)
     written.set(e.path, clock.now())
     return { value: undefined }
   })
   on('fs.exists', (_, e) => ({ value: files.has(e.path) || dirs.has(e.path) }))
+  // A file's size and time, as fs.list and fs.stat give them: what it holds, and when it was last written (by the mod,
+  // or by a test through write; one a test set directly counts as just written)
+  const size = (p: string) => new TextEncoder().encode(files.get(p) ?? '').length
   on('fs.list', (_, e) => ({
-    value: [...files.keys()].filter(p => p.startsWith(`${e.path}/`)).map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: written.get(p) ?? clock.now(), isLink: false })),
+    value: [...files.keys()].filter(p => p.startsWith(`${e.path}/`)).map(p => ({ name: p.slice(e.path.length + 1), kind: 'file' as const, size: size(p), mtimeMs: written.get(p) ?? clock.now(), isLink: false })),
   }))
   on('fs.stat', (_, e) => {
     if (dirs.has(e.path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: made.get(e.path) ?? 0, isLink: false } }
     if (!files.has(e.path)) throw new Error(`ENOENT: ${e.path}`)
-    return { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }
+    return { value: { kind: 'file' as const, size: size(e.path), mtimeMs: written.get(e.path) ?? clock.now(), isLink: false } }
   })
+  // A file someone else wrote (Claude, another session) at the mocked time: its time stays until it's written again
+  const write = (path: string, text: string) => {
+    files.set(path, text)
+    written.set(path, clock.now())
+  }
   const runs: string[][] = []
   const cwds: (string | undefined)[] = []
   const envs: (Record<string, string> | undefined)[] = []
@@ -219,14 +255,19 @@ export function world(on: On, options: WorldOptions = {}): World {
       const header = argv.find((a, i) => argv[i - 1] === '-o' && /=./.test(a))
       return ok(header ? [header.slice(header.indexOf('=') + 1), ...ps.value.split('\n').map(l => l.trim().split(/\s+/)[0])].join('\n') : ps.value)
     }
-    if (argv[0] === 'osascript') return ok(terminal.value(argv.slice(2)))
+    if (argv[0] === 'osascript') {
+      const answer = () => ok(terminal.value(argv.slice(2)))
+      return terminalLate.value > 0 ? clock.sleep(terminalLate.value).then(answer) : answer()
+    }
     if (argv[0] === 'xprop') {
       const answer = xprop.value(argv.slice(1))
       return answer === null ? failed() : ok(answer)
     }
     if (argv[0] === '/bin/claude' && argv[1] === '--bg' && bgError.value) return { value: { exitCode: 1, stdout: '', stderr: bgError.value, isStdoutTruncated: false, isStderrTruncated: false } }
-    if (argv[0] === '/bin/claude' && argv[1] === '--version') return ok('2.1.316 (Claude Code)')
-    if (argv[0] === '/bin/claude' && argv[1] === 'plugin') return ok(plugins.value)
+    if (argv[0] === '/bin/claude' && (argv[1] === '--version' || argv[1] === 'plugin')) {
+      const answer = () => (installedFail.value ? { value: { exitCode: 127, stdout: '', stderr: 'timed out', isStdoutTruncated: false, isStderrTruncated: false } } : ok(argv[1] === '--version' ? '2.1.316 (Claude Code)' : plugins.value))
+      return installedLate.value > 0 ? clock.sleep(installedLate.value).then(answer) : answer()
+    }
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok(`${options.system ?? 'Darwin'}|`)
     // The transcript's first row (readAgent)
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('.jsonl')) return transcript.value === undefined ? failed() : ok(transcript.value)
@@ -268,7 +309,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, bgError, memory, ps, terminal, xprop, agentsGate, agentsFail, plugins, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

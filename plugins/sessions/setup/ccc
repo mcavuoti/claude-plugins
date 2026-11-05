@@ -11,14 +11,59 @@
 # The plugin's setup installs this file in ~/.claude/mods/sessions-data/bin/ (SESSIONS_DATA_DIR) and nothing rewrites
 # it while sessions run. It runs the launcher (hooks/visor.sh) of the copy of the plugin that Claude Code has enabled,
 # found with `claude plugin list --json`, so the launcher always matches the installed version; it passes that version
-# and since when it's installed on to the launcher. SESSIONS_PLUGIN_DIR names another copy (tests); without an installed
-# plugin (a folder copy), it uses the copy the setup was run from.
+# and since when it's installed on to the launcher. That answer takes claude most of a second, so it's kept per folder
+# (cached_lookup) and asked again only once something it comes from changed. SESSIONS_PLUGIN_DIR names another copy
+# (tests); without an installed plugin (a folder copy), it uses the copy the setup was run from.
 SETUP_ROOT=''
+# The format of the files the mod and its launcher share (FORMAT in hooks/state.ts): here, the lookup it keeps
+FORMAT=3
+
+# What `claude plugin list --json` answered from this folder last time, kept in <data>/lookup/<this folder, / as _>
+# (format=, claude=, path=, version=, since= lines): it holds while that file is newer than everything the answer comes
+# from (Claude's record of the installed plugins; the settings that enable them: the user's, those of this folder and
+# each one above it, the managed ones) and the folder it names still has the plugin. Prints "path<tab>version<tab>since"
+cached_lookup() {
+  local cache="$1" claude="$2" config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" d f k v format='' who='' path='' version='' since=''
+  [ -f "$cache" ] || return 1
+  for f in "$config/plugins/installed_plugins.json" "$config/settings.json" "/Library/Application Support/ClaudeCode/managed-settings.json" /etc/claude-code/managed-settings.json; do
+    [ ! -e "$f" ] || [ "$cache" -nt "$f" ] || return 1
+  done
+  d=$PWD
+  while :; do
+    for f in "$d/.claude/settings.json" "$d/.claude/settings.local.json"; do
+      [ ! -e "$f" ] || [ "$cache" -nt "$f" ] || return 1
+    done
+    if [ -z "$d" ] || [ "$d" = / ]; then break; fi
+    d=${d%/*}
+  done
+  while IFS='=' read -r k v; do
+    case "$k" in
+      format) format=$v ;;
+      claude) who=$v ;;
+      path) path=$v ;;
+      version) version=$v ;;
+      since) since=$v ;;
+    esac
+  done < "$cache"
+  if [ "$format" != "$FORMAT" ] || [ "$who" != "$claude" ] || [ ! -f "$path/hooks/visor.sh" ]; then return 1; fi
+  printf '%s\t%s\t%s\n' "$path" "$version" "$since"
+}
+
+save_lookup() {
+  local cache="$1"
+  mkdir -p "${cache%/*}" 2>/dev/null || return 0
+  printf 'format=%s\nclaude=%s\npath=%s\nversion=%s\nsince=%s\n' "$FORMAT" "$2" "$3" "$4" "$5" > "$cache.$$" 2>/dev/null && mv -f "$cache.$$" "$cache" 2>/dev/null
+  rm -f "$cache.$$" 2>/dev/null
+  return 0
+}
 
 main() {
-  local dir="${SESSIONS_PLUGIN_DIR:-}" py info version since
-  if [ -z "$dir" ] && py=$(command -v python3) && ! { [ "$py" = /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; }; then
-    info=$("${SESSIONS_CLAUDE:-claude}" plugin list --json 2>/dev/null | "$py" -c '
+  local dir="${SESSIONS_PLUGIN_DIR:-}" claude="${SESSIONS_CLAUDE:-claude}" py info='' version since cache
+  if [ -z "$dir" ]; then
+    cache="${SESSIONS_DATA_DIR:-$HOME/.claude/mods/sessions-data}/lookup/${PWD//\//_}"
+    info=$(cached_lookup "$cache" "$claude") || info=''
+    if [ -z "$info" ] && py=$(command -v python3) && ! { [ "$py" = /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; }; then
+      info=$("$claude" plugin list --json 2>/dev/null | "$py" -c '
 import json, sys
 from datetime import datetime
 try:
@@ -35,6 +80,11 @@ for p in rows if isinstance(rows, list) else []:
         print("%s\t%s\t%d" % (p["installPath"], p.get("version", ""), since))
         break
 ')
+      if [ -n "$info" ]; then
+        IFS=$'\t' read -r dir version since <<<"$info"
+        save_lookup "$cache" "$claude" "$dir" "$version" "$since"
+      fi
+    fi
     if [ -n "$info" ]; then
       IFS=$'\t' read -r dir version since <<<"$info"
       export SESSIONS_PLUGIN_VERSION="${SESSIONS_PLUGIN_VERSION:-$version}" SESSIONS_PLUGIN_SINCE="${SESSIONS_PLUGIN_SINCE:-$since}"

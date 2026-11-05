@@ -71,6 +71,9 @@ export type PaneNote = '' | 'closed' | 'narrow'
 // The ccc tell request whose $.prompt.submit is on its way (its id, and when it was submitted), kept in $.state so a
 // reload of the mod's code doesn't submit it twice; null when none
 export type TellInFlight = { id: string; at: number } | null
+// What this session's classic.SessionStart had the engine watch: the set of paths (WATCH_SET in hooks/watch.ts), for
+// which session id, and when; null when none came in this session (the panel then reads on a short timer)
+export type Watching = { set: number; sessionId: string; at: number } | null
 
 // ---- The API for other plugins: $.sessions, contract api 1 ----
 // What other plugins call. Everything above, and PluginState below, is this plugin's own and not part of it.
@@ -216,6 +219,7 @@ declare module 'claude-code' {
       limits: RateLimit[]
       summary: PanelSummary
       tellInFlight: TellInFlight
+      watching: Watching
     }
   }
 }

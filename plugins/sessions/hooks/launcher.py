@@ -23,7 +23,8 @@ asks whether to restart it first. On arrival the panel takes the keyboard: a req
 The files it reads and writes are the mod's (hooks/state.ts has the formats): <data>/alive/<sessionId> (heartbeats),
 <data>/order/<root> (the panel's order), <data>/inbox/<sessionId> (requests), <data>/windows/<tty> (what a window opens
 next), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), <data>/sections.json (the
-person's sections, which ccc section changes), with <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
+person's sections, which ccc section changes, ringing <data>/bell/sections for the panels that watch it), with
+<data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
 Other environment: SESSIONS_CLAUDE (the claude command), SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the
 installed plugin, from the ccc command), SESSIONS_START_WAIT (seconds to wait for a new session's mod).
 """
@@ -40,7 +41,8 @@ SECTIONS_FORMAT = 1
 TELL_MAX_BYTES = 4096
 HEARTBEAT_VERSION = (0, 10, 0)
 HEARTBEAT_FRESH_MS = 45000
-ORDER_FRESH_MS = 60000
+# The panels rewrite the order file when it changes and at least once a pass (a minute, each from its own offset)
+ORDER_FRESH_MS = 150000
 INBOX_FRESH_MS = 30000
 
 HOME = os.environ.get('HOME', '')
@@ -939,8 +941,17 @@ def section(argv):
     if isinstance(result, str):
         say(result)
         return 1
+    ring('sections')
     say('%s is in “%s” now' % (who, result['title']) if result else '%s is in no section now' % who)
     return 0
+
+
+# A bell (<data>/bell/<name>, hooks/watch.ts): the panels, which watch that folder, read again what it names
+def ring(name):
+    try:
+        write_key_lines(os.path.join(DATA, 'bell', name), [('format', FORMAT), ('from', 'ccc'), ('at', now_ms())])
+    except OSError:
+        pass
 
 
 def main(argv):

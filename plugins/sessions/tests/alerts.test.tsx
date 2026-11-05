@@ -236,6 +236,8 @@ test('⧗ on a row working, or done and unseen in the background, for staleMinut
     },
   })
   await startSession($, w)
+  // The rows' times are reckoned at the minute: from the next one (and its refresh) they read the full hours
+  await w.clock.advance(23000)
   const text = await drawn($)
   expect(text).toContain('⧗2h')
   expect(text).toContain('⧗3h')

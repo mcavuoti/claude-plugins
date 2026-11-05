@@ -16,6 +16,7 @@ import type {
   TellInFlight,
   Usage,
   UsageView,
+  Watching,
 } from '../types'
 
 import {
@@ -151,8 +152,20 @@ import {
   type Wait,
   FORMAT,
   NOTICE_MARKER,
+  sameData,
+  labelMinute,
+  listSignature,
+  listHolds,
+  LIST_MS,
+  nextSeenCheck,
+  sessionTags,
+  usageSummaryOf,
+  type ListedFile,
+  nextLabelChange,
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
+import { bellFrom, bellOfKey, bellText, classify, jobIds, listDrift, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchSetOf, type Locations, type RegistryNews } from './watch'
+import { electLeader, LEADER_STALE_MS, leaderText, leads, parseLeader, PASS_MS, type Candidate } from './leader'
 
 const PANE = 'sessions'
 
@@ -192,6 +205,13 @@ const limits = atom({ plugin: 'sessions', key: 'limits' } as const, [] as RateLi
 const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, waiting: 0, unseen: 0, spent: null } as PanelSummary)
 // The ccc tell request on its way to a turn (checkTells): in $.state, which a reload of the mod's code keeps
 const tellInFlight = atom({ plugin: 'sessions', key: 'tellInFlight' } as const, null as TellInFlight)
+// What this session's classic.SessionStart had the engine watch (watch.ts): in $.state, which a reload keeps as the
+// engine keeps the watched paths; null when no SessionStart of this mod came in this session
+const watching = atom({ plugin: 'sessions', key: 'watching' } as const, null as Watching)
+
+// Every write of a value the panel or the band reads draws them again, equal or not (the engine compares nothing): so
+// each one is written only when its data changed (sameData), and a refresh that finds nothing new draws nothing. The
+// engine's scan wants each value named where it's read or written, hence the same comparison at every write
 
 let claude = 'claude'
 let myId = ''
@@ -232,7 +252,10 @@ let currentFocus: string | undefined
 let requestedWidth = 0
 let defaultWidth = 0
 let defaultWindowWidth = 0
-let remeasure = false
+// What the panel's last draw saw, fullscreen: its width, the window's (conversation + panel + border) and the width the
+// mod had asked for then (0: none). The draw only notes it, and when it differs from the one before has adjustWidth run
+// from a timer: nothing is decided or written while drawing
+let paneSeen: { body: number; window: number; asked: number } | null = null
 // The session that was asked whether to stop: only its answer is accepted, and only for a while. fallback is the row
 // that stays selected if it leaves the list: its neighbor in the list you were looking at when you pressed Stop
 let pendingAsk: { sessionId: string; at: number; fallback?: string; topic: Topic; detail: string; target: Row } | undefined
@@ -267,9 +290,36 @@ let quietHours: QuietHours | null = null
 let quietHoursText = ''
 let notificationsPerDay = 5
 let staleMs = 3600000
-// The installed version this session's mod already tried to update itself to (once per version)
+// The installed version this session's mod already tried to update itself to (once per version), and the one it
+// can't, since it watches another set of paths (said once in the debug log)
 let reloadTriedFor = ''
+let watchRefusedFor = ''
 const startProblems: string[] = []
+
+// ---- Push (watch.ts, leader.ts) ----
+// Where the watched files are; the sessions as Claude's files show them (null until the mod starts); live: the engine
+// watches this session's paths (its classic.SessionStart of this WATCH_SET came, in this module or in one before it in
+// this session: the watching state), else the panel reads them on a short timer (the poll); reloadedInto: this module
+// came in by a reload (another module had drawn in this session before), so a missing SessionStart means the paths
+// watched are an older version's and only a restart (u) or /clear brings it; slowList: the files can't stand for
+// `claude agents` (see SessionFiles.usable), which is then run as before, at most every 3.5 s
+let locations: Locations = { registry: '', data: '', jobs: '' }
+let sessionFiles: SessionFiles | null = null
+let live = false
+let reloadedInto = false
+let slowList = false
+// This session's background job (its short id), found in the registry when SessionStart asks what to watch
+let ownJob: string | null = null
+// Whether this session leads the machine-wide work (leader.ts), and when it last did each part of it
+let leading = false
+// Another session leads, as this one's last turn saw it (it lists, reads the usage and runs the shared commands)
+let leaderElsewhere = false
+let reconciledAt = 0
+let usageRunAt = 0
+let leaderWrittenAt = 0
+// This session's own status from its own turn hooks, ahead of the registry (which comes 0.6 s later): it stands while
+// it's newer than the registry's statusUpdatedAt, for 10 s at most
+let ownHint: { status: string; at: number } | null = null
 
 // Where the mod's commands run: the home folder (/ until it's known, or if it's missing), never the session's own
 // folder. A command left to inherit the session's folder can't start once that folder is gone (a worktree the session
@@ -308,6 +358,26 @@ async function exists($: any, path: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+// A small file that changes now and then (pins.json, sections.json, a background session's state in the service's
+// folder), read again only when it changed: one stat (its time and size) where there was an exists and a read, and the
+// text kept from the last read when it didn't move. null when it isn't there; a read that fails throws
+const fileCache = new Map<string, { mtimeMs: number; size: number; text: string }>()
+async function readIfChanged($: any, path: string): Promise<string | null> {
+  let st: any
+  try {
+    st = await $.fs.stat(path)
+  } catch {
+    fileCache.delete(path)
+    return null
+  }
+  const held = fileCache.get(path)
+  if (held && held.mtimeMs === st.mtimeMs && held.size === st.size) return held.text
+  const text = String(await $.fs.read(path))
+  if (fileCache.size > 200) fileCache.clear()
+  fileCache.set(path, { mtimeMs: Number(st.mtimeMs), size: Number(st.size), text })
+  return text
 }
 
 // The platform's commands run through runSafe, with this hook's $
@@ -362,11 +432,14 @@ function debugLine($: any, text: string) {
 // Data shared between sessions: the mod's official store ($.store), a JSON file managed by Claude. Keys:
 // state:<id> (SessionState: what each session publishes about itself), seen:<id> (seen at), title:<id> (title from the
 // first prompt), waiting:<id> (waiting since),
-// restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (the cached session list: at,
-// when the listing came back; sessions; until, when a slow listing pushed the next one back; one listing at a time,
-// under the <data>/list.lock folder),
-// installed (installed Claude version), plugin (the installed plugin), usageView, pinPass (last auto-pin pass),
-// autoPins (AutoPins), pluginPins (PluginPins: the sessions other plugins keep pinned through $.sessions.pin), reopenPass (last reopen pass, and normalSince: since when memory has been normal),
+// restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (the session list claude
+// agents gave: at, when the listing came back; sessions; sig, what Claude's registry and the service's folder looked
+// like just before; until, when a slow or failed listing pushed the next one back; one listing at a time, under the
+// <data>/list.lock folder),
+// installed (installed Claude version: at, version) and plugin (the installed plugin: at, plugin), both also pendingAt,
+// a session running the command right now (sharedAnswer), usageView, pinPass (last auto-pin pass),
+// autoPins (AutoPins), pluginPins (PluginPins: the sessions other plugins keep pinned through $.sessions.pin),
+// reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
 // session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
 // marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts), collapsed (the
@@ -374,11 +447,12 @@ function debugLine($: any, text: string) {
 // at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
 // (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
-// and the window in front, shared for 1.5 s by the seen check: at, windows / tty; windowsList also pendingAt, a session
-// listing right now, and until, when a slow ps pushed the next one back), answer:<id> (the answer to a Stop or
-// Restart question that session asked, when the asked session couldn't send it as a notice: format, sessionId,
-// action, cameBack, at; that session's panel takes it and deletes it), personStop:<id> (when the person stopped that
-// session from a panel: a plugin's wake leaves it stopped until it's started again).
+// and the window in front, shared by the seen check for SEEN_WINDOWS_MS and FRONT_SHARED_MS: at, windows / tty, and
+// frontWindow's tags, the sessions an agent view in front shows; both also pendingAt, a session asking right now, and
+// windowsList until, when a slow ps pushed the next one back),
+// answer:<id> (the answer to a Stop or Restart question that session asked, when the asked session couldn't send it as
+// a notice: format, sessionId, action, cameBack, at; that session's panel takes it and deletes it), personStop:<id>
+// (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
@@ -395,8 +469,9 @@ async function storeNamespaceOf($: any): Promise<string> {
     await $.env.get('SESSIONS_CLAUDE'),
     await $.env.get('SESSIONS_PLUGIN_VERSION'),
     await $.env.get('SESSIONS_PLUGIN_SINCE'),
+    await $.env.get('SESSIONS_REGISTRY_DIR'),
   ]
-  const names = ['SESSIONS_DATA_DIR', 'SESSIONS_JOBS_DIR', 'SESSIONS_DAEMON_LOG', 'SESSIONS_CLAUDE', 'SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE']
+  const names = ['SESSIONS_DATA_DIR', 'SESSIONS_JOBS_DIR', 'SESSIONS_DAEMON_LOG', 'SESSIONS_CLAUDE', 'SESSIONS_PLUGIN_VERSION', 'SESSIONS_PLUGIN_SINCE', 'SESSIONS_REGISTRY_DIR']
   apartBecause = names.filter((_, i) => values[i])
   namespaceNow = storeNamespace(values)
   return namespaceNow
@@ -420,9 +495,26 @@ async function apartText($: any): Promise<string> {
   return `${launcherOnly.join(', ')}: set in this session's environment and ignored (they count only beside a location override, in a test session). ccc sets them for its launcher; a background service that a launcher before sessions 0.13.6 brought up hands them on to every session it starts. Harmless now: nothing to do`
 }
 
+// Each store read reads and parses Claude's whole store file (and touches it). So a refresh reads the store's keys once
+// and then only the keys that are there, what can't change for a while is kept in memory (a session's first-prompt
+// title, the installed versions until their 5 minutes are up), and what only this session writes (when it last
+// finished, when it was last seen) is kept as it reads and writes it (own): the 2 s seen check reads nothing between
+// its checks With the engine watching this session's paths, what other sessions write in the store and say with a bell
+// (watch.ts: bellOfKey: each session's record, seen and title, the marks, the shared f and c) is kept as last read,
+// until that bell rings or the pass reads everything again: a file event then reads only the keys it names. On the
+// short timer (nothing watched) every refresh reads them anew, as before
+const storeCache = new Map<string, unknown>()
+const cacheable = (key: string) => live && bellOfKey(key) !== null
+function forgetStored(match: (key: string) => boolean) {
+  for (const k of [...storeCache.keys()]) if (match(k)) storeCache.delete(k)
+}
+
 async function storeGet($: any, key: string): Promise<any> {
+  if (cacheable(key) && storeCache.has(key)) return storeCache.get(key)
   try {
-    return await $.store.get(`${await storeNamespaceOf($)}${key}`)
+    const value = await $.store.get(`${await storeNamespaceOf($)}${key}`)
+    if (cacheable(key)) storeCache.set(key, value)
+    return value
   } catch {
     return undefined
   }
@@ -431,6 +523,10 @@ async function storeGet($: any, key: string): Promise<any> {
 async function storeSet($: any, key: string, value: unknown): Promise<boolean> {
   try {
     await $.store.set(`${await storeNamespaceOf($)}${key}`, value)
+    noteOwn(key, value)
+    if (cacheable(key)) storeCache.set(key, value)
+    else storeCache.delete(key)
+    ringFor($, key)
     return true
   } catch {
     return false
@@ -440,7 +536,49 @@ async function storeSet($: any, key: string, value: unknown): Promise<boolean> {
 async function storeDelete($: any, key: string) {
   try {
     await $.store.delete(`${await storeNamespaceOf($)}${key}`)
+    noteOwn(key, undefined)
+    if (cacheable(key)) storeCache.set(key, undefined)
+    else storeCache.delete(key)
+    ringFor($, key)
   } catch {}
+}
+
+// The bell (watch.ts) a write of the store rings, so the panels that watch read it again: only a write that others draw
+function ringFor($: any, key: string) {
+  const name = bellOfKey(key)
+  if (name) bg(ring($, name))
+}
+
+async function ring($: any, name: string) {
+  const dir = await dataFolder($)
+  if (!dir || !/^[A-Za-z0-9_:-]+$/.test(name)) return
+  let from = myId
+  try {
+    from ||= String(await $.session.id())
+  } catch {}
+  try {
+    await $.fs.write(`${dir}/bell/${name}`, bellText(from, await $.clock.now()))
+  } catch {}
+}
+
+// This session's last finish (its state's `finished`) and when it was last seen (seen:<id>): only it writes either, so
+// what it read or wrote last is what's there. null: not known yet (read it)
+let selfSeen: { id: string; finished: number; seen: number } | null = null
+function noteOwn(key: string, value: unknown) {
+  if (!myId || (key !== `state:${myId}` && key !== `seen:${myId}`)) return
+  if (!selfSeen || selfSeen.id !== myId) {
+    selfSeen = null
+    return
+  }
+  if (key === `seen:${myId}`) selfSeen.seen = Number(value) || 0
+  else selfSeen.finished = Number((value as SessionState | undefined)?.finished) || 0
+}
+
+async function ownSeenState($: any): Promise<{ finished: number; seen: number }> {
+  if (selfSeen && selfSeen.id === myId) return selfSeen
+  const next = { id: myId, finished: (await readState($, myId))?.finished ?? 0, seen: await seenAt($, myId) }
+  selfSeen = next
+  return next
 }
 
 // The keys of this session's namespace, without it
@@ -478,9 +616,9 @@ async function listWindows($: any): Promise<Windows> {
 }
 
 // The window this session's panel was just used from (macOS: the front Terminal window, if it shows this session;
-// Linux: the one whose launcher has it open)
-async function frontWindowShowingMe($: any): Promise<string | null> {
-  return platform.windowShowingMe(sys($), await windows($), me())
+// Linux: the one whose launcher has it open). v: a listing the caller already has, for the rest of the same action
+async function frontWindowShowingMe($: any, v?: Windows): Promise<string | null> {
+  return platform.windowShowingMe(sys($), v ?? (await windows($)), me())
 }
 
 // The launcher (hooks/visor.sh, next to this file) runs in each window opened with ccc and opens one session after
@@ -506,8 +644,8 @@ function agentsTarget(): WindowTarget {
 // A single window: if a viewer or the agent view (clients) is in front and the window runs the launcher, switch to the
 // target in that same tab: write it the target and close the viewer; the launcher opens the next one. A window that
 // wasn't opened with ccc has no launcher and can't be switched in place (false): the caller opens a new window
-async function switchInPlace($: any, target: WindowTarget, front: string): Promise<boolean> {
-  const v = await windows($)
+async function switchInPlace($: any, target: WindowTarget, front: string, listed?: Windows): Promise<boolean> {
+  const v = listed ?? (await windows($))
   const pid = v.clients[front]
   if (!pid || !v.launchers[front] || !dataDir) return false
   try {
@@ -532,20 +670,26 @@ async function myWindows($: any): Promise<string[]> {
   return myWindowsIn(await windows($))
 }
 
-// The windows listing and the window in front, shared by every session for a moment: the seen check runs every 2 s in
-// each session with an answer nobody saw, and one ps and one question to Terminal then serve them all. Only for that
-// check: what acts on a window (closing a viewer, a switch) reads the listing right then. Like the session list: stamped
-// when ps came back; a session about to list says so (`pendingAt`), and the others use the stored windows meanwhile;
-// a ps that took longer than SHARED_MS pushes every session's next one back (twice its time, up to 30 s)
+// The windows listing and the window in front, shared by every session for the seen check: one ps then serves every
+// session for SEEN_WINDOWS_MS (5 s in the first minute after a finish; which windows are open changes rarely, and
+// arriving in a session marks it seen without it), and one question to Terminal for FRONT_SHARED_MS, a little under
+// the fastest pace of the check. Only for that
+// check: what acts on a window (closing a viewer, a switch) reads the listing right then. Like the session list:
+// stamped when ps came back; a session about to list says so (`pendingAt`), and the others use the stored windows
+// meanwhile; a ps that took longer than SHARED_MS pushes every session's next one back (twice its time, up to 30 s)
 const SHARED_MS = 1500
+const SEEN_WINDOWS_MS = 30000
+const FRONT_SHARED_MS = 1900
 const WINDOWS_PENDING_MS = 10000
+// Two questions to Terminal at most (the front window, an agent view's text), 8 s each at most
+const FRONT_PENDING_MS = 20000
 const WINDOWS_BACKOFF_MAX_MS = 30000
-async function sharedWindows($: any): Promise<Windows> {
+async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<Windows> {
   const now = await $.clock.now()
   const c = await storeGet($, 'windowsList')
   const stored = c && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid ? (c.windows as Windows) : null
   if (stored) {
-    if (now - Number(c.at) < SHARED_MS) return stored
+    if (now - Number(c.at) < maxAge) return stored
     if (typeof c.until === 'number' && now < c.until) return stored
     if (typeof c.pendingAt === 'number' && now - c.pendingAt < WINDOWS_PENDING_MS) return stored
     await storeSet($, 'windowsList', { ...c, pendingAt: now })
@@ -557,13 +701,26 @@ async function sharedWindows($: any): Promise<Windows> {
   return v
 }
 
-async function sharedFront($: any, v: Windows): Promise<string | null> {
+// The window in front ('frontWindow': at, tty, and with an agent view in front, tags: the sessions it shows by their
+// ⟨id⟩ tag, sessionTags), the way the windows listing is shared: `at` is when Terminal answered; a session about to ask
+// says so (`pendingAt`) and the others skip their check meanwhile (the next one is at most a pace away). The session
+// that asks also reads the text of an agent view in front, so the sessions it shows don't each read it: however many
+// sessions are unseen, one question to Terminal (two with an agent view in front) per FRONT_SHARED_MS. null: another
+// session is asking
+type Front = { tty: string | null; tags?: string[] }
+async function sharedFront($: any, v: Windows): Promise<Front | null> {
   const now = await $.clock.now()
   const c = await storeGet($, 'frontWindow')
-  if (c && now - Number(c.at) < SHARED_MS && (typeof c.tty === 'string' || c.tty === null)) return c.tty
+  const isView = (tty: unknown) => typeof tty === 'string' && v.agentsViews.some(a => a.tty === tty)
+  const answered = !!c && typeof c.at === 'number' && (typeof c.tty === 'string' || c.tty === null) && (!isView(c.tty) || Array.isArray(c.tags))
+  if (answered && now - c.at < FRONT_SHARED_MS) return { tty: c.tty, ...(Array.isArray(c.tags) ? { tags: c.tags.map(String) } : {}) }
+  if (c && typeof c.pendingAt === 'number' && now >= c.pendingAt && now - c.pendingAt < FRONT_PENDING_MS) return null
+  await storeSet($, 'frontWindow', { ...(c && typeof c === 'object' ? c : {}), pendingAt: now })
   const tty = await platform.windowInFront(sys($), await shownWindows($, v))
-  await storeSet($, 'frontWindow', { at: now, tty })
-  return tty
+  const tags = tty && isView(tty) ? sessionTags(await platform.readWindow(sys($), tty)) : undefined
+  const front: Front = { tty, ...(tags ? { tags } : {}) }
+  await storeSet($, 'frontWindow', { at: await $.clock.now(), ...front })
+  return front
 }
 
 // The viewers' windows, each with the name of the session it shows (its viewer titles the window with it), for a
@@ -580,37 +737,58 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
 }
 
 // Are you looking at me? Someone at the computer (the platform can tell on macOS: screen unlocked, recent input) and a
-// window in front with one of my viewers, or an agent view showing my tag. A session shown in no window (most
-// background sessions) asks nothing: no question to Terminal, which a quit Terminal would also take as a reason to
-// start. Where the front window can't be known (Linux without X11), a session counts as seen only when you type in it
+// window in front with one of my viewers, or an agent view showing my tag. Only while this session's last answer is
+// unseen, at the pace nextSeenCheck sets (the 2 s timer does nothing between checks), and only a session shown in some
+// window (one of its viewers, or an agent view) asks which window is in front: most background sessions are shown in
+// none, and ask Terminal nothing, which a quit Terminal would also take as a reason to start. Where the front window
+// can't be known (Linux without X11), a session counts as seen only when you type in it, use its panel or arrive there
+// A session no window shows (no viewer of it, no agent view) past the first minute after its answer is checked again a
+// minute later (seenQuietUntil), with a listing up to a minute old: arriving there with ccc or Enter marks it seen anyway
+let seenCheckedAt = 0
+let seenQuietUntil = 0
 async function markSeenIfLooking($: any) {
   if (!platform.frontKnown) return
-  const finished = (await readState($, myId))?.finished ?? 0
-  const seen = await seenAt($, myId)
+  const { finished, seen } = await ownSeenState($)
   if (finished <= seen) return
-  const v = await sharedWindows($)
+  const now = await $.clock.now()
+  if (now < nextSeenCheck(finished, seenCheckedAt) || now < seenQuietUntil) return
+  seenCheckedAt = now
+  // In the first minute after a finish the person may well be opening a window on it: a listing at most 5 s old then;
+  // a minute old once the answer is 10 minutes old, or when no window showed this session last time
+  const age = now - finished
+  const v = await sharedWindows($, age < 60000 ? 5000 : age >= 600000 || seenQuietUntil > 0 ? 2 * SEEN_WINDOWS_MS : SEEN_WINDOWS_MS)
   const mine = myWindowsIn(v)
+  seenQuietUntil = mine.length === 0 && v.agentsViews.length === 0 && age >= 60000 ? now + 60000 : 0
   if (mine.length === 0 && v.agentsViews.length === 0) return
-  const tty = await sharedFront($, v)
+  const front = await sharedFront($, v)
+  const tty = front?.tty
   if (!tty) return
-  let looking = mine.includes(tty)
-  if (!looking && v.agentsViews.some(c => c.tty === tty)) {
-    looking = (await platform.readWindow(sys($), tty)).includes(`⟨${myShortId()}⟩`)
-  }
+  const looking = mine.includes(tty) || (v.agentsViews.some(c => c.tty === tty) && !!front.tags?.includes(myShortId()))
   if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
 
+// The person is at this session right now (arrived from another panel or with ccc, or pressing keys in its panel):
+// what it last answered is seen, with no check
+async function seenNow($: any) {
+  if (!myId) return
+  const { finished, seen } = await ownSeenState($)
+  if (finished > seen) await storeSet($, `seen:${myId}`, await $.clock.now())
+}
+
 // The official list (claude agents --json --all), shared by every session through the store ('list': { at, sessions,
-// until? }). One listing at a time: in a session, callers share the one in flight; across sessions, whoever takes
+// sig?, until? }). One listing at a time: in a session, callers share the one in flight; across sessions, whoever takes
 // <data>/list.lock runs it, and the others read the stored list, however old, until it lands. `at` is when the listing
-// came back, never when it started. A listing that took longer than LIST_MS, or failed, pushes every session's next one
+// came back, never when it started; `sig`, what Claude's registry and the service's folder looked like just before it
+// started (listSignature). A stored list serves while nothing it's made of moved (listHolds: up to LIST_QUIET_MS), so
+// an idle machine lists about twice a minute, and a change (a session turning busy or idle, starting, ending, renamed)
+// is listed at the next refresh. A listing that took longer than LIST_MS, or failed, pushes every session's next one
 // back (`until`: twice its time, up to LIST_BACKOFF_MAX_MS): a slow machine (after a sleep, under an endpoint scanner
 // that checks every exec) isn't flooded with more listings, each slower than the last
-const LIST_MS = 3500
 const LIST_BACKOFF_MAX_MS = 60000
 const LIST_LOCK_STALE_MS = 30000
 const LIST_WAIT_MS = 15000
 type Listed = { sessions: any[]; at: number }
+type Stored = Listed & { sig?: string; until?: number }
 let listing: Promise<Listed | string> | null = null
 
 async function officialList($: any, maxAge = LIST_MS): Promise<any[] | string> {
@@ -618,18 +796,36 @@ async function officialList($: any, maxAge = LIST_MS): Promise<any[] | string> {
   return typeof r === 'string' ? r : r.sessions
 }
 
-async function storedList($: any): Promise<(Listed & { until?: number }) | null> {
+async function storedList($: any): Promise<Stored | null> {
   const c = await storeGet($, 'list')
-  return c && Array.isArray(c.sessions) && typeof c.at === 'number' ? (c as Listed & { until?: number }) : null
+  return c && Array.isArray(c.sessions) && typeof c.at === 'number' ? (c as Stored) : null
+}
+
+// What the session list is made of, as Claude's files show it right now (listSignature): its registry folder
+// (~/.claude/sessions, read only) and the service's job folders, one fs.list each. null when it can't tell
+async function registrySignature($: any): Promise<string | null> {
+  if (!home) return null
+  let registry: ListedFile[]
+  try {
+    registry = (await $.fs.list(`${home}/.claude/sessions`)).map((f: any) => ({ name: String(f.name), mtimeMs: Number(f.mtimeMs), size: Number(f.size) }))
+  } catch {
+    return null
+  }
+  let jobs: { name: string }[] = []
+  try {
+    if (jobsDir) jobs = (await $.fs.list(jobsDir)).map((f: any) => ({ name: String(f.name) }))
+  } catch {}
+  return listSignature(registry, jobs, myPid)
 }
 
 // The list with when it was read. maxAge: how old a stored one may be (0 for one read now, as a restart's question
 // wants); a caller that wants it fresh checks `at` itself, since another session's listing may be the one in flight
 async function listWithAge($: any, maxAge = LIST_MS): Promise<Listed | string> {
+  const direct = await directListed($, maxAge)
+  if (direct) return direct
   const now = await $.clock.now()
   const c = await storedList($)
-  if (c && now - c.at < maxAge) return c
-  if (c && maxAge >= LIST_MS && typeof c.until === 'number' && now < c.until) return c
+  if (listHolds(c, now, maxAge, c && maxAge >= LIST_MS && typeof c.sig === 'string' ? await registrySignature($) : null)) return c as Stored
   if (!listing) listing = fetchList($, maxAge).finally(() => (listing = null))
   return listing
 }
@@ -662,10 +858,12 @@ async function fetchList($: any, maxAge: number): Promise<Listed | string> {
     }
   }
   try {
-    // Read again under the lock: the session that held it before may have just stored a fresh one
+    // Read again under the lock: the session that held it before may have just stored a fresh one. The signature is
+    // taken before the listing starts, so a change while it runs is listed again next time
     const started = await $.clock.now()
+    const sig = await registrySignature($)
     const c = await storedList($)
-    if (c && started - c.at < maxAge) return c
+    if (listHolds(c, started, maxAge, sig)) return c as Stored
     const r = await run($, [claude, 'agents', '--json', '--all'])
     const list = r.exitCode !== 0 ? "Couldn't read the session list (claude agents --json)" : validateList(r.stdout)
     if (typeof list === 'string') {
@@ -677,7 +875,7 @@ async function fetchList($: any, maxAge: number): Promise<Listed | string> {
     }
     const at = await $.clock.now()
     const took = at - started
-    await storeSet($, 'list', { at, sessions: list, ...(took > LIST_MS ? { until: at + Math.min(LIST_BACKOFF_MAX_MS, 2 * took) } : {}) })
+    await storeSet($, 'list', { at, sessions: list, ...(sig ? { sig } : {}), ...(took > LIST_MS ? { until: at + Math.min(LIST_BACKOFF_MAX_MS, 2 * took) } : {}) })
     return { sessions: list, at }
   } finally {
     if (holding) await runSafe($, ['rmdir', lock])
@@ -687,24 +885,500 @@ async function fetchList($: any, maxAge: number): Promise<Listed | string> {
 // After a start, a stop or a restart the list is out of date: the next caller reads it again (under the lock), and the
 // stored sessions still serve the others meanwhile
 async function invalidateList($: any) {
+  if (sessionFiles) sessionFiles.syncedAt = 0
+  if (!slowList && sessionFiles?.usable(myId, myPid)) return
   const c = await storedList($)
   await storeSet($, 'list', c ? { at: 0, sessions: c.sessions } : {})
 }
 
-// The heartbeats of the sessions in a list, by sessionId (only the ones that exist and parse)
+// The list from Claude's files (watch.ts), with no command: what every caller gets while those files can stand for
+// `claude agents` (SessionFiles.usable). Watched, they're as fresh as the last file event, read again only when a
+// caller asks for a list younger than the panel's pace (a restart's question) and on the pass; on the short timer, read
+// again when older than maxAge. null: the list is read the slow way
+async function directListed($: any, maxAge: number): Promise<Listed | null> {
+  if (!sessionFiles || !myId) return null
+  const now = await $.clock.now()
+  const limit = live && maxAge >= LIST_MS ? PASS_MS : maxAge
+  if (sessionFiles.syncedAt === 0 || now - sessionFiles.syncedAt >= limit) await syncFiles($)
+  const usable = sessionFiles.usable(myId, myPid)
+  if (slowList !== !usable) {
+    slowList = !usable
+    debugLine($, slowList ? `list: the slow way (${sessionFiles.problem || "this session isn't in Claude's registry"})` : "list: from Claude's files")
+    setPace($)
+  }
+  return usable ? { sessions: sessionFiles.list(), at: sessionFiles.syncedAt } : null
+}
+
+// Claude's files read again (watch.ts): the registry (only what moved), and the service's stopped jobs (all of them on
+// a full pass; else the new ones and those whose session just left the registry). What moved, for the caller
+let retrying = false
+async function syncFiles($: any, full = false): Promise<RegistryNews | null> {
+  if (!sessionFiles) return null
+  const news = await syncRegistry($, sessionFiles)
+  if (locations.jobs) {
+    let names: string[] = []
+    try {
+      names = jobIds(await $.fs.list(locations.jobs))
+    } catch {}
+    for (const id of sessionFiles.jobsToCheck(names, full, news.left)) {
+      const path = `${locations.jobs}/${id}/state.json`
+      let st: { mtimeMs: number; size: number } | null = null
+      try {
+        const s = await $.fs.stat(path)
+        st = { mtimeMs: Number(s.mtimeMs), size: Number(s.size) }
+      } catch {}
+      if (!sessionFiles.jobMoved(id, st) || !st) continue
+      try {
+        sessionFiles.setJob(id, st, JSON.parse(String(await $.fs.read(path))))
+      } catch {}
+    }
+  }
+  // A file cut short while Claude rewrote it: read again in a moment (not at once: a read in the same instant would
+  // find it cut short again, and twice is a format the panel can't read)
+  if (sessionFiles.retry && !retrying) {
+    retrying = true
+    $.clock.after(300, () => {
+      retrying = false
+      scheduleFlush($, 0, d => (d.registry = true))
+    })
+  }
+  if (news.bridge) leaderNews.bridge = true
+  if (news.ended) leaderNews.ended = true
+  return news
+}
+
+// The registry read again: one listing of its folder, and only the files that moved
+async function syncRegistry($: any, files: SessionFiles): Promise<RegistryNews> {
+  let listed: FileListed[] | null = null
+  try {
+    listed = (await $.fs.list(files.locations.registry)).map((f: any) => ({ name: String(f?.name ?? ''), mtimeMs: Number(f?.mtimeMs), size: Number(f?.size) }))
+  } catch {}
+  const texts = new Map<string, string | null>()
+  for (const name of listed ? files.toRead(listed) : []) {
+    try {
+      texts.set(name, String(await $.fs.read(`${files.locations.registry}/${name}`)))
+    } catch {
+      texts.set(name, null)
+    }
+  }
+  return files.applyRegistry(listed, texts, await $.clock.now())
+}
+
+// ---- Push: file events, the pass, the short timer, the leader ----
+
+// What the file events since the last read said (classify in watch.ts): read in one go a moment later (flush), so the
+// events of one change come together (a turn's registry write and its bell; the engine already folds a burst of writes
+// to one file into one event)
+type Dirty = { registry: boolean; bells: Set<string>; inbox: boolean; tell: boolean; pins: boolean; job: boolean; rows: boolean; all: boolean }
+const noDirt = (): Dirty => ({ registry: false, bells: new Set(), inbox: false, tell: false, pins: false, job: false, rows: false, all: false })
+const isDirty = (d: Dirty) => d.registry || d.bells.size > 0 || d.inbox || d.tell || d.pins || d.job || d.rows || d.all
+let dirty = noDirt()
+let flushTimer: { cancel: () => void } | null = null
+let flushing = false
+// What the leader's next turn hears about: a Remote Control connection came or went, a turn ended somewhere
+let leaderNews = { bridge: false, ended: false }
+
+function fileChanged($: any, path: string, event: string) {
+  const c = classify(path, locations)
+  if (!c) return
+  scheduleFlush($, 30, d => {
+    if (c.kind === 'registry') d.registry = true
+    else if (c.kind === 'bell') d.bells.add(c.name)
+    else if (c.kind === 'inbox') d.inbox ||= c.id === myId && event !== 'unlink'
+    // ccc tell's requests for this session (its .status files are this session's own writes)
+    else if (c.kind === 'tell') d.tell ||= event !== 'unlink' && !c.file.endsWith('.status')
+    else if (c.kind === 'pins') d.pins = true
+    else d.job = true
+  })
+}
+
+// A read already due later (a retry 300 ms out) is brought forward by an event that wants it sooner. Without the
+// clock's time at hand, ms says how soon: a flush asked within less than the one pending is set again
+let flushIn = 0
+function scheduleFlush($: any, ms: number, mark: (d: Dirty) => void) {
+  mark(dirty)
+  if (flushing || (flushTimer && flushIn <= ms)) return
+  flushTimer?.cancel()
+  flushIn = ms
+  flushTimer = $.clock.after(ms, () => {
+    flushTimer = null
+    bg(flush($))
+  })
+}
+
+async function flush($: any) {
+  if (flushing) return
+  flushing = true
+  try {
+    for (let round = 0; round < 3 && isDirty(dirty); round++) {
+      const d = dirty
+      dirty = noDirt()
+      if (d.inbox || d.all) bg(solo('inbox', () => checkInbox($)))
+      if (d.tell || d.all) bg(solo('tells', () => checkTells($)))
+      let redraw = d.rows || d.pins || d.job || d.all
+      if (d.registry || d.all) {
+        const problem = sessionFiles?.problem ?? ''
+        const news = await syncFiles($, d.all)
+        // A file the panel can't read, or one it can again: the list from claude agents, or from the files
+        if ((sessionFiles?.problem ?? '') !== problem) redraw = true
+        if (news?.changed.size) {
+          // A session's status moved: its record is read again with it (its turn's start or end). The list other
+          // plugins' calls answer from follows sessions of every folder, the rows only this project's
+          for (const id of news.changed) forgetStored(k => k.endsWith(`:${id}`))
+          redraw ||= [...news.changed].some(inThisProject)
+          if (!redraw && sessionFiles && !slowList && sessionFiles.usable(myId, myPid)) lastList = sessionFiles.list()
+        }
+        // Who leads changes only when a session comes or goes; what the leader does, when a turn ends or Remote Control
+        // moves (the rest waits for the pass)
+        if (news && (news.membership || (leading && (news.bridge || news.ended)))) bg(solo('leader', () => leaderTurn($, 'event')))
+      }
+      for (const name of d.bells) {
+        if (name === 'marks') forgetStored(k => k.startsWith('marks:'))
+        else if (name === 'prefs') forgetStored(k => k === 'waitingOnly' || k === 'collapsed')
+        else if (name === 'usage') bg(readUsage($, USAGE_FOLLOWER_MS))
+        else if (name.startsWith('answer-')) {
+          // The answer to this session's Stop or Restart question, left in the store
+          if (name === `answer-${myId}` && pendingAsk) {
+            forgetStored(k => k === `answer:${myId}`)
+            bg(solo('answer', () => checkStoredAnswer($)))
+          }
+          continue
+        } else if (name !== 'sections' && name !== 'pins') {
+          // A session's own record, seen or title: read again, unless this session rang it itself
+          if (name === myId && (await bellRinger($, name)) === myId) continue
+          forgetStored(k => k.endsWith(`:${name}`))
+          if (!inThisProject(name)) continue
+        }
+        redraw = true
+      }
+      if (redraw) await requestRefresh($)
+    }
+  } finally {
+    flushing = false
+    if (isDirty(dirty)) scheduleFlush($, 30, () => {})
+  }
+}
+
+// Whether a session is drawn here: this one, one of the project's (as the list has it now), or one the list doesn't
+// have yet (just started)
+function inThisProject(sessionId: string): boolean {
+  if (sessionId === myId || projectRows.some(f => f.sessionId === sessionId)) return true
+  const s = (sessionFiles && !slowList ? sessionFiles.list() : lastList).find(x => x.sessionId === sessionId)
+  return !s || (typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home))
+}
+
+async function bellRinger($: any, name: string): Promise<string> {
+  try {
+    return bellFrom(String(await $.fs.read(`${dataDir}/bell/${name}`)))
+  } catch {
+    return ''
+  }
+}
+
+// One refresh at a time; one asked for while it runs runs once more after it (a file event never goes unread), and the
+// caller waits for that one: an older refresh never lands after a newer one. The person is told of long waits
+// (pushWaits) after a refresh from the mod's own timers and file events, never from an action's or a turn's hook (push
+// false)
+let refreshRun: Promise<void> | null = null
+let refreshAgain = false
+let refreshPush = false
+function requestRefresh($: any, push = true): Promise<void> {
+  refreshPush ||= push
+  if (refreshRun) {
+    refreshAgain = true
+    return refreshRun
+  }
+  const runs = async () => {
+    try {
+      do {
+        refreshAgain = false
+        await refresh($)
+        const pushing = refreshPush
+        refreshPush = false
+        if (pushing) await pushWaits($)
+      } while (refreshAgain)
+    } finally {
+      refreshRun = null
+    }
+  }
+  refreshRun = runs()
+  return refreshRun
+}
+
+// The pass: every PASS_MS in every session, from an offset of its own. Everything read again, whatever the events said
+// (a missed event costs at most a pass), the leader's turn, and while watched what the short timer does otherwise
+async function pass($: any) {
+  storeCache.clear()
+  await syncFiles($, true)
+  await requestRefresh($)
+  await solo('leader', () => leaderTurn($, 'pass'))
+  if (!live) return
+  // The requests and the queues another plugin fills, as the short timer would (a missed event, or a queue whose kick
+  // never came, waits a pass at most)
+  quickTick($)
+  bg(readUsage($, USAGE_FOLLOWER_MS))
+  await chores($)
+  bg(scheduleSeen($))
+}
+
+// What the 15 s timer did besides the heartbeat: a /clear's new id, the agent, the session's usage and spend, the
+// update in place. Watched, once a pass; on the short timer, every 15 s
+async function chores($: any) {
+  await rebind($)
+  await readAgent($)
+  await publishUsage($)
+  bg(notifySpend($))
+  await updateInPlace($)
+}
+
+// The short timer, while the engine watches nothing for this session (no SessionStart of this WATCH_SET came: updated
+// in place from an older version, or a host that never sends it), as the panel ran before: requests every 0.5 s, the
+// list every 3 s, the seen check every 2 s, the chores every 15 s, the leader's turn every 20 s, the token usage every
+// minute. Watched with a list that can't be read from Claude's files (slowList), only the list every 3 s
+let pollTimers: { cancel: () => void }[] = []
+let slowTimer: { cancel: () => void } | null = null
+function setPace($: any) {
+  if (!active) return
+  if (!live && pollTimers.length === 0) {
+    pollTimers = [
+      $.clock.every(500, () => quickTick($)),
+      $.clock.every(3000, () => {
+        bg(pollRefresh($))
+      }),
+      $.clock.every(2000, () => {
+        bg(
+          solo('seen', async () => {
+            if (await justWoke($)) return
+            await markSeenIfLooking($)
+          }),
+        )
+      }),
+      $.clock.every(15000, () => {
+        bg(chores($))
+      }),
+      $.clock.every(20000, () => {
+        bg(solo('leader', () => leaderTurn($, 'tick')))
+      }),
+      $.clock.every(60000, () => {
+        bg(readUsage($))
+      }),
+    ]
+  }
+  if (live && pollTimers.length) {
+    for (const t of pollTimers) t.cancel()
+    pollTimers = []
+  }
+  const slow = live && slowList
+  if (slow && !slowTimer) {
+    slowTimer = $.clock.every(3000, () => {
+      bg(pollRefresh($))
+    })
+  }
+  if (!slow && slowTimer) {
+    slowTimer.cancel()
+    slowTimer = null
+  }
+}
+
+// The requests the short timer looks for, and the queues other plugins fill (also run at once when filled: kickQueue)
+function quickTick($: any) {
+  bg(solo('answer', () => checkStoredAnswer($)))
+  bg(solo('inbox', () => checkInbox($)))
+  bg(runLaunches($))
+  bg(runWakes($))
+  bg(runRestarts($))
+  bg(solo('tells', () => checkTells($)))
+}
+
+// The list on the short timer: after a sleep this session's own offset first (justWoke); with nothing watched, what
+// other sessions wrote in the store is read anew every time
+async function pollRefresh($: any) {
+  if (refreshRun || (await justWoke($))) return
+  if (!live) storeCache.clear()
+  // The poll is what reads the files: Claude's registry anew every time
+  await syncFiles($)
+  await requestRefresh($)
+}
+
+// A start, a wake or a restart another plugin queued ($.sessions.start, wake, restart) runs at once, from this mod's own
+// timer (set at start)
+let kickQueue: () => void = () => {}
+
+// The rows' times, watched: one timer for the next moment one of them changes (nextLabelChange)
+let labelTimer: { cancel: () => void } | null = null
+let labelAt = 0
+function scheduleLabel($: any, next: number, now: number) {
+  if (!live || !Number.isFinite(next)) return
+  if (labelTimer && labelAt === next) return
+  labelTimer?.cancel()
+  labelAt = next
+  labelTimer = $.clock.after(Math.max(1000, next - now + 50), () => {
+    labelTimer = null
+    labelAt = 0
+    bg(requestRefresh($))
+  })
+}
+
+// The seen check, watched: a timer only while this session's last answer is unseen, at the check's own pace
+// (nextSeenCheck): none at all once it's seen
+let seenTimer: { cancel: () => void } | null = null
+async function scheduleSeen($: any) {
+  if (!live || !platform.frontKnown || !myId) return
+  const { finished, seen } = await ownSeenState($)
+  seenTimer?.cancel()
+  seenTimer = null
+  if (finished <= seen) return
+  const due = Math.max(nextSeenCheck(finished, seenCheckedAt), seenQuietUntil)
+  seenTimer = $.clock.after(Math.max(0, due - (await $.clock.now())), () => {
+    seenTimer = null
+    bg(
+      solo('seen', async () => {
+        await markSeenIfLooking($)
+        await scheduleSeen($)
+      }),
+    )
+  })
+}
+
+// ---- The leader (leader.ts) ----
+
+// Who can lead: the sessions Claude's registry has running whose heartbeat here is fresh, of this format and process,
+// and from a version that leads
+async function leaderCandidates($: any, now: number): Promise<Candidate[]> {
+  const running = (sessionFiles && !slowList ? sessionFiles.list() : lastList).filter(s => typeof s.sessionId === 'string' && typeof s.pid === 'number' && s.pid > 0)
+  const beats = await readHeartbeats($, running.map(s => s.sessionId))
+  return running
+    .filter(s => {
+      const h = beats[s.sessionId]
+      return !!h && heartbeatStatus(h, s.pid, now) === 'ok' && leads(h.version)
+    })
+    .map(s => ({ pid: s.pid, sessionId: s.sessionId }))
+}
+
+// The leader's turn: who leads (electLeader), and, leading, the record rewritten and what's due. On the pass and the
+// short timer's tick: the listing (a pass apart), the pins, the reopen, the prune; on a file event: the listing when it
+// just took over, the pins when a Remote Control connection moved, the token usage when a turn ended (two minutes
+// apart at least, and every 10 minutes)
+async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
+  if (!dataDir || !myId || !myPid) return
+  const now = await $.clock.now()
+  let text: string | null = null
+  try {
+    text = String(await $.fs.read(`${dataDir}/leader.json`))
+  } catch {}
+  const record = parseLeader(text)
+  const e = electLeader({ pid: myPid, sessionId: myId }, await leaderCandidates($, now), record, now)
+  const first = e.lead && !leading
+  if (e.lead !== leading || e.takeover) debugLine($, e.lead ? `leader: this session (${why}${e.takeover ? `, in place of pid ${record?.pid}` : ''})` : `leader: pid ${e.leader}`)
+  leading = e.lead
+  leaderElsewhere = !e.lead
+  if (!e.lead) return
+  if (first || record?.pid !== myPid || now - leaderWrittenAt >= PASS_MS / 2) {
+    try {
+      await $.fs.write(`${dataDir}/leader.json`, leaderText({ pid: myPid, sessionId: myId, at: now }))
+      leaderWrittenAt = now
+    } catch {}
+  }
+  const news = leaderNews
+  leaderNews = { bridge: false, ended: false }
+  const timed = why === 'pass' || why === 'tick' || why === 'start'
+  if (!slowList && sessionFiles && (e.takeover || first || (timed && now - reconciledAt >= PASS_MS - 5000))) await reconcile($)
+  if (timed || news.bridge) bg(pinRemoteSessions($))
+  if (timed) bg(reopenRetiredSessions($))
+  if (timed) bg(prune($))
+  if (live && ((news.ended && now - usageRunAt >= 120000) || now - usageRunAt >= 600000)) {
+    usageRunAt = now
+    bg(readUsage($, news.ended ? 120000 : 600000, true))
+  }
+}
+
+// The leader's listing (claude agents --json --all), a pass apart: Claude removes the registry files of sessions whose
+// process is gone as it lists (a crashed one's file stays until then), and what it lists is checked against the direct
+// read, any difference said in the debug log
+async function reconcile($: any) {
+  reconciledAt = await $.clock.now()
+  const r = await run($, [claude, 'agents', '--json', '--all'])
+  if (r.exitCode !== 0) return
+  const official = validateList(r.stdout)
+  if (typeof official === 'string') return
+  const drift = listDrift(sessionFiles?.list() ?? [], official)
+  if (drift) debugLine($, `reconcile: ${drift}`)
+  // The files it swept: their events come; read again in a moment all the same
+  scheduleFlush($, 300, d => (d.registry = true))
+}
+
+// ---- What the engine watches (watch.ts) ----
+
+// Where the watched files are, also before the mod has started here (SessionStart can come first)
+async function locationsOf($: any): Promise<Locations> {
+  if (locations.registry) return locations
+  const h = (await $.env.get('HOME')) ?? ''
+  return {
+    registry: (await $.env.get('SESSIONS_REGISTRY_DIR')) || (h ? `${h}/.claude/sessions` : ''),
+    data: (await $.env.get('SESSIONS_DATA_DIR')) || (h ? `${h}/.claude/mods/sessions-data` : ''),
+    jobs: (await $.env.get('SESSIONS_JOBS_DIR')) || (h ? `${h}/.claude/jobs` : ''),
+  }
+}
+
+// This session's background job, if it's one: the folder Claude names in CLAUDE_JOB_DIR, else its record in the
+// registry
+async function ownJobOf($: any, l: Locations, sessionId: string): Promise<string | null> {
+  const dir = String((await $.env.get('CLAUDE_JOB_DIR')) ?? '').replace(/\/+$/, '')
+  const named = dir.split('/').pop() ?? ''
+  if (/^[A-Za-z0-9_-]+$/.test(named)) return named
+  const files = sessionFiles ?? new SessionFiles(l)
+  if (files.syncedAt === 0) await syncRegistry($, files)
+  const own = files.entries().find(e => e.sessionId === sessionId)
+  return own?.kind === 'bg' && own.jobId ? own.jobId.slice(0, 8) : null
+}
+
+// classic.SessionStart (a start, /clear, a compaction, a resume): the paths for the engine to watch, from now on in
+// this session (watchPaths in watch.ts), and it's live: the short timer stops. After /clear or a resume the session's
+// new id comes with it, which the mod follows at once
+async function watchFor($: any, sessionId: string, source: string): Promise<string[]> {
+  const l = await locationsOf($)
+  if (!l.registry || !l.data) return []
+  ownJob = (await ownJobOf($, l, sessionId)) ?? ownJob
+  const paths = watchPaths(l, ownJob)
+  const was = live
+  live = true
+  {
+    const next = { set: WATCH_SET, sessionId, at: await $.clock.now() }
+    await update($, watching, () => next)
+  }
+  debugLine($, `watching ${paths.length} paths (${source || 'start'}${was ? '' : ', live now'})`)
+  if (active) {
+    setPace($)
+    if ((source === 'clear' || source === 'resume') && sessionId && sessionId !== myId) bg(rebind($))
+    scheduleFlush($, 0, d => (d.all = true))
+  }
+  return paths
+}
+
+// The heartbeats of the sessions in a list, by sessionId (only the ones that exist and parse). The folder's listing
+// gives each file's time and size: a heartbeat that didn't move since the last read isn't read again
+const beatCache = new Map<string, { mtimeMs: number; size: number; beat: Heartbeat | null }>()
 async function readHeartbeats($: any, ids: string[]): Promise<Record<string, Heartbeat>> {
   const out: Record<string, Heartbeat> = {}
   if (!dataDir) return out
-  let names: Set<string>
+  let files: Map<string, { mtimeMs: number; size: number }>
   try {
-    names = new Set((await $.fs.list(`${dataDir}/alive`)).map((f: any) => String(f.name)))
+    files = new Map((await $.fs.list(`${dataDir}/alive`)).map((f: any) => [String(f.name), { mtimeMs: Number(f.mtimeMs), size: Number(f.size) }]))
   } catch {
     return out
   }
   for (const id of ids) {
-    if (!names.has(id)) continue
+    const f = files.get(id)
+    if (!f) continue
+    const held = beatCache.get(id)
+    if (held && held.mtimeMs === f.mtimeMs && held.size === f.size) {
+      if (held.beat) out[id] = held.beat
+      continue
+    }
     try {
       const h = parseHeartbeat(await $.fs.read(`${dataDir}/alive/${id}`))
+      if (beatCache.size > 500) beatCache.clear()
+      beatCache.set(id, { ...f, beat: h })
       if (h) out[id] = h
     } catch {}
   }
@@ -815,61 +1489,133 @@ async function usablePython($: any): Promise<string | null> {
   return (python = path)
 }
 
+// Every session with the panel open wants the same totals once a minute: usage.py leaves what it answered in
+// <data>/usage/summary.json (touched on every run, rewritten only when it changed), and a session finding one from the
+// last USAGE_SHARED_MS reads it instead of running usage.py. The panel's value is rewritten only when the totals
+// changed Watched, the leader alone runs usage.py (after a turn ended somewhere, two minutes apart at least, and every
+// 10 minutes: leaderTurn) and rings the usage bell when the totals changed; the others read its summary then, and run
+// usage.py themselves only when it's older than USAGE_FOLLOWER_MS (no leader kept it)
+const USAGE_SHARED_MS = 50000
+const USAGE_FOLLOWER_MS = 900000
+async function sharedUsage($: any, maxAge: number): Promise<UsageSummary | null> {
+  try {
+    const path = `${dataDir}/usage/summary.json`
+    const st = await $.fs.stat(path)
+    if ((await $.clock.now()) - Number(st.mtimeMs) > maxAge) return null
+    return usageSummaryOf(JSON.parse(String(await $.fs.read(path))))
+  } catch {
+    return null
+  }
+}
+
+// The usage block's totals: the summary in <data>/usage if it's at most maxAge old, else usage.py run here. Only with
+// the panel open, unless always (the leader's run)
 let readingUsage = false
-async function readUsage($: any) {
+async function readUsage($: any, maxAge = USAGE_SHARED_MS, always = false) {
   if (readingUsage || !home || !dataDir) return
-  if (!(await $.ui.panes()).some((p: any) => p.id === PANE)) return
+  if (!always && !(await $.ui.panes()).some((p: any) => p.id === PANE)) return
   readingUsage = true
   try {
-    const py = await usablePython($)
-    if (!py) {
-      await update($, usage, () => ({ summary: null, note: 'Token usage needs python3' }))
-      return
+    const before = await read($, usage)
+    let next: Usage
+    const shared = await sharedUsage($, maxAge)
+    const py = shared ? null : await usablePython($)
+    if (shared) next = { summary: shared, note: '' }
+    else if (!py) next = { summary: null, note: 'Token usage needs python3' }
+    else {
+      const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`], { timeoutMs: 120000 })
+      let summary: UsageSummary | null = null
+      try {
+        if (r.exitCode === 0) summary = usageSummaryOf(JSON.parse(r.stdout))
+      } catch {}
+      next = summary ? { summary, note: '' } : { summary: before.summary, note: before.summary ? '' : "Couldn't read token usage" }
+      // New totals: the other panels read them
+      if (summary && !sameData(before.summary, summary)) bg(ring($, 'usage'))
     }
-    const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`], { timeoutMs: 120000 })
-    let summary: UsageSummary | null = null
-    try {
-      const d = JSON.parse(r.stdout)
-      if (r.exitCode === 0 && d?.format === FORMAT && typeof d?.today === 'string' && typeof d?.hour === 'string' && d.days && d.hours) summary = d
-    } catch {}
-    await update($, usage, previous => (summary ? { summary, note: '' } : { summary: previous.summary, note: previous.summary ? '' : "Couldn't read token usage" }))
+    if (!sameData(await read($, usage), next)) await update($, usage, () => next)
   } finally {
     readingUsage = false
   }
 }
 
 // The chosen period and scope are remembered (and apply to all sessions)
-async function chooseUsageView($: any, change: Partial<UsageView>) {
-  const next = { ...(await read($, usageView)), ...change }
-  await update($, usageView, () => next)
+async function chooseUsageView($: any, choice: Partial<UsageView>) {
+  const next = { ...(await read($, usageView)), ...choice }
+  if (!sameData(await read($, usageView), next)) await update($, usageView, () => next)
   await storeSet($, 'usageView', next)
 }
 
-// What `claude --version` says, once every 5 minutes for all sessions (shared through the store)
-async function readInstalledVersion($: any): Promise<string> {
+// What `claude --version` and `claude plugin list --json` say, shared by every session through the store for
+// INSTALLED_MS ('installed': at, version; 'plugin': at, plugin), like the windows listing: `at` is when the command came
+// back; a session about to run one says so (`pendingAt`), and the others use the stored answer meanwhile, however old
+// (none stored: what they'd answer without one). One that failed keeps the answer it had, stamped when it failed, so
+// it's tried again INSTALLED_MS later, not at every refresh of every session. While another session leads (leader.ts:
+// as this session last saw it, a sleep in between or not) only the leader runs them, at its own refresh, a pass apart
+// at most, and the others read what it stored, unless nothing is or it's INSTALLED_ORPHAN_MS old (a leader that doesn't
+// keep it: one of another version, or one with a store of its own). In this session, callers share the run in flight.
+// What was read stays good here until its INSTALLED_MS are up, with no store read meanwhile
+const INSTALLED_MS = 300000
+const INSTALLED_PENDING_MS = 30000
+const INSTALLED_ORPHAN_MS = 3 * INSTALLED_MS
+type Answer = { at?: number; pendingAt?: number; [field: string]: unknown }
+const answering = new Map<string, Promise<Answer | null>>()
+async function sharedAnswer($: any, key: 'installed' | 'plugin', ask: () => Promise<Record<string, unknown> | null>): Promise<Answer | null> {
   const now = await $.clock.now()
-  const c = await storeGet($, 'installed')
-  if (c && now - c.at < 300000 && typeof c.version === 'string') return c.version
-  const r = await run($, [claude, '--version'])
-  const v = r.exitCode === 0 ? parseVersion(r.stdout) : null
-  if (v) await storeSet($, 'installed', { at: now, version: v })
-  return v ?? (typeof c?.version === 'string' ? c.version : '')
+  const c = await storeGet($, key)
+  const stored: Answer | null = c && typeof c === 'object' ? (c as Answer) : null
+  const at = typeof stored?.at === 'number' ? stored.at : null
+  const age = at === null || now < at ? Infinity : now - at
+  if (age < INSTALLED_MS) return stored
+  const pendingAt = typeof stored?.pendingAt === 'number' ? stored.pendingAt : null
+  if (pendingAt !== null && now >= pendingAt && now - pendingAt < INSTALLED_PENDING_MS) return stored
+  if (leaderElsewhere && age < INSTALLED_ORPHAN_MS) return stored
+  let inFlight = answering.get(key)
+  if (!inFlight) {
+    inFlight = (async () => {
+      await storeSet($, key, { ...(stored ?? {}), pendingAt: now })
+      const got = await ask()
+      const back = await $.clock.now()
+      const kept: Answer = { ...(stored ?? {}), at: back }
+      delete kept.pendingAt
+      const next = got ? { at: back, ...got } : kept
+      await storeSet($, key, next)
+      return next
+    })().finally(() => answering.delete(key))
+    answering.set(key, inFlight)
+  }
+  return inFlight
 }
 
-// The installed plugin (`claude plugin list --json`), once every 5 minutes for all sessions: which version of the mod
-// sessions start with, and since when, to tell which sessions should have a heartbeat. SESSIONS_PLUGIN_VERSION and
-// SESSIONS_PLUGIN_SINCE (ms) stand in for it in a test session only (a location override beside them); elsewhere they're
-// ccc's, handed on by a background service, and stale after the next update, so the real one is read
+let installedHeld: { at: number; version: string } | null = null
+async function readInstalledVersion($: any): Promise<string> {
+  const now = await $.clock.now()
+  if (installedHeld && now - installedHeld.at < INSTALLED_MS && now >= installedHeld.at) return installedHeld.version
+  const c = await sharedAnswer($, 'installed', async () => {
+    const r = await run($, [claude, '--version'])
+    const version = r.exitCode === 0 ? parseVersion(r.stdout) : null
+    return version ? { version } : null
+  })
+  const version = typeof c?.version === 'string' ? c.version : ''
+  if (typeof c?.at === 'number' && now - c.at < INSTALLED_MS) installedHeld = { at: c.at, version }
+  return version
+}
+
+// The installed plugin (`claude plugin list --json`), shared as above: which version of the mod sessions start with,
+// and since when, to tell which sessions should have a heartbeat. SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE
+// (ms) stand in for it in a test session only (a location override beside them); elsewhere they're ccc's, handed on by
+// a background service, and stale after the next update, so the real one is read
+let pluginHeld: { at: number; plugin: InstalledPlugin | null } | null = null
 async function installedPlugin($: any): Promise<InstalledPlugin | null> {
   const version = (await isTestSession($)) ? await $.env.get('SESSIONS_PLUGIN_VERSION') : ''
   if (version) return { path: '', version, since: Number(await $.env.get('SESSIONS_PLUGIN_SINCE')) || 0 }
   const now = await $.clock.now()
-  const c = await storeGet($, 'plugin')
-  if (c && now - c.at < 300000) return c.plugin ?? null
-  const r = await run($, [claude, 'plugin', 'list', '--json'])
-  if (r.exitCode !== 0) return c?.plugin ?? null
-  const plugin = parsePluginList(r.stdout)
-  await storeSet($, 'plugin', { at: now, plugin })
+  if (pluginHeld && now - pluginHeld.at < INSTALLED_MS && now >= pluginHeld.at) return pluginHeld.plugin
+  const c = await sharedAnswer($, 'plugin', async () => {
+    const r = await run($, [claude, 'plugin', 'list', '--json'])
+    return r.exitCode === 0 ? { plugin: parsePluginList(r.stdout) } : null
+  })
+  const plugin = (c?.plugin as InstalledPlugin | null | undefined) ?? null
+  if (typeof c?.at === 'number' && now - c.at < INSTALLED_MS) pluginHeld = { at: c.at, plugin }
   return plugin
 }
 
@@ -879,10 +1625,14 @@ function pinsPath(): string {
   return `${jobsDir}/pins.json`
 }
 
-async function pinsFromFile($: any): Promise<string[] | null> {
+async function pinsFromFile($: any, fresh = false): Promise<string[] | null> {
   try {
-    if (!(await $.fs.exists(pinsPath()))) return []
-    return parsePins(await $.fs.read(pinsPath()))
+    if (fresh) {
+      if (!(await $.fs.exists(pinsPath()))) return []
+      return parsePins(await $.fs.read(pinsPath()))
+    }
+    const text = await readIfChanged($, pinsPath())
+    return text === null ? [] : parsePins(text)
   } catch {
     return null
   }
@@ -920,14 +1670,18 @@ async function dataFolder($: any): Promise<string> {
 }
 
 // sections.json (see SECTIONS_FORMAT in state.ts): missing is empty; one that can't be read, or from a newer sessions,
-// is a problem and is never rewritten
-async function readSectionsFile($: any): Promise<{ file: SectionsFile } | { problem: string }> {
+// is a problem and is never rewritten. Read again only when it changed, except under its lock (fresh)
+async function readSectionsFile($: any, fresh = false): Promise<{ file: SectionsFile } | { problem: string }> {
   const dir = await dataFolder($)
   if (!dir) return { file: emptySectionsFile() }
   const path = `${dir}/sections.json`
-  if (!(await exists($, path))) return { file: emptySectionsFile() }
   try {
-    return parseSectionsFile(await $.fs.read(path))
+    if (fresh) {
+      if (!(await exists($, path))) return { file: emptySectionsFile() }
+      return parseSectionsFile(await $.fs.read(path))
+    }
+    const text = await readIfChanged($, path)
+    return text === null ? { file: emptySectionsFile() } : parseSectionsFile(text)
   } catch {
     return { problem: "Couldn't read sections.json" }
   }
@@ -949,7 +1703,7 @@ async function changeSections(
     $,
     path,
     async () => {
-      const current = await readSectionsFile($)
+      const current = await readSectionsFile($, true)
       if ('problem' in current) {
         result = { ok: false, reason: 'refused', detail: current.problem }
         return
@@ -971,6 +1725,7 @@ async function changeSections(
     },
     tries,
   )
+  if (result.ok) await ring($, 'sections')
   return result
 }
 
@@ -978,7 +1733,9 @@ async function changeSections(
 // (bridgeSessionId) while it's on, also during a relaunch, and deletes it when it's turned off. null if it couldn't be read
 async function hasRemoteControl($: any, id: string): Promise<boolean | null> {
   try {
-    const e = JSON.parse(await $.fs.read(`${jobsDir}/${id}/state.json`))
+    const text = await readIfChanged($, `${jobsDir}/${id}/state.json`)
+    if (text === null) return null
+    const e = JSON.parse(text)
     return typeof e?.bridgeSessionId === 'string' && e.bridgeSessionId !== ''
   } catch {
     return null
@@ -1000,8 +1757,10 @@ async function writePins($: any, file: string, pins: readonly string[], unpinned
 
 // Background sessions with Remote Control get pinned automatically, so the service doesn't close them after 8 idle
 // hours while you drive them from your phone; when their Remote Control is turned off they get unpinned (only the ones
-// the mod pinned: reconcilePins). Across all folders. Only one session does it every 20 s, the first one that finds the
-// previous pass stale
+// the mod pinned: reconcilePins). Across all folders. Only the leader does it (leader.ts): every pass, and when a
+// Remote Control connection came or went in the registry. What's to change is worked out first from the files as they
+// are; only a pass with something to pin, unpin or record takes the pins lock and works it out again under it (an idle
+// machine runs no command for it)
 let pinning = false
 async function pinRemoteSessions($: any) {
   if (pinning || !jobsDir) return
@@ -1020,8 +1779,18 @@ async function pinRemoteSessions($: any) {
       remote[s.id] = await hasRemoteControl($, s.id)
     }
     const file = pinsPath()
+    const pinsNow = await pinsFromFile($)
+    if (!pinsNow) return
+    const recordNow = await storeGet($, 'autoPins')
+    if (recordNow && Array.isArray(recordNow.ids) && Array.isArray(recordNow.released)) {
+      const kept: AutoPins = { ids: recordNow.ids, released: recordNow.released }
+      const r = reconcilePins(pinsNow, remote, kept)
+      const pluginNow = pluginPinsOf(await storeGet($, 'pluginPins'))
+      const k = keepPluginPins(r, pluginNow, new Set(Object.keys(remote)))
+      if (sameData(k.pins, pinsNow) && sameData(r.auto, kept) && sameData(k.plugin, pluginNow)) return
+    }
     await withLock($, file, async () => {
-      const pins = await pinsFromFile($)
+      const pins = await pinsFromFile($, true)
       if (!pins) return
       // With no record of what the mod pinned (a new store, or a lost one), it's rebuilt from what's there: the pinned
       // sessions with Remote Control on count as the mod's (adoptAutoPins)
@@ -1047,15 +1816,22 @@ async function pinRemoteSessions($: any) {
 // pinned, if memory pressure stays critical) are reopened automatically once memory has been normal for 3 minutes
 // straight, with the same conversation and the same Remote Control address. One per pass, and each one at most 3 times
 // in 2 h (if memory fills up again right away, it doesn't insist). The reason for the closure comes from the service's
-// log: one you stopped, unpinned (Ctrl+T) or that closed for another reason isn't reopened. Only one session does it
-// every 20 s, the first one that finds the previous pass stale, under a lock (<data>/reopen.lock): two sessions whose
-// timers fired together would both respawn the same session, the second cutting the first restart short
+// log: one you stopped, unpinned (Ctrl+T) or that closed for another reason isn't reopened. Only the leader does it
+// (leader.ts), every pass (every 20 s on the short timer), under a lock (<data>/reopen.lock): two sessions that both
+// took the lead for a moment would both respawn the same session, the second cutting the first restart short
+// With no pinned background session lacking a process there's nothing it could reopen: no pass at all then (no memory
+// reading, no lock). Memory counts as normal since the first pass that found it so, among passes no more than two and
+// a half minutes apart (one that comes after a longer gap starts the count again)
 const NORMAL_BEFORE_REOPEN = 180000
 let reopening = false
 async function reopenRetiredSessions($: any) {
   if (reopening || !daemonLog || !dataDir) return
   const first = await storeGet($, 'reopenPass')
   if (first && (await $.clock.now()) - first.at < 15000) return
+  const pinned = new Set((await pinsFromFile($)) ?? [])
+  if (pinned.size === 0) return
+  const list = await officialList($)
+  if (typeof list === 'string' || !list.some(s => s.kind === 'background' && !s.pid && pinned.has(s.id))) return
   reopening = true
   try {
     await withLock($, `${dataDir}/reopen`, () => reopenPass($), 10)
@@ -1070,12 +1846,13 @@ async function reopenPass($: any) {
   const c = await storeGet($, 'reopenPass')
   if (c && now - c.at < 15000) return
   const normal = await platform.memoryNormal(sys($))
-  const normalSince = normal ? (typeof c?.normalSince === 'number' ? c.normalSince : now) : undefined
+  const counting = typeof c?.normalSince === 'number' && now - Number(c.at) <= 150000
+  const normalSince = normal ? (counting ? c.normalSince : now) : undefined
   await storeSet($, 'reopenPass', { at: now, normalSince })
   if (normalSince === undefined || now - normalSince < NORMAL_BEFORE_REOPEN) return
-  const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
-  if (r.exitCode !== 0) return
-  const closed = stopReasons(r.stdout)
+  const r = await daemonLogTail($)
+  if (r === null) return
+  const closed = stopReasons(r)
   if (!Object.values(closed).some(c => c.why === 'low-memory')) return
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const list = await officialList($)
@@ -1103,8 +1880,27 @@ async function reopenPass($: any) {
 async function stopLogNow($: any): Promise<StopLog> {
   const none: StopLog = { reasons: {}, started: {}, deaths: [] }
   if (!daemonLog) return none
+  const text = await daemonLogTail($)
+  return text === null ? none : stopLog(text)
+}
+
+// The end of the background service's log (its last 4000 lines), read with tail only when the log changed (its time
+// and size) since the last read here: $.sessions.status and the reopen pass ask for it often, and it rarely moves.
+// null when it can't be read
+let logTail: { mtimeMs: number; size: number; text: string } | null = null
+async function daemonLogTail($: any): Promise<string | null> {
+  let st: any = null
+  try {
+    st = await $.fs.stat(daemonLog)
+  } catch {}
+  if (st && logTail && logTail.mtimeMs === Number(st.mtimeMs) && logTail.size === Number(st.size)) return logTail.text
   const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
-  return r.exitCode === 0 ? stopLog(r.stdout) : none
+  if (r.exitCode !== 0) {
+    logTail = null
+    return null
+  }
+  logTail = st ? { mtimeMs: Number(st.mtimeMs), size: Number(st.size), text: r.stdout } : null
+  return r.stdout
 }
 
 // Why a background session of the list with no process is stopped (stoppedKind): the log, read once by the caller; the
@@ -1162,17 +1958,20 @@ async function runWakes($: any) {
   }
 }
 
-// The sessions other plugins asked to restart ($.sessions.restart), from this mod's own 0.5 s timer: claude respawn of a
-// running background session once it's idle with no background task (what u checks too), this very session through
-// respawnSelf. One working or waiting for the person by then is dropped, said in the debug log: its caller asks again
-// once it's idle. While that can't be known yet (no list read in the last few seconds: another session's listing still
-// running, a back-off, a listing that failed), or it has background tasks (or they can't be read), it waits, tried
-// again every RESTART_RETRY_MS, up to RESTART_WAIT_MS after the last ask; then it's dropped, said in the debug log
+// The sessions other plugins asked to restart ($.sessions.restart), from this mod's own timer (at once when asked:
+// kickQueue): claude respawn of a running background session once it's idle with no background task (what u checks
+// too), this very session through respawnSelf. One working or waiting for the person by then is dropped, said in the
+// debug log: its caller asks again once it's idle. While that can't be known yet (Claude's files can't stand for the
+// list and no list was read in the last few seconds: another session's listing still running, a back-off, a listing
+// that failed), or it has background tasks (or they can't be read), it waits, tried again every RESTART_RETRY_MS on a
+// timer of its own (the short timer and the pass run the queue too), up to RESTART_WAIT_MS after the last ask; then
+// it's dropped, said in the debug log
 const RESTART_RETRY_MS = 2000
 const RESTART_WAIT_MS = 300000
 type QueuedRestart = { id: string; sessionId: string; name: string; reason: string; until: number; next: number; waiting?: string }
 let restarts: QueuedRestart[] = []
 let restarting = false
+let restartTimer: { cancel: () => void } | null = null
 async function runRestarts($: any) {
   if (restarting || restarts.length === 0) return
   restarting = true
@@ -1218,6 +2017,12 @@ async function runRestarts($: any) {
     }
   } finally {
     restarting = false
+    if (restarts.length && !restartTimer) {
+      restartTimer = $.clock.after(RESTART_RETRY_MS, () => {
+        restartTimer = null
+        bg(runRestarts($))
+      })
+    }
   }
 }
 
@@ -1239,8 +2044,8 @@ async function writeOrder($: any, list: Row[], now: number) {
 // every session. An expired one is deleted by whichever session finds it
 let marksNow: Record<string, RowMark> = {}
 let markSources: { source: string; rows: number; until: number }[] = []
-async function readMarks($: any, now: number) {
-  const keys = (await storeKeys($)).filter(k => k.startsWith('marks:'))
+async function readMarks($: any, now: number, all: readonly string[]) {
+  const keys = all.filter(k => k.startsWith('marks:'))
   const slots: MarkSlot[] = []
   const sources: typeof markSources = []
   for (const k of keys) {
@@ -1400,23 +2205,36 @@ async function notifySpend($: any) {
   }
 }
 
+// The panel's rows, from the session list and what each session published. Every value the panel draws is written only
+// when it changed (sameData), and the rows' times are reckoned at the minute (labelMinute): a refresh that finds
+// nothing new draws nothing, and an idle panel is drawn about once a minute, for its times
 async function refresh($: any) {
   const list = await officialList($)
   if (typeof list === 'string') {
-    await update($, notice, () => list)
+    if (!sameData(await read($, notice), list)) await update($, notice, () => list)
     return
   }
   lastList = list
   listedAt = await $.clock.now()
   const own = list.find(s => s.sessionId === myId)
   if (own?.pid) myPid = own.pid
-  if (myShortId() !== (await read($, shortId))) await update($, shortId, () => myShortId())
+  {
+    const next = myShortId()
+    if (!sameData(await read($, shortId), next)) await update($, shortId, () => next)
+  }
   await followFolder($)
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const now = await $.clock.now()
-  await readMarks($, now)
-  // The project's sessions, and this one always, wherever it is
-  const project = list.filter(s => typeof s.sessionId === 'string' && (s.sessionId === myId || (typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home))))
+  const minute = labelMinute(now)
+  // One read of the store's keys, and then only the keys that are there: most rows have no title, wait or needs record
+  const keys = new Set(await storeKeys($))
+  await readMarks($, now, [...keys])
+  // The project's sessions, and this one always, wherever it is (its status from its own turn hooks while they're ahead
+  // of the registry)
+  const project = list
+    .filter(s => typeof s.sessionId === 'string' && (s.sessionId === myId || (typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home))))
+    .map(s => (s.sessionId === myId ? withOwnHint(s, now) : s))
+  const sinces: { since?: number; staleFrom?: number }[] = []
   const beats = await readHeartbeats($, project.map(s => s.sessionId))
   const plugin = await installedPlugin($)
   const fresh: Row[] = []
@@ -1427,13 +2245,14 @@ async function refresh($: any) {
   // The usual hours the project's other sessions published, for a session with none of its own yet
   const usuals: number[] = []
   for (const s of project) {
-    const e = await readState($, s.sessionId)
+    const e = keys.has(`state:${s.sessionId}`) ? await readState($, s.sessionId) : null
     if (s.sessionId !== myId && typeof e?.usualHour === 'number' && e.usualHour > 0) usuals.push(e.usualHour)
-    const seen = await seenAt($, s.sessionId)
+    const seen = keys.has(`seen:${s.sessionId}`) ? await seenAt($, s.sessionId) : 0
+    if (s.sessionId === myId) selfSeen = { id: myId, finished: e?.finished ?? 0, seen }
     const unnamed = !s.name || s.name === s.id
-    const ownTitle = String((await storeGet($, `title:${s.sessionId}`)) ?? '')
+    const ownTitle = unnamed && keys.has(`title:${s.sessionId}`) ? String((await storeGet($, `title:${s.sessionId}`)) ?? '') : ''
     // Since when it's been waiting for you: the panel records it the first time it sees it "waiting"
-    let waitingSince = Number(await storeGet($, `waiting:${s.sessionId}`)) || undefined
+    let waitingSince = keys.has(`waiting:${s.sessionId}`) ? Number(await storeGet($, `waiting:${s.sessionId}`)) || undefined : undefined
     if (s.status === 'waiting' && !waitingSince) {
       waitingSince = now
       await storeSet($, `waiting:${s.sessionId}`, now)
@@ -1441,6 +2260,8 @@ async function refresh($: any) {
       await storeDelete($, `waiting:${s.sessionId}`)
     }
     const { color, since } = colorOf(s, e, seen, waitingSince)
+    const staling = staleMs > 0 && since && (color === 'blue' || (color === 'yellow' && s.kind === 'background'))
+    sinces.push({ since, staleFrom: staling && since ? since + staleMs : undefined })
     // A stopped session doesn't run any version: it opens with the installed one
     const version = color === 'gray' ? '' : e?.version || (s.pid ? await processVersion($, s.pid) : '')
     if (version) {
@@ -1456,12 +2277,13 @@ async function refresh($: any) {
     const helpers = s.kind === 'background' && s.pid && typeof s.id === 'string' ? ((await backgroundTasks($, s.id))?.count ?? 0) : 0
     const title = unnamed ? ownTitle || s.id || s.sessionId.slice(0, 8) : s.name
     // Since when it waits for the person (red, or marked as needing them), for the push when that runs long. A mark has
-    // no start of its own: the panels record it as needsSince:<sessionId>, { since, at }, and a record no panel kept
-    // fresh for a minute is a wait that ended
+    // no start of its own: the panels record it as needsSince:<sessionId>, { since, at }, kept fresh by every refresh
+    // that sees it (a pass apart at least, watched), and a record no panel kept fresh for two and a half minutes is a
+    // wait that ended
     let needsSince: number | undefined
     if (marked.needsPerson && color !== 'gray') {
-      const n = await storeGet($, `needsSince:${s.sessionId}`)
-      const kept = n && now - Number(n.at) < 60000 && Number(n.since) > 0 ? Number(n.since) : undefined
+      const n = keys.has(`needsSince:${s.sessionId}`) ? await storeGet($, `needsSince:${s.sessionId}`) : undefined
+      const kept = n && now - Number(n.at) < 150000 && Number(n.since) > 0 ? Number(n.since) : undefined
       needsSince = kept ?? now
       if (!kept || now - Number(n.at) > 20000) await storeSet($, `needsSince:${s.sessionId}`, { since: needsSince, at: now })
     }
@@ -1474,7 +2296,7 @@ async function refresh($: any) {
       id: s.id ?? null,
       title,
       color,
-      time: since ? timeSince(since, now) : '',
+      time: since ? timeSince(since, minute) : '',
       model: e?.model ?? '',
       context: typeof e?.context === 'number' ? `${Math.round(e.context)}%` : '',
       current,
@@ -1494,7 +2316,7 @@ async function refresh($: any) {
       depth: 0,
       folded: false,
       helpers,
-      stale: isStale({ color, background: s.kind === 'background' }, since, now, staleMs),
+      stale: isStale({ color, background: s.kind === 'background' }, since, minute, staleMs),
     })
   }
   waitsNow = waits
@@ -1516,14 +2338,36 @@ async function refresh($: any) {
   const focused = !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
   // The filter and the folds changed in another session apply here too, once the panel doesn't have the keyboard
   if (!focused) {
-    waitingOnly = (await storeGet($, 'waitingOnly')) === true
-    collapsed = await readCollapsed($)
+    waitingOnly = keys.has('waitingOnly') && (await storeGet($, 'waitingOnly')) === true
+    collapsed = keys.has('collapsed') ? await readCollapsed($) : new Set()
   }
   await layout($, focused)
-  await update($, notice, () => sectionsProblem)
+  {
+    const next = noticeText()
+    if (!sameData(await read($, notice), next)) await update($, notice, () => next)
+  }
   await paneState($)
-  await adjustWidth($)
-  await prune($)
+  // Watched, nothing moves the rows' times but the clock: one timer for the next one that changes
+  scheduleLabel($, nextLabelChange(sinces, now), now)
+}
+
+// What the panel's notice line says: why the list isn't live or isn't read from Claude's files, and a sections.json
+// that can't be read
+function noticeText(): string {
+  const parts: string[] = []
+  if (!live && reloadedInto) parts.push('Live updates off: this session was updated in place; u restarts it, or /clear')
+  if (slowList && sessionFiles?.problem) parts.push("List read the slow way: Claude's registry changed format")
+  if (sectionsProblem) parts.push(sectionsProblem)
+  return parts.join(' · ')
+}
+
+// This session's row with the status its own turn hooks gave it, while that's newer than what the registry says (the
+// registry's statusUpdatedAt; a list without it, `claude agents`'s, for 10 s)
+function withOwnHint(s: any, now: number): any {
+  const h = ownHint
+  if (!h || now - h.at > 10000 || !s.pid) return s
+  if (typeof s.statusUpdatedAt === 'number' && s.statusUpdatedAt >= h.at) return s
+  return s.status === h.status ? s : { ...s, status: h.status }
 }
 
 // The rows as the panel shows them: grouped in sections, children under their parents (groupRows), only the ones
@@ -1545,7 +2389,11 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
   const kept = keepPlaces(foldRows(grouped, collapsed, !!members), shownBefore, frozen)
   // A fold the person made: the rows stay put, and only the folds are taken anew, over the sections as they're drawn
   const shown = reflow === 'fold' ? foldRows(kept, collapsed, !!members) : kept
-  await update($, rows, () => shown)
+  // The width the panel asks for follows what its rows hold (names, spend, marks): worked out again when they changed
+  if (!sameData(shownBefore, shown)) {
+    await update($, rows, () => shown)
+    bg(adjustWidth($))
+  }
   const spends = projectRows.filter(f => f.usd !== null)
   const others = projectRows.filter(f => !f.current)
   const next: PanelSummary = {
@@ -1555,7 +2403,7 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     unseen: others.filter(f => f.color === 'yellow').length,
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
-  if (JSON.stringify(next) !== JSON.stringify(await read($, summary))) await update($, summary, () => next)
+  if (!sameData(await read($, summary), next)) await update($, summary, () => next)
   if (!focused || reflow) return
   const target = refocusTarget(ringKeys(shownBefore), ringKeys(shown), currentFocus)
   if (target) bg(focusElement($, target))
@@ -1581,7 +2429,7 @@ async function paneState($: any) {
     const pane = (await $.ui.panes()).find((p: any) => p.id === PANE)
     note = !pane ? 'closed' : pane.isPlaced === false ? 'narrow' : ''
   } catch {}
-  if (note !== (await read($, paneNote))) await update($, paneNote, () => note)
+  if (!sameData(await read($, paneNote), note)) await update($, paneNote, () => note)
 }
 
 // When leaving a session, its panel releases the keyboard: when you come back, the text box receives you
@@ -1592,18 +2440,21 @@ async function releaseFocus($: any) {
   await $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined })
 }
 
-// Asks Claude for the docked panel's width (it's a request: if the person dragged it, their width wins).
-// Never reopens a panel the person closed.
+// Asks Claude for the docked panel's width (it's a request: if the person dragged it, their width wins), from what the
+// panel's last draw saw (paneSeen): run when that changed, and when the rows changed. A draw with no width asked is
+// Claude's own width for the window, the cap; a window whose width changed is measured again by opening the panel
+// without asking for one, whose draw comes back here. Never reopens a panel the person closed.
 async function adjustWidth($: any) {
   if (!(await $.ui.panes()).some((p: any) => p.id === PANE)) return
-  if (remeasure) {
-    // The window changed: reopen without asking for a width to measure "the default one" again (the render records it)
-    // and adjust right away
-    remeasure = false
+  const seen = paneSeen
+  if (seen && seen.asked === 0) {
+    defaultWidth = seen.body
+    defaultWindowWidth = seen.window
+  } else if (seen && defaultWindowWidth && seen.window !== defaultWindowWidth) {
     requestedWidth = 0
-    const before = defaultWindowWidth
+    defaultWindowWidth = seen.window
     await $.ui.open({ id: PANE, title: 'Sessions' })
-    for (let i = 0; i < 10 && defaultWindowWidth === before; i++) await $.clock.sleep(100)
+    return
   }
   if (defaultWidth === 0) return
   const shown = await read($, rows)
@@ -1614,8 +2465,9 @@ async function adjustWidth($: any) {
 }
 
 // You arrived from another session's panel, or with ccc: the panel takes the keyboard, on the session next to this one,
-// so you can keep going through them
+// so you can keep going through them. You're looking at this session: what it answered is seen
 async function focusPanel($: any) {
+  bg(seenNow($))
   // A panel you closed stays closed: you land on the prompt, and the line above it says how to open it
   if (await closedByYou($)) return
   const list = (await read($, rows)).filter(f => !f.folded)
@@ -1641,7 +2493,8 @@ async function focusSession($: any, sessionId: string | undefined) {
 }
 
 // Moves the panel's focus (it already has the keyboard or is about to) to an element: a session or a field. While
-// Claude is settling the focus it rejects another change ("the focus moved meanwhile"), so it retries a bit. The
+// Claude is settling the focus it rejects another change ("the focus moved meanwhile"), so it retries a bit (every
+// 50 ms, for 1.5 s at most: the sooner it lands, the less the highlight shows on the row it came in on). The
 // ui.focus hook doesn't hear about changes the mod itself requests: they're recorded here. If you moved with the arrows
 // meanwhile, the focus isn't fought over.
 // A field that appears with autoFocus does NOT take the focus if the panel already had the keyboard: the focus goes by
@@ -1649,7 +2502,7 @@ async function focusSession($: any, sessionId: string | undefined) {
 // why it's moved here
 async function focusElement($: any, key: string) {
   const moves = personMoves
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 30; i++) {
     if (personMoves !== moves) return
     let panes: any[] = []
     try {
@@ -1671,7 +2524,7 @@ async function focusElement($: any, key: string) {
         return
       }
     }
-    await $.clock.sleep(100)
+    await $.clock.sleep(50)
   }
 }
 
@@ -1756,41 +2609,47 @@ function peerRow(sessionId: string, carried: Record<string, unknown> = {}): Row 
 }
 
 // Switches the front window to another session. With notifyFocus set to false, the target doesn't take the keyboard
-// with its panel (when it's about to show a question, or when it'll do so itself afterwards)
+// with its panel (when it's about to show a question, or when it'll do so itself afterwards). One ps serves the whole
+// switch (which window is this one, which shows the target, the viewer to close), and nothing waits before the viewer
+// is closed: the notice that gives the target's panel the keyboard and this panel's release of it go once the window
+// went (the target takes the keyboard with no window attached too, and gets it when the window attaches)
 async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
   if (f.current) return false
   // If the jump was made with the keyboard in the panel, the target session receives you with the focus on its panel.
   // When leaving, this session's panel releases the keyboard
   const fromKeyboard = notifyFocus && !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
-  const notifyAndRelease = async () => {
-    if (fromKeyboard) await sendNotice($, f, 'focus')
-    await releaseFocus($)
+  const gone = (): true => {
+    bg(
+      (async () => {
+        if (fromKeyboard) await sendNotice($, f, 'focus')
+        await releaseFocus($)
+      })(),
+    )
+    return true
   }
+  const v = await windows($)
   // A regular session lives in its own window: bring that one forward, whichever is in front. If it runs where the
   // panel can't reach (another terminal app, tmux, an editor), say so instead of doing nothing
   if (!f.background) {
     const s = lastList.find(x => x.sessionId === f.sessionId)
-    const tty = s?.pid ? (await windows($)).byPid[String(s.pid)] : undefined
+    const tty = s?.pid ? v.byPid[String(s.pid)] : undefined
     if (!tty || !(await platform.bringWindow(sys($), tty, f.title))) {
       $.ui.toast(platform.text.regularUnreachable(f.title))
       return false
     }
-    await notifyAndRelease()
-    return true
+    return gone()
   }
-  const front = await frontWindowShowingMe($)
+  const front = await frontWindowShowingMe($, v)
   if (!front) {
     $.ui.toast(platform.text.switchNeedsWindow)
     return false
   }
-  await notifyAndRelease()
-  const v = await windows($)
   // If it's already open in another window, bring that one: never the same session in two windows. Look among the
   // viewers (claude attach <id>) and among the agent views, which don't say which session they show: read their
   // screen looking for its tag
   const target = (f.id ? v.byId[f.id]?.find(t => t !== front) : undefined) ?? (await agentsViewShowing($, v, f, front))
   if (target) {
-    if (await platform.bringWindow(sys($), target, f.title)) return true
+    if (await platform.bringWindow(sys($), target, f.title)) return gone()
     // Where it can't be brought forward (Linux without wmctrl/xdotool, or Wayland), show it in this window too
     if (!platform.showHereIfCantBring) {
       $.ui.toast(`Couldn't bring the window showing “${f.title}”`)
@@ -1801,12 +2660,12 @@ async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
     $.ui.toast(`Can't find the window for “${f.title}”`)
     return false
   }
-  if (await switchInPlace($, { command: 'attach', id: f.id, title: f.title }, front)) return true
+  if (await switchInPlace($, { command: 'attach', id: f.id, title: f.title }, front, v)) return gone()
   // This window can't switch (it wasn't opened with ccc): open another one next to it, same size and position, with
   // the launcher
   const opened = await platform.openWindow(sys($), front, `${DOT[f.color]} ${f.title}`, launcherCommand({ command: 'attach', id: f.id, title: f.title }))
   $.ui.toast(opened ? `Opened “${f.title}” in a new window: this one wasn't opened with ccc, so it can't switch` : platform.text.cantOpen(f.title))
-  return opened
+  return opened ? gone() : false
 }
 
 // What's being asked: stop a running session, remove a stopped one from the list, or restart one. The values are sent
@@ -1873,7 +2732,7 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
       $.ui.toast(`“${f.title}” restarted${f.outdated && installedVersion ? ` on Claude ${installedVersion}` : ''}`)
     }
     await invalidateList($)
-    await refresh($)
+    await requestRefresh($, false)
     return
   }
   const before = action === 'rm' ? [] : ((await windows($)).byId[f.id] ?? [])
@@ -1891,7 +2750,7 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
     if (r.exitCode !== 0) $.ui.toast(`Couldn't remove “${f.title}” from the list`)
   }
   await invalidateList($)
-  await refresh($)
+  await requestRefresh($, false)
   if (closeWindows && before.length) {
     await $.clock.sleep(1500)
     const mine = await myWindows($)
@@ -1911,7 +2770,8 @@ async function focusRow($: any, sessionId: string, fallback: string | undefined)
 async function backgroundTasks($: any, id: string): Promise<{ count: number; kinds: string[] } | null> {
   if (!jobsDir) return null
   try {
-    return realTasks(JSON.parse(await $.fs.read(`${jobsDir}/${id}/state.json`))?.inFlight)
+    const text = await readIfChanged($, `${jobsDir}/${id}/state.json`)
+    return text === null ? null : realTasks(JSON.parse(text)?.inFlight)
   } catch {
     return null
   }
@@ -2149,12 +3009,17 @@ async function statusNow($: any, sessionId: string): Promise<string | null | und
   return s ? (s.status ?? null) : undefined
 }
 
-// What a session is doing, for a queued restart: from a list read in the last RESTART_FRESH_MS, whoever read it
-// (another session's listing serves once it lands), else one read now (through the lock), unless a back-off holds.
-// 'unknown' when there's none that fresh yet (another session holds the lock, a back-off, the listing failed): the
-// restart waits
+// What a session is doing, for a queued restart: from Claude's files read now, while they can stand for the list
+// (directListed); else from a list read in the last RESTART_FRESH_MS, whoever read it (another session's listing serves
+// once it lands), else one read now (through the lock), unless a back-off holds. 'unknown' when there's none that fresh
+// yet (another session holds the lock, a back-off, the listing failed): the restart waits
 const RESTART_FRESH_MS = 5000
 async function restartStatus($: any, sessionId: string): Promise<string | null | undefined> {
+  const direct = await directListed($, 0)
+  if (direct) {
+    const s = direct.sessions.find(x => x.sessionId === sessionId)
+    return s ? (s.status ?? null) : undefined
+  }
   const now = await $.clock.now()
   const stored = await storedList($)
   let fresh: Listed | null = stored && now - stored.at < RESTART_FRESH_MS ? stored : null
@@ -2219,7 +3084,7 @@ async function createSession($: any, name: string) {
     bg(focusElement($, 'name'))
     return
   }
-  await update($, askingName, () => false)
+  if (!sameData(await read($, askingName), false)) await update($, askingName, () => false)
   if (!myCwd || !(await exists($, myCwd))) {
     $.ui.toast(`Can't create a session: this session's folder no longer exists${myCwd ? ` (${myCwd})` : ''}`)
     return
@@ -2235,7 +3100,7 @@ async function createSession($: any, name: string) {
   }
   // Without parsing the output text: the new session is looked up in the official list (JSON), by name and start time
   for (let attempt = 0; attempt < 6; attempt++) {
-    await refresh($)
+    await requestRefresh($, false)
     const s = lastList
       .filter(x => x.name === clean && x.cwd === myCwd && (x.startedAt ?? 0) >= since)
       .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))[0]
@@ -2254,8 +3119,8 @@ async function createSession($: any, name: string) {
 // mod gets no event for it, so a short watcher closes the field as soon as the pane loses the keyboard; otherwise the
 // field stayed open, the next visit to the pane landed in it, and every key (r included) was typed into it
 async function closeFields($: any) {
-  await update($, askingName, () => false)
-  await update($, renaming, () => null)
+  if (!sameData(await read($, askingName), false)) await update($, askingName, () => false)
+  if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
 }
 
 let fieldWatch = 0
@@ -2288,7 +3153,7 @@ async function watchField($: any) {
 // the end
 async function toggleRename($: any) {
   if (await read($, renaming)) {
-    await update($, renaming, () => null)
+    if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
     return
   }
   const list = await read($, rows)
@@ -2301,17 +3166,20 @@ async function toggleRename($: any) {
     $.ui.toast(`“${f.title}” is stopped: open it and use /rename there`)
     return
   }
-  await update($, askingName, () => false)
-  await update($, renaming, () => ({ sessionId: f.sessionId, title: f.title }))
+  if (!sameData(await read($, askingName), false)) await update($, askingName, () => false)
+  {
+    const next = { sessionId: f.sessionId, title: f.title }
+    if (!sameData(await read($, renaming), next)) await update($, renaming, () => next)
+  }
   bg(focusElement($, 'rename-input'))
   bg(watchField($))
 }
 
 // The n key: opens the field for the new session's name and moves the focus to it
 async function toggleNew($: any) {
-  await update($, renaming, () => null)
+  if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
   const open = !(await read($, askingName))
-  await update($, askingName, () => open)
+  if (!sameData(await read($, askingName), open)) await update($, askingName, () => open)
   if (open) {
     bg(focusElement($, 'name'))
     bg(watchField($))
@@ -2384,7 +3252,7 @@ async function unfold($: any, section: string) {
 // (it runs it when it finishes what it's doing)
 async function rename($: any, text: string) {
   const r = await read($, renaming)
-  await update($, renaming, () => null)
+  if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
   // The focus goes back to the renamed session's row (the field that had it is gone)
   if (r && r.sessionId !== myId) bg(focusSession($, r.sessionId))
   const name = text.trim().replace(/\s+/g, ' ').slice(0, 80)
@@ -2512,7 +3380,7 @@ async function publishUsage($: any) {
   } catch {
     return
   }
-  if (JSON.stringify(spend.limits) !== JSON.stringify(await read($, limits))) await update($, limits, () => spend.limits)
+  if (!sameData(await read($, limits), spend.limits)) await update($, limits, () => spend.limits)
   const agent = agentFor === myId ? myAgent : undefined
   const root = myCwd
   const previous = (await readState($, myId)) ?? {}
@@ -2548,6 +3416,12 @@ async function notifyWhenBack($: any) {
     }
     await $.clock.sleep(500)
   }
+}
+
+// This session's own row, from its own turn hooks: drawn at once (the registry says the same 0.6 s later, withOwnHint)
+async function ownStatus($: any, status: 'busy' | 'idle') {
+  ownHint = { status, at: await $.clock.now() }
+  scheduleFlush($, 0, d => (d.rows = true))
 }
 
 async function markTurnStart($: any) {
@@ -2703,9 +3577,12 @@ async function tellOne($: any, dir: string, names: string[], next: string) {
   if (new TextEncoder().encode(text).length > TELL_MAX_BYTES) return refuse('longer than 4 KB')
   // On its way before it's taken: a reload in between finds it in $.state, and its file still in line
   const at = await $.clock.now()
-  await update($, tellInFlight, () => ({ id, at }))
+  {
+    const next = { id, at }
+    if (!sameData(await read($, tellInFlight), next)) await update($, tellInFlight, () => next)
+  }
   if ((await runSafe($, ['mv', '-f', `${dir}/${next}`, `${dir}/${id}.taken`])).exitCode !== 0) {
-    await update($, tellInFlight, () => null)
+    if (!sameData(await read($, tellInFlight), null)) await update($, tellInFlight, () => null)
     return
   }
   debugLine($, `ccc tell ${id} from ${req.from}: submitted`)
@@ -2713,7 +3590,7 @@ async function tellOne($: any, dir: string, names: string[], next: string) {
   try {
     r = await $.prompt.submit({ text: tellPrompt(id, req.from, text) })
   } catch (err) {
-    await update($, tellInFlight, () => null)
+    if (!sameData(await read($, tellInFlight), null)) await update($, tellInFlight, () => null)
     const failures = (tellFailures.get(id) ?? 0) + 1
     tellFailures.set(id, failures)
     if (failures > 1) return refuse(`couldn't be submitted: ${String(err).slice(0, 120)}`)
@@ -2722,7 +3599,7 @@ async function tellOne($: any, dir: string, names: string[], next: string) {
     return
   }
   if (r?.drop) {
-    await update($, tellInFlight, () => null)
+    if (!sameData(await read($, tellInFlight), null)) await update($, tellInFlight, () => null)
     await runSafe($, ['mv', '-f', `${dir}/${id}.taken`, `${dir}/${id}.held`])
     await tellStatus($, dir, id, 'held', `${r.drop}: it goes once the person types in the session`)
     debugLine($, `ccc tell ${id}: held (${r.drop})`)
@@ -2820,7 +3697,7 @@ async function rebind($: any) {
     await beat($)
   } catch {}
   await invalidateList($)
-  bg(refresh($))
+  bg(requestRefresh($))
 }
 
 // Starts, wakes and restarts other plugins asked for, queued or running in this module: a reload now would drop them
@@ -2854,6 +3731,10 @@ async function updateInPlace($: any) {
   if (own?.status !== 'idle') return
   const panes = await $.ui.panes()
   const tasks = own?.id ? ((await backgroundTasks($, own.id))?.count ?? null) : 0
+  let installedSource: string | null = null
+  try {
+    installedSource = String(await $.fs.read(`${plugin.path}/hooks/watch.ts`))
+  } catch {}
   const decision = reloadDecision({
     running: modVersion,
     runningDir: PLUGIN_DIR.replace(/\/hooks\/\.\.$/, ''),
@@ -2863,7 +3744,14 @@ async function updateInPlace($: any) {
     tasks,
     paneFocused: !!panes.find((p: any) => p.id === PANE)?.isFocused,
     fieldOpen: (await read($, askingName)) || !!(await read($, renaming)),
+    // A copy that watches other paths can't be reloaded into (the ↑ mark stays, and u restarts it)
+    watchSet: WATCH_SET,
+    installedWatchSet: watchSetOf(installedSource),
   })
+  if (decision === 'no' && watchSetOf(installedSource) !== WATCH_SET && watchRefusedFor !== plugin.version) {
+    watchRefusedFor = plugin.version
+    debugLine($, `not updating in place to ${plugin.version}: it watches another set of paths (u restarts it)`)
+  }
   // Again: the checks above take seconds (a list read now), and a start, wake or restart may have been queued meanwhile
   if (decision !== 'reload' || queuedHere()) return
   reloadTriedFor = plugin.version
@@ -2928,11 +3816,30 @@ async function statusText($: any): Promise<string> {
       ? `Marks: ${markSources.map(m => `${m.source} (${m.rows === 1 ? '1 row' : `${m.rows} rows`}, ${Math.max(0, Math.ceil((m.until - now) / 60000))} min left)`).join(', ')}`
       : 'Marks: none',
     await notificationsText($, now),
+    await liveText($, now),
   ]
   const apart = await apartText($)
   if (apart) lines.push(apart)
   if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)
   return lines.join('\n')
+}
+
+// /sessions status, about how the panel learns what changed: watched files or the short timer, where the list comes
+// from, and who does the machine-wide work
+async function liveText($: any, now: number): Promise<string> {
+  const w = await read($, watching)
+  const how = live
+    ? `Live: the engine watches Claude's registry and the panel's files (set ${WATCH_SET}${w ? `, since ${Math.max(0, Math.round((now - w.at) / 1000))} s ago` : ''})`
+    : reloadedInto
+      ? 'Not live: this session was updated in place from a version that watched other files; it reads them every 3 s until it restarts (u) or is cleared (/clear)'
+      : 'Not live: no SessionStart reached the panel in this session; it reads the files every 3 s'
+  const list = slowList ? `the list from claude agents (${sessionFiles?.problem || "this session isn't in Claude's registry"})` : "the list from Claude's files"
+  let record: ReturnType<typeof parseLeader> = null
+  try {
+    record = parseLeader(String(await $.fs.read(`${dataDir}/leader.json`)))
+  } catch {}
+  const leader = leading ? 'this session leads the machine-wide work' : record ? `pid ${record.pid} leads the machine-wide work (${Math.max(0, Math.round((now - record.at) / 1000))} s ago${now - record.at >= LEADER_STALE_MS ? ', late' : ''})` : 'no session leads yet'
+  return `${how} · ${list} · ${leader}`
 }
 
 // /sessions section <title>: puts this session in a section of the person's (made if needed); "-" takes it out; nothing,
@@ -2957,7 +3864,7 @@ async function sectionCommand($: any, title: string): Promise<string> {
     return { file: p.file }
   })
   if (!r.ok) return r.reason === 'busy' ? 'Another session is changing the sections: try again' : (r.detail ?? said)
-  bg(refresh($))
+  bg(requestRefresh($, false))
   return said
 }
 
@@ -3095,6 +4002,7 @@ function sessionsApi($: any): Sessions {
       const same = (name: unknown, cwd: unknown) => name === l.name && typeof cwd === 'string' && inProject(cwd, root, home)
       if (lastList.some(s => same(s.name, s.cwd)) || launches.some(x => same(x.name, x.cwd))) return { ok: false, reason: 'refused', detail: `a session named “${l.name}” is already in ${root}` }
       launches.push({ ...l, root })
+      kickQueue()
       return { ok: true, queued: true }
     },
     wake: async input => {
@@ -3106,6 +4014,7 @@ function sessionsApi($: any): Sessions {
       if (v.state === 'refused') return { ok: false, reason: 'refused', detail: v.detail, state: 'refused' }
       const reason = typeof input?.reason === 'string' ? input.reason.trim().replace(/\s+/g, ' ').slice(0, 120) : ''
       if (!wakes.some(w => w.id === v.id)) wakes.push({ id: v.id, name: v.name, reason })
+      kickQueue()
       return { ok: true, state: 'queued' }
     },
     setMarks: async input => {
@@ -3124,6 +4033,9 @@ function sessionsApi($: any): Sessions {
       } catch (err) {
         return { ok: false, reason: 'busy', detail: `couldn't write the marks: ${String(err).slice(0, 120)}` }
       }
+      // The panels read the marks again: this one at once, the others when the bell's event comes
+      forgetStored(k => k.startsWith('marks:'))
+      await ring($, 'marks')
       return Object.keys(v.rejected).length ? { ok: true, rejected: v.rejected } : { ok: true }
     },
     pin: async input => {
@@ -3189,6 +4101,7 @@ function sessionsApi($: any): Sessions {
       const queued = restarts.find(r => r.id === s.id)
       if (queued) queued.until = until
       else restarts.push({ id: s.id, sessionId: s.sessionId, name, reason, until, next: 0 })
+      kickQueue()
       return { ok: true, state: 'queued' as const }
     },
   }
@@ -3203,6 +4116,23 @@ function ensureStarted($: any, via: string): Promise<void> {
     starting = start($)
   }
   return starting
+}
+
+// The first draw starts the mod from a timer it sets (a draw only draws), with that draw's $, and the timer can fire
+// before the draw has settled (the band's own reads, or the plugins beneath it, still answering). Until it has, the
+// engine refuses every $.state write made with that $ ("made while ui.render is being dispatched"), so the start's
+// first write is tried again 10 ms apart until it's taken, for 2 s at most; any other failure ends the wait. Once the
+// draw has settled no later write meets it
+async function afterDraw($: any, write: () => Promise<unknown>) {
+  for (let tries = 1; ; tries++) {
+    try {
+      await write()
+      return
+    } catch (err) {
+      if (tries >= 200 || !/while ui\.render is being dispatched/.test(String(err))) throw err
+      await $.clock.sleep(10)
+    }
+  }
 }
 
 async function start($: any) {
@@ -3220,13 +4150,24 @@ async function start($: any) {
   }
   await step('session id', async () => {
     myId = String(await $.session.id())
-    await update($, shortId, () => myId.slice(0, 8))
+    // Another module drew in this session before this one: this one came in by a reload, and watches what that one
+    // asked
+    const before = await read($, shortId)
+    reloadedInto = before !== ''
+    live ||= (await read($, watching))?.set === WATCH_SET
+    // The start's first write: started by the first draw, it waits for that draw to settle (afterDraw), and is written
+    // even when it's the same, so that nothing after it writes before
+    const next = myId.slice(0, 8)
+    if (startedVia === 'first draw') await afterDraw($, () => $.state.set({ plugin: 'sessions', key: 'shortId' }, next))
+    else if (!sameData(before, next)) await update($, shortId, () => next)
   })
   await step('folders', async () => {
     home = (await $.env.get('HOME')) ?? ''
     dataDir = (await $.env.get('SESSIONS_DATA_DIR')) || (home ? `${home}/.claude/mods/sessions-data` : '')
     jobsDir = (await $.env.get('SESSIONS_JOBS_DIR')) || (home ? `${home}/.claude/jobs` : '')
     daemonLog = (await $.env.get('SESSIONS_DAEMON_LOG')) || (home ? `${home}/.claude/daemon.log` : '')
+    locations = await locationsOf($)
+    if (locations.registry) sessionFiles = new SessionFiles(locations)
     if (home && (await exists($, home))) workDir = home
     if (dataDir) {
       const sub = ['alive', 'order', 'inbox', 'windows', 'replies', 'debug', 'usage', 'tell'].map(d => `${dataDir}/${d}`)
@@ -3256,7 +4197,11 @@ async function start($: any) {
     const e = (await readState($, myId)) ?? {}
     await storeSet($, `state:${myId}`, { ...e, created: e.created ?? (await $.clock.now()) })
   })
-  await step('heartbeat', () => beat($))
+  await step('heartbeat', async () => {
+    await beat($)
+    // Here: the other panels read this session's record and heartbeat
+    await ring($, myId)
+  })
   await step('update notice', () => announceUpdate($))
   await step('timers', async () => {
     // If this session was restarted from its own panel (u), announce that it's back
@@ -3271,64 +4216,49 @@ async function start($: any) {
     collapsed = await readCollapsed($)
     const view = await storeGet($, 'usageView')
     if (view && ['day', 'week', 'month'].includes(view.period) && ['all', 'project'].includes(view.scope)) {
-      await update($, usageView, () => ({ period: view.period, scope: view.scope }))
+      {
+        const next = { period: view.period, scope: view.scope }
+        if (!sameData(await read($, usageView), next)) await update($, usageView, () => next)
+      }
     }
-    $.clock.every(500, () => {
-      bg(solo('answer', () => checkStoredAnswer($)))
-      bg(solo('inbox', () => checkInbox($)))
-      bg(runLaunches($))
-      bg(runWakes($))
-      bg(runRestarts($))
-      bg(solo('tells', () => checkTells($)))
-    })
-    // The person is told (pushWaits, notifySpend) from these timers only, never from a hook of a turn. Each runs once at
-    // a time, and after a sleep waits this session's own offset first (justWoke)
-    $.clock.every(3000, () => {
-      bg(
-        solo('refresh', async () => {
-          if (await justWoke($)) return
-          await refresh($)
-          await pushWaits($)
-        }),
-      )
-    })
-    $.clock.every(2000, () => {
-      bg(
-        solo('seen', async () => {
-          if (await justWoke($)) return
-          await markSeenIfLooking($)
-        }),
-      )
-    })
+    // The person is told (pushWaits, notifySpend) from the mod's own timers and file events only, never from a hook of
+    // a turn. Watched, the timers are the heartbeat, the pass (from this session's own offset), the rows' times and the
+    // seen check while something is unseen; with nothing watched, the short timer too (setPace)
+    kickQueue = () => {
+      $.clock.after(0, () => quickTick($))
+    }
     $.clock.every(15000, () => {
-      void (async () => {
-        await rebind($)
-        await beat($).catch(() => {})
-        await readAgent($)
-        await publishUsage($)
-        bg(notifySpend($))
-        await updateInPlace($)
-      })().catch(() => {})
+      bg(beat($))
     })
-    $.clock.every(60000, () => {
-      bg(readUsage($))
-    })
-    $.clock.every(20000, () => {
-      bg(pinRemoteSessions($))
-      bg(reopenRetiredSessions($))
+    $.clock.after(wakeStagger(myId), () => {
+      bg(solo('pass', () => pass($)))
+      $.clock.every(PASS_MS, () => {
+        bg(solo('pass', () => pass($)))
+      })
     })
     active = true
-    bg(refresh($))
+    setPace($)
+    bg(
+      (async () => {
+        await syncFiles($, true)
+        await requestRefresh($)
+        await solo('leader', () => leaderTurn($, 'start'))
+        if (live) {
+          bg(solo('inbox', () => checkInbox($)))
+          bg(solo('tells', () => checkTells($)))
+          bg(scheduleSeen($))
+        }
+      })(),
+    )
     void recordTitle($).catch(() => {})
     bg(readAgent($).then(() => publishUsage($)))
-    bg(pinRemoteSessions($))
     // Running again: a stop of the person's from before no longer keeps a plugin's wake away from it
     if (myId) bg(storeDelete($, `personStop:${myId}`))
   })
   await step('panel', async () => {
     if (!(await closedByYou($))) {
       await $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined })
-      bg(readUsage($))
+      bg(readUsage($, live ? USAGE_FOLLOWER_MS : USAGE_SHARED_MS))
     }
     await paneState($)
   })
@@ -3374,7 +4304,9 @@ export const register: Register = (on, options) => {
                       ? $.env.get('SESSIONS_PLUGIN_VERSION')
                       : key === 'SESSIONS_PLUGIN_SINCE'
                         ? $.env.get('SESSIONS_PLUGIN_SINCE')
-                        : Promise.resolve(undefined),
+                        : key === 'SESSIONS_REGISTRY_DIR'
+                          ? $.env.get('SESSIONS_REGISTRY_DIR')
+                          : Promise.resolve(undefined),
       },
       fs: {
         read: (path: string) => $.fs.read(path),
@@ -3405,6 +4337,23 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // The paths the engine watches for this session (watch.ts), handed over with what the plugins beneath ask (fleet's
+  // own, for one); and what changed in them: noted, read a moment later (flush), and passed on, since every plugin's
+  // hook hears every watched path
+  on('classic.SessionStart', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      const paths = await watchFor($, String(e.session_id ?? ''), String(e.source ?? ''))
+      return paths.length ? { ...r, watchPaths: [...(r?.watchPaths ?? []), ...paths] } : r
+    } catch {
+      return r
+    }
+  }).catch(($, e, next) => next(e))
+  on('classic.FileChanged', async ($, e, next) => {
+    if (active && locations.registry) fileChanged($, String(e.file_path ?? ''), String(e.event ?? ''))
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('session.end', async ($, e, next) => {
     // /clear (and /resume) keep this process and change the session's id: follow it
     if (active && (e.reason === 'clear' || e.reason === 'resume')) {
@@ -3425,6 +4374,7 @@ export const register: Register = (on, options) => {
   // the main turn), and nothing here holds the run up
   on('turn.start', async ($, e, next) => {
     if (active && e.agentId === undefined) {
+      bg(ownStatus($, 'busy'))
       bg(markTurnStart($))
       // A ccc tell request's turn: delivered (also when the call that submitted it was lost to a reload)
       const id = tellIdIn(String(e.text ?? ''))
@@ -3485,8 +4435,17 @@ export const register: Register = (on, options) => {
         question: line.endsWith('?'),
       }
       await storeSet($, `state:${myId}`, state)
+      bg(ownStatus($, 'idle'))
       void recordTitle($).catch(() => {})
       bg(publishUsage($))
+      // Watched: what's due at a turn's end, which the short timer would find (the seen check while it's unseen, ccc
+      // tell's next request), from a timer of the mod's own: a request is submitted only from there
+      if (live) {
+        bg(scheduleSeen($))
+        $.clock.after(0, () => {
+          bg(solo('tells', () => checkTells($)))
+        })
+      }
     }
     return r
   })
@@ -3539,7 +4498,7 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     if (e.id === PANE && e.origin.kind === 'person') {
       await storeSet($, 'panelClosed', true)
-      await update($, paneNote, () => 'closed')
+      if (!sameData(await read($, paneNote), 'closed')) await update($, paneNote, () => 'closed')
     }
     return r
   })
@@ -3559,6 +4518,8 @@ export const register: Register = (on, options) => {
       return r
     }
     personMoves++
+    // Keys in this session's panel: the person is at this session
+    bg(seenNow($))
     // With the New or Rename field open, Tab and the arrows stay in it (Enter or Esc get you out)
     const field = (await read($, askingName)) ? 'name' : (await read($, renaming)) ? 'rename-input' : null
     if (field) return e.element === field ? next(e) : next({ ...e, element: field })
@@ -3587,7 +4548,7 @@ export const register: Register = (on, options) => {
   // isn't shown (with a button that opens it: shift+→ then Enter, or a click), the account's windows on a subscription,
   // and this session's short id. One row, with whatever other mods (and Claude) draw there after it: the band is
   // shared. Its first draw starts the mod when nothing else did (a session draws even with no window attached; a draw
-  // only draws, so the start runs from a timer)
+  // only draws, so the start runs from a timer, and its first write waits for the draw to settle: afterDraw)
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     if (!starting && !renderScheduled) {
@@ -3655,15 +4616,14 @@ export const register: Register = (on, options) => {
     // One line per session. If it still doesn't fit, Claude uses ↑↓ to scroll instead of moving the focus: say so
     const height = (e.viewport?.rows ?? 40) - 6
     // Window width = conversation (viewport.columns) + panel + border. With no requested width, the panel has "the
-    // default one": it's recorded as the cap. If the window changes later, adjustWidth measures it again (it runs on
-    // every refresh, every 3 s)
+    // default one", the cap. What this draw saw is noted, and a change has adjustWidth work the width out again
     if (e.viewport?.isFullscreen && e.viewport.columns && e.props.bodyColumns) {
-      const windowWidth = e.viewport.columns + e.props.bodyColumns + 1
-      if (requestedWidth === 0) {
-        defaultWidth = e.props.bodyColumns
-        defaultWindowWidth = windowWidth
-      } else if (windowWidth !== defaultWindowWidth) {
-        remeasure = true
+      const seen = { body: e.props.bodyColumns, window: e.viewport.columns + e.props.bodyColumns + 1, asked: requestedWidth }
+      if (!paneSeen || seen.body !== paneSeen.body || seen.window !== paneSeen.window || seen.asked !== paneSeen.asked) {
+        paneSeen = seen
+        $.clock.after(0, () => {
+          bg(adjustWidth($))
+        })
       }
     }
     const marks = list.some(f => f.noPanel || f.otherFormat)
@@ -3686,13 +4646,14 @@ export const register: Register = (on, options) => {
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
     // and a flexible spacer pushes the block down
     const view = await read($, usageView)
-    const usageData = await read($, usage)
     const bodyRows: number | undefined = e.props.scroll?.bodyRows
     const room = bodyRows ?? height
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
       lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
+    // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
+    const usageData = showUsage ? await read($, usage) : null
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
     // How many sessions (or folded sections) don't fit below: said at the top, where it's always in view, so a running
     // session past the bottom edge isn't taken for a missing one
@@ -3874,9 +4835,9 @@ export const register: Register = (on, options) => {
             />
           </Box>
         )}
-        {showUsage && !usageData.summary && <Text dimColor>{usageData.note || 'Reading token usage…'}</Text>}
+        {showUsage && !usageData?.summary && <Text dimColor>{usageData?.note || 'Reading token usage…'}</Text>}
         {showUsage &&
-          usageData.summary &&
+          usageData?.summary &&
           (() => {
             const includes = view.scope === 'all' ? () => true : (cwd: string) => inProject(cwd, myCwd, home)
             const w = usageWindow(usageData.summary, view.period, includes)

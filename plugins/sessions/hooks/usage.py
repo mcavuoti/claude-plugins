@@ -13,8 +13,11 @@ thinking]}}, "hours": ...}
 Usage: usage.py [logs folder] [cache folder]
 
 The cache file (in the cache folder) is shared by every session: files = each log's read position (offset read up to,
-size at that point), seen = responses already counted (by day), days and hours = the totals. `format` is the format of
-the output and the cache (the panel reads only its own; a cache in another format is started over).
+size at that point), seen = responses already counted (by day), days and hours = the totals. It's rewritten only when
+a run changed it (most runs find nothing new). summary.json beside it is what the last run printed, without
+`generated`: rewritten when it changed and touched on every run, so a session that finds it from the last minute reads
+it instead of running this again. `format` is the format of the output, the summary and the cache (the panel reads
+only its own; a cache in another format is started over).
 """
 import fcntl
 import hashlib
@@ -42,15 +45,35 @@ def add(target, key, values):
     target[key] = values if previous is None else [a + b for a, b in zip(previous, values)]
 
 
-def read_cache(path):
+def read_text(path):
     try:
         with open(path) as f:
-            c = json.load(f)
-        if c.get('format') == FORMAT:
+            return f.read()
+    except OSError:
+        return None
+
+
+def read_cache(text):
+    try:
+        c = json.loads(text) if text is not None else None
+        if isinstance(c, dict) and c.get('format') == FORMAT:
             return c
-    except (OSError, ValueError):
+    except ValueError:
         pass
     return {'format': FORMAT, 'files': {}, 'seen': {}, 'days': {}, 'hours': {}}
+
+
+# Writes a file whole (a temporary file that then replaces it) only when its text changed; else, with touch, only its
+# time moves (what the panels go by to know a run was recent)
+def write_if_changed(path, text, previous, touch=False):
+    if text == previous:
+        if touch:
+            os.utime(path, None)
+        return
+    temporary = path + '.tmp'
+    with open(temporary, 'w') as f:
+        f.write(text)
+    os.replace(temporary, path)
 
 
 def prune(c, now):
@@ -150,25 +173,19 @@ def main():
     folder = sys.argv[2] if len(sys.argv) > 2 else os.path.join(home, '.claude', 'mods', 'sessions-data', 'usage')
     os.makedirs(folder, exist_ok=True)
     cache_path = os.path.join(folder, 'cache.json')
+    summary_path = os.path.join(folder, 'summary.json')
     # Only one update at a time (several sessions run this): the others wait and read the result
     with open(os.path.join(folder, 'cache.lock'), 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         now = datetime.now().astimezone()
-        c = read_cache(cache_path)
+        before = read_text(cache_path)
+        c = read_cache(before)
         update(root, c, now)
         prune(c, now)
-        temporary = cache_path + '.tmp'
-        with open(temporary, 'w') as f:
-            json.dump(c, f, separators=(',', ':'))
-        os.replace(temporary, cache_path)
-    json.dump({
-        'format': FORMAT,
-        'generated': int(time.time() * 1000),
-        'today': day_key(now),
-        'hour': hour_key(now),
-        'days': c['days'],
-        'hours': c['hours'],
-    }, sys.stdout, separators=(',', ':'))
+        write_if_changed(cache_path, json.dumps(c, separators=(',', ':')), before)
+        summary = {'format': FORMAT, 'today': day_key(now), 'hour': hour_key(now), 'days': c['days'], 'hours': c['hours']}
+        write_if_changed(summary_path, json.dumps(summary, separators=(',', ':')), read_text(summary_path), touch=True)
+    json.dump(dict(summary, generated=int(time.time() * 1000)), sys.stdout, separators=(',', ':'))
 
 
 if __name__ == '__main__':
