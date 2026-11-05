@@ -71,7 +71,9 @@ main() {
     *) echo "usage: visor.sh start [--new | --agents | <name> | tell <name|id> <text> | section <title>] | attach <id> | agents"; return 2 ;;
   esac
 
-  local cmd id title folder format k v first=1 began code
+  local cmd id title folder format k v first=1 began code system
+  # Read once, not on every switch: each command run between two viewers is time the window shows nothing
+  system=$(uname -s)
   while [ -s "$file" ]; do
     cmd='' id='' title='' folder='' format=''
     while IFS='=' read -r k v; do
@@ -93,10 +95,10 @@ main() {
     [ -n "$title" ] && printf '\033[2m→ %s\033[0m\n' "$title"
     # Outside macOS, the window title is the session's name: the panel brings a window forward by its title (wmctrl,
     # xdotool). On macOS Terminal.app keeps the title the panel gave the window when it opened it
-    if [ -n "$title" ] && [ "$(uname -s)" != Darwin ]; then printf '\033]0;%s\007' "$title"; fi
+    if [ -n "$title" ] && [ "$system" != Darwin ]; then printf '\033]0;%s\007' "$title"; fi
     # The agent view opens in its folder; if that folder is gone, in the current one
     if [ -n "$folder" ]; then cd "$folder" 2>/dev/null || true; fi
-    began=$(date +%s)
+    began=$SECONDS
     code=0
     # Without what ccc hands the launcher (SESSIONS_PLUGIN_VERSION/SINCE): a viewer that brings up the background
     # service would pass them on to it, and from it to every session it starts (launcher.py's CHILD_ENV)
@@ -106,7 +108,7 @@ main() {
     esac
     # A viewer that ends at once on the first open of ccc failed to attach (the session went away meanwhile): pick
     # again, once, without it. Unless something was written down for this window: then the panel is switching it
-    if [ "$mode" = start ] && [ "$first" = 1 ] && [ "$cmd" = attach ] && [ "$code" -ne 0 ] && [ $(($(date +%s) - began)) -lt 3 ] && [ ! -s "$file" ] && [ -n "${py:-}" ]; then
+    if [ "$mode" = start ] && [ "$first" = 1 ] && [ "$cmd" = attach ] && [ "$code" -ne 0 ] && [ $((SECONDS - began)) -lt 3 ] && [ ! -s "$file" ] && [ -n "${py:-}" ]; then
       reset_terminal
       echo "Couldn't open that session; picking another."
       "$py" "$here/launcher.py" start --tty "$window" --file "$file" --new --exclude "$id"
