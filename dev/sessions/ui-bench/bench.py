@@ -394,7 +394,10 @@ class Bench:
                 time.sleep(0.5)
                 x.keys('ENTER')
                 pressed = x.last_key_time('ENTER')
-                arrived = x.wait(lambda t: t.current() == dst, after=pressed, timeout=30)
+                x.wait(lambda t: t.current() == dst, after=pressed, timeout=30)
+                # From the trace, replayed: keys() reads the frames that come while it waits for its key, unchecked, so
+                # an arrival within its 0.2 s would only be seen at the next redraw
+                arrived = x.first_since(pressed, lambda t: t.current() == dst)
                 title = x.first_since(pressed, lambda t: any(('→ %s' % dst) in row for row in t.rows.values()))
                 results[k].append(arrived - pressed if arrived else None)
                 results[k + 'Title'].append(title - pressed if title else None)
@@ -681,6 +684,9 @@ class Terminal:
                 found.append(t)
         deadline = time.time() + timeout
         self.pump(check)
+        # Already so, from frames an earlier pump read (keys() pumps too): a quiet screen may not change again
+        if not found and pred(self) and self.events and self.events[-1][0] >= after:
+            found.append(self.events[-1][0])
         while not found and time.time() < deadline:
             time.sleep(0.02)
             self.pump(check)
