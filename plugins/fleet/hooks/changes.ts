@@ -65,18 +65,32 @@ export type ChangeEvent = {
   outside?: true
   /** An intake record (via intake): its kind, tags, sender, the model's summary and who it's routed to; never the body */
   intake?: IntakeMeta
-  /** Found by the scan while a session's background command ran (via bash, by that session): probably its doing, maybe
-   * the person's, so he can stamp it as his like an outside change */
+  /** Found by the scan while a session's background command ran, or just after one of its commands whose run covers
+   * the file's time and that doesn't name it (via bash, by that session): probably its doing, maybe the person's, so he
+   * can stamp it as his like an outside change. Never counts as that session's landing (its cadence) */
   probably?: true
+  /** Found by the scan, outside fleet, while commands of more than one session or thread may have made it (each ran
+   * when the file got its time, or ran in the background then): who they were, none of them blamed */
+  candidates?: Who[]
+  /** A change the person applied (via answer, by the person): the session that drafted it, which hears its flags */
+  drafter?: Who
 }
 /** A thread: 'main' for the main loop, else the helper's agentId */
 export type Threads = Record<string, Record<string, FleetRead>>
 /** <project>/.claude/fleet/reads/<sessionId>.json: what a session's threads read, for /fleet status and a restart; and
  * the outside content its context read, if any (it stays until /clear, through a restart) */
-export type ReadsFile = { format: number; sessionId: string; ref: string | null; name: string | null; at: number; threads: Threads; outside?: { at: number; what: string }; running?: Running[] }
+export type ReadsFile = { format: number; sessionId: string; ref: string | null; name: string | null; at: number; threads: Threads; outside?: { at: number; what: string }; running?: Running[]; finished?: Finished[] }
 /** A Bash command a session runs now (shown once it has run a few seconds; task: one in the background), so the sweeper
- * doesn't take what it writes meanwhile for a change outside fleet */
-export type Running = { thread: string; at: number; task?: string }
+ * doesn't take what it writes meanwhile for a change outside fleet; command: its first 300 characters, so a peer's
+ * command that names a file the command writes too leaves it to the scan */
+export type Running = { thread: string; at: number; task?: string; command?: string }
+/** A Bash command a session ran lately that may have written (from its look at the world to its end): a change it
+ * didn't name, that no event explains, whose time falls in that run, is probably its, when no other command's run
+ * covers it too. It counts for FINISHED_MS after its end, or until a scan that waited on another command meanwhile
+ * looks (kept FINISHED_KEEP_MS for that: the longest a scan waits) */
+export type Finished = { thread: string; at: number; end: number }
+export const FINISHED_MS = 60000
+export const FINISHED_KEEP_MS = 12 * 60000
 
 // ---- world.json ----
 
@@ -263,9 +277,16 @@ export function isEvent(v: any): v is ChangeEvent {
   return !!v && v.format === FORMAT && typeof v.at === 'number' && typeof v.path === 'string' && typeof v.via === 'string'
 }
 
-/** Of two events for one path, the one that's current */
+/** Of two events for one path, whether b is the one that's current */
 export function newer(a: ChangeEvent | undefined, b: ChangeEvent): boolean {
-  return !a || b.at >= a.at
+  if (!a) return true
+  // A tool's landing of a version stays its, whichever came first: a blind one of the same version (a peer's
+  // post-scan that saw it land, its event written later or earlier) is the same write seen late
+  if (a.to === b.to) {
+    if (a.via === 'tool' && b.via === 'bash' && b.blind) return false
+    if (b.via === 'tool' && a.via === 'bash' && a.blind) return true
+  }
+  return b.at >= a.at
 }
 
 // ---- Words: who, when ----
@@ -292,18 +313,25 @@ export function whoText(e: ChangeEvent, me: Me): string {
   const who = sessionWords(e.by, me)
   if (e.via === 'accept') return 'the person'
   if (e.via === 'answer') return 'the person (a change applied by fleet)'
-  if (e.via === 'bash') return e.probably ? `${who} (probably its background command, landed blind)` : `${who} (a Bash command, landed blind)`
+  if (e.via === 'bash') return e.probably ? `${who} (probably a command of its, landed blind)` : `${who} (a Bash command, landed blind)`
   return e.tool ? `${who} (${e.tool})` : who
 }
 
 const OUTSIDE = 'outside fleet (an editor, a script, or a session without fleet)'
+
+/** Who may have made an outside change, in words: "TEST A or TEST B" */
+export function candidatesText(e: ChangeEvent, me: Me): string {
+  const names = (e.candidates ?? []).map(w => sessionWords(w, me))
+  return names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}` : (names[0] ?? '')
+}
 
 /** "changed at 14:02 by TEST B (Edit)", "was removed at 14:05 outside fleet (…)"; a record's adds its new version,
  * ", now R-12@5", with the kind when it's not a revision */
 export function changeLine(e: ChangeEvent, me: Me): string {
   const what = `${e.to === null ? 'was removed' : 'changed'} at ${clock(e.changedAt ?? e.at, me.offsetMin)}`
   const rev = e.id && e.rev && e.to !== null ? `, now ${e.id}@${e.rev}${e.kind && e.kind !== 'revision' ? ` (${e.kind})` : ''}` : ''
-  return `${e.via === 'intake' ? `${what} by ${whoText(e, me)}` : e.via === 'outside' || !e.by ? `${what} ${OUTSIDE}` : `${what} by ${whoText(e, me)}`}${rev}`
+  const outside = e.candidates?.length ? `outside fleet as far as it can tell (commands of ${candidatesText(e, me)} ran then; or an editor, a script)` : OUTSIDE
+  return `${e.via === 'intake' ? `${what} by ${whoText(e, me)}` : e.via === 'outside' || !e.by ? `${what} ${outside}` : `${what} by ${whoText(e, me)}`}${rev}`
 }
 
 // ---- The gate ----
@@ -332,7 +360,8 @@ export function gateText(v: Exclude<Verdict, 'pass'>, rel: string, last: ChangeE
 /** What the model reads after its own landing replaced a version someone else made after it read it: a Write or a
  * command over it, or an Edit on top of it (another landing came in while the write waited, or the command didn't
  * go through the gate) */
-export function overwroteText(rel: string, last: ChangeEvent, me: Me, how: 'write' | 'edit' | 'command'): string {
+export function overwroteText(rel: string, last: ChangeEvent, me: Me, how: 'write' | 'edit' | 'command' | 'probably'): string {
+  if (how === 'probably') return `fleet: ${rel} changed while a command of yours ran that doesn't name it (probably your command: a script, a checkout, a stash), over a change: it ${changeLine(last, me)} after you read it. Read ${rel} and check that change is still there.`
   if (how === 'edit') {
     return `fleet: your edit of ${rel} landed on top of a change that ${changeLine(last, me).replace(/^changed /, 'came in ')} while your edit waited. Read ${rel} and check that both changes are right.`
   }
@@ -350,8 +379,52 @@ export function duringText(rel: string, last: ChangeEvent | null, me: Me): strin
 // ---- Bash: whether a command writes (its syntax only; a program not known to only read counts as a writer) ----
 
 // Programs that only read, unless a flag or an operand below names a file they write. env and the like aren't here:
-// the shell reader takes them off and judges the command they run
-const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'printenv', 'id', 'whoami', 'hostname', 'uname'])
+// the shell reader takes them off and judges the command they run. ps, kill and the like write no file
+const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'printenv', 'id', 'whoami', 'hostname', 'uname', 'ps', 'pgrep', 'uptime', 'kill', 'qstat', 'nproc'])
+const AWKS = new Set(['awk', 'gawk', 'mawk', 'nawk'])
+
+/** A project's check script as a command names it, from the project's folder */
+export const CHECK_SCRIPT = /^(\.\/)?\.claude\/fleet\/checks\/[^/]+\.py$/
+
+// The short options that take a value: curl's and ssh's (a value may be attached, -oFILE, or follow)
+const CURL_VALUED = 'AbcCdDeEFHKmoPQrtTuUwxXyYz'
+const SSH_VALUED = 'BbcDEeFIiJLlmOoPpQRSWw'
+
+/** The value of a short option among want in the cluster at args[i] (-sSo file, -oFILE), or undefined: the first
+ * letter of the cluster that takes a value takes the rest of it, or the next word */
+function shortValue(args: readonly string[], i: number, valued: string, want: string): string | undefined {
+  const a = args[i] as string
+  if (!/^-[A-Za-z0-9#]/.test(a) || a.startsWith('--')) return undefined
+  for (let k = 1; k < a.length; k++) {
+    const c = a[k] as string
+    if (!valued.includes(c)) continue
+    if (!want.includes(c)) return undefined
+    return k + 1 < a.length ? a.slice(k + 1) : (args[i + 1] ?? '')
+  }
+  return undefined
+}
+
+/** Whether a short option among want stands in the cluster a before the letter that takes a value (-sO, not -XPOST) */
+function shortFlag(a: string, valued: string, want: string): boolean {
+  if (!/^-[A-Za-z0-9#]/.test(a) || a.startsWith('--')) return false
+  for (let k = 1; k < a.length; k++) {
+    const c = a[k] as string
+    if (want.includes(c)) return true
+    if (valued.includes(c)) return false
+  }
+  return false
+}
+
+/** A copy's destination on another machine (host:path, user@host:path, rsync://…): it writes nothing here */
+function remoteOperand(op: string): boolean {
+  return /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(op) || (/^[^/\s:]+:/.test(op) && !/^\.\.?\//.test(op))
+}
+
+/** The last path segment of a URL, as curl -O and wget name what they fetch (index.html when there is none) */
+function urlName(url: string): string {
+  const path = url.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*/, '').replace(/[?#].*$/, '')
+  return path.slice(path.lastIndexOf('/') + 1) || 'index.html'
+}
 const READ_ONLY_VCS = new Set(['diff', 'log', 'show', 'status', 'grep', 'blame', 'ls-files', 'ls-tree', 'rev-parse', 'cat-file', 'describe', 'shortlog', 'merge-base', 'rev-list', 'whatchanged'])
 
 /** The operands of a command's words (no options, nor the values of the options given that take one) */
@@ -376,7 +449,7 @@ function operandsOf(args: readonly string[], valued: RegExp): string[] {
  * without -i or a w command, find without -delete or -exec, git's reading subcommands without --output, sort without -o,
  * uniq and xxd with one operand…). inWorld says whether a file a command writes is a world file (a path as the command
  * names it); without it, every file counts. A file it can't name ($var) counts. Unsure counts as writing */
-export function bashWritesNothing(command: string, inWorld?: (target: string) => boolean): boolean {
+export function bashWritesNothing(command: string, inWorld?: (target: string) => boolean, checkScript: (script: string) => boolean = s => CHECK_SCRIPT.test(s)): boolean {
   const c = command.trim()
   if (!c || c.includes('`')) return false
   const targets: string[] = []
@@ -453,9 +526,215 @@ export function bashWritesNothing(command: string, inWorld?: (target: string) =>
     if (prog === 'less' && args.some(a => /^-[a-zA-Z]*[oO]/.test(a) || a.startsWith('--log-file') || a.startsWith('--LOG-FILE'))) return false
     if (prog === 'file' && args.some(a => /^-[a-zA-Z]*C/.test(a) || a === '--compile')) return false
     if (prog === 'rg' && args.some(a => a === '--pre' || a.startsWith('--pre='))) return false
+    // ssh runs its command on the other machine: here it writes only a log it's told to (-E, its file attached or
+    // not); what it prints goes to a redirection the shell reader saw already
+    if (prog === 'ssh') {
+      for (let i = 0; i < args.length; i++) {
+        const f = shortValue(args, i, SSH_VALUED, 'E')
+        if (f !== undefined && writes(f)) return false
+      }
+      continue
+    }
+    // A copy writes its destination (the last operand, or -t's): a remote one (host:path) or one outside the world
+    // writes nothing here. mv takes its sources away too: a source in the world is a write of the world
+    if (prog === 'scp' || prog === 'rsync' || prog === 'cp' || prog === 'mv' || prog === 'install' || prog === 'ln') {
+      const valued = prog === 'scp' ? /^-[PioFlcSJ]$/ : prog === 'rsync' ? /^-[eBT]$|^--(rsh|rsync-path|exclude|include|filter|files-from|exclude-from|include-from|temp-dir|partial-dir|backup-dir|compare-dest|copy-dest|link-dest|password-file|out-format|chmod|chown|timeout|bwlimit|max-size|min-size|port|sockopts)$/ : /^-[tSmogb]$|^--(target-directory|suffix|mode|owner|group|backup)$/
+      if (prog === 'rsync' && args.some(a => (a.startsWith('--log-file=') && writes(a.slice('--log-file='.length))) || a === '--log-file')) return false
+      const ops = operandsOf(args, valued)
+      const t = args.findIndex(a => a === '-t' || a === '--target-directory')
+      const eq = args.find(a => a.startsWith('--target-directory='))
+      const dest = t >= 0 ? args[t + 1] : eq ? eq.slice('--target-directory='.length) : ops[ops.length - 1]
+      const sources = t >= 0 || eq ? ops : ops.slice(0, -1)
+      if (prog === 'install' && args.some(a => a === '-d' || a === '--directory' || /^-[a-zA-Z]*d[a-zA-Z]*$/.test(a))) {
+        if (ops.some(o => writes(o))) return false
+        continue
+      }
+      if (dest === undefined) return false
+      if (!((prog === 'scp' || prog === 'rsync') && remoteOperand(dest)) && writes(dest)) return false
+      if (prog === 'mv' && sources.some(s => writes(s))) return false
+      if (prog === 'rsync' && args.some(a => a === '--remove-source-files') && sources.some(s => !remoteOperand(s) && writes(s))) return false
+      continue
+    }
+    // tee, touch and mkdir write every file they name
+    if (prog === 'tee' || prog === 'touch' || prog === 'mkdir') {
+      const ops = operandsOf(args, prog === 'touch' ? /^-[dtr]$|^--(date|reference)$/ : prog === 'mkdir' ? /^-m$|^--mode$/ : /^$/)
+      if (!ops.length || ops.some(o => writes(o))) return false
+      continue
+    }
+    // curl writes what -o names, or the URL's last segment with -O (into --output-dir); its other files (headers,
+    // cookies, a trace) too. Without them it prints: a read here (the outbound gate judges what it sends)
+    if (prog === 'curl') {
+      const urls = args.filter(a => /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(a))
+      const dirAt = args.findIndex(a => a === '--output-dir')
+      const dir = dirAt >= 0 ? args[dirAt + 1] : undefined
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i] as string
+        // -o, -D and -c with their file attached (-oboard/x.json, -sSo x) or next
+        const short = shortValue(args, i, CURL_VALUED, 'oDc')
+        if (a === '--output' || a === '--dump-header' || a === '--cookie-jar' || a === '--trace' || a === '--trace-ascii' || a === '--stderr' || a === '--libcurl' || short !== undefined) {
+          const f = short ?? args[i + 1]
+          if (f !== '-' && writes(dir && !String(f).startsWith('/') ? `${dir}/${f}` : f)) return false
+        } else if (/^--(output|dump-header|cookie-jar|trace|trace-ascii|stderr|libcurl)=/.test(a)) {
+          const f = a.slice(a.indexOf('=') + 1)
+          if (f !== '-' && writes(f)) return false
+        } else if (a === '--remote-name' || a === '--remote-name-all' || a === '--remote-header-name' || shortFlag(a, CURL_VALUED, 'OJ')) {
+          for (const u of urls.length ? urls : ['']) if (writes(`${dir ? `${dir}/` : ''}${urlName(u)}`)) return false
+        }
+      }
+      continue
+    }
+    // wget writes what it fetches: -O's file (- is the output), else the URL's last segment (in -P's folder); and a log
+    if (prog === 'wget') {
+      const urls = args.filter(a => /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(a))
+      let out: string | undefined
+      let dir: string | undefined
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i] as string
+        if (a === '-O' || a === '--output-document') out = args[i + 1]
+        else if (a.startsWith('--output-document=')) out = a.slice(a.indexOf('=') + 1)
+        else if (a === '-P' || a === '--directory-prefix') dir = args[i + 1]
+        else if (a.startsWith('--directory-prefix=')) dir = a.slice(a.indexOf('=') + 1)
+        else if (a === '-o' || a === '-a' || a === '--output-file' || a === '--append-output') {
+          if (writes(args[i + 1])) return false
+        }
+      }
+      if (out === '-') continue
+      if (out !== undefined) {
+        if (writes(out)) return false
+        continue
+      }
+      for (const u of urls.length ? urls : ['']) if (writes(`${dir ? `${dir}/` : ''}${urlName(u)}`)) return false
+      continue
+    }
+    // awk reads, unless its program's print redirects (> or |), it runs something (system, "cmd" | getline), or it
+    // edits in place; a > elsewhere compares (NR > 1). A program from a file can't be seen, and counts as writing
+    if (AWKS.has(prog)) {
+      if (args.some(a => a === '-f' || /^--file(=|$)/.test(a) || a === '--inplace' || (a === '-i' && /^inplace$/.test(String(args[args.indexOf(a) + 1]))) || a === '-iinplace')) return false
+      const program = operandsOf(args, /^-[Fvi]$|^--(field-separator|assign|include)$/)[0]
+      if (program === undefined || /\bprintf?\b[^;}\n]*[>|]|\|\s*getline|\bsystem\s*\(/.test(program)) return false
+      continue
+    }
+    // sysctl only reads, unless it sets (-w, or a name=value)
+    if (prog === 'sysctl') {
+      if (args.some(a => /^-[a-zA-Z]*w/.test(a) || /^[^-][^=]*=/.test(a))) return false
+      continue
+    }
+    // A check script of the project's (its .claude/fleet/checks/, which the person stamps: it prints its results) run
+    // by python only reads (checkScript says which are: the caller resolves the path, and none while proofs rerun
+    // commands); any other script can write anything
+    if (/^python[0-9.]*$/.test(prog)) {
+      const script = operandsOf(args, /^-[WXc]$/)[0]
+      if (args.some(a => a === '-c' || a === '-m') || script === undefined || !checkScript(script)) return false
+      continue
+    }
     if (!READ_ONLY_PROGRAMS.has(prog)) return false
   }
   return true
+}
+
+/** Whether a command names a world file (rel): one of its words resolves to the file or to a folder it's in, or is a
+ * glob that matches it (a word with $ in it is one: dir/$x is dir/*). A word after a cd resolves from the cd's folder;
+ * after a cd fleet can't follow (cd $X, cd -), a word with no folder names a file of its name anywhere. resolve: a word
+ * as a path relative to the project (null: outside it, or not a path). What a command writes and doesn't name lands
+ * only if no other session's event explains it (the post-scan's B5 rule) */
+export function namesPath(command: string, rel: string, resolve: (word: string) => string | null): boolean {
+  let pieces: string[]
+  try {
+    pieces = topCommands(command.trim())
+  } catch {
+    return true
+  }
+  // A cd's folder names nothing it writes (cd <project> && python3 tool.py names no file)
+  const isCd = (w: string[]) => ['cd', 'pushd', 'popd'].includes((stripPrefixes(w)[0] ?? '').split('/').pop() ?? '')
+  const base = rel.slice(rel.lastIndexOf('/') + 1)
+  // Where the words resolve from: '' the session's folder, a path (relative to it, or absolute), null a cd not followed
+  let dir: string | null = ''
+  const under = (d: string, w: string) => (w.startsWith('/') || w === '~' || w.startsWith('~/') || !d ? w : `${d.replace(/\/+$/, '')}/${w}`)
+  const names = (w: string, d: string | null): boolean => {
+    if (!w || w.startsWith('-')) return false
+    const glob = /\$/.test(w) ? w.replace(/\$\([^)]*\)|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]/g, '*') : w
+    if (/[*?[{]/.test(glob)) {
+      const r = resolve(d === null ? glob : under(d, glob))
+      try {
+        if ((r !== null && globRegex(r, false).test(rel)) || (d === null && !glob.includes('/') && globRegex(glob, false).test(base))) return true
+      } catch {}
+      return false
+    }
+    const r = resolve(d === null ? w : under(d, w))
+    if (r !== null && (r === rel || rel.startsWith(`${r.replace(/\/+$/, '')}/`) || r === '')) return true
+    return d === null && !w.includes('/') && w === base
+  }
+  const strip = (w: string) => w.replace(/^--?[A-Za-z][\w-]*=/, '')
+  for (const piece of pieces) {
+    const targets: string[] = []
+    let cmds: string[][]
+    try {
+      cmds = commandsOf(piece, 0, targets)
+    } catch {
+      return true
+    }
+    const from = dir
+    for (const c of cmds) {
+      const w = stripPrefixes(c)
+      if (isCd(c)) {
+        const to = w[1]
+        dir = dir === null || w[0]?.endsWith('popd') || to === undefined || to === '-' || to.includes('$') ? null : under(dir, to)
+        continue
+      }
+      if (w.map(strip).some(x => names(x, dir))) return true
+    }
+    // A redirection's place among the piece's commands isn't kept: it resolves from where the piece started or ended
+    if (targets.map(strip).some(t => names(t, from) || names(t, dir))) return true
+  }
+  return false
+}
+
+/** A shell line's commands as written, split where one ends (; & | && || and a new line), quotes, $( … ), ( … ) and
+ * backticks kept whole; a line with a here-document keeps its lines together (its body isn't commands) */
+function topCommands(line: string): string[] {
+  const out: string[] = []
+  const heredoc = line.includes('<<')
+  let cur = ''
+  let depth = 0
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i] as string
+    if (ch === "'" || ch === '`') {
+      const end = line.indexOf(ch, i + 1)
+      const j = end < 0 ? line.length - 1 : end
+      cur += line.slice(i, j + 1)
+      i = j
+      continue
+    }
+    if (ch === '"') {
+      let j = i + 1
+      while (j < line.length && line[j] !== '"') j += line[j] === '\\' ? 2 : 1
+      cur += line.slice(i, j + 1)
+      i = j
+      continue
+    }
+    if (ch === '\\') {
+      cur += line.slice(i, i + 2)
+      i++
+      continue
+    }
+    if (ch === '(') depth++
+    else if (ch === ')') depth = Math.max(0, depth - 1)
+    const split = depth === 0 && (ch === ';' || ch === '|' || (ch === '\n' && !heredoc) || (ch === '&' && !/[<>]$/.test(cur) && line[i + 1] !== '>'))
+    if (split) {
+      if (cur.trim()) out.push(cur)
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  if (cur.trim()) out.push(cur)
+  return out
+}
+
+/** A temporary file another program writes beside a world file and renames over it (an editor's or a tool's
+ * <name>.tmp.<pid>.<n>): never a landing of its own */
+export function isTempName(rel: string): boolean {
+  return /\.tmp\.\d+(\.|$)/.test(rel.slice(rel.lastIndexOf('/') + 1))
 }
 
 /** Where a volume's way with case can be seen: the path with its deepest name that has letters in another case (null

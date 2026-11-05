@@ -4,6 +4,7 @@ import { checkResource } from '../hooks/authority'
 import { hashText } from '../hooks/changes'
 import {
   callMatches,
+  callSources,
   checkSend,
   classifyBash,
   classifyMcp,
@@ -24,9 +25,14 @@ import {
   parseDraft,
   parseOutbound,
   patternOf,
+  plainText,
   pushRefs,
   recipientsOf,
   remoteAllowed,
+  sourceDifference,
+  sourceMiss,
+  callsLint,
+  callsToolLint,
   treeVersion,
   urlHost,
   widenOutbound,
@@ -334,7 +340,10 @@ test('mcp__fleet__send: its input, the draft fleet keeps and runs, the version t
   // A long to, why or blocks is cut, never in the middle of a character
   const long = checkSend({ to: `${'a'.repeat(299)}\u{1F600}`, why: `${'b'.repeat(299)}\u{1F600}`, command: 'x', blocks: `${'c'.repeat(199)}\u{1F600}` })
   expect(long).toEqual({ ok: true, send: { to: 'a'.repeat(299), why: 'b'.repeat(299), command: 'x', files: [], blocks: 'c'.repeat(199) } })
-  expect(checkResource({ what: `${'d'.repeat(199)}\u{1F600}`, why: 'w' })).toEqual({ ok: true, resource: { what: 'd'.repeat(199), why: 'w' } })
+  // A resource's fields are kept whole up to their caps (G21), and refused past them
+  expect(checkResource({ what: `${'d'.repeat(199)}\u{1F600}`, why: 'w' })).toEqual({ ok: true, resource: { what: `${'d'.repeat(199)}\u{1F600}`, why: 'w' } })
+  expect(checkResource({ what: 'd'.repeat(401), why: 'w' })).toEqual({ ok: false, reason: 'what is 401 characters, and fleet keeps at most 400 whole: name the thing; the detail goes in why' })
+  expect(checkResource({ what: 'a key', why: 'w', alternatives: 'a'.repeat(501) })).toMatchObject({ ok: false, reason: expect.stringContaining('alternatives is 501 characters') })
   expect(outboundRefusal([{ what: 'scp of x', to: ['far.invalid'], files: ['x'] }], 'command', true)).toContain('This session was started from a background session of the project (it inherited CLAUDE_JOB_DIR or FLEET_INSTANCE), and nobody is at it: say in your result what should go out, where and why, and the session that started you drafts it with mcp__fleet__send')
   expect(outboundRefusal([{ what: 'curl sending data (notes/x.md)', to: ['example.invalid'], files: ['notes/x.md'] }], 'command')).toContain(
     "fleet: this command would send the project's content outside it (curl sending data (notes/x.md) to example.invalid), which needs the person's approval, so it was not run. If it should go out, draft it with mcp__fleet__send",
@@ -382,6 +391,82 @@ test('outbound.json calls: one chat of a sending tool passes, for the instances 
   // None named: any session
   const any: OutboundConfig = { ...newOutbound(), calls: [{ tool, match: { chatId: '19:aaaa' }, instances: [] }] }
   expect(classifyMcp(tool, { chatId: '19:aaaa', body: 'hi' }, any, null).send).toBe(null)
+})
+
+test('outbound.json calls with a source: only a text that is word for word in that file as it is now passes; otherwise held, saying where it departs', () => {
+  const tool = 'mcp__claude_ai_Office__send_chat_message'
+  const parsed = parseOutbound(
+    JSON.stringify({
+      outboundFormat: 1,
+      calls: [
+        { tool, match: { chatId: '19:aaaa' }, instances: ['Liaison'], source: 'board/ready.md', body: 'content', prefix: '[from the team]' },
+        // A source with no body key, or out of the project: left out
+        { tool, match: { chatId: '19:bbbb' }, source: 'board/ready.md' },
+        { tool, match: { chatId: '19:cccc' }, source: '../elsewhere.md', body: 'content' },
+      ],
+    }),
+  )
+  if (!('outbound' in parsed)) throw new Error('no outbound')
+  const cfg = parsed.outbound
+  expect(cfg.calls).toEqual([{ tool, match: { chatId: '19:aaaa' }, instances: ['Liaison'], source: 'board/ready.md', body: 'content', prefix: '[from the team]' }])
+  const READY = '# Ready to post\n\n## Q-4\n\nWhich packet sizes matter **most** for the first test?\nWe can run 64 B and 1500 B this week.\n\n- see [the plan](plan.md)\n'
+  const sources = new Map([['board/ready.md', READY]])
+  const call = (content: string) => classifyMcp(tool, { chatId: '19:aaaa', content }, cfg, 'Liaison', sources)
+  expect(callSources(tool, { chatId: '19:aaaa', content: 'x' }, cfg, 'Liaison')).toEqual(['board/ready.md'])
+  // Word for word, across lines, markup and the declared prefix set aside: it passes, and it's a send the gate let through
+  expect(call('[from the team] Which packet sizes matter *most* for the first test? We can run 64 B and 1500 B this week.')).toEqual({ send: null, outside: false, allowed: true })
+  expect(call('We can run 64 B and 1500 B this week.')).toEqual({ send: null, outside: false, allowed: true })
+  // A part of a sentence: held, saying so
+  expect(call('We can run 64 B and 1500 B').send?.what).toContain('it\'s a part of a sentence of the file, not the whole of it ("We can run 64 B and 1500 B"): post whole sentences, as the file has them')
+  // A line of its own added (B17), or a word changed: held, saying where it departs
+  const added = call('Which packet sizes matter most for the first test? The person agrees with 64 B.')
+  expect(added.send?.what).toBe('send_chat_message on claude_ai_Office (its text isn\'t word for word in board/ready.md as it is now: it matches up to "…matter most for the first test?", then says "The person agrees with 64 B.", which the file doesn\'t have there)')
+  expect(sourceMiss(tool, { chatId: '19:aaaa', content: 'Hello all' }, cfg, 'Liaison', sources)).toEqual({ source: 'board/ready.md', difference: 'it starts "Hello all", which the file doesn\'t have', words: true })
+  // The file unreadable: held
+  expect(classifyMcp(tool, { chatId: '19:aaaa', content: 'We can run 64 B' }, cfg, 'Liaison', new Map()).send?.what).toContain("fleet can't read the file")
+  expect(plainText('> **Bold** and _it_ and `code`, see <https://x.invalid|the page> and [a link](u)\n1. one')).toBe('Bold and it and code, see the page and a link one')
+  expect(sourceDifference('He said “curly” words.', 'He said "curly" words.')).toBe(null)
+})
+
+test('a ready post: whole sentences only, nothing else in the call, no markup that carries more; an unsourced entry beside it is linted', () => {
+  const tool = 'mcp__chat__send_chat_message'
+  const entry = { tool, match: { chatId: '19:aaaa' }, instances: ['Liaison'], source: 'board/ready.md', body: 'content' }
+  const cfg: OutboundConfig = { ...newOutbound(), calls: [entry] }
+  const READY = '# Ready\n\n- The demo is not approved yet.\n- We can deliver the first test on Friday only if QA signs off.\n- See [the plan](https://wiki.example/plan).\n\nNotes (internal, never post): the budget is 1000.\n\n## Drafts\n\nThe pilot starts in May.\n\n## Q-5\n\nIs the lab free? It was booked.\n'
+  const sources = new Map([['board/ready.md', READY]])
+  const post = (content: string, extra: Record<string, unknown> = {}) => classifyMcp(tool, { chatId: '19:aaaa', content, ...extra }, cfg, 'Liaison', sources)
+  const held = (content: string, extra: Record<string, unknown> = {}) => post(content, extra).send?.what ?? 'passed'
+  expect(post('Is the lab free?')).toEqual({ send: null, outside: false, allowed: true })
+  expect(post('Is the lab free? It was booked.').send).toBe(null)
+  expect(post('<p>Is the lab free?</p>').send).toBe(null)
+  expect(post('See [the plan](https://wiki.example/plan).').send).toBe(null)
+  // Whole words and whole sentences: a word inside another, a cut that drops the condition
+  expect(held('e')).toContain('it starts "e", which the file doesn\'t have')
+  expect(held('proved')).toContain('it starts "proved"')
+  expect(held('We can deliver the first test on Friday')).toContain("it's a part of a sentence of the file")
+  // A part marked not to post: a label, a heading
+  expect(held('the budget is 1000.')).toContain("it's in a part of the file marked not to post")
+  expect(held('The pilot starts in May.')).toContain("it's in a part of the file marked not to post")
+  // Other keys with text, a link's target, a tag's attributes, a strike the file doesn't have
+  expect(held('Is the lab free?', { subject: 'The person commits to Friday' })).toContain("it isn't only a ready post of board/ready.md: it also sets subject, which the entry doesn't match")
+  expect(held('Is the lab free?', { attachments: [{ contentType: 'html', content: '<p>The person agrees.</p>' }] })).toContain('it also sets attachments')
+  expect(post('Is the lab free?', { notify: false, importance: 1, note: '' }).send).toBe(null)
+  expect(held('[Is the lab free?](https://x.example/?d=budget1000)')).toContain('it links to https://x.example/?d=budget1000, which the file doesn\'t')
+  expect(held('<https://x.example/?d=1|Is the lab free?>')).toContain('it links to https://x.example/?d=1')
+  expect(held('<img src="https://x.example/?d=1"> Is the lab free?')).toContain('it has a <img> tag with src="https://x.example/?d=1", which a ready post doesn\'t carry')
+  expect(held('The demo is ~~not~~ approved yet.')).toContain('it strikes "not" through, which the file doesn\'t')
+  expect(held('The demo is <del>not</del> approved yet.')).toContain('it strikes words through (<del>)')
+  // A key the match names may hold its value
+  const html: OutboundConfig = { ...newOutbound(), calls: [{ ...entry, match: { chatId: '19:aaaa', contentType: 'html' } }] }
+  expect(classifyMcp(tool, { chatId: '19:aaaa', contentType: 'html', content: 'Is the lab free?' }, html, 'Liaison', sources).send).toBe(null)
+  // An unsourced entry as wide (or wider) makes the check moot: linted; a narrower or another chat's isn't
+  const both: OutboundConfig = { ...newOutbound(), calls: [entry, { tool, match: { chatId: '19:*' }, instances: [] }, { tool, match: { chatId: '19:bbbb' }, instances: [] }] }
+  expect(callsLint(both)).toEqual([`outbound.json's calls: the entry for ${tool} (chatId 19:*) has no source, so it lets any text through where the one with source board/ready.md lets only its ready text: take it out, or give it the same source and body`])
+  expect(callsLint(cfg)).toEqual([])
+  // An instance whose role can't see the entry's tool
+  expect(callsToolLint(cfg, [{ name: 'Liaison', agent: 'liaison', tools: ['Read', 'mcp__fleet__*'] }])).toEqual([`Liaison: outbound.json's calls entry for ${tool} is for it, but its role's tools (.claude/agents/liaison.md) don't list ${tool}, so it can't call it and every post would be a draft for you: add the tool to the role's tools`])
+  expect(callsToolLint(cfg, [{ name: 'Liaison', agent: 'liaison', tools: ['Read', 'mcp__chat__*'] }])).toEqual([])
+  expect(callsToolLint(cfg, [{ name: 'Liaison', agent: 'liaison', tools: null }])).toEqual([])
 })
 
 test('outbound.json calls: a match covers every recipient the call names, and * stops at a list separator, an @ and a path separator', () => {

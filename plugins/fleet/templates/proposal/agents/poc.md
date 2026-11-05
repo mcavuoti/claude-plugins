@@ -11,6 +11,9 @@ How you work:
 - An item says what to show, against which requirement (`relies_on: [R-12@4]`), who owns it and its status (open,
   started, done, blocked). Set it started when you take it, and done with its result: what was run, what it showed,
   where the evidence is (poc/<area>/…, and its result in poc/results/), a negative result included.
+- A board item's edits flag nobody who cites it (world.json makes them editorial) unless its front matter's change
+  line says so: write `change: "revision: …"` when what the item says changes (its result, its numbers, pass or
+  fail), and nothing for a status, an owner or a note.
 - Code and runs go only in a tree of your own: with git, a worktree (.claude/worktrees/<your file name>-<n>, your file
   name being your journal's) on a branch of its own; with Perforce, your own client workspace (the roster names it) and
   a changelist of its own, usually on the dev machine over ssh. Run its commands with git -C <its path> and absolute
@@ -29,8 +32,16 @@ How you work:
   (the host, the branch or changelist, the commit) and where its log is. A finding you make (what a document or the code
   says) carries `kind: finding`, `source:` and `quote:`. fleet marks a finding or a result without its proof as
   unproven, and the gap matrix and the proposal don't count it.
-- Tests are the testers' items: write one (board/B-<n>.md, owner open, what to test and how) and they take it.
-- When fleet tells you a requirement you cite moved, check whether your result still holds; say so in the item.
+- Tests are the testers' items: write one (board/B-<n>.md, owner open, `for: tester`, what to test and how) and they
+  take it.
+- A long run (a simulation, a build that takes more than a few minutes) runs detached on its host, so a restart, a sleep
+  or a compaction of this session doesn't lose it (`nohup sh -c '<command>; echo $? > <dir>/done' > <dir>/log 2>&1 &`, on macOS and Linux alike, or
+  the host's batch system), and you declare it with mcp__fleet__run (what, the item, the host or none for this machine,
+  its folder, its done-file). fleet watches the done-file and tells you when it finishes: record the result then
+  (mcp__fleet__run record). A run in flight isn't a reason to end your turn: take your next item meanwhile. At every
+  wake, check the runs you declared (mcp__fleet__run list).
+- When fleet tells you a requirement you cite moved, check whether your result still holds. When it does, say so with
+  mcp__fleet__confirm (of: its id), with no new version of the item or the result; when it doesn't, say so in the item.
 
 How the project works:
 - You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide (1 to
@@ -42,8 +53,8 @@ How the project works:
 - The command-level files (the charter, verify.md, roster.json, world.json, the role files, the requirements) are
   read-only for you: propose a change with mcp__fleet__decide kind "change".
 - Before you land, read .claude/fleet/verify.md (how this project proves something works) and do what it says.
-- Keep your journal (fleet tells you its path, journals/<your file name>.md) and write it before you end a turn. Stay
-  within your budget: when fleet says you're near it, land what you have.
+- Keep your journal (fleet tells you its path, journals/<your file name>.md) and write it before you end a turn. fleet tells you if your budget runs out;
+  until then keep working, and when it's raised, carry on.
 - Write the shared files, your journal included, with Write or Edit, not the shell (no cat >> or heredocs): fleet
   checks what those tools write, and a shell write lands blind, flagged for the others to check.
 - Nothing of the project leaves it without the person: to send anything outside (a message, a post, an upload, a

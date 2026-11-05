@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
+import { insideOffer } from '../hooks/authority'
 import { hashText } from '../hooks/changes'
 import { DEC, FLEET, JOB, REF, ROOT, SID, decide, fleet, json, startSession, under, world, type World, WITH_SESSIONS } from './world'
 
@@ -48,6 +49,13 @@ test('a background session’s upload outside is refused with the way through; t
   await w.clock.settle()
   // The web read before them was outside content: the conversation is marked (once: the first mark stays)
   expect(await fleet($, 'status')).toContain('this conversation read outside content (a command that read example.invalid at ')
+})
+
+test("the inside offer names the tool that marked, never the whole server; for mail or chat it says outside senders' messages are outside content", () => {
+  expect(insideOffer({ at: 0, what: 'mcp__claude_ai_Office__search_people' })).toEqual({ server: 'claude_ai_Office', tool: 'mcp__claude_ai_Office__search_people', line: '"mcp__claude_ai_Office__search_people"', messages: false })
+  expect(insideOffer({ at: 0, what: 'mcp__claude_ai_Gmail__search_threads' })).toMatchObject({ line: '"mcp__claude_ai_Gmail__search_threads"', messages: true })
+  expect(insideOffer({ at: 0, what: 'mcp__chat__list_chat_messages' })?.messages).toBe(true)
+  expect(insideOffer({ at: 0, what: 'WebFetch of example.invalid' })).toBe(null)
 })
 
 test('git push: to a remote the person allows, or a local path, it passes; to another it’s held', async ($, on) => {
@@ -412,8 +420,9 @@ test('an outbound MCP call, approved: fleet makes it with the server’s own con
   expect(calls.length).toBe(1)
 })
 
-test('outside content marks the conversation: a change filed then waits for the person, even in his own turn; /clear ends it', async ($, on) => {
+test('outside content marks the conversation: a change filed in his own turn goes to his dialog, labelled; another waits; /clear ends it', async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
+  const asked = dialogs(on, ['Apply'])
   // The person attached to this background session (a viewer): his typing is his
   w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: '2026-11-02T11:00:00Z' }))
   on('tool.call', { tool: 'WebFetch' }, () => ({ result: { bytes: 10, code: 200 }, text: 'a page' }) as any)
@@ -423,12 +432,22 @@ test('outside content marks the conversation: a change filed then waits for the 
   await $.tool.call({ tool: 'WebFetch', url: 'https://example.invalid/idea', prompt: 'the idea' } as any)
   await w.clock.settle()
   expect(w.logs.some(l => l.includes("outside content: WebFetch of example.invalid; this conversation's changes wait for the person's apply until /clear"))).toBe(true)
+  // His own turn (the owner's 9a): fleet's dialog asks him, saying it was drafted after outside content, the diff a tap away
   const r = await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the idea', content: '# Charter\n\nThe idea.\n' })
-  expect(r.result).toContain('Queued as D-1 for the person')
-  expect(r.result).toContain("It waits for the person's apply although they typed this turn: this conversation read outside content (WebFetch of example.invalid at ")
-  expect(json(w, `${DEC}/queue/D-1.json`).outside).toMatchObject({ what: 'WebFetch of example.invalid' })
+  expect(r.result).toContain('Filed as D-1: fleet is asking the person, here, whether to apply this change to .claude/fleet/charter.md (+2 −0)')
   expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n')
+  await w.clock.settle()
+  expect(asked[0]).toMatch(/^Drafted after this conversation read outside content \(WebFetch of example\.invalid at \d\d:\d\d\): read the diff before you apply it\. Apply D-1 to \.claude\/fleet\/charter\.md \("the idea", \+2 −0\)\?$/)
+  expect(w.files.get(`${FLEET}/charter.md`)).toBe('# Charter\n\nThe idea.\n')
+  await $.turn.complete({ text: '' } as any)
+  // Not his turn (a plugin's prompt): it waits for /fleet n apply, labelled
+  await $.prompt.submit({ text: 'from a plugin', origin: { kind: 'plugin', name: 'sessions' }, wait: false } as any)
+  await $.turn.start({ text: 'The sessions plugin sent a message:\nfrom a plugin', turnId: 't-2' })
+  expect((await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'more', content: '# Charter\n\nThe idea, again.\n' })).result).toContain('Queued as D-2 for the person')
+  expect(json(w, `${DEC}/queue/D-2.json`).outside).toMatchObject({ what: 'WebFetch of example.invalid' })
   expect(await fleet($, '')).toContain('drafted after reading outside content (WebFetch of example.invalid at ')
+  // Status names what marked it
+  expect(await fleet($, 'status')).toContain("this conversation read outside content (WebFetch of example.invalid at ")
   // Kept in the reads file (a restart keeps it), gone with the conversation
   await tick(w)
   expect(json(w, `${FLEET}/reads/${SID}.json`).outside).toMatchObject({ what: 'WebFetch of example.invalid' })
@@ -436,6 +455,17 @@ test('outside content marks the conversation: a change filed then waits for the 
   await $.session.end({ reason: 'clear', sessionId: SID } as any)
   await w.clock.settle()
   expect(await fleet($, 'status')).toContain('this conversation read nothing from outside')
+})
+
+test('a read of an outside service marks the conversation: status names it and offers the exact inside line for his own organisation’s', async ($, on) => {
+  const w = project(on)
+  on('tool.call', { tool: 'mcp__claude_ai_Gmail__search_threads' }, () => ({ result: 'threads', text: 'threads' }) as any)
+  await startSession($, w)
+  await $.tool.call({ tool: 'mcp__claude_ai_Gmail__search_threads', query: 'x' } as any)
+  await w.clock.settle()
+  const status = await fleet($, 'status')
+  expect(status).toContain('this conversation read outside content (mcp__claude_ai_Gmail__search_threads at ')
+  expect(status).toContain('  if what mcp__claude_ai_Gmail__search_threads reads is your own organisation\'s (its directory, its files, its own people\'s messages), add "mcp__claude_ai_Gmail__search_threads" to outbound.json\'s "inside" (then /fleet accept outbound.json): reading it then marks nothing. It reads messages, and one from an outside sender is outside content: leave it out if outside senders reach it')
 })
 
 // The person's answers to fleet's own dialogs, in order (null: Esc); what each dialog asked
@@ -559,7 +589,7 @@ test('a change he files in his own turn: Show the diff prints it to him and asks
   expect(w.logs.some(l => /… \d+ more lines: /.test(l))).toBe(true)
 })
 
-test('a resource answered with words alone is recorded as done with them as its note, said so, and delivered', async ($, on) => {
+test('a resource answered with words alone in quotes is recorded as done with them as its note, said so, and delivered; without quotes, nothing', async ($, on) => {
   const w = project(on)
   await startSession($, w)
   await decide($, { kind: 'resource', what: 'where the spare test board is', why: 'the plan sizes the work' })
@@ -573,6 +603,12 @@ test('a resource answered with words alone is recorded as done with them as its 
   await decide($, { kind: 'resource', what: 'a second license', why: 'more runs' })
   await fleet($, '')
   expect(await fleet($, '1a')).toContain('answer /fleet 1 done "a note" once you have it, or /fleet 1 no "why"')
+  // Words without quotes may say anything (1 nope): nothing recorded, and the forms that record them
+  const bare = await fleet($, '1 nope')
+  expect(bare).toContain("1: NOT recorded: D-2 asks for a second license, and words without quotes don't say whether you got it.")
+  expect(bare).toContain('/fleet 1 done "nope" records that you got it (your words its note), /fleet 1 no "nope" that you didn\'t (your words why)')
+  expect(w.files.has(`${DEC}/answers/D-2.1.json`)).toBe(false)
+  expect(await fleet($, '')).toContain('a second license')
   // Words alone on a change: not recorded, and said so plainly, with the forms that keep them
   await fleet($, '1 no "not now"')
   await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'the goal', content: '# Charter\n\nGoal A.\n' })

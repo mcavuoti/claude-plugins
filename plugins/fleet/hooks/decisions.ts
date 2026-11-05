@@ -46,6 +46,10 @@
 //   state/slots/<slot>/<n>.json          wire: lease n of a slot, published no-clobber by its taker (slots.ts)
 //   state/slots/<slot>/waiting/<who>.json  wire: one in line for a slot, written by the session that waits
 //   state/judges/<day>/<sid8>.json       wire: a session's judge calls and their cost today, written only by it
+//   state/work.json                      wire: the open board items nobody owns, their offers, the capacity line
+//                                        (the sweeper's)
+//   runs/run-<n>.json, .done.json, .recorded.json  wire: a long run declared by its owner, its done-file seen by the
+//                                        sweeper, its result recorded by its owner; each published no-clobber (runs.ts)
 //   inbox/<source>/<name>.json, latest   a poller's items (itemFormat, intake.ts), and the trigger it rewrites
 //   intake/seen/<key>.json               wire: an item read (dedup), published no-clobber by the sweeper
 //   intake/raw/, dup/, failed/           items as they arrived, kept aside once read, duplicates, unreadable ones and
@@ -61,7 +65,7 @@ import type { ChangeSpec } from './drafts'
 import type { JudgeEntry, TasteSpec } from './judges'
 import type { OutboundSpec } from './outbound'
 
-/** The format of the wire files: queue/, answers/, applied/, last, prune/, events/, reads/, state/, instances/. Raise it
+/** The format of the wire files: queue/, answers/, applied/, last, prune/, events/, reads/, state/, runs/, instances/. Raise it
  * when a key or its meaning changes */
 export const FORMAT = 1
 /** Person data: the register. It only gains fields, and a write keeps the fields it doesn't know */
@@ -98,6 +102,8 @@ export type QueueRecord = {
   reversible?: boolean
   touchesMoney?: boolean
   outsideWorld?: boolean
+  /** The decision this one replaces (decide's supersedes): /fleet says so beside it */
+  supersedes?: string
 }
 /** origin: how the person typed it (composer: a terminal; bridge: over Remote Control); session: the session it was
  * typed in. pre: a change applied as it was filed, because the person typed the turn that filed it, or a choice he
@@ -116,7 +122,8 @@ export type ReplacedJudge = { label?: string; text?: string; cites: string[]; re
  * hosts and remotes the person allowed as he sent it; labels: the options he picked in a dialog's multi-select, text
  * then only what matched none) */
 export type Outcome = { label?: string; labels?: string[]; text?: string; note?: string; origin?: string; session?: string; at?: number; pre?: true; allowed?: string[]; judge?: JudgeCite; replacedJudge?: ReplacedJudge }
-export type RegisterState = 'delivered' | 'dropped' | 'abandoned' | 'answered' | 'not answered'
+/** withdrawn: its asker took it back (decide kind withdraw, or a decision filed with supersedes) */
+export type RegisterState = 'delivered' | 'dropped' | 'abandoned' | 'withdrawn' | 'answered' | 'not answered'
 export type RegisterRecord = {
   registerFormat: number
   id: string
@@ -149,6 +156,8 @@ export type RegisterRecord = {
   judge?: JudgeEntry
   /** A taste record's what, about, principle and provenance */
   taste?: TasteSpec
+  /** The decision this one replaced (its asker filed it with supersedes) */
+  supersedes?: string
 }
 export type DialogQuestion = { question: string; header?: string; options: Option[]; multiSelect?: boolean }
 export type Config = { configFormat: number; template: string; commitRegister: boolean; [key: string]: unknown }
@@ -260,6 +269,29 @@ function text(v: unknown, max: number): string {
   return typeof v === 'string' ? cut(v.trim(), max) : ''
 }
 
+/** The most each field of decide keeps, whole: past it the call is refused with its length and how to split it, and
+ * nothing is cut (G21) */
+export const FIELD_MAX = { question: 1000, why: 500, description: 400, blocks: 500, what: 400, cost: 400, byWhen: 200, alternatives: 500 } as const
+const SPLIT: Record<string, string> = {
+  question: "put the detail in the options' descriptions or in why, or ask it as two questions",
+  why: 'say in one line why you recommend it; the reasoning belongs in your journal',
+  description: 'say what choosing it means in a line; the detail goes in the question',
+  label: 'a few words, the detail in its description',
+  blocks: 'name what waits on it; the detail belongs in your journal',
+  what: 'name the thing; the detail goes in why',
+  cost: 'a rough figure',
+  byWhen: 'a date or a moment',
+  alternatives: 'what you would do without it, in a line or two',
+}
+
+/** A field's text, trimmed and whole; or why it's refused, past its cap */
+export function field(v: unknown, max: number, name: string, where = ''): { text: string } | { reason: string } {
+  const t = typeof v === 'string' ? v.trim() : ''
+  const n = Array.from(t).length
+  if (n > max) return { reason: `${where}${name} is ${n} characters, and fleet keeps at most ${max} whole: ${SPLIT[name] ?? 'say it shorter'}` }
+  return { text: t }
+}
+
 /** The input of mcp__fleet__decide as JSON schema: 1-4 questions, each with 2-4 options, the recommended one and why;
  * or, with kind change, a change to a command-level file (drafts.ts) */
 export const DECIDE_SCHEMA = {
@@ -267,9 +299,9 @@ export const DECIDE_SCHEMA = {
   properties: {
     kind: {
       type: 'string',
-      enum: ['choice', 'change', 'resource', 'answered', 'wait'],
+      enum: ['choice', 'change', 'resource', 'answered', 'wait', 'withdraw'],
       description:
-        "choice (the default): questions for the person. change: a change to a command-level file of this project (the charter, roster.json, world.json, outbound.json, a role file in .claude/agents/, a check script, or the records world.json lists under command), which your own tools can't write: fleet writes your draft once the person applies it. resource: something only the person can get for you (a license, an access, a machine, more budget), with what, why and optionally cost, byWhen and alternatives. answered: with id (and q when it has several questions open), one of your own open questions the person just answered by typing in this session (fleet records their words as its answer and takes it off their queue). wait: with id, another session's decision (D-<n>) your work waits on: fleet tells you at your next step once it closes, with its outcome",
+        "choice (the default): questions for the person. change: a change to a command-level file of this project (the charter, roster.json, world.json, outbound.json, a role file in .claude/agents/, a check script, or the records world.json lists under command), which your own tools can't write: fleet writes your draft once the person applies it. resource: something only the person can get for you (a license, an access, a machine, more budget), with what, why and optionally cost, byWhen and alternatives. answered: with id (and q when it has several questions open), one of your own open questions the person just answered by typing in this session (fleet records their words as its answer and takes it off their queue). wait: with id, another session's decision (D-<n>) your work waits on: fleet tells you at your next step once it closes, with its outcome. withdraw: with id and why, one of your own open decisions you no longer need (asked wrong, settled by your own work): it leaves the person's queue, no judge looks at it, and the register keeps it as withdrawn",
     },
     questions: {
       type: 'array',
@@ -280,7 +312,7 @@ export const DECIDE_SCHEMA = {
         type: 'object',
         required: ['question', 'options', 'recommended', 'why'],
         properties: {
-          question: { type: 'string', maxLength: 400, description: 'Complete enough to answer without reading your conversation' },
+          question: { type: 'string', maxLength: 1000, description: 'Complete enough to answer without reading your conversation (kept whole, up to 1000 characters)' },
           header: { type: 'string', maxLength: 12, description: 'Optional short label, up to 12 characters' },
           options: {
             type: 'array',
@@ -290,17 +322,17 @@ export const DECIDE_SCHEMA = {
               type: 'object',
               required: ['label'],
               properties: {
-                label: { type: 'string', description: 'A few words, up to about 60 characters; the detail goes in description' },
-                description: { type: 'string', maxLength: 200, description: 'Optional: what choosing it means' },
+                label: { type: 'string', maxLength: 200, description: 'A few words, up to about 60 characters; the detail goes in description' },
+                description: { type: 'string', maxLength: 400, description: 'Optional: what choosing it means' },
               },
             },
           },
           recommended: { type: 'string', description: 'The label of the option you recommend' },
-          why: { type: 'string', maxLength: 300, description: 'One line: why you recommend it' },
+          why: { type: 'string', maxLength: 500, description: 'One line: why you recommend it' },
         },
       },
     },
-    blocks: { type: 'string', maxLength: 200, description: 'Optional: what waits on the answer' },
+    blocks: { type: 'string', maxLength: 500, description: 'Optional: what waits on the answer' },
     area: { type: 'string', maxLength: 40, description: "kind choice, optional: the area the decision belongs to, one of the project's tags (world.json tags)" },
     reversible: { type: 'boolean', description: "kind choice: true if a wrong choice is cheap to undo, false if it can't be undone" },
     touchesMoney: { type: 'boolean', description: 'kind choice: true if any option spends, moves, promises or prices money' },
@@ -317,12 +349,13 @@ export const DECIDE_SCHEMA = {
       },
     },
     content: { type: 'string', description: 'kind change: the whole new text instead of edits (for a new file, or a rewrite)' },
-    what: { type: 'string', maxLength: 200, description: 'kind resource: what you need' },
-    why: { type: 'string', maxLength: 300, description: 'kind resource: what it is for, in one line' },
-    cost: { type: 'string', maxLength: 200, description: 'kind resource, optional: what it costs, roughly' },
+    what: { type: 'string', maxLength: 400, description: 'kind resource: what you need' },
+    why: { type: 'string', maxLength: 500, description: 'kind resource: what it is for, in one line' },
+    cost: { type: 'string', maxLength: 400, description: 'kind resource, optional: what it costs, roughly' },
     byWhen: { type: 'string', maxLength: 200, description: 'kind resource, optional: when you need it by' },
-    alternatives: { type: 'string', maxLength: 200, description: 'kind resource, optional: what you would do without it' },
-    id: { type: 'string', description: 'kind answered: the decision (D-<n>) the person just answered here; kind wait: the decision your work waits on' },
+    alternatives: { type: 'string', maxLength: 500, description: 'kind resource, optional: what you would do without it' },
+    id: { type: 'string', description: 'kind answered: the decision (D-<n>) the person just answered here; kind wait: the decision your work waits on; kind withdraw: your own open decision to take back' },
+    supersedes: { type: 'string', description: 'kind choice, change or resource, optional: your own open decision (D-<n>) this one replaces: fleet withdraws it, and /fleet shows the person this one replaces it' },
     q: { type: 'integer', minimum: 1, description: 'kind answered: which of its questions their words answer (1 for the first); needed when it has several open, once per question' },
   },
 } as const
@@ -342,17 +375,23 @@ export function checkDecide(input: any): ({ ok: true; questions: Question[]; blo
   const notes: string[] = []
   for (const [i, raw] of list.entries()) {
     const n = i + 1
-    const question = text(raw?.question, 400)
+    const fq = field(raw?.question, FIELD_MAX.question, 'question', `question ${n}: `)
+    if ('reason' in fq) return { ok: false, reason: fq.reason }
+    const question = fq.text
     if (!question) return { ok: false, reason: `question ${n}: the question text is missing` }
     const opts = raw?.options
     if (!Array.isArray(opts) || opts.length < 2 || opts.length > 4) return { ok: false, reason: `question ${n}: give 2 to 4 options` }
     const options: Option[] = []
     for (const o of opts) {
-      const label = text(typeof o === 'string' ? o : o?.label, LABEL_MAX)
+      const fl = field(typeof o === 'string' ? o : o?.label, LABEL_MAX, 'label', `question ${n}, option ${letter(options.length)}: its `)
+      if ('reason' in fl) return { ok: false, reason: fl.reason }
+      const label = fl.text
       if (!label) return { ok: false, reason: `question ${n}: every option needs a label` }
       if (Array.from(label).length > LABEL_READS) notes.push(`question ${n}, option ${letter(options.length)}: its label is ${Array.from(label).length} characters, kept whole, but a label of a few words with the detail in its description reads better`)
       if (options.some(x => x.label.toLowerCase() === label.toLowerCase())) return { ok: false, reason: `question ${n}: two options are both "${label}"` }
-      const description = text(o?.description, 200)
+      const fd = field(o?.description, FIELD_MAX.description, 'description', `question ${n}, option ${letter(options.length)}: its `)
+      if ('reason' in fd) return { ok: false, reason: fd.reason }
+      const description = fd.text
       options.push(description ? { label, description } : { label })
     }
     // The recommendation: an option's label, or its letter (a-d)
@@ -361,12 +400,16 @@ export function checkDecide(input: any): ({ ok: true; questions: Question[]; blo
     const byLetter = /^[a-d]\)?$/i.test(said) ? LETTERS.indexOf(said[0]!.toLowerCase()) : -1
     const pick = k >= 0 ? k : byLetter < options.length ? byLetter : -1
     if (pick < 0) return { ok: false, reason: `question ${n}: recommended must be one of the option labels (${options.map(o => o.label).join(', ')})` }
-    const why = text(raw?.why, 300)
+    const fw = field(raw?.why, FIELD_MAX.why, 'why', `question ${n}: `)
+    if ('reason' in fw) return { ok: false, reason: fw.reason }
+    const why = fw.text
     if (!why) return { ok: false, reason: `question ${n}: say in one line why you recommend "${options[pick]!.label}"` }
     const header = text(raw?.header, 12)
     questions.push({ question, ...(header ? { header } : {}), options, recommended: options[pick]!.label, why })
   }
-  const blocks = text(input?.blocks, 200)
+  const fb = field(input?.blocks, FIELD_MAX.blocks, 'blocks')
+  if ('reason' in fb) return { ok: false, reason: fb.reason }
+  const blocks = fb.text
   const flags: DecideFlags = {}
   for (const k of ['reversible', 'touchesMoney', 'outsideWorld'] as const) if (typeof input?.[k] === 'boolean') flags[k] = input[k]
   if (input?.area !== undefined) flags.area = input.area
@@ -438,8 +481,9 @@ export function bracketedIds(textIn: string): string[] {
  * quotes may follow */
 export type Verb = 'apply' | 'reject' | 'edit' | 'send' | 'done' | 'no'
 /** n: the item's number in the last list, or the decision's id as typed (D-3): an id needs no list, and names its only
- * open question */
-export type AnswerItem = { n: number | string; letter?: string; text?: string; verb?: Verb; hash?: string; allow?: true; note?: string }
+ * open question. bare: text was typed with no quote around it (`3 nope`), so a resource doesn't take it as done.
+ * bareNote: the verb's note was typed with no quotes (`2 send not yet`), so a send or an apply doesn't go */
+export type AnswerItem = { n: number | string; letter?: string; text?: string; bare?: true; verb?: Verb; hash?: string; allow?: true; note?: string; words?: string; bareNote?: true }
 export type Command =
   | { kind: 'list' }
   | { kind: 'answer'; items: AnswerItem[] }
@@ -449,7 +493,7 @@ export type Command =
   | { kind: 'init'; template: string; commitRegister: boolean }
   | { kind: 'world'; action: 'list' | 'add' | 'remove'; glob: string }
   | { kind: 'accept'; paths: string[] }
-  | { kind: 'up'; dryRun: boolean; wave: number | null; names: string[]; stopped: boolean }
+  | { kind: 'up'; dryRun: boolean; wave: number | null; names: string[]; stopped: boolean; restartWhenIdle: boolean }
   | { kind: 'down'; names: string[] }
   | { kind: 'remove'; names: string[]; yes: boolean }
   | { kind: 'worktrees'; prune: boolean; yes: boolean }
@@ -461,36 +505,140 @@ export type Command =
   | { kind: 'help' }
   | { kind: 'bad'; reason: string }
 
-/** `1a 2b`, `1a2b`, `1) a 2) b`, `1a, 2b`, `3 "free text"` (straight or curly quotes); for a change `1 apply`,
- * `1 apply h1a2b3c4d` (the draft's version, after editing it), `1 reject`, `1 edit`; for a resource `1 done`, `1 no`;
- * for an outbound `1 send` (`1 send h1a2b3c4d`, `1 send --allow`), `1 reject`, `1 edit`, `1 done`. A verb may carry a
- * note in quotes: `1 done "the key is in the vault"`. The decision's id goes where the number does: `D-3 apply`,
- * `D-7 b` */
-export function parseAnswers(args: string): AnswerItem[] | string {
-  const items: AnswerItem[] = []
-  let rest = args.trim()
-  while (rest) {
-    const m = /^(\d+|[Dd]-\d+)\s*[).:]?\s*(?:(apply|reject|edit|send|done|no)((?:\s+(?:h[0-9a-f]{6,14}|--allow))*)(?![A-Za-z0-9-])(?:\s*(?:"([^"]*)"|“([^”]*)”))?|([a-dA-D])(?![a-zA-Z])|"([^"]*)"|“([^”]*)”)\s*[,;]?\s*/i.exec(rest)
-    if (!m) return `can't read "${rest.slice(0, 30)}": answer like /fleet 1a 2b, 3 "your words", 4 apply or 5 done "a note"`
-    const n = /^\d+$/.test(m[1] as string) ? Number(m[1]) : (m[1] as string).toUpperCase()
-    if (items.some(i => i.n === n)) return `${n} is answered twice`
-    const said = m[7] ?? m[8]
-    const note = (m[4] ?? m[5])?.trim()
-    if (m[2]) {
-      const verb = m[2].toLowerCase() as Verb
-      const extra = (m[3] ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
-      const hashes = extra.filter(x => x !== '--allow')
-      if (hashes.length > 1) return `${n}: one version at most`
-      const allow = extra.includes('--allow')
-      if (allow && verb !== 'send') return `${n}: --allow goes with send (/fleet ${n} send --allow)`
-      items.push({ n, verb, ...(hashes[0] ? { hash: hashes[0] } : {}), ...(allow ? { allow: true as const } : {}), ...(note ? { note: cut(note, 1000) } : {}) })
-    } else if (said !== undefined) {
-      if (!said.trim()) return `${n}: the quotes are empty`
-      items.push({ n, text: cut(said.trim(), 2000) })
-    } else items.push({ n, letter: (m[6] as string).toLowerCase() })
-    rest = rest.slice(m[0].length)
+/** The most a typed answer or note keeps: past it fleet refuses, showing the text, rather than cut it */
+export const TYPED_MAX = 4000
+
+type Parse = { items: AnswerItem[] } | { at: string; fix: string | null; why?: string }
+const ITEM_AT = /^(\d+|[Dd]-\d+)\s*[).:]?\s*/
+const VERB_AT = /^(apply|reject|edit|send|done|no)((?:\s+(?:h[0-9a-f]{6,14}|--allow))*)(?![A-Za-z0-9-])\s*/i
+const LETTER_AT = /^([a-dA-D])(?![a-zA-Z])\s*/
+const SEP_AT = /^\s*[,;]?\s*/
+
+/** A quoted text at the start of s, for each closing quote in turn: the words inside and what follows. A quote inside
+ * the words stays in them: the words end at the first closing quote after which the rest of the line reads */
+function quotedAt(s: string): { words: string; after: string }[] {
+  if (s[0] !== '"' && s[0] !== '“') return []
+  const out: { words: string; after: string }[] = []
+  for (let i = 1; i < s.length && out.length < 24; i++) if (s[i] === '"' || s[i] === '”') out.push({ words: s.slice(1, i), after: s.slice(i + 1) })
+  return out
+}
+
+/** Words typed with no quotes (or a quote never closed): to the end of the line, a stray quote around them dropped */
+function unquoted(s: string): string {
+  return s.trim().replace(/^["“]/, '').replace(/["”]$/, '').trim()
+}
+
+/** Prose that says something: two words or more, or one of three characters or more (not a stray letter) */
+function prose(s: string): boolean {
+  return /\s/.test(s) || Array.from(s).length >= 3
+}
+
+/** The items of what's left of the line. strict: only letters, verbs and quoted words (a reading of quotes that
+ * leaves the rest readable this way wins); otherwise unquoted words after a number run to the end of the line */
+function itemsAt(line: string, done: readonly AnswerItem[], strict: boolean, budget: { n: number }): Parse {
+  const rest = line.replace(SEP_AT, '')
+  if (!rest) return { items: [...done] }
+  if (--budget.n < 0) return { at: rest, fix: null }
+  const h = ITEM_AT.exec(rest)
+  if (!h) return { at: rest, fix: null }
+  const n = /^\d+$/.test(h[1] as string) ? Number(h[1]) : (h[1] as string).toUpperCase()
+  if (done.some(i => i.n === n)) return { at: rest, fix: null, why: `${n} is answered twice` }
+  const head = rest.slice(0, h[0].length)
+  const body = rest.slice(h[0].length)
+  const words = unquoted(body)
+  // The exact form that records what follows the number as the person's words
+  const asWords = words ? `${head.trimEnd()} "${words}"` : null
+  if (!body.trim()) return { at: rest, fix: null, why: `${n}: nothing after it (a letter, ${n}a, or your words: /fleet ${n} your words)` }
+  const v = VERB_AT.exec(body)
+  if (v) {
+    const verb = (v[1] as string).toLowerCase() as Verb
+    const extra = (v[2] ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+    const hashes = extra.filter(x => x !== '--allow')
+    if (hashes.length > 1) return { at: rest, fix: null, why: `${n}: one version at most` }
+    const allow = extra.includes('--allow')
+    if (allow && verb !== 'send') return { at: rest, fix: null, why: `${n}: --allow goes with send (/fleet ${n} send --allow)` }
+    const base: AnswerItem = { n, verb, ...(hashes[0] ? { hash: hashes[0] } : {}), ...(allow ? { allow: true as const } : {}) }
+    const after = body.slice(v[0].length)
+    for (const q of quotedAt(after)) {
+      const note = q.words.trim()
+      if (!note) continue
+      const r = itemsAt(q.after, [...done, { ...base, note }], strict, budget)
+      if ('items' in r) return r
+    }
+    const next = itemsAt(after, [...done, base], strict, budget)
+    if ('items' in next || strict || next.why) return next
+    // A flag it doesn't know is a typo, never a note (send --allowed)
+    const flag = /^-+[A-Za-z]\S*/.exec(after.trim())
+    if (flag) return { at: rest, fix: null, why: `${n}: ${flag[0]} isn't an option of ${verb}${verb === 'send' ? ' (there is --allow)' : ''}` }
+    // Unquoted words after the verb: its note, to the end of the line (and, for a question, the person's words). After
+    // send or apply they may say not to ("send not yet"): the answer refuses those (looseVerbText)
+    const note = unquoted(after.replace(SEP_AT, ''))
+    return note ? { items: [...done, { ...base, note, words, bareNote: true }] } : next
   }
-  return items.length ? items : 'nothing to answer'
+  const qs = quotedAt(body)
+  if (qs.length) {
+    let first: Parse | null = null
+    for (const q of qs) {
+      const said = q.words.trim()
+      if (!said) {
+        first ??= { at: rest, fix: null, why: `${n}: the quotes are empty` }
+        continue
+      }
+      const r = itemsAt(q.after, [...done, { n, text: said }], strict, budget)
+      if ('items' in r) return r
+      first ??= r
+    }
+    if (strict || !words) return first as Parse
+    // No closing quote leaves the rest readable (or none closes): the words run to the end of the line
+    return { items: [...done, { n, text: words }] }
+  }
+  const l = LETTER_AT.exec(body)
+  if (l) {
+    const r = itemsAt(body.slice(l[0].length), [...done, { n, letter: (l[1] as string).toLowerCase() }], strict, budget)
+    // A letter and then words that don't read: the form that keeps them all as his words
+    const after = body.slice(l[0].length).replace(SEP_AT, '')
+    return 'items' in r || strict || r.why || r.fix !== null || r.at !== after ? r : { at: rest, fix: asWords }
+  }
+  if (strict || !prose(words)) return { at: rest, fix: asWords }
+  // A quote opened and never closed still says these are his words
+  return { items: [...done, { n, text: words, ...(/^["“]/.test(body) ? {} : { bare: true as const }) }] }
+}
+
+/** `1a 2b`, `1a2b`, `1) a 2) b`, `1a, 2b`, `3 "free text"` (straight or curly quotes, quotes inside kept: the text
+ * ends at the closing quote after which the rest reads), or `3 free text` (no quotes: to the end of the line); for a
+ * change `1 apply`, `1 apply h1a2b3c4d` (the draft's version, after editing it), `1 reject`, `1 edit`; for a resource
+ * `1 done`, `1 no`; for an outbound `1 send` (`1 send h1a2b3c4d`, `1 send --allow`), `1 reject`, `1 edit`, `1 done`. A
+ * verb may carry a note, quoted or to the end of the line: `1 done "the key is in the vault"`. The decision's id goes
+ * where the number does: `D-3 apply`, `D-7 b`. What can't be read is refused with the whole line and the form that
+ * records it, never cut or dropped */
+export function parseAnswers(args: string): AnswerItem[] | string {
+  const line = args.trim()
+  const strict = itemsAt(line, [], true, { n: 4000 })
+  const r = 'items' in strict ? strict : itemsAt(line, [], false, { n: 4000 })
+  const whole = `You typed:\n/fleet ${line}`
+  if (!('items' in r)) {
+    const fix = r.fix ? `\nThis records it: /fleet ${line.slice(0, line.length - r.at.length)}${r.fix}` : '\nAnswer like /fleet 1a 2b, 3 "your words" (or 3 your words), 4 apply or 5 done "a note"'
+    return `${r.why ?? `can't read "${shown(r.at, 60)}"`}, so nothing was recorded. ${whole}${fix}`
+  }
+  if (!r.items.length) return 'nothing to answer'
+  for (const it of r.items) {
+    const long = [it.text, it.note].find(t => t !== undefined && t.length > TYPED_MAX)
+    if (long !== undefined) return `${it.n}: your words are ${long.length} characters, and an answer keeps at most ${TYPED_MAX}, so nothing was recorded. Shorten them, or put the rest in /fleet note ${it.n} "…". ${whole}`
+  }
+  return r.items
+}
+
+/** A send or an apply with words after it in no quotes (`2 send not yet`, `3 apply but rename it first`): they may
+ * say not to, so nothing on the line is recorded, sent or applied; the forms that keep the words, from the line */
+export function looseVerbText(it: AnswerItem, line: string): string {
+  const n = it.n
+  const note = (it.note ?? '').replace(/["“”]/g, "'")
+  const head = `${it.verb}${it.hash ? ` ${it.hash}` : ''}${it.allow ? ' --allow' : ''}`
+  const forms =
+    it.verb === 'send'
+      ? [`/fleet ${n} ${head} "${note}" sends it as shown, your words its note`, `/fleet ${n} reject "${note}" doesn't send it (its asker hears your words)`, `/fleet note ${n} "${note}" adds your words and leaves it waiting`]
+      : [`/fleet ${n} ${head} "${note}" applies it as drafted, your words its note`, `/fleet ${n} edit changes the draft first`, `/fleet ${n} reject "${note}" doesn't apply it (its asker hears your words)`, `/fleet note ${n} "${note}" adds your words and leaves it waiting`]
+  return `Nothing was recorded, ${it.verb === 'send' ? 'sent' : 'applied'} or changed: after ${it.verb}, a note goes in quotes, and words without them ("${shown(note, 60)}") may say not to. You typed:\n/fleet ${line}\n${forms.join('\n')}`
 }
 
 /** Words with "quoted words" kept together */
@@ -541,15 +689,15 @@ export function parseCommand(args: string): Command {
       const names: string[] = []
       for (let i = 0; i < w.length; i++) {
         const x = w[i] as string
-        if (x === '--dry-run' || x === '--stopped') continue
+        if (x === '--dry-run' || x === '--stopped' || x === '--restart-when-idle') continue
         if (x === '--wave' || x.startsWith('--wave=')) {
           const v = x === '--wave' ? w[++i] : x.slice('--wave='.length)
           if (!v || !/^\d+$/.test(v) || Number(v) < 1) return { kind: 'bad', reason: 'write /fleet up --wave <n> (a wave of roster.json, from 1)' }
           wave = Number(v)
-        } else if (x.startsWith('--')) return { kind: 'bad', reason: `unknown option ${x} (there are --dry-run, --wave <n> and --stopped)` }
+        } else if (x.startsWith('--')) return { kind: 'bad', reason: `unknown option ${x} (there are --dry-run, --wave <n>, --stopped and --restart-when-idle)` }
         else names.push(x)
       }
-      return { kind: 'up', dryRun: w.includes('--dry-run'), wave, names, stopped: w.includes('--stopped') }
+      return { kind: 'up', dryRun: w.includes('--dry-run'), wave, names, stopped: w.includes('--stopped'), restartWhenIdle: w.includes('--restart-when-idle') }
     }
     case 'down':
       return { kind: 'down', names: wordsOf(tail) }
@@ -574,12 +722,16 @@ export function parseCommand(args: string): Command {
       const m = /^(\d+|D-\d+)\s+([\s\S]+)$/i.exec(tail)
       if (!m) return { kind: 'bad', reason: 'write /fleet note <n> <text> (or the decision, D-<n>)' }
       const n = /^\d+$/.test(m[1] as string) ? Number(m[1]) : (m[1] as string).toUpperCase()
-      return { kind: 'note', n, text: cut((m[2] as string).trim(), 1000) }
+      const said = unquoted(m[2] as string)
+      if (said.length > TYPED_MAX) return { kind: 'bad', reason: `your note is ${said.length} characters, and a note keeps at most ${TYPED_MAX}, so nothing was saved. Shorten it, or split it into two notes. You typed:\n/fleet ${line}` }
+      return { kind: 'note', n, text: said }
     }
     case 'drop': {
       const m = /^(\d+|D-\d+)\b\s*([\s\S]*)$/i.exec(tail)
       if (!m) return { kind: 'bad', reason: 'write /fleet drop <n> [why] (or the decision, D-<n>)' }
-      return { kind: 'drop', target: (m[1] as string).toUpperCase(), why: cut((m[2] as string).trim().replace(/^["“]|["”]$/g, ''), 300) }
+      const why = unquoted(m[2] as string)
+      if (why.length > 1000) return { kind: 'bad', reason: `your reason is ${why.length} characters, and a drop keeps at most 1000, so nothing was dropped. Shorten it (the rest can go in /fleet note ${m[1]} first). You typed:\n/fleet ${line}` }
+      return { kind: 'drop', target: (m[1] as string).toUpperCase(), why }
     }
     case 'world': {
       const [action = '', glob = '', ...extra] = more
@@ -596,39 +748,73 @@ export function parseCommand(args: string): Command {
   return typeof items === 'string' ? { kind: 'bad', reason: items } : { kind: 'answer', items }
 }
 
-/** `/fleet overrule D-7 b "why"`: one question's letter (the first question by default), `1b 2a`, or the person's words
- * in quotes (`1 "use both"`); a quoted text after an answer is why */
-export function parseOverrule(tail: string): Command {
-  const bad: Command = { kind: 'bad', reason: 'write /fleet overrule D-<n> <answer> ["why"]: a letter (b), one per question (1b 2a), or your words in quotes' }
-  const m = /^(D-\d+)\s+([\s\S]+)$/i.exec(tail.trim())
-  if (!m) return bad
-  const answers: { q: number; letter?: string; text?: string }[] = []
-  let why = ''
-  let rest = (m[2] as string).trim()
-  while (rest) {
-    const l = /^(?:(\d+)\s*[).:]?\s*)?([a-d])(?![A-Za-z0-9])\s*,?\s*/i.exec(rest)
-    if (l) {
-      const q = l[1] ? Number(l[1]) : 1
-      if (answers.some(a => a.q === q)) return { kind: 'bad', reason: `question ${q} is answered twice` }
-      answers.push({ q, letter: (l[2] as string).toLowerCase() })
-      rest = rest.slice(l[0].length)
-      continue
-    }
-    const t = /^(?:(\d+)\s*[).:]?\s*)?(?:"([^"]*)"|“([^”]*)”)\s*,?\s*/.exec(rest)
-    if (!t) return bad
-    const words = (t[2] ?? t[3] ?? '').trim()
-    rest = rest.slice(t[0].length)
-    if (!words) return { kind: 'bad', reason: 'the quotes are empty' }
-    if (!t[1] && answers.length) {
-      if (why) return bad
-      why = cut(words, 300)
-      continue
-    }
-    const q = t[1] ? Number(t[1]) : 1
-    if (answers.some(a => a.q === q)) return { kind: 'bad', reason: `question ${q} is answered twice` }
-    answers.push({ q, text: cut(words, 2000) })
+/** The most an overrule keeps of the person's words and of his why: past them it's refused with the length, never cut */
+export const OVERRULE_WORDS_MAX = 2000
+export const OVERRULE_WHY_MAX = 300
+
+type OverruleAnswer = { q: number; letter?: string; text?: string }
+type OverruleParse = { answers: OverruleAnswer[]; why: string } | { why?: string }
+
+/** The answers and the why of what's left of an overrule: letters, words in quotes (quotes inside them kept, as in an
+ * answer: the words end at the closing quote after which the rest reads), and one quoted why after an answer */
+function overruleAt(line: string, answers: readonly OverruleAnswer[], why: string, budget: { n: number }): OverruleParse {
+  const rest = line.replace(SEP_AT, '')
+  if (!rest) return answers.length ? { answers: [...answers], why } : {}
+  if (--budget.n < 0) return {}
+  const l = /^(?:(\d+)\s*[).:]?\s*)?([a-d])(?![A-Za-z0-9])\s*/i.exec(rest)
+  if (l) {
+    const q = l[1] ? Number(l[1]) : 1
+    if (answers.some(a => a.q === q)) return { why: `question ${q} is answered twice` }
+    return overruleAt(rest.slice(l[0].length), [...answers, { q, letter: (l[2] as string).toLowerCase() }], why, budget)
   }
-  return answers.length ? { kind: 'overrule', id: (m[1] as string).toUpperCase(), answers, why } : bad
+  const t = /^(?:(\d+)\s*[).:]?\s*)?/.exec(rest) as RegExpExecArray
+  let first: OverruleParse | null = null
+  for (const x of quotedAt(rest.slice(t[0].length))) {
+    const words = x.words.trim()
+    if (!words) {
+      first ??= { why: 'the quotes are empty' }
+      continue
+    }
+    let r: OverruleParse
+    if (!t[1] && answers.length) {
+      if (why) {
+        first ??= {}
+        continue
+      }
+      r = overruleAt(x.after, answers, words, budget)
+    } else {
+      const q = t[1] ? Number(t[1]) : 1
+      if (answers.some(a => a.q === q)) {
+        first ??= { why: `question ${q} is answered twice` }
+        continue
+      }
+      r = overruleAt(x.after, [...answers, { q, text: words }], why, budget)
+    }
+    if ('answers' in r) return r
+    first ??= r
+  }
+  return first ?? {}
+}
+
+/** `/fleet overrule D-7 b "why"`: one question's letter (the first question by default), `1b 2a`, or the person's words
+ * in quotes (`1 "use both"`, quotes inside them kept); a quoted text after an answer is why. What can't be read is
+ * refused with the whole line and the form that records it; past a cap, with the length, never cut */
+export function parseOverrule(tail: string): Command {
+  const typed = `You typed:\n/fleet overrule ${tail.trim()}`
+  const usage = 'write /fleet overrule D-<n> <answer> ["why"]: a letter (b), one per question (1b 2a), or your words in quotes'
+  const m = /^(D-\d+)\s+([\s\S]+)$/i.exec(tail.trim())
+  if (!m) return { kind: 'bad', reason: usage }
+  const id = (m[1] as string).toUpperCase()
+  const r = overruleAt((m[2] as string).trim(), [], '', { n: 4000 })
+  if (!('answers' in r)) {
+    const words = unquoted(m[2] as string).replace(/["“”]/g, "'")
+    return { kind: 'bad', reason: `${r.why ?? "can't read it"}, so nothing was recorded. ${typed}\nThis records it as your words: /fleet overrule ${id} "${words}"\n(${usage})` }
+  }
+  for (const a of r.answers) {
+    if (a.text !== undefined && a.text.length > OVERRULE_WORDS_MAX) return { kind: 'bad', reason: `your words for question ${a.q} are ${a.text.length} characters, and an overrule keeps at most ${OVERRULE_WORDS_MAX}, so nothing was recorded. Shorten them. ${typed}` }
+  }
+  if (r.why.length > OVERRULE_WHY_MAX) return { kind: 'bad', reason: `your why is ${r.why.length} characters, and an overrule keeps at most ${OVERRULE_WHY_MAX}, so nothing was recorded. Shorten it. ${typed}` }
+  return { kind: 'overrule', id, answers: r.answers, why: r.why }
 }
 
 export const HELP = [
@@ -651,7 +837,7 @@ export const HELP = [
   '/fleet judges          the live areas, the areas back in shadow, your taste; /fleet judges live <area> (its exact repeats answered at once), /fleet judges off <area>',
   '/fleet overrule D-7 b ["why"]  correct the judge\'s answer to D-7: its asker hears it, and the judges read it next time',
   '/fleet init [template] set fleet up in this project (.claude/fleet/): blank, solo, software or proposal',
-  '/fleet up [--dry-run] [--wave n] [--stopped] [name…]  start the roster\'s instances that aren\'t running (--dry-run: the plan, the lints, the cost; --stopped: only wake the stopped ones, as after a restart, and start none)',
+  '/fleet up [--dry-run] [--wave n] [--stopped] [--restart-when-idle] [name…]  start the roster\'s instances that aren\'t running (--dry-run: the plan, the lints, the cost; --stopped: only wake the stopped ones, as after a restart, and start none; --restart-when-idle: a running one whose settings changed, or each one named, restarts with them once idle)',
   '/fleet down [name…]    take instances down: no wakes or nudges, /fleet up skips them (s in the panel stops one)',
   '/fleet remove <name>   forget an instance\'s settings and state (it stays in roster.json); --yes to do it',
   '/fleet budget [name|project] [amount|+n]  today\'s budgets; set or raise one for today',

@@ -42,7 +42,9 @@ export type OutboundConfig = {
   /** MCP tools (globs) whose results are outside content, besides the outside services' reads: they mark the context */
   outside: string[]
   /** Calls that pass although their tool sends: one tool (a glob) with what its input must hold (each key's value, a
-   * glob), for the named instances only (none named: any session). One chat, not the whole tool */
+   * glob), for the named instances only (none named: any session). One chat, not the whole tool. With source and body,
+   * only a text that is word for word in that file as it is now (a ready post): the body key's value, less a declared
+   * prefix, a contiguous span of the file once whitespace and markup are set aside */
   calls?: OutboundCall[]
   /** The person's own: MCP tools (globs) and hosts (or *.domain) whose content isn't outside content (his own tenant's
    * directory, his own chat, his intranet): reading them doesn't mark the conversation */
@@ -50,7 +52,7 @@ export type OutboundConfig = {
   [key: string]: unknown
 }
 
-export type OutboundCall = { tool: string; match: Record<string, string>; instances: string[] }
+export type OutboundCall = { tool: string; match: Record<string, string>; instances: string[]; source?: string; body?: string; prefix?: string }
 
 export function newOutbound(): OutboundConfig {
   return { outboundFormat: OUTBOUND_FORMAT, hosts: [], remotes: [], recipients: [], tools: { outbound: [], free: [] }, commands: [], outside: [] }
@@ -76,7 +78,13 @@ function callsOf(v: unknown): OutboundCall[] {
     const match: Record<string, string> = {}
     for (const [k, val] of Object.entries(o.match as Record<string, unknown>)) if (typeof val === 'string' || typeof val === 'number') match[k] = String(val)
     if (!Object.keys(match).length || Object.values(match).every(m => /^[*?\s]*$/.test(m))) continue
-    out.push({ tool: o.tool.trim(), match, instances: strings(o.instances) })
+    // A source names a file of the project, relative, and the input key that holds the text: without both, the entry
+    // isn't used (it would pass any text)
+    const source = typeof o.source === 'string' ? o.source.trim().replace(/^\.\//, '') : ''
+    const body = typeof o.body === 'string' ? o.body.trim() : ''
+    if (o.source !== undefined && (!source || source.startsWith('/') || source.split('/').includes('..') || !body)) continue
+    const prefix = typeof o.prefix === 'string' && o.prefix.trim() ? o.prefix : ''
+    out.push({ tool: o.tool.trim(), match, instances: strings(o.instances), ...(source ? { source, body } : {}), ...(source && prefix ? { prefix } : {}) })
   }
   return out
 }
@@ -408,15 +416,266 @@ function callValues(key: string, v: unknown): string[] | null {
 /** A call outbound.json's calls let pass: its tool, every key it names holding only values its glob matches, every other
  * recipient the call names one the person's recipients allow, and this session one of the instances it names (or it
  * names none). who: this session's instance, null for none */
-export function callAllowed(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null): boolean {
+/** A calls entry's tool, instances and match hold for this call (its source aside) */
+function callNamed(k: OutboundCall, tool: string, input: Record<string, unknown>, who: string | null): boolean {
+  if (!matches(tool, k.tool)) return false
+  if (k.instances.length && !(who && k.instances.some(i => i.toLowerCase() === who.toLowerCase()))) return false
+  return Object.entries(k.match).every(([key, want]) => {
+    const vals = callValues(key, input[key])
+    return !!vals && vals.every(v => (urlKey(key) ? urlMatches(v, want) : callMatches(v, want)))
+  })
+}
+
+/** A text with its markup and spacing set aside, for comparing a post with its source: links keep their words,
+ * headings, quotes, bullets and emphasis go, curly quotes are straight, whitespace is one space */
+export function plainText(s: string): string {
+  return s
+    .replace(/<(https?:[^|>\s]+)\|([^>]+)>/g, '$2')
+    .replace(/<(https?:[^>\s]+)>/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/<\/?[a-z][^>]*>/gi, ' ')
+    .replace(/^[ \t]{0,3}(?:#{1,6}[ \t]+|>[ \t]?|[-*+•][ \t]+|\d+[.)][ \t]+)/gm, '')
+    .replace(/[*_`~]+/g, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** A post's text less the prefix its entry declares, as typed (markup kept) */
+function rawBody(text: string, prefix?: string): string {
+  const t = text.trimStart()
+  return prefix && t.startsWith(prefix.trim()) ? t.slice(prefix.trim().length) : t
+}
+
+/** A text's blocks, in order: its paragraphs, list items, table rows and headings (with their level) */
+function blocksOf(text: string): { text: string; heading?: number }[] {
+  const out: { text: string; heading?: number }[] = []
+  let cur: string[] = []
+  const flush = () => {
+    if (cur.length) out.push({ text: cur.join('\n') })
+    cur = []
+  }
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) {
+      flush()
+      continue
+    }
+    const h = /^[ \t]{0,3}(#{1,6})[ \t]+/.exec(line)
+    if (h) {
+      flush()
+      out.push({ text: line, heading: (h[1] as string).length })
+      continue
+    }
+    if (/^[ \t]*(?:[-*+•]|\d+[.)])[ \t]+/.test(line) || /^[ \t]*\|/.test(line)) flush()
+    cur.push(line)
+  }
+  flush()
+  return out
+}
+
+/** Words that say a block or a heading's part isn't to be posted: "not ready", "never post", "do not post" anywhere, or
+ * internal, draft, private or hold in its label (a heading, or the words before a block's first colon) */
+const NOT_POSTED = /\b(?:not ready|never post(?:ed)?|do not post|don't post|not for posting|not to be posted)\b/i
+const NOT_POSTED_LABEL = /\b(?:internal|draft|drafts|private|hold|held|unready)\b/i
+
+function notPosted(block: { text: string; heading?: number }): boolean {
+  const t = plainText(block.text)
+  if (NOT_POSTED.test(t)) return true
+  if (block.heading) return NOT_POSTED_LABEL.test(t)
+  const colon = t.indexOf(':')
+  return colon > 0 && colon <= 60 && NOT_POSTED_LABEL.test(t.slice(0, colon))
+}
+
+/** A block's sentences: split after . ! ? (and a closing quote or bracket) */
+function sentencesIn(t: string): string[] {
+  return plainText(t)
+    .split(/(?<=[.!?…]["'”’)\]]*)\s+/)
+    .map(x => x.trim())
+    .filter(Boolean)
+}
+
+/** The sentences a ready post may be made of, in the file's order: every block's, less a block marked not to post and
+ * every block under a heading marked so (to the next heading of its level or above) */
+export function postableSentences(source: string): string[] {
+  const out: string[] = []
+  let skipBelow = 0
+  for (const b of blocksOf(source)) {
+    if (b.heading) {
+      if (skipBelow && b.heading > skipBelow) continue
+      skipBelow = notPosted(b) ? b.heading : 0
+      if (!skipBelow) out.push(...sentencesIn(b.text))
+      continue
+    }
+    if (skipBelow || notPosted(b)) continue
+    out.push(...sentencesIn(b.text))
+  }
+  return out
+}
+
+/** Whether a post is made of whole sentences of its source, one after another as the file has them */
+function wholeSentences(body: string, source: string): boolean {
+  const said = blocksOf(body).flatMap(b => sentencesIn(b.text))
+  const file = postableSentences(source)
+  if (!said.length) return false
+  for (let i = 0; i + said.length <= file.length; i++) if (said.every((x, k) => file[i + k] === x)) return true
+  return false
+}
+
+function escaped(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** Whether words stand in a text as whole words (not inside a longer one) */
+function hasWords(text: string, words: string): boolean {
+  return new RegExp(`(?:^|[^\\p{L}\\p{N}])${escaped(words)}(?![\\p{L}\\p{N}])`, 'u').test(text)
+}
+
+function shortText(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s
+}
+
+/** Whether a post is word for word in its source as it is now: null when it is (whole sentences of the file, one after
+ * another, none from a part marked not to post); else where it departs (the last words that match, and the first that
+ * don't), or that it's a part of a sentence, or of a part not to post */
+export function sourceDifference(text: string, source: string, prefix?: string): string | null {
+  const raw = rawBody(text, prefix)
+  const body = plainText(raw)
+  const file = plainText(source)
+  if (body && wholeSentences(raw, source)) return null
+  const words = body.split(' ').filter(Boolean)
+  if (!words.length) return 'it has no text'
+  if (hasWords(file, body)) {
+    if (!hasWords(postableSentences(source).join(' '), body)) return `it's in a part of the file marked not to post ("${shortText(body, 60)}")`
+    return `it's a part of a sentence of the file, not the whole of it ("${shortText(body, 60)}"): post whole sentences, as the file has them`
+  }
+  let lo = 0
+  let hi = words.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (hasWords(file, words.slice(0, mid).join(' '))) lo = mid
+    else hi = mid - 1
+  }
+  const next = words.slice(lo, lo + 12).join(' ')
+  const more = lo + 12 < words.length ? '…' : ''
+  if (!lo) return `it starts "${next}${more}", which the file doesn't have`
+  return `it matches up to "…${words.slice(Math.max(0, lo - 6), lo).join(' ')}", then says "${next}${more}", which the file doesn't have there`
+}
+
+/** What a post's markup would carry that its words don't: a link's target, a tag's attributes (an image's source), a
+ * struck-through span the file doesn't strike. Markup is set aside only when nothing is lost: a link to a target the
+ * file has, a tag with no attributes */
+export function markupProblem(text: string, source: string): string | null {
+  for (const m of text.matchAll(/!?\[[^\]]*\]\(\s*<?([^)\s>]*)>?[^)]*\)/g)) {
+    const url = (m[1] as string).trim()
+    if (url && !source.includes(url)) return `it links to ${shortText(url, 80)}, which the file doesn't`
+  }
+  for (const m of text.matchAll(/<((?:https?|mailto):[^|>\s]+)\|[^>]*>/gi)) {
+    if (!source.includes(m[1] as string)) return `it links to ${shortText(m[1] as string, 80)}, which the file doesn't`
+  }
+  for (const m of text.matchAll(/<([a-z][a-z0-9-]*)\b([^>]*)>/gi)) {
+    const tag = (m[1] as string).toLowerCase()
+    const attrs = (m[2] as string).replace(/\/\s*$/, '').trim()
+    if (/^(?:s|del|strike)$/.test(tag)) return `it strikes words through (<${tag}>), which changes what they say`
+    if (!attrs) continue
+    const href = /^href\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))$/i.exec(attrs)
+    const url = href ? (href[1] ?? href[2] ?? href[3] ?? '') : ''
+    if (tag === 'a' && url && source.includes(url)) continue
+    return `it has a <${tag}> tag with ${shortText(attrs, 80)}, which a ready post doesn't carry`
+  }
+  for (const m of text.matchAll(/~~([^~]+)~~/g)) {
+    if (!source.includes(m[0])) return `it strikes "${shortText(m[1] as string, 40)}" through, which the file doesn't`
+  }
+  return null
+}
+
+/** The strings a value holds, anywhere in it (an object's, a list's) */
+function stringsIn(v: unknown, depth = 0): string[] {
+  if (typeof v === 'string') return [v]
+  if (depth > 8 || !v || typeof v !== 'object') return []
+  return (Array.isArray(v) ? v : Object.values(v as Record<string, unknown>)).flatMap(x => stringsIn(x, depth + 1))
+}
+
+/** A sourced entry's call sets nothing but its text and the keys the entry matches: another key with text in it (a
+ * subject, an attachment, a card) would go out unchecked */
+function otherKeys(k: OutboundCall, input: Record<string, unknown>): string | null {
+  for (const [key, v] of Object.entries(input)) {
+    if (key === k.body || key in k.match) continue
+    if (stringsIn(v).some(x => x.trim() !== '')) return `it also sets ${key}, which the entry doesn't match (a ready post sets only ${k.body} and the keys its match names)`
+  }
+  return null
+}
+
+/** Why a call a sourced entry names isn't a ready post (null: it is): another key with text, markup that carries more
+ * than its words (words: false), or a text that isn't whole sentences of the file as it is now */
+function sourcedProblem(k: OutboundCall, input: Record<string, unknown>, text: string | null | undefined): { why: string; words: boolean } | null {
+  if (text === null || text === undefined) return { why: "fleet can't read the file", words: true }
+  const said = input[k.body as string]
+  if (typeof said !== 'string') return { why: `the call has no text in ${k.body}`, words: true }
+  const other = otherKeys(k, input) ?? markupProblem(said, text)
+  if (other) return { why: other, words: false }
+  const d = sourceDifference(said, text, k.prefix)
+  return d ? { why: d, words: true } : null
+}
+
+/** A held ready post's reason, as /fleet and the hold say it */
+export function missText(m: { source: string; difference: string; words?: boolean }): string {
+  return m.words === false ? `it isn't only a ready post of ${m.source}: ${m.difference}` : `its text isn't word for word in ${m.source} as it is now: ${m.difference}`
+}
+
+/** A calls entry for named instances whose role's tools don't list its tool: the tool is hidden from that session, so
+ * every post becomes a draft for the person. tools: the instance's role tools (null: no tools line, so every tool) */
+export function callsToolLint(c: OutboundConfig, instances: readonly { name: string; agent: string; tools: string[] | null }[]): string[] {
+  const out: string[] = []
+  for (const k of c.calls ?? []) {
+    for (const name of k.instances) {
+      const inst = instances.find(i => i.name.toLowerCase() === name.toLowerCase())
+      if (!inst || inst.tools === null) continue
+      const sees = inst.tools.some(t => t === '*' || t === k.tool || matches(k.tool, t) || matches(t, k.tool) || k.tool.startsWith(`${t}__`))
+      if (!sees) out.push(`${inst.name}: outbound.json's calls entry for ${k.tool} is for it, but its role's tools (.claude/agents/${inst.agent}.md) don't list ${k.tool}, so it can't call it and every post would be a draft for you: add the tool to the role's tools`)
+    }
+  }
+  return out
+}
+
+/** An entry with no source that lets through what a sourced one checks word for word (the same tool, a match as wide or
+ * wider, for the same sessions): any text passes there, so the check is moot. One line each, for /fleet status and
+ * /fleet up --dry-run */
+export function callsLint(c: OutboundConfig): string[] {
+  const out: string[] = []
+  const calls = c.calls ?? []
+  for (const s of calls.filter(k => k.source)) {
+    for (const u of calls.filter(k => !k.source)) {
+      if (!(u.tool === s.tool || matches(s.tool, u.tool))) continue
+      if (u.instances.length && !(s.instances.length && s.instances.every(i => u.instances.some(x => x.toLowerCase() === i.toLowerCase())))) continue
+      if (!Object.entries(u.match).every(([key, want]) => key in s.match && (s.match[key] === want || callMatches(s.match[key] as string, want)))) continue
+      out.push(`outbound.json's calls: the entry for ${u.tool} (${Object.entries(u.match).map(([key, v]) => `${key} ${v}`).join(', ')}) has no source, so it lets any text through where the one with source ${s.source} lets only its ready text: take it out, or give it the same source and body`)
+    }
+  }
+  return [...new Set(out)]
+}
+
+/** The source files the calls entries for this call name, which the gate reads before it checks the call */
+export function callSources(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null): string[] {
+  return [...new Set((c.calls ?? []).filter(k => k.source && callNamed(k, tool, input, who)).map(k => k.source as string))]
+}
+
+/** For a call a sourced entry names whose text isn't in that file as it is now: the file and where the text departs */
+export function sourceMiss(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null, sources: ReadonlyMap<string, string | null>): { source: string; difference: string; words: boolean } | null {
+  for (const k of c.calls ?? []) {
+    if (!k.source || !k.body || !callNamed(k, tool, input, who)) continue
+    const d = sourcedProblem(k, input, sources.get(k.source))
+    if (!d) return null
+    return { source: k.source, difference: d.why, words: d.words }
+  }
+  return null
+}
+
+export function callAllowed(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null, sources: ReadonlyMap<string, string | null> = new Map()): boolean {
   return (c.calls ?? []).some(k => {
-    if (!matches(tool, k.tool)) return false
-    if (k.instances.length && !(who && k.instances.some(i => i.toLowerCase() === who.toLowerCase()))) return false
-    const named = Object.entries(k.match).every(([key, want]) => {
-      const vals = callValues(key, input[key])
-      return !!vals && vals.every(v => (urlKey(key) ? urlMatches(v, want) : callMatches(v, want)))
-    })
-    if (!named) return false
+    if (!callNamed(k, tool, input, who)) return false
+    // A ready post: only its text as the file has it now, whole sentences, nothing else set, no markup that carries more
+    if (k.source && k.body && sourcedProblem(k, input, sources.get(k.source)) !== null) return false
     // Recipients the input doesn't hold (a draft by its id, a reply to all): never
     if (implicitRecipients(input)) return false
     // A recipient on a key the entry doesn't name goes only where the person's recipients allow; one fleet can't read
@@ -480,7 +739,9 @@ export function recipientsOf(input: Record<string, unknown>): string[] {
  * context). An outside service's tool that doesn't read sends, unless it only moves or marks what's there; another
  * server's sends when its name has a verb that writes. The person's lists come first; a message whose every recipient
  * is on his list passes */
-export function classifyMcp(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null = null): { send: Send | null; outside: boolean } {
+/** allowed: a call that sends, let through by a calls entry or the person's recipients (the gate checks such a send
+ * against what this thread read: refused once when that changed since) */
+export function classifyMcp(tool: string, input: Record<string, unknown>, c: OutboundConfig, who: string | null = null, sources: ReadonlyMap<string, string | null> = new Map()): { send: Send | null; outside: boolean; allowed?: true } {
   const parts = mcpParts(tool)
   if (!parts || /^fleet$/i.test(parts.server)) return { send: null, outside: false }
   const words = nameWords(parts.name)
@@ -496,11 +757,14 @@ export function classifyMcp(tool: string, input: Record<string, unknown>, c: Out
   const outside = (toolListed(tool, c.outside) || (remote && reads)) && !insideCall(tool, input, c)
   const listed = toolListed(tool, c.tools.outbound)
   if (!listed && (toolListed(tool, c.tools.free) || claudeServer(parts.server))) return { send: null, outside }
-  if (callAllowed(tool, input, c, who)) return { send: null, outside }
-  if (!listed && !writes && !(remote && !reads && !neutral)) return { send: null, outside }
+  const sends = listed || writes || (remote && !reads && !neutral)
+  if (callAllowed(tool, input, c, who, sources)) return sends ? { send: null, outside, allowed: true } : { send: null, outside }
+  if (!sends) return { send: null, outside }
   const to = recipientsOf(input)
-  if (!listed && to.length && recipientsReadable(input) && to.every(r => recipientAllowed(r, c))) return { send: null, outside }
-  return { send: { what: `${parts.name} on ${parts.server}`, to: to.length ? to : [parts.server], files: [] }, outside }
+  if (!listed && to.length && recipientsReadable(input) && to.every(r => recipientAllowed(r, c))) return { send: null, outside, allowed: true }
+  // A ready post whose text isn't its file's as it is now: held, and the hold says where it departs
+  const miss = sourceMiss(tool, input, c, who, sources)
+  return { send: { what: `${parts.name} on ${parts.server}${miss ? ` (${missText(miss)})` : ''}`, to: to.length ? to : [parts.server], files: [] }, outside }
 }
 
 // ---- Bash: the simple commands a line runs ----

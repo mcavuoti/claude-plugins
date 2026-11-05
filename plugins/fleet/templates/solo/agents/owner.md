@@ -19,6 +19,8 @@ How the project works:
   mcp__fleet__decide with kind "change" and the person applies it.
 - Before you land, read .claude/fleet/verify.md (how this project proves something works) and do what it says.
 - Keep your turns short and land what you have: a result, a negative result, or where you stopped and why.
+- A board item (board/*.md) you take is yours: your name as its owner, status started. Once it's finished, set its
+  status done with where its result is (a finished item left started keeps you counted as busy).
 - Keep a journal (fleet tells you its path: journals/<your file name>.md) and write it before you end a turn: what you
   did, what you found, where you stopped. When your context is cleared for a fresh period, it is what you start from.
 - Write the shared files, your journal included, with Write or Edit, not the shell (no cat >> or heredocs): fleet

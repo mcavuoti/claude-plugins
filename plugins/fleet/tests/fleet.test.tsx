@@ -28,7 +28,7 @@ test('/fleet init sets the project up: config, decisions folders, .gitignore; ag
   expect(w.files.get(`${FLEET}/.gitignore`)).toContain('\ndecisions/\n')
   for (const d of ['queue', 'answers', 'register', 'tmp', 'prune']) expect(w.dirs.has(`${DEC}/${d}`)).toBe(true)
   // Not a background session: no decide here; the person's taste is heard from now on
-  expect(w.tools.map(t => t.name)).toEqual(['taste'])
+  expect(w.tools.map(t => t.name)).toEqual(['taste', 'confirm'])
   expect(await fleet($, 'init --commit-register')).toContain('Up to date')
   expect(json(w, `${FLEET}/config.json`).commitRegister).toBe(true)
   expect(w.files.get(`${FLEET}/.gitignore`)).toContain('!decisions/register/')
@@ -50,8 +50,8 @@ test('/fleet init refuses the home folder and a config.json from a newer fleet',
 test('decide is offered in a background session of a fleet project only, in the first request', WITH_SESSIONS, async ($, on) => {
   const w = world(on)
   await startSession($, w)
-  expect(w.tools.map(t => [t.name, t.isDeferred])).toEqual([['taste', false], ['decide', false], ['send', false], ['slot', false]])
-  expect(w.tools[1].inputSchema.properties.questions.maxItems).toBe(4)
+  expect(w.tools.map(t => [t.name, t.isDeferred])).toEqual([['taste', false], ['confirm', true], ['decide', false], ['send', false], ['slot', false], ['run', false]])
+  expect(w.tools.find(t => t.name === 'decide')?.inputSchema.properties.questions.maxItems).toBe(4)
   expect(w.commands).toEqual(['fleet'])
 })
 
@@ -59,7 +59,7 @@ test('decide is not offered outside a background session, nor where the job fold
   const w = world(on, { background: false })
   await startSession($, w)
   // The person's taste is heard where he types: taste is offered in every session of a fleet project
-  expect(w.tools.map(t => t.name)).toEqual(['taste'])
+  expect(w.tools.map(t => t.name)).toEqual(['taste', 'confirm'])
   expect(await fleet($, 'status')).toContain("decide: not offered here: this isn't a background session")
 })
 
@@ -67,7 +67,7 @@ test('a claude started from a background session’s shell inherits CLAUDE_JOB_D
   const w = world(on)
   w.files.set(`${HOME}/.claude/jobs/${REF}/state.json`, JSON.stringify({ sessionId: 'bbbbbbbb-0000-0000-0000-000000000000' }))
   await startSession($, w)
-  expect(w.tools.map(t => t.name)).toEqual(['taste'])
+  expect(w.tools.map(t => t.name)).toEqual(['taste', 'confirm'])
 })
 
 test('decide answers at once with a ticket and queues the record; refuses subagents and bad input', WITH_SESSIONS, async ($, on) => {
@@ -116,7 +116,7 @@ test('the whole loop: listed, answered once from a terminal, delivered exactly o
   const said = await fleet($, '1a 2b')
   expect(said).toContain('1: Which database for the cache? → a) SQLite')
   expect(said).toContain('2: Should entries expire? → b) Never')
-  expect(said).toContain("D-1 goes to TEST A when it's idle")
+  expect(said).toContain("D-1 goes to TEST A at its next step")
   expect(json(w, `${DEC}/answers/D-1.1.json`)).toMatchObject({ format: 1, id: 'D-1', q: 1, label: 'SQLite', origin: 'composer', session: 'TEST A' })
   // A second answer finds the first
   expect(await fleet($, '1b')).toContain('already answered')
@@ -411,6 +411,14 @@ test("in an instance the model's own AskUserQuestion is refused toward decide; a
   await decide($, { questions: [TWO_QUESTIONS.questions[0]] })
   await fleet($, '')
   expect(await fleet($, '1a')).toContain("(typed in Owner A's session, an instance of the roster: recorded as your answers all the same)")
+  // Whatever its kind: a resource done, a change rejected; and not when nothing was recorded
+  await decide($, { kind: 'resource', what: 'a license for the simulator', why: 'the runs need it' })
+  await decide($, { kind: 'change', path: '.claude/fleet/charter.md', summary: 'goal A', content: '# Charter\n\nGoal A.\n' })
+  const list = await fleet($, '')
+  expect(list).toContain('a license for the simulator')
+  expect(await fleet($, 'D-2 done "in the vault"')).toContain("(typed in Owner A's session, an instance of the roster: recorded as your answers all the same)")
+  expect(await fleet($, 'D-3 reject "not now"')).toContain("(typed in Owner A's session, an instance of the roster")
+  expect(await fleet($, 'D-3 reject "again"')).not.toContain('(typed in')
 })
 
 test("in the person's own background session (not an instance) the model's AskUserQuestion is shown, not refused", { plugins: [FAKE_SESSIONS], timeoutMs: 30000 }, async ($, on) => {

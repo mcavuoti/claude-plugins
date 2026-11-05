@@ -29,9 +29,17 @@ leaves the charter or the roster unclear.
     Perforce depot on a dev machine (its host and depot path); the branch or depot path fleet watches; each code
     role's worktree or client workspace. fleet tells a role at its next step when that branch changed a file it
     changed, or someone submitted a file it has open.
-15. Cadence: how often each kind of owner lands something; quiet hours; time zone.
+15. Cadence: how often each kind of owner lands something; quiet hours; time zone. And the pace: how often fleet may wake or nudge an idle instance (roster.json's "wakes"). The
+    template's, one every 60 min and at most 8 a day, keeps the cost low; offer `{ "everyMin": 20, "perDay": null }`
+    (one every 20 min, no daily cap: the dry run prices it) and recommend it when results are wanted within the day.
+    A role that checks something on a schedule (a mailbox, a queue) gets roster.json's `"poll": { "everyMin": n,
+    "prompt": "..." }`, which fleet sends while it's idle, rather than a CronCreate of its own.
 16. The roster: which roles and how many of each, the areas of the proof of concept, the first wave.
-17. Deciding alone: what each role may decide without asking (by default, what is reversible inside its own part),
+17. Models and effort per role (roster.json's "model" and "effort", on a role or an instance): the strong model on
+    hands-on technical work. Recommend opus for the leads, the proofs of concept, the verifier, the integrator and
+    the planner, sonnet for the researchers and the testers, haiku only for the janitor, and effort xhigh for the
+    verifier and the lead; the dry run prices each.
+18. Deciding alone: what each role may decide without asking (by default, what is reversible inside its own part),
     and what must reach the person (by default: the goal or the scope, a conflict the owners couldn't settle, money,
     anything that leaves the project or touches its confidential material, what can't be undone). It's the charter's
     "Deciding alone, and asking the person" section; the fewer questions reach the person, the faster the fleet goes.

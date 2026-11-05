@@ -169,7 +169,12 @@ test('R6: the scan runs during a long command; what the command writes lands as 
   expect(mine(w)).toEqual([])
   finish()
   await pending
-  expect(mine(w)).toEqual([expect.objectContaining({ path: 'notes/plan.md', via: 'bash', by: expect.objectContaining({ sessionId: SID }) })])
+  // npm test doesn't name it: no event explains it either, and it got its time while the command ran, so it's probably
+  // the command's (B5)
+  expect(mine(w)).toEqual([])
+  await tick(w, 10000)
+  await tick(w, 10000)
+  expect(mine(w)).toEqual([expect.objectContaining({ path: 'notes/plan.md', via: 'bash', probably: true, by: expect.objectContaining({ sessionId: SID }) })])
   // Another session runs a long command (its reads file says so): a change meanwhile waits for its post-scan
   const OTHER = `${FLEET}/reads/${B_SID}.json`
   const reads = (running: unknown[]) => w.touch(OTHER, JSON.stringify({ format: 1, sessionId: B_SID, ref: 'bbbbbbbb', name: 'TEST B', at: w.clock.now(), threads: {}, running }))
@@ -199,14 +204,14 @@ test('a command run in the background: what changes while it runs is probably it
   const r = await call($, { tool: 'Bash', command: 'npm run build', run_in_background: true })
   expect(r.result.backgroundTaskId).toBe('bash-1')
   await tick(w, 1100)
-  expect(json(w, `${FLEET}/reads/${SID}.json`)?.running).toEqual([{ thread: 'main', at: expect.any(Number), task: 'bash-1' }])
+  expect(json(w, `${FLEET}/reads/${SID}.json`)?.running).toEqual([{ thread: 'main', at: expect.any(Number), task: 'bash-1', command: 'npm run build' }])
   // It writes plan.md: the sweeper's scan takes it as probably this session's background command, never the person's
   w.touch(PLAN, 'plan from the build\n')
   await tick(w, 10000)
   await tick(w, 10000)
   expect(mine(w)).toEqual([expect.objectContaining({ path: 'notes/plan.md', via: 'bash', blind: true, probably: true, by: expect.objectContaining({ sessionId: SID, agentId: null }) })])
   expect(await fleet($, 'status')).toContain('notes/plan.md: changed at')
-  expect(await fleet($, 'status')).toContain("by this session's main thread (probably its background command, landed blind)")
+  expect(await fleet($, 'status')).toContain("by this session's main thread (probably a command of its, landed blind)")
   // ... which the person can stamp as his, like an outside change
   expect(await fleet($, 'accept')).toContain('notes/plan.md: changed at')
   // It writes todo.md and completes: at the next stop (or its notification), what's left lands as its own
@@ -216,12 +221,14 @@ test('a command run in the background: what changes while it runs is probably it
   expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([])
   await $.prompt.submit({ text: '<task-notification><task-id>bash-1</task-id><status>completed</status></task-notification>', origin: { kind: 'task-notification' }, wait: false } as any)
   await w.clock.settle()
-  expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([expect.objectContaining({ via: 'bash', blind: true, by: expect.objectContaining({ sessionId: SID }) })])
-  expect(mine(w).find(e => e.path === 'notes/todo.md')?.probably).toBe(undefined)
+  // npm run build doesn't name it: its run covers its time, so it's probably its
+  await tick(w, 10000)
+  await tick(w, 10000)
+  expect(mine(w).filter(e => e.path === 'notes/todo.md')).toEqual([expect.objectContaining({ via: 'bash', blind: true, probably: true, by: expect.objectContaining({ sessionId: SID }) })])
   await tick(w, 1100)
   expect(json(w, `${FLEET}/reads/${SID}.json`)?.running).toBe(undefined)
   // Another one, whose end only the stop says (no notification seen): gone from the background tasks, it lands
-  await call($, { tool: 'Bash', command: 'npm run docs', run_in_background: true })
+  await call($, { tool: 'Bash', command: 'npm run docs -- --out notes/docs.md', run_in_background: true })
   w.touch(`${ROOT}/notes/docs.md`, 'docs\n')
   await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as any)
   await w.clock.settle()
@@ -238,7 +245,7 @@ test('a command that writes many shared files lands them in a couple of processe
     w.touch(`${ROOT}/req/R-2.md`, 'R-2 v2\n')
   }
   const before = w.runs.length
-  await call($, { tool: 'Bash', command: 'make notes' })
+  await call($, { tool: 'Bash', command: 'make -C tools notes req' })
   // One shell for the records' versions, one for the events
   const spawned = w.runs.slice(before)
   expect(spawned.map(a => a[0])).toEqual(['sh', 'sh'])

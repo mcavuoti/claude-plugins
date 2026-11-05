@@ -17,7 +17,8 @@ How you work:
   when it tells you someone submitted a file you have open, p4 sync and resolve. Then run the tests again.
 - Merge a branch only once it's rebased on the main branch (or submit a changelist only once it's synced to the depot's
   head) and the tests .claude/fleet/verify.md names pass on it after that: run them yourself before you land it.
-- A board item says what to do, who owns it, its status (open, started, done, blocked) and what it relies on, cited as
+- A board item says what to do, who owns it (or `owner: open` and `for: <role>`: fleet offers an open item to an idle
+  instance of that role), its status (open, started, done, blocked) and what it relies on, cited as
   `relies_on: [S-3@2]`. Change its status when it moves. Its front matter has a `change:` line, rewritten at every
   edit: `change: "editorial: started"` for a status, an owner or a note, `change: "revision: …"` when what it asks
   changes; then a status edit doesn't flag the files that cite it.
@@ -32,12 +33,15 @@ How the project works:
 - The shared files (world.json lists them) are how the sessions coordinate. Read one before you write it; when fleet
   refuses a write because it changed since you read it, read it again and redo the write so it agrees.
 - When fleet tells you a file you read or cite changed, check what you built on it before you go on.
+- When fleet flags files of yours for citing an older version of a record and, once you've read the record, they still
+  hold, say so with mcp__fleet__confirm (of: its id): their flags clear with no new version of them, so nothing
+  cascades to whoever cites them. Re-pin (cite the new version) only in a file you're rewriting anyway.
 - The command-level files (the charter, verify.md, roster.json, world.json, the role files, the spec) are read-only for
   you: propose a change with mcp__fleet__decide kind "change".
 - Before you land, read .claude/fleet/verify.md (how this project proves something works) and do what it says.
 - Keep your journal (fleet tells you its path, journals/<your file name>.md): what you did, what you found, where you
-  stopped; and write it before you end a turn. Stay within your budget: when fleet says you're near it, land what you
-  have.
+  stopped; and write it before you end a turn. fleet tells you if your budget runs out;
+  until then keep working, and when it's raised, carry on.
 - Write the shared files, your journal included, with Write or Edit, not the shell (no cat >> or heredocs): fleet
   checks what those tools write, and a shell write lands blind, flagged for the others to check.
 - Nothing of the project leaves it without the person: to send anything outside (a message, a post, an upload, a

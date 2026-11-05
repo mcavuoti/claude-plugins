@@ -12,6 +12,8 @@ fail() {
   echo "test-proof-check: $*" >&2
   status=1
 }
+# Its source parses with every warning an error (a backslash escape in a docstring that isn't raw warns)
+python3 -W error -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1])' "$script" || fail "it doesn't parse with warnings as errors"
 sha() { python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'; }
 record() { mkdir -p "$(dirname "$project/$1")" && cat >"$project/$1"; }
 
@@ -141,9 +143,49 @@ quote: "Measured on the testbench"
 ---
 EOF
 
+# A quote with \" and \\ in it, wrapped in double quotes: read as the source has it; a wrong one still fails; an
+# unwrapped one is taken as it is
+record notes/quoted.md <<'EOF'
+The operator said "hold the rate" and saved it to C:\runs\a.
+EOF
+record findings/F-9.md <<'EOF'
+---
+kind: finding
+source: notes/quoted.md
+quote: "said \"hold the rate\" and saved it to C:\\runs\\a"
+---
+EOF
+record findings/F-10.md <<'EOF'
+---
+kind: finding
+source: notes/quoted.md
+quote: "said \"drop the rate\" and saved it"
+---
+EOF
+record findings/F-11.md <<'EOF'
+---
+kind: finding
+source: notes/quoted.md
+quote: saved it to C:\runs\a.
+---
+EOF
+# A source that changed after the finding was written: its quote is no longer there
+record notes/later.md <<'EOF'
+The first draft says the margin is twelve percent.
+EOF
+record findings/F-12.md <<'EOF'
+---
+kind: finding
+source: notes/later.md
+quote: "the margin is twelve percent"
+---
+EOF
+touch -t 202001010000 "$project/findings/F-12.md"
+echo 'The second draft says the margin is nine percent.' >"$project/notes/later.md"
+
 files=(findings/F-1.md findings/F-2.md findings/F-3.md findings/F-4.md findings/F-5.md findings/F-6.md findings/F-7.md
-  findings/F-8.md poc/results/R-1.md poc/results/R-2.md poc/results/R-3.md poc/results/R-4.md poc/results/R-5.md
-  poc/results/R-6.md poc/results/R-7.md)
+  findings/F-8.md findings/F-9.md findings/F-10.md findings/F-11.md findings/F-12.md poc/results/R-1.md
+  poc/results/R-2.md poc/results/R-3.md poc/results/R-4.md poc/results/R-5.md poc/results/R-6.md poc/results/R-7.md)
 # Run from the project's folder, as fleet runs a check: prints its exit code, its lines in out and its notes in err
 run() {
   if (cd "$project" && python3 "$script" "$@" >"$project/out" 2>"$project/err"); then echo 0; else echo $?; fi
@@ -155,6 +197,8 @@ want="findings/F-2.md: quote not found in notes/sheet.md
 findings/F-5.md: source ../outside.md must be inside the project
 findings/F-6.md: source notes/missing.md isn't there
 findings/F-7.md: source: notes/sheet.md: its quote: is shorter than 10 characters
+findings/F-10.md: quote not found in notes/quoted.md
+findings/F-12.md: quote no longer in notes/later.md (it changed after this file)
 poc/results/R-2.md: run: printf 'rate 41\n' gave sha256 ${other:0:12}…, not ${good:0:12}… (exit 0)
 poc/results/R-6.md: run: printf 'rate 42\n' has no sha: after it
 poc/results/R-7.md: run: printf 'rate 41\n' gave sha256 ${other:0:12}…, not ${good:0:12}… (exit 0)"
@@ -168,6 +212,15 @@ for f in "${files[@]}"; do
   if grep -q "^$f" "$project/err"; then fail "a note starts with $f, so fleet would read it as a failure"; fi
 done
 
+# With no file named: every file under proofs.paths, and how many on standard error
+code="$(run --budget 20)"
+[ "$code" = 1 ] || fail "with no file named, exit $code, not 1"
+if [ "$(sort "$project/out")" != "$(echo "$want" | sort)" ]; then
+  fail "with no file named, its lines aren't the ones expected:"
+  diff <(echo "$want" | sort) <(sort "$project/out") >&2 || true
+fi
+grep -q "checked ${#files[@]} file(s) under proofs.paths" "$project/err" || fail "with no file named, it doesn't say how many it checked: $(cat "$project/err")"
+
 # Once the budget is used up nothing runs again: a wrong hash keeps its stored one
 code="$(run --budget 0 poc/results/R-2.md poc/results/R-1.md)"
 [ "$code" = 0 ] || fail "with no budget left, exit $code, not 0"
@@ -177,6 +230,10 @@ grep -q 'the budget is used up' "$project/err" || fail "the used-up budget isn't
 echo '{ "worldFormat": 1, "paths": ["findings/**"] }' >"$project/.claude/fleet/world.json"
 code="$(run poc/results/R-2.md findings/F-1.md findings/F-4.md)"
 [ "$code" = 0 ] || fail "with no rerun listed, exit $code, not 0"
+# ... and with no proofs.paths, a bare run checks nothing and says so
+code="$(run)"
+[ "$code" = 0 ] || fail "with no proofs.paths, a bare run exits $code, not 0"
+grep -q 'no proofs.paths' "$project/err" || fail "with no proofs.paths, a bare run doesn't say why it checked nothing"
 
 [ "$status" -eq 0 ] && echo "fleet: the proofs check fails what it should, and re-runs only what world.json lists"
 exit "$status"

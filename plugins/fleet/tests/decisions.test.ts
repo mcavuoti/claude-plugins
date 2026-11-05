@@ -47,6 +47,43 @@ test('answers: 1a 2b, 1) a 2) b, commas, free text in quotes; anything else is r
   expect(typeof parseAnswers('1 ""')).toBe('string')
 })
 
+test('his words: quotes inside a quoted answer are kept, unquoted words run to the end, and what can\'t be read shows the line and the form that records it', () => {
+  // B20: the answer ends at the closing quote after which the rest reads, so quotes inside it stay
+  const said = 'Start from the copy called "Archive" on the shared drive, then tell me what is missing'
+  expect(parseAnswers(`1 "${said}"`)).toEqual([{ n: 1, text: said }])
+  expect(parseAnswers('3 "the copy called "Archive" please" 4b')).toEqual([{ n: 3, text: 'the copy called "Archive" please' }, { n: 4, letter: 'b' }])
+  expect(parseAnswers('1 "he said "no" to that"')).toEqual([{ n: 1, text: 'he said "no" to that' }])
+  expect(parseAnswers('1 "use version "2 of it" please"')).toEqual([{ n: 1, text: 'use version "2 of it" please' }])
+  expect(parseAnswers('1 "x" 2 "y"')).toEqual([{ n: 1, text: 'x' }, { n: 2, text: 'y' }])
+  expect(parseAnswers('2 “mixed "quotes” inside”')).toEqual([{ n: 2, text: 'mixed "quotes” inside' }])
+  // Unquoted words after the number: to the end of the line, as his words; a quote left open too
+  expect(parseAnswers('3 use the fast path, the other is too slow')).toEqual([{ n: 3, text: 'use the fast path, the other is too slow', bare: true }])
+  expect(parseAnswers('1a 2 keep both for now')).toEqual([{ n: 1, letter: 'a' }, { n: 2, text: 'keep both for now', bare: true }])
+  expect(parseAnswers('3 "use the fast path')).toEqual([{ n: 3, text: 'use the fast path' }])
+  expect(parseAnswers('D-7 neither, ask again next week')).toEqual([{ n: 'D-7', text: 'neither, ask again next week', bare: true }])
+  // A verb then words: the note (and on a question, the words are the answer)
+  expect(parseAnswers('5 done the key is in the vault')).toEqual([{ n: 5, verb: 'done', note: 'the key is in the vault', words: 'done the key is in the vault', bareNote: true }])
+  expect(parseAnswers('2 no, the other one')).toEqual([{ n: 2, verb: 'no', note: 'the other one', words: 'no, the other one', bareNote: true }])
+  // After send or apply, words in no quotes are marked: the answer refuses them (they may say not to)
+  expect(parseAnswers('2 send not yet')).toEqual([{ n: 2, verb: 'send', note: 'not yet', words: 'send not yet', bareNote: true }])
+  expect(parseAnswers('2 send?')).toEqual([{ n: 2, verb: 'send', note: '?', words: 'send?', bareNote: true }])
+  expect(parseAnswers('2 send --allow just this once')).toEqual([{ n: 2, verb: 'send', allow: true, note: 'just this once', words: 'send --allow just this once', bareNote: true }])
+  expect(parseAnswers('3 apply but rename X first')).toMatchObject([{ n: 3, verb: 'apply', note: 'but rename X first', bareNote: true }])
+  expect(parseAnswers('2 send "not yet"')).toEqual([{ n: 2, verb: 'send', note: 'not yet' }])
+  // What can't be read: the whole line back, and the form that records it
+  const letterThen = parseAnswers('1a 3 b because it is faster') as string
+  expect(letterThen).toBe(`can't read "3 b because it is faster", so nothing was recorded. You typed:\n/fleet 1a 3 b because it is faster\nThis records it: /fleet 1a 3 "b because it is faster"`)
+  expect(parseAnswers('2 ok')).toContain('This records it: /fleet 2 "ok"')
+  expect(parseAnswers('yes please')).toContain('You typed:\n/fleet yes please\nAnswer like /fleet 1a 2b')
+  // Past the cap: refused with its length, never cut
+  const long = 'x'.repeat(4001)
+  expect(parseAnswers(`1 "${long}"`)).toContain('1: your words are 4001 characters, and an answer keeps at most 4000, so nothing was recorded.')
+  expect(parseAnswers(`1 "${'x'.repeat(4000)}"`)).toEqual([{ n: 1, text: 'x'.repeat(4000) }])
+  expect(parseCommand(`note 2 ${long}`)).toMatchObject({ kind: 'bad', reason: expect.stringContaining('your note is 4001 characters') })
+  expect(parseCommand(`note 2 "keep it local"`)).toEqual({ kind: 'note', n: 2, text: 'keep it local' })
+  expect(parseCommand(`drop 3 ${'y'.repeat(1001)}`)).toMatchObject({ kind: 'bad', reason: expect.stringContaining('your reason is 1001 characters') })
+})
+
 test('/fleet words: list, status, init, note, drop, help; the rest are answers', () => {
   expect(parseCommand('')).toEqual({ kind: 'list' })
   expect(parseCommand(' status ')).toEqual({ kind: 'status' })
@@ -64,31 +101,33 @@ test('a change is answered with a verb: apply (with the edited draft’s version
   expect(parseAnswers('1 apply 2b 3 reject')).toEqual([{ n: 1, verb: 'apply' }, { n: 2, letter: 'b' }, { n: 3, verb: 'reject' }])
   expect(parseAnswers('4 Apply h1A2b3c4d')).toEqual([{ n: 4, verb: 'apply', hash: 'h1a2b3c4d' }])
   expect(parseAnswers('1 edit, 2 apply')).toEqual([{ n: 1, verb: 'edit' }, { n: 2, verb: 'apply' }])
-  expect(typeof parseAnswers('1 applied')).toBe('string')
-  expect(typeof parseAnswers('1 apply 1a')).toBe('string')
+  // Not a verb: his words (a change says it records none of them)
+  expect(parseAnswers('1 applied')).toEqual([{ n: 1, text: 'applied', bare: true }])
+  expect(parseAnswers('1 apply 1a')).toContain('1 is answered twice')
 })
 
 test('a resource is answered done or no, an outbound send (with its version after an edit), reject, edit or done; a note may follow', () => {
   expect(parseAnswers('1 done "the key is in the vault" 2 no')).toEqual([{ n: 1, verb: 'done', note: 'the key is in the vault' }, { n: 2, verb: 'no' }])
   expect(parseAnswers('3 send h1a2b3c4d, 4 reject “not yet”')).toEqual([{ n: 3, verb: 'send', hash: 'h1a2b3c4d' }, { n: 4, verb: 'reject', note: 'not yet' }])
   expect(parseAnswers('5 "free text" 6a')).toEqual([{ n: 5, text: 'free text' }, { n: 6, letter: 'a' }])
-  expect(typeof parseAnswers('1 nope')).toBe('string')
+  expect(parseAnswers('1 nope')).toEqual([{ n: 1, text: 'nope', bare: true }])
   // send --allow: it also adds where it goes to outbound.json; with the version, in either order
   expect(parseAnswers('1 send --allow 2 send h1a2b3c --allow "mine"')).toEqual([{ n: 1, verb: 'send', allow: true }, { n: 2, verb: 'send', hash: 'h1a2b3c', allow: true, note: 'mine' }])
   expect(parseAnswers('3 send --allow h1a2b3c4d')).toEqual([{ n: 3, verb: 'send', hash: 'h1a2b3c4d', allow: true }])
-  expect(parseAnswers('1 apply --allow')).toBe('1: --allow goes with send (/fleet 1 send --allow)')
-  expect(typeof parseAnswers('1 send --allowed')).toBe('string')
-  expect(parseAnswers('1 send h1a2b3c h4d5e6f')).toBe('1: one version at most')
+  expect(parseAnswers('1 apply --allow')).toContain('1: --allow goes with send (/fleet 1 send --allow), so nothing was recorded.')
+  expect(parseAnswers('1 send --allowed')).toContain("1: --allowed isn't an option of send (there is --allow)")
+  expect(parseAnswers('1 send h1a2b3c h4d5e6f')).toContain('1: one version at most')
   expect(parseCommand('brief')).toEqual({ kind: 'brief', chief: false })
   expect(parseCommand('brief --chief')).toEqual({ kind: 'brief', chief: true })
   expect(parseCommand('brief all').kind).toBe('bad')
 })
 
 test("/fleet up, down, remove, budget, worktrees: their words and what's refused", () => {
-  expect(parseCommand('up')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [], stopped: false })
-  expect(parseCommand('up --dry-run --wave 2')).toEqual({ kind: 'up', dryRun: true, wave: 2, names: [], stopped: false })
-  expect(parseCommand('up --stopped')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [], stopped: true })
-  expect(parseCommand('up "Area A" chief --wave=1')).toEqual({ kind: 'up', dryRun: false, wave: 1, names: ['Area A', 'chief'], stopped: false })
+  expect(parseCommand('up')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [], stopped: false, restartWhenIdle: false })
+  expect(parseCommand('up --dry-run --wave 2')).toEqual({ kind: 'up', dryRun: true, wave: 2, names: [], stopped: false, restartWhenIdle: false })
+  expect(parseCommand('up --restart-when-idle Chief')).toEqual({ kind: 'up', dryRun: false, wave: null, names: ['Chief'], stopped: false, restartWhenIdle: true })
+  expect(parseCommand('up --stopped')).toEqual({ kind: 'up', dryRun: false, wave: null, names: [], stopped: true, restartWhenIdle: false })
+  expect(parseCommand('up "Area A" chief --wave=1')).toEqual({ kind: 'up', dryRun: false, wave: 1, names: ['Area A', 'chief'], stopped: false, restartWhenIdle: false })
   expect(parseCommand('up --wave').kind).toBe('bad')
   expect(parseCommand('up --wave 0').kind).toBe('bad')
   expect(parseCommand('up --force').kind).toBe('bad')
@@ -137,6 +176,15 @@ test("decide's input: counts, labels, the recommendation by label or letter, and
   expect(bad({ questions: [{ question: 'Q', options: ['A', 'B'], recommended: 'c', why: 'w' }] })).toContain('recommended must be one of')
   expect(bad({ questions: [{ question: 'Q', options: ['A', 'B'], recommended: 'A' }] })).toContain('why you recommend')
   expect(bad({ questions: [{ options: ['A', 'B'], recommended: 'A', why: 'w' }] })).toContain('question text is missing')
+  // G21: a field is kept whole up to its cap, and past it refused with its length and how to split it
+  const q = (extra: Record<string, unknown>) => ({ questions: [{ question: 'Q', options: ['A', 'B'], recommended: 'A', why: 'w', ...extra }] })
+  const big = checkDecide(q({ question: 'q'.repeat(1000) }))
+  expect(big.ok && big.questions[0]!.question.length).toBe(1000)
+  expect(bad(q({ question: 'q'.repeat(1001) }))).toBe("question 1: question is 1001 characters, and fleet keeps at most 1000 whole: put the detail in the options' descriptions or in why, or ask it as two questions")
+  expect(bad(q({ why: 'w'.repeat(501) }))).toContain('question 1: why is 501 characters, and fleet keeps at most 500 whole')
+  expect(bad(q({ options: ['A', { label: 'B', description: 'd'.repeat(401) }] }))).toContain('question 1, option b: its description is 401 characters')
+  expect(bad({ ...q({}), blocks: 'b'.repeat(501) })).toContain('blocks is 501 characters, and fleet keeps at most 500 whole')
+  expect(bad(q({ options: ['A', 'l'.repeat(201)] }))).toContain('question 1, option b: its label is 201 characters, and fleet keeps at most 200 whole')
 })
 
 test('held questions and progress: per question, a drop clears the whole decision', () => {

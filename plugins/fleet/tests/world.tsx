@@ -53,7 +53,9 @@ export const FAKE_SESSIONS = {
         await $.fs.write('/fake/sessions.log', `${before}${JSON.stringify(line)}\n`)
       }
       const api: EngineInterface['sessions'] = {
-        contract: async () => ({ api: 1, version: '0.13.0', format: 2, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks'] }),
+        // extra: the methods sessions 0.13.8 added (pin, restart), listed only when a test says so: unlisted, fleet goes
+        // on as with an older sessions
+        contract: async () => ({ api: 1, version: '0.13.0', format: 2, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', ...((await world()).extra ?? [])] }),
         current: async () => (await world()).current ?? { ready: false, ref: null, sessionId: '', name: '', root: '', background: false, agent: null },
         status: async input => {
           const w = await world()
@@ -90,6 +92,16 @@ export const FAKE_SESSIONS = {
         assignSection: async input => {
           await note({ assignSection: input })
           return (await world()).refuseSections ? { ok: false, reason: 'refused', detail: 'the person placed it' } : { ok: true }
+        },
+        pin: async input => {
+          await note({ pin: input })
+          return { ok: true }
+        },
+        // refuseRestart: what sessions says when it refuses one (a window not opened with ccc, and the like)
+        restart: async input => {
+          await note({ restart: input })
+          const refuse = (await world()).refuseRestart
+          return refuse ? { ok: false, reason: 'refused', detail: refuse } : { ok: true, state: 'queued' }
         },
       }
       return { ...$, sessions: api }
@@ -438,7 +450,7 @@ export function under(w: World, dir: string): string[] {
 }
 
 // The fake sessions' answers: this session as current, and the others by ref
-export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean }) {
+export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; extra?: string[]; refuseRestart?: string }) {
   w.files.set(FAKE, JSON.stringify(say))
 }
 

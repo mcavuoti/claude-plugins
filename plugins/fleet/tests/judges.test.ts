@@ -31,6 +31,10 @@ import {
   decisionText,
   exactRepeat,
   gateOf,
+  healthLine,
+  heldKey,
+  softGateOf,
+  precedentText,
   judgeEntryOf,
   judgePrompt,
   judgesOf,
@@ -73,7 +77,7 @@ test("world.json's judges: on by default with a cheap model; off, patterns, thre
   expect(j.problems).toEqual(['world.json: judges.hold "(bad" isn\'t a pattern (ignored)'])
 })
 
-test('the gates, before any model: money, the outside world, what can’t be undone, outside content, a kind, patterns, askers', () => {
+test('the gates, before any model: money, the outside world, what can’t be undone, a kind, askers; outside content and patterns only keep it a proposal', () => {
   const c = judgesOf({ worldFormat: 1, paths: [], judges: { hold: ['invoice'], skip: ['janitor'] } }).judges
   const f = { text: decisionText({ questions: [DB] }), asker: { name: 'Owner A', role: 'owner' } }
   expect(gateOf(f, c)).toBe(null)
@@ -81,13 +85,17 @@ test('the gates, before any model: money, the outside world, what can’t be und
   expect(gateOf({ ...f, touchesMoney: true }, c)).toBe('it touches money')
   expect(gateOf({ ...f, outsideWorld: true }, c)).toBe('it reaches outside the project')
   expect(gateOf({ ...f, reversible: false }, c)).toBe("it can't be undone")
-  expect(gateOf({ ...f, outside: { at: AT, what: 'WebFetch of example.invalid' } }, c)).toBe('it was asked after reading outside content (WebFetch of example.invalid)')
+  // Outside content and a judges.hold pattern (the owner's 8a): the judge still proposes, but no live answer
+  expect(gateOf({ ...f, outside: { at: AT, what: 'WebFetch of example.invalid' } }, c)).toBe(null)
+  expect(softGateOf({ ...f, outside: { at: AT, what: 'WebFetch of example.invalid' } }, c)).toBe('it was asked after reading outside content (WebFetch of example.invalid)')
   expect(gateOf({ ...f, kind: 'change' }, c)).toBe("a change is the person's alone")
-  expect(gateOf({ ...f, text: 'Pay the Invoice now?' }, c)).toBe('it matches world.json\'s judges.hold "invoice"')
+  expect(gateOf({ ...f, text: 'Pay the Invoice now?' }, c)).toBe(null)
+  expect(softGateOf({ ...f, text: 'Pay the Invoice now?' }, c)).toBe('it matches world.json\'s judges.hold "invoice"')
+  expect(softGateOf(f, c)).toBe(null)
   expect(gateOf({ ...f, asker: { name: 'Janitor', role: 'janitor' } }, c)).toBe("its asker is in world.json's judges.skip")
   // The money pattern the templates ship: a question about spending holds even when its asker said touchesMoney false
   const money = judgesOf({ worldFormat: 1, paths: [], judges: { hold: ['\\b(spend\\w*|spent|pric\\w*|pay|paid|payments?|invoic\\w*|purchas\\w*|refund\\w*|dollars?|euros?|usd|eur)\\b|[$€£]\\s?\\d|\\d\\s?[$€£]'] } }).judges
-  const asked = (question: string) => gateOf({ ...f, touchesMoney: false, text: decisionText({ questions: [{ ...DB, question }] }) }, money)
+  const asked = (question: string) => softGateOf({ ...f, touchesMoney: false, text: decisionText({ questions: [{ ...DB, question }] }) }, money)
   expect(asked('What is the most you want to spend on the first year?')).toContain("it matches world.json's judges.hold")
   expect(asked('Renew the hosting plan at €40 a month?')).toContain('judges.hold')
   expect(asked('Which pricing page goes first?')).toContain('judges.hold')
@@ -103,7 +111,7 @@ test('the gates, before any model: money, the outside world, what can’t be und
   expect(asked('100 € per month for the plan?')).toContain('judges.hold')
 })
 
-test('the case law: only the person’s answers (never a judge’s own), dialogs, corrections, and taste he typed', () => {
+test('the case law: only the person’s answers (never a judge’s own), dialogs, corrections, and taste he typed, after outside content too', () => {
   const records: RegisterLike[] = [
     answered('D-1', DB, 'SQLite'),
     { ...answered('D-2', COLOR, 'Red'), answers: [{ label: 'Red', origin: 'judge' }] },
@@ -123,10 +131,18 @@ test('the case law: only the person’s answers (never a judge’s own), dialogs
   expect(ps.map(p => [p.id, p.kind])).toEqual([
     ['ask-x', 'answer'],
     ['T-1', 'taste'],
+    ['T-3', 'taste'],
     ['D-1', 'answer'],
     ['D-6', 'rejection'],
     ['D-9', 'rejection'],
   ])
+  // His typed words count after outside content (the owner's 8a): said is verbatim, the rest is the asker's reading,
+  // the mark a note; a live answer never rests on it
+  const t3 = ps.find(p => p.id === 'T-3')!
+  expect(precedentText(t3)).toBe('T-3 (2026-11-01), the person said no, in his words: "x"; what it\'s about, as the asking session read it: y; the principle it suggests, as that session read it: z (recorded after that session had read outside content)')
+  expect(precedentText(ps.find(p => p.id === 'T-1')!)).not.toContain('outside')
+  expect(supportProblem(t3, { label: 'x' })).toBe(null)
+  expect(supportProblem(t3, { label: 'x' }, undefined, true)).toBe("T-3 was recorded after its session read outside content: a live answer doesn't rest on it")
   expect(caseLawText(ps.filter(p => p.kind === 'rejection'))).toContain(
     'D-6 (2026-11-01), the person rejected the change to plan.md ("add it now"), saying: "not yet: after the merge"\nD-9 (2026-11-01), the person rejected the outbound a mail to a@example.invalid, saying: "too early"',
   )
@@ -264,6 +280,12 @@ test('citations, checked by code: shown to the judge, a precedent with that very
   expect(checkVerdict(v('Redis', ['principles.md:3']), DB, shown, statute).unchecked?.problem).toBe('principles.md:3 doesn\'t speak to "Redis"')
   expect(checkVerdict(v('SQLite', []), DB, shown, statute).unchecked?.problem).toBe('it cited nothing')
   expect(checkVerdict({ q: 1, outcome: 'hold', cites: [], why: 'taste' }, DB, shown, statute).outcome).toBe('hold')
+  // A suggestion's citations are checked too: those that don't support it aren't shown as support, and /fleet says so
+  const sug = (option: string, cites: string[]) => ({ q: 1, outcome: 'suggest' as const, option, cites, why: 'it leans that way' })
+  expect(checkVerdict(sug('SQLite', ['d-1']), DB, shown, statute)).toEqual(sug('SQLite', ['D-1']))
+  const leaned = checkVerdict(sug('Redis', ['D-1', 'D-12', 'principles.md:3']), DB, shown, statute)
+  expect(leaned).toEqual({ ...sug('Redis', []), unchecked: { cites: ['D-1', 'D-12', 'principles.md:3'], problem: 'D-1 wasn\'t answered "Redis"; D-12 isn\'t a precedent or a statute line it was shown; principles.md:3 doesn\'t speak to "Redis"' } })
+  expect(proposalLine({ format: 1, id: 'D-5', at: AT, area: null, verdicts: [leaned] }, DB, 1)).toBe('judge suggests b) Redis: it leans that way (nothing on record settles it: a suggestion, never answered for you) (it also cited D-1, D-12, principles.md:3, which code didn\'t take: D-1 wasn\'t answered "Redis"; D-12 isn\'t a precedent or a statute line it was shown; principles.md:3 doesn\'t speak to "Redis")')
   expect(citeKey('[T-3]'.replace(/^\[|\]$/g, ''))).toBe('T-3')
   // A taste is a "no": it supports what its words or principle name, never what it said no to
   const taste = precedentsOf([{ id: 'T-1', source: 'taste', at: AT, questions: [], answers: [], taste: { said: 'one SQLite file is enough', about: 'a cache server', principle: 'no servers for local data', person: true } }])[0]!
@@ -316,13 +338,24 @@ test('citations, checked by code: shown to the judge, a precedent with that very
   expect(checkVerdict(v('SQLite', ['principles.md:3', 'D-1']), DB, shown, rules, true).outcome).toBe('decided')
 })
 
-test('nothing on record: no precedent in the area and no principle of his, or a call is made', () => {
+test('nothing on record: no precedent in the area or sharing its words, and no line in the charter, principles or rules, or a call is made', () => {
   const ps = precedentsOf([{ id: 'D-1', source: 'decide', at: AT, area: 'storage', questions: [DB], answers: [{ label: 'SQLite', origin: 'composer' }] }])
-  const none = statuteOf([{ label: 'principles.md', text: PRINCIPLES_TEXT }, { label: 'charter.md', text: '# Charter\n\nA tool.\n' }]).lines
-  expect(nothingOnRecord('ui', ps, none)).toBe('nothing on record yet: no answer of yours in area ui, and no principle of yours in principles.md')
+  const none = statuteOf([{ label: 'principles.md', text: PRINCIPLES_TEXT }, { label: 'charter.md', text: '# Charter\n' }]).lines
+  expect(nothingOnRecord('ui', ps, none)).toBe('nothing on record yet: no answer of yours in area ui or with words in common with it, and no line in the charter, principles.md or the rules')
   expect(nothingOnRecord(null, ps, none)).toContain('no answer of yours to a question with no area')
   expect(nothingOnRecord('storage', ps, none)).toBe(null)
   expect(nothingOnRecord('ui', ps, statuteOf([{ label: 'principles.md', text: `${PRINCIPLES_TEXT}Warnings are amber.\n` }]).lines)).toBe(null)
+  // The charter and the rules count as much as his principles (the owner's 8a, 05/11)
+  expect(nothingOnRecord('ui', ps, statuteOf([{ label: 'charter.md', text: '# Charter\n\nA tool.\n' }]).lines)).toBe(null)
+  // The charter as /fleet init wrote it (a template's own lines) puts nothing on record; a line of the person's does
+  const init = new Set(['# Charter', 'What the project must show, and to whom.'])
+  expect(nothingOnRecord('ui', ps, statuteOf([{ label: 'charter.md', text: '# Charter\n\nWhat the project must show, and to whom.\n' }]).lines, '', init)).toContain('nothing on record yet')
+  expect(nothingOnRecord('ui', ps, statuteOf([{ label: 'charter.md', text: '# Charter\n\nWhat the project must show, and to whom.\nA tool for one lab.\n' }]).lines, '', init)).toBe(null)
+  expect(nothingOnRecord('ui', ps, statuteOf([{ label: 'principles.md', text: 'What the project must show, and to whom.\n' }]).lines, '', init)).toBe(null)
+  expect(nothingOnRecord('ui', ps, statuteOf([{ label: '.claude/rules/style.md', text: 'Warnings are amber.\n' }]).lines)).toBe(null)
+  // And so does an answer in another area sharing the question's words
+  expect(nothingOnRecord('ui', ps, none, 'Which database for the settings cache?')).toBe(null)
+  expect(nothingOnRecord('ui', ps, none, 'Which color for the warning band?')).toContain('nothing on record yet')
 })
 
 test('agreement, the register’s entry and /fleet’s line; the stats per area', () => {
@@ -352,6 +385,22 @@ test('agreement, the register’s entry and /fleet’s line; the stats per area'
   expect([s.repeatAgreed, s.repeatDisagreed, s.modelAgreed, s.modelDisagreed]).toEqual([1, 1, 0, 0])
   expect(statsLine(s)).toBe('storage: 2 decisions, 3 questions: 2 decided (2 exact repeats), agreed 1 of 2 (50%): repeats 1 of 2 (50%), model verdicts 0 of 0 (—) · 0 sent back · 1 held · 1 decision (2 questions) held by a gate · $0.0006 in 2 calls')
   expect(stats.get('(no area)')?.sentBack).toBe(1)
+  expect(s.heldBy).toEqual({ 'it touches money': 2, 'it needs the person': 1 })
+  expect(healthLine(s)).toBe(null)
+  // A suggestion: shown beside the question, counted apart, never answered for him
+  const sug: JudgeFile = { ...f, verdicts: [{ q: 1, outcome: 'suggest', option: 'Redis', cites: [], why: 'the queue runs it' }] }
+  expect(proposalLine(sug, DB, 1)).toBe('judge suggests b) Redis: the queue runs it (nothing on record settles it: a suggestion, never answered for you)')
+  expect(proposalLine({ ...sug, shadowOnly: 'it was asked after reading outside content (WebSearch)' }, DB, 1)).toContain('(a proposal only: it was asked after reading outside content (WebSearch))')
+  expect(agreementOf(sug.verdicts[0], { label: 'Redis', origin: 'composer' })).toBe(true)
+  const ss = statsOf([{ area: 'ui', judge: judgeEntryOf(sug, [{ label: 'Redis' }]) }, { area: 'ui', judge: judgeEntryOf(sug, [{ label: 'SQLite' }]) }]).get('ui')!
+  expect([ss.suggested, ss.suggestAgreed, ss.suggestDisagreed, ss.decided, ss.agreed]).toEqual([2, 1, 1, 0, 0])
+  expect(statsLine(ss)).toContain('2 suggested (you chose the suggestion 1 of 2 (50%))')
+  // An area whose judges proposed nothing in 5 questions: what held them
+  const gated = { area: 'mail', judge: judgeEntryOf({ ...f, area: 'mail', gated: 'it reaches outside the project', verdicts: [] }, [null, null]) }
+  const quiet = { area: 'mail', judge: judgeEntryOf({ ...f, area: 'mail', verdicts: [{ q: 1, outcome: 'hold', cites: [], why: 'nothing on record yet: no answer of yours in area mail' }] }, [null]) }
+  expect(healthLine(statsOf([gated, gated, quiet]).get('mail')!)).toBe('mail: the judges proposed nothing in 5 questions: most were held by "it reaches outside the project" (4)')
+  expect(healthLine(statsOf([gated, quiet]).get('mail')!)).toBe(null)
+  expect(heldKey('nothing on record yet: no answer of yours in area mail')).toBe('nothing on record yet')
   const c = judgesOf(null).judges
   // 30 exact repeats and no model verdict: the repeats are his own answers; the model's own verdicts have no record
   const repeat = { area: 'storage', judge: judgeEntryOf({ ...f, verdicts: [f.verdicts[0]!] }, [{ label: 'SQLite' }]) }
@@ -367,10 +416,18 @@ test('agreement, the register’s entry and /fleet’s line; the stats per area'
 test('taste: its input, its number, and what the session is told by its provenance; an area of the project’s tags', () => {
   expect(checkTaste({ said: ' no stand-ins ', about: 'a placeholder chart', principle: 'never show placeholders', area: 'UI' })).toEqual({ ok: true, said: 'no stand-ins', about: 'a placeholder chart', principle: 'never show placeholders', area: 'ui' })
   expect(checkTaste({ said: 'no', about: 'x' })).toEqual({ ok: false, reason: 'principle: say in one line the principle it suggests' })
+  // His words whole: past a cap, refused with the length, never cut
+  expect(checkTaste({ said: 'w'.repeat(301), about: 'x', principle: 'y' })).toEqual({ ok: false, reason: 'said is 301 characters, and fleet keeps at most 300 whole: quote the part of their words that says no' })
+  expect(checkTaste({ said: 'no', about: 'x'.repeat(201), principle: 'y' })).toMatchObject({ ok: false, reason: expect.stringContaining('about is 201 characters') })
+  expect(checkTaste({ said: 'w'.repeat(300), about: 'x', principle: 'y' })).toMatchObject({ ok: true, said: 'w'.repeat(300) })
   expect(nextTasteNumber(['D-3.json', 'T-2.json', 'T-10.json', 'ask-x.json'])).toBe(11)
   expect(tasteResult('T-3', { said: 'a', about: 'b', principle: 'c', person: true })).toContain("Recorded as T-3 in the register: a principle candidate (\"c\") the project's judges read from now on.")
   expect(tasteResult('T-3', { said: 'a', about: 'b', principle: 'c', person: false })).toContain("the person didn't type this turn): the judges don't read it until the person promotes it")
   expect(tasteResult('T-3', { said: 'a', about: 'b', principle: 'c', person: false }, "what it says isn't in what the person typed this turn")).toContain("(what it says isn't in what the person typed this turn)")
+  // His typed words after outside content: his all the same, the mark a note
+  const marked = tasteResult('T-3', { said: 'a', about: 'b', principle: 'c', person: true, outside: { at: AT, what: 'WebSearch' } })
+  expect(marked).toContain("the project's judges read from now on (noted: this conversation had read outside content, WebSearch;")
+  expect(marked).not.toContain('not heard')
   // His, when what it says is in his words: 60% or more of its words that carry meaning
   expect(heardIn('the band is too loud', 'no, the band is too loud: make it amber')).toBe(true)
   expect(heardIn('vendor X is out, he said no to it', 'tidy up the notes')).toBe(false)
@@ -445,7 +502,15 @@ test('/fleet judges and /fleet overrule: the grammar', () => {
   expect(parseCommand('overrule D-7 "use both" "they differ"')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 1, text: 'use both' }], why: 'they differ' })
   expect(parseCommand('overrule D-7 2 “keep it”')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 2, text: 'keep it' }], why: '' })
   expect(parseCommand('overrule D-7').kind).toBe('bad')
-  expect(parseCommand('overrule D-7 1b 1a')).toEqual({ kind: 'bad', reason: 'question 1 is answered twice' })
+  expect(parseCommand('overrule D-7 1b 1a')).toMatchObject({ kind: 'bad', reason: expect.stringMatching(/^question 1 is answered twice, so nothing was recorded\. You typed:\n\/fleet overrule D-7 1b 1a\n/) })
+  // Quotes inside his words are kept (B20); what can't be read shows the line and the form that records it
+  expect(parseCommand('overrule D-7 "the folder named "Archive" please"')).toEqual({ kind: 'overrule', id: 'D-7', answers: [{ q: 1, text: 'the folder named "Archive" please' }], why: '' })
+  expect(parseCommand('overrule D-4 b "the outside, as in "the shed list" style"')).toEqual({ kind: 'overrule', id: 'D-4', answers: [{ q: 1, letter: 'b' }], why: 'the outside, as in "the shed list" style' })
+  expect(parseCommand('overrule D-7 use both')).toMatchObject({ kind: 'bad', reason: expect.stringContaining('You typed:\n/fleet overrule D-7 use both\nThis records it as your words: /fleet overrule D-7 "use both"') })
+  // Past a cap: refused with its length, never cut
+  expect(parseCommand(`overrule D-7 b "${'w'.repeat(301)}"`)).toMatchObject({ kind: 'bad', reason: expect.stringContaining('your why is 301 characters, and an overrule keeps at most 300, so nothing was recorded.') })
+  expect(parseCommand(`overrule D-7 "${'w'.repeat(2001)}"`)).toMatchObject({ kind: 'bad', reason: expect.stringContaining('your words for question 1 are 2001 characters, and an overrule keeps at most 2000') })
+  expect(parseCommand(`overrule D-7 b "${'w'.repeat(300)}"`)).toMatchObject({ kind: 'overrule', why: 'w'.repeat(300) })
   expect(parseCommand('overrule 7 b').kind).toBe('bad')
 })
 

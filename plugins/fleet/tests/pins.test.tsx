@@ -86,19 +86,24 @@ test('C10: a record cited at a version that has been revised: its owner hears it
   expect(step).toMatch(new RegExp(`- req/R-1\\.md: changed at ${WHEN} by TEST R \\(Edit\\), now R-1@2`))
   expect(step).toMatch(new RegExp(`fleet: shared files you wrote last are flagged[^\\n]*\\n- board/B-1\\.md \\(B-1\\) cites R-1@1, and R-1 is at v2 \\(a revision at ${WHEN} by TEST R\\)`))
   expect((await call($, { tool: 'Bash', command: 'ls' })).context).toBe(undefined)
-  expect(await band($)).toContain('!! 1 flagged · /fleet status')
-  expect(await fleet($, 'status')).toMatch(/suspect \(flags, nothing is held\):\n {2}board\/B-1\.md \(B-1\) cites R-1@1, and R-1 is at v2 \(a revision at \d\d:\d\d by TEST R\) · last written by this session/)
-  // Its landing still citing v1 is refused once, with what to read; nothing is written
-  const refused = await call($, { tool: 'Edit', file_path: B1, old_string: 'started', new_string: 'done' })
+  // Only behind the revision: one line a move on the band and in status, apart from the real flags (B23)
+  expect(await band($)).toContain('1 behind R-1@2 · /fleet status')
+  expect(await band($)).not.toContain('flagged')
+  expect(await fleet($, 'status')).toMatch(/behind a revision \(flags, nothing is held[^\n]*\n {2}1 file\(s\) behind R-1@2 \(\d\d:\d\d\), owners told: this session 1\nsuspect: none/)
+  expect(await fleet($, 'status --all')).toMatch(/suspect \(flags, nothing is held\):\n {2}board\/B-1\.md \(B-1\) cites R-1@1, and R-1 is at v2 \(a revision at \d\d:\d\d by TEST R\) · last written by this session/)
+  // A quarter of an hour on (its read of R-1@1 is no longer fresh), an edit that writes v1's pin is refused once, with
+  // what to read; nothing is written
+  await tick(w, 16 * 60000)
+  const refused = await call($, { tool: 'Edit', file_path: B1, old_string: 'built on R-1@1', new_string: 'built on R-1@1, done' })
   expect(refused.deny).toMatch(new RegExp(`^fleet: this write cites records you need to read first \\(this write was not made\\):\\n- R-1@1: R-1 is at v2 now \\(a revision at ${WHEN} by TEST R\\)\\. Read req/R-1\\.md, decide whether your work still holds, then cite R-1@2`))
-  expect(w.files.get(B1)).toContain('started')
+  expect(w.files.get(B1)).not.toContain('done')
   // It re-reads, moves the pin, and lands
   expect((await call($, { tool: 'Read', file_path: R1 })).context).toEqual(["fleet: this is R-1@2. It has no change: line, so every edit of it counts as a revision: cite it by version only where what you write rests on what it says now (a status or an owner isn't that)."])
   const fixed = await call($, { tool: 'Edit', file_path: B1, old_string: 'relies_on: [R-1@1]', new_string: 'relies_on: [R-1@2]' })
   expect(fixed.deny).toBe(undefined)
   expect(fixed.context).toContain('fleet: board/B-1.md is now B-1@3.')
-  // The body still says R-1@1 (every ID@n of the text is a pin): kept after reading R-1 at v2, it's confirmed
-  expect(events(w).at(-1)).toMatchObject({ rev: 3, pins: ['R-1@1', 'R-1@2'], confirmed: ['R-1@1>2'] })
+  // The body still says R-1@1: beside R-1@2 it's history, not a pin (only an id's highest version counts)
+  expect(events(w).at(-1)).toMatchObject({ rev: 3, pins: ['R-1@2'] })
   await tick(w)
   expect(json(w, `${STATE}/suspects.json`).suspects).toEqual([])
   expect(await band($)).not.toContain('flagged')
@@ -106,7 +111,7 @@ test('C10: a record cited at a version that has been revised: its owner hears it
   landByR(w, R1, 'R-1 v3\n', 3)
   await tick(w)
   await tick(w)
-  expect(json(w, `${STATE}/suspects.json`).suspects.map((s: any) => [s.path, s.reasons.map((r: any) => r.pin)])).toEqual([['board/B-1.md', ['R-1@1', 'R-1@2']]])
+  expect(json(w, `${STATE}/suspects.json`).suspects.map((s: any) => [s.path, s.reasons.map((r: any) => r.pin)])).toEqual([['board/B-1.md', ['R-1@2']]])
 })
 
 test('a journal is history: it cites what it read when, and is never suspect nor refused for a pin; a record with a change line is cited as usual', WITH_SESSIONS, async ($, on) => {
@@ -125,7 +130,7 @@ test('a journal is history: it cites what it read when, and is never suspect nor
   // A write of the journal still citing R-1@1 isn't refused
   await call($, { tool: 'Read', file_path: J })
   expect((await call($, { tool: 'Edit', file_path: J, old_string: '- read R-1@1\n', new_string: '- read R-1@1\n- then more\n' })).deny).toBe(undefined)
-  expect(await band($)).toContain('!! 1 flagged')
+  expect(await band($)).toContain('1 behind R-1@2')
 })
 
 test('another session’s landing that keeps a stale pin after reading its record clears the suspect at once, before any scan here', WITH_SESSIONS, async ($, on) => {
@@ -154,7 +159,7 @@ test('the gate tells once: a second identical try passes; a new pin of a record 
   // A stale pin, told once, then passes on a second try
   landByR(w, R1, 'R-1 v2\n', 2)
   await tick(w)
-  const again = { tool: 'Edit', file_path: B1, old_string: 'part one', new_string: 'part two' }
+  const again = { tool: 'Edit', file_path: B1, old_string: 'built on R-1@1', new_string: 'built on R-1@1, part two' }
   expect((await call($, again)).deny).toContain('- R-1@1: R-1 is at v2 now')
   expect((await call($, again)).deny).toBe(undefined)
   // An editorial change doesn't make a pin stale
@@ -162,6 +167,7 @@ test('the gate tells once: a second identical try passes; a new pin of a record 
   landByR(w, R2, 'R-2 v1, a typo fixed\n', 2, 'editorial')
   await tick(w)
   expect((await call($, { tool: 'Edit', file_path: B1, old_string: 'part two', new_string: 'part three' })).deny).toBe(undefined)
+  expect(w.files.get(B1)).toContain('part three')
   const log = w.logs.join('\n')
   expect(log).toContain('fleet: refused once: Edit of board/B-1.md by main (pins R-2@1 unread)')
   expect(log).toContain('fleet: refused once: Edit of board/B-1.md by main (pins R-1@1 stale)')
@@ -219,7 +225,6 @@ test('R4: renaming a record (git mv, or outside fleet) is an editorial version a
 test('C10b: a Bash heredoc that writes a record citing a stale pin and one never read lands blind, and the record is suspect', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { worldPaths: ['req/**', 'board/**'], files: { [R1]: 'R-1 v1\n', [R2]: 'R-2 v1\n', [`${ROOT}/req/R-3.md`]: 'R-3 v1\n' } })
   await begin($, w)
-  await call($, { tool: 'Read', file_path: R1 })
   landByR(w, R1, 'R-1 v2\n', 2)
   await tick(w)
   await call($, { tool: 'Read', file_path: R2 })

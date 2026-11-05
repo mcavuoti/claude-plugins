@@ -6,8 +6,8 @@
     { "id": "checks", "title": "Checks", "order": 221 }
   ],
   "roles": {
-    "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24 },
-    "integrator": { "agent": "integrator", "context": "long", "model": "opus", "budget": { "usdDay": 20 }, "cadenceH": 8 },
+    "chief": { "agent": "chief", "context": "long", "model": "opus", "budget": { "usdDay": 10 }, "cadenceH": 24, "settings": { "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000" } } },
+    "integrator": { "agent": "integrator", "context": "long", "model": "opus", "budget": { "usdDay": 20 }, "cadenceH": 8, "settings": { "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000" } } },
     "area-owner": { "agent": "area-owner", "model": "sonnet", "budget": { "usdDay": 15 }, "cadenceH": 6 },
     "reviewer": { "agent": "reviewer", "model": "sonnet", "budget": { "usdDay": 8 }, "cadenceH": 8 },
     "janitor": { "agent": "janitor", "model": "haiku", "budget": { "usdDay": 2 }, "cadenceH": 12 }
@@ -20,7 +20,7 @@
     { "name": "Reviewer", "role": "reviewer", "section": "checks", "wave": 2 },
     { "name": "Janitor", "role": "janitor", "section": "checks", "wave": 3 }
   ],
-  "settings": { "permissions": { "defaultMode": "auto" }, "worktree": { "bgIsolation": "none" } },
+  "settings": { "permissions": { "defaultMode": "auto" }, "worktree": { "bgIsolation": "none" }, "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "300000" } },
   "budget": { "usdDay": 80 },
   "wakes": { "everyMin": 60, "perDay": 8 }
 }

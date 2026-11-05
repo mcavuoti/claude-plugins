@@ -8,7 +8,6 @@
 // deny it); the person's own editor always may (/fleet accept stamps it as his).
 
 import { hashText } from './changes'
-import { cut } from './decisions'
 
 /** The change a queue record carries: the file (relative to the project), what it does, the versions it's bound to,
  * where the draft and its diff are (relative to the project's .claude/fleet/) and how many lines it adds and removes */
@@ -35,6 +34,8 @@ export type ChangeOutcome = 'applied' | 'rejected' | 'stale'
 export const SUMMARY_READS = 200
 /** The longest summary fleet keeps */
 export const SUMMARY_MAX = 1000
+/** A change's blocks, as a choice's (decisions.ts FIELD_MAX.blocks) */
+export const BLOCKS_MAX = 500
 
 /** The biggest draft fleet keeps */
 export const MAX_DRAFT = 1024 * 1024
@@ -45,8 +46,10 @@ export const DIFF_SHOWN = 12
 export function checkChange(input: any): { ok: true; path: string; summary: string; edits?: Edit[]; content?: string; blocks?: string } | { ok: false; reason: string } {
   const path = typeof input?.path === 'string' ? input.path.trim() : ''
   if (!path) return { ok: false, reason: 'path: name the file to change, relative to the project folder' }
-  const summary = typeof input?.summary === 'string' ? cut(input.summary.trim().replace(/\s+/g, ' '), SUMMARY_MAX) : ''
+  const summary = typeof input?.summary === 'string' ? input.summary.trim().replace(/\s+/g, ' ') : ''
   if (!summary) return { ok: false, reason: 'summary: say in one line what the change does and why' }
+  // Past a cap it's refused with the length, never cut (as decide's other fields)
+  if (summary.length > SUMMARY_MAX) return { ok: false, reason: `summary is ${summary.length} characters, and fleet keeps at most ${SUMMARY_MAX} whole: say in one line what it does and why; the rest goes in the file` }
   // edits sent as a JSON string of the list (some calls arrive so) is read as the list
   let list: unknown = input?.edits
   if (typeof list === 'string' && list.trim().startsWith('[')) {
@@ -59,7 +62,8 @@ export function checkChange(input: any): { ok: true; path: string; summary: stri
   const hasContent = typeof input?.content === 'string'
   if (hasEdits && hasContent) return { ok: false, reason: 'give edits or content, not both: edits change the file as it is, content replaces it whole' }
   if (!hasEdits && !hasContent) return { ok: false, reason: `the change itself is missing: give edits (a list of { "old_string": …, "new_string": … }, as with Edit) or content (the whole new text of ${path})` }
-  const blocks = typeof input?.blocks === 'string' ? cut(input.blocks.trim(), 200) : ''
+  const blocks = typeof input?.blocks === 'string' ? input.blocks.trim() : ''
+  if (blocks.length > BLOCKS_MAX) return { ok: false, reason: `blocks is ${blocks.length} characters, and fleet keeps at most ${BLOCKS_MAX} whole: say in one line what waits on it` }
   const more = blocks ? { blocks } : {}
   if (hasContent) {
     if (input.content.length > MAX_DRAFT) return { ok: false, reason: `content: at most ${MAX_DRAFT} characters` }

@@ -30,11 +30,20 @@ How the project works:
 - The shared files (world.json lists them) are how the sessions coordinate. Read one before you write it; when fleet
   refuses a write because it changed since you read it, read it again and redo the write so it agrees.
 - When fleet tells you a file you read or cite changed, check what you built on it before you go on.
+- When fleet flags files of yours for citing an older version of a record and, once you've read the record, they still
+  hold, say so with mcp__fleet__confirm (of: its id): their flags clear with no new version of them, so nothing
+  cascades to whoever cites them. Re-pin (cite the new version) only in a file you're rewriting anyway.
 - The command-level files (the charter, verify.md, roster.json, world.json, the role files, the spec) are read-only for
   you: propose a change with mcp__fleet__decide kind "change".
+- A long run (a long build or test suite, more than a few minutes) runs detached on its host, so a restart, a sleep
+  or a compaction of this session doesn't lose it (`nohup sh -c '<command>; echo $? > <dir>/done' > <dir>/log 2>&1 &`, on macOS and Linux alike, or
+  the host's batch system), and you declare it with mcp__fleet__run (what, the item, the host or none for this machine,
+  its folder, its done-file). fleet watches the done-file and tells you when it finishes: record the result then
+  (mcp__fleet__run record). A run in flight isn't a reason to end your turn: take your next item meanwhile. At every
+  wake, check the runs you declared (mcp__fleet__run list).
 - Before you land, read .claude/fleet/verify.md (how this project proves something works) and do what it says.
-- Keep your journal (fleet tells you its path, journals/<your file name>.md) and write it before you end a turn. Stay
-  within your budget: when fleet says you're near it, land what you have.
+- Keep your journal (fleet tells you its path, journals/<your file name>.md) and write it before you end a turn. fleet tells you if your budget runs out;
+  until then keep working, and when it's raised, carry on.
 - Write the shared files, your journal included, with Write or Edit, not the shell (no cat >> or heredocs): fleet
   checks what those tools write, and a shell write lands blind, flagged for the others to check.
 - Nothing of the project leaves it without the person: to send anything outside (a message, a post, an upload, a

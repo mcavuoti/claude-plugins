@@ -136,7 +136,7 @@ test('the sweeper reads each item once with one model call, writes the record it
   expect(under(w, `${FLEET}/intake/failed`)).toEqual(['mail-broken.json'])
 })
 
-test('an instance hears the pointers routed to it, reading a record marks it, and a change it drafts from one waits', WITH_SESSIONS, async ($, on) => {
+test('an instance hears the pointers routed to it, being told marks nothing, reading a record marks it, and a change it drafts from one waits', WITH_SESSIONS, async ($, on) => {
   model(on)
   const w = project(on, { background: true, env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Requirements', FLEET_ROLE: 'owner' }, files: { [`${FLEET}/instances/requirements.json`]: '{}\n' } })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.01 } } }))
@@ -157,18 +157,19 @@ test('an instance hears the pointers routed to it, reading a record marks it, an
   await tick(w, 30100)
   expect(json(w, `${FLEET}/instances/requirements/state.json`).intakeSeen).toBeGreaterThan(0)
   expect(w.submits.length).toBe(2)
-  // The pointers carry outside text (a model's summary, a sender): its conversation is marked once they're told, read
-  // or not; the change it then drafts waits for the person, with the diff
-  expect(await fleet($, 'status')).toContain('this conversation read outside content (pointers to intake records I-3, I-4 at ')
+  // Being told the pointers marks nothing (0.9.0: fleet's own line, the outside words labelled); reading a record does,
+  // and the change it then drafts waits for the person, with the diff
+  expect(await fleet($, 'status')).toContain('this conversation read nothing from outside')
   await $.tool.call({ tool: 'Read', file_path: `${ROOT}/inputs/intake/I-3.md` } as any)
   await w.clock.settle()
+  expect(await fleet($, 'status')).toContain('this conversation read outside content (the intake record I-3 (an item from outside) at ')
   await $.tool.call({ tool: 'Read', file_path: `${ROOT}/req/R-1.md` } as any)
   const r = await decide($, { kind: 'change', path: 'req/R-1.md', summary: 'R-1 becomes 8, as I-3 asks', edits: [{ old_string: 'is 5', new_string: 'is 8' }] })
   expect(r.result).toContain('Queued as D-1 for the person: a change to req/R-1.md')
-  expect(json(w, `${FLEET}/decisions/queue/D-1.json`).outside).toMatchObject({ what: 'pointers to intake records I-3, I-4' })
+  expect(json(w, `${FLEET}/decisions/queue/D-1.json`).outside).toMatchObject({ what: 'the intake record I-3 (an item from outside)' })
   const list = await fleet($, '')
   expect(list).toContain('1. Change req/R-1.md: "R-1 becomes 8, as I-3 asks" (+1 −1 lines)')
-  expect(list).toContain('drafted after reading outside content (pointers to intake records I-3, I-4 at ')
+  expect(list).toContain('drafted after reading outside content (the intake record I-3 (an item from outside) at ')
   expect(w.files.get(`${ROOT}/req/R-1.md`)).toBe('# R-1\n\nThe target is 5.\n')
   // A /clear: the new conversation doesn't remember the pointers it was told, so it hears them once more
   await $.session.end({ reason: 'clear', sessionId: SID } as any)

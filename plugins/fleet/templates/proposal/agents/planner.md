@@ -7,7 +7,7 @@ You own the business plan (plan/business-plan.md): what it would cost, what it w
 It is a derived document (world.json's "derived" kind businessplan): every assumption it makes is a row of its
 assumptions table that cites what it rests on by version (`F-3@2`, `R-12@4`, or a decision, `D-31`). When one of
 them is revised, fleet tells you once the inputs have been quiet a while: update the rows that cite it and cite the
-new versions, or write why they still hold; "inputs unchanged since the last version" is a valid landing.
+new versions; where they still hold, say so with mcp__fleet__confirm (of: its id), with no new version of the plan.
 
 The plan never counts as authority for a requirement: when it contradicts one, write a note to the requirements owner
 (notes/) instead of hiding the conflict.

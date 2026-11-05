@@ -33,6 +33,7 @@ import {
   windowFolders,
   type ChangeEvent,
 } from '../hooks/changes'
+import { isTempName, namesPath, newer } from '../hooks/changes'
 import { parseCommand } from '../hooks/decisions'
 
 const ME = { sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', offsetMin: 0 }
@@ -258,7 +259,7 @@ test('a command with no write syntax: reading programs, no redirection to a file
     'git checkout notes/x.md',
     'cat a.md | tee b.md',
     'echo `date`',
-    "awk '{print}' a.md",
+    "awk '{print > \"b.md\"}' a.md",
     '',
     // env runs the command after its options and assignments
     'env rm notes/a.md',
@@ -298,7 +299,7 @@ test('a command with no write syntax: reading programs, no redirection to a file
   expect(bashWritesNothing('sort -o /tmp/s.txt notes/plan.md', inWorld)).toBe(true)
   expect(bashWritesNothing('grep -n x notes/plan.md > notes/hits.md', inWorld)).toBe(false)
   expect(bashWritesNothing('grep -n x notes/plan.md > /tmp/hits.txt')).toBe(false)
-  expect(bashWritesNothing('cp notes/plan.md /tmp/x', inWorld)).toBe(false)
+  expect(bashWritesNothing('cp notes/plan.md /tmp/x', inWorld)).toBe(true)
 })
 
 test('a world file that changed while a read-only command ran: the writer named only when its event is the version there now', () => {
@@ -306,4 +307,138 @@ test('a world file that changed while a read-only command ran: the writer named 
   expect(duringText('notes/a.md', null, me)).toBe(
     "fleet: notes/a.md changed while your command ran (by someone fleet hasn't seen yet: an editor, a script, or a session whose event is still coming); your command didn't change it. If your command read it, read it again.",
   )
+})
+
+test('B5: what reads more than it seemed (remote copies, writes outside the world, awk, ps, a proofs check) writes nothing; a write into the world still writes', () => {
+  const inWorld = (t: string) => !t.startsWith('/tmp/') && !t.startsWith('/home/x/') && !t.includes(':')
+  for (const c of [
+    "ssh build.example.invalid 'make -C /home/x/src test'",
+    'ssh -o BatchMode=yes build.example.invalid uptime',
+    'scp notes/plan.md build.example.invalid:/home/x/plan.md',
+    'rsync -az notes/ build.example.invalid:backup/notes/',
+    'cp notes/plan.md /tmp/plan.md',
+    'cp -r notes /tmp/notes-copy',
+    'install -m 644 notes/plan.md /tmp/plan.md',
+    'mkdir -p /tmp/run-1',
+    'touch /tmp/stamp',
+    'cat notes/plan.md | tee /tmp/plan.txt',
+    'curl -s -o /tmp/page.html https://example.invalid/page',
+    'curl -sS https://example.invalid/api',
+    'wget -q -O - https://example.invalid/page',
+    'wget -q -O /tmp/page.html https://example.invalid/page',
+    "awk '{print $1}' notes/plan.md",
+    "awk -F, 'NR > 1 {print $2}' notes/table.csv",
+    'ps aux',
+    'pgrep -fl python',
+    'kill 1234',
+    'sysctl -n hw.ncpu',
+    'python3 -I .claude/fleet/checks/proof-check.py findings/F-1.md',
+    'python3 .claude/fleet/checks/proof-check.py',
+  ]) {
+    expect([c, bashWritesNothing(c, inWorld)]).toEqual([c, true])
+  }
+  for (const c of [
+    "ssh build.example.invalid 'cat /home/x/log' > notes/log.md",
+    'scp build.example.invalid:/home/x/plan.md notes/plan.md',
+    'rsync -az build.example.invalid:notes/ notes/',
+    'cp /tmp/plan.md notes/plan.md',
+    'mv notes/plan.md /tmp/plan.md',
+    'mkdir -p notes/new',
+    'touch notes/plan.md',
+    'cat /tmp/x | tee notes/x.md',
+    'curl -s -o notes/page.md https://example.invalid/page',
+    'curl -sO https://example.invalid/page.md',
+    'wget -q https://example.invalid/page.md',
+    "awk '{print > \"notes/b.md\"}' notes/a.md",
+    "awk '{print | \"sh\"}' notes/a.md",
+    "awk '{system(\"rm notes/a.md\")}' notes/a.md",
+    'awk -i inplace \'{print}\' notes/a.md',
+    'sysctl -w kern.maxfiles=100',
+    'python3 tool.py',
+    'python3 -I .claude/fleet/checks/proof-check.py > notes/out.md',
+    'python3 -c "open(\'notes/a.md\', \'w\')" .claude/fleet/checks/proof-check.py',
+  ]) {
+    expect([c, bashWritesNothing(c, inWorld)]).toEqual([c, false])
+  }
+})
+
+test('B5: what a command names: a word, a folder it is in, a glob that matches it, its own name after a cd; never a cd folder', () => {
+  const resolve = (w: string) => (w.startsWith('/Users/x/proj/') ? w.slice('/Users/x/proj/'.length) : w === '/Users/x/proj' || w === '.' ? '' : w.startsWith('/') ? null : w.replace(/^\.\//, '').replace(/\/+$/, ''))
+  const names = (c: string, rel: string) => namesPath(c, rel, resolve)
+  expect(names("sed -i '' s/a/b/ notes/plan.md", 'notes/plan.md')).toBe(true)
+  expect(names("sed -i '' s/a/b/ notes/plan.md", 'notes/todo.md')).toBe(false)
+  expect(names('cp /tmp/a.md notes/', 'notes/a.md')).toBe(true)
+  expect(names('rm notes/*.md', 'notes/plan.md')).toBe(true)
+  expect(names('rm notes/*.md', 'board/B-1.md')).toBe(false)
+  expect(names("cd notes && sed -i '' s/a/b/ plan.md", 'notes/plan.md')).toBe(true)
+  expect(names('cd /Users/x/proj && python3 tools/gen.py', 'notes/plan.md')).toBe(false)
+  expect(names('python3 tools/gen.py --out=notes/plan.md', 'notes/plan.md')).toBe(true)
+  expect(names('python3 tools/gen.py > notes/plan.md', 'notes/plan.md')).toBe(true)
+  expect(names("find . -name '*.md' -exec sed -i '' s/a/b/ {} +", 'notes/plan.md')).toBe(true)
+  expect(names('npm test', 'notes/plan.md')).toBe(false)
+  expect(isTempName('notes/plan.md.tmp.4242.1730000000')).toBe(true)
+  expect(isTempName('notes/plan.tmp.4242')).toBe(true)
+  expect(isTempName('notes/plan.tmp.md')).toBe(false)
+})
+
+test("B24: a tool's landing of a version stays the newest event of it: a blind one of the same version seen late doesn't replace it", () => {
+  const tool: ChangeEvent = { format: 1, at: 1000, path: 'req/R-1.md', from: 'h1', to: 'h2', via: 'tool', blind: false, by: null }
+  expect(newer(tool, { ...tool, at: 2000, via: 'bash', blind: true })).toBe(false)
+  expect(newer(tool, { ...tool, at: 2000, to: 'h3', via: 'bash', blind: true })).toBe(true)
+  expect(newer({ ...tool, via: 'bash', blind: true }, { ...tool, at: 2000 })).toBe(true)
+})
+
+test('B5: a word after a cd is read from its folder; a bare name after a cd fleet can not follow is any file of that name; dir/$x is dir/*', () => {
+  // The project at /Users/x/proj, the session in it; . and .. folded
+  const resolve = (w: string) => {
+    const abs = w.startsWith('/') ? w : `/Users/x/proj/${w}`
+    const parts: string[] = []
+    for (const p of abs.split('/')) {
+      if (p === '' || p === '.') continue
+      if (p === '..') parts.pop()
+      else parts.push(p)
+    }
+    const a = `/${parts.join('/')}`
+    return a === '/Users/x/proj' ? '' : a.startsWith('/Users/x/proj/') ? a.slice('/Users/x/proj/'.length) : null
+  }
+  const names = (c: string, rel: string) => namesPath(c, rel, resolve)
+  expect(names('cd poc/area-a && python3 bench.py > ../results/x.md', 'poc/results/x.md')).toBe(true)
+  expect(names("cd poc && sed -i '' s/a/b/ results/x.md", 'poc/results/x.md')).toBe(true)
+  expect(names("cd poc && sed -i '' s/a/b/ x.md", 'board/x.md')).toBe(false)
+  expect(names("cd poc && sed -i '' s/a/b/ x.md", 'poc/x.md')).toBe(true)
+  expect(names('cd poc; cd area-a; python3 run.py --out=../results/y.md', 'poc/results/y.md')).toBe(true)
+  // A cd it can't follow: a bare name is any file of that name
+  expect(names("cd \"$DIR\" && sed -i '' s/a/b/ x.md", 'board/x.md')).toBe(true)
+  expect(names('cd - && python3 run.py', 'board/x.md')).toBe(false)
+  // A word with a variable in it is a glob: dir/$x names what's directly in dir
+  expect(names('for f in a b; do sed -i "" s/a/b/ "board/$f.md"; done', 'board/B-4.md')).toBe(true)
+  expect(names('for f in a b; do sed -i "" s/a/b/ "board/$f.md"; done', 'notes/B-4.md')).toBe(false)
+  // A quoted ; or | is no command's end
+  expect(names("sed -i '' 's/a;b/c|d/' notes/plan.md", 'notes/plan.md')).toBe(true)
+  expect(names('cd /Users/x/proj && python3 tools/gen.py', 'notes/plan.md')).toBe(false)
+})
+
+test("B24: newer() is the same whichever order a tool's landing and a blind one of the same version come in", () => {
+  const tool: ChangeEvent = { format: 1, at: 2000, path: 'req/R-1.md', from: 'h1', to: 'h2', via: 'tool', blind: false, by: null }
+  const blind: ChangeEvent = { ...tool, at: 1000, via: 'bash', blind: true }
+  expect(newer(blind, tool)).toBe(true)
+  expect(newer(tool, { ...blind, at: 3000 })).toBe(false)
+  // ... an earlier tool landing still beats a later blind one of its version, not one of another version
+  expect(newer({ ...blind, at: 3000 }, { ...tool, at: 2000 })).toBe(true)
+  expect(newer({ ...blind, at: 3000, to: 'h3' }, { ...tool, at: 2000 })).toBe(false)
+})
+
+test("B5: a check script reads only as the caller says (this project's, while proofs rerun nothing); curl's and ssh's files count attached", () => {
+  const inWorld = (t: string) => !t.startsWith('/tmp/')
+  expect(bashWritesNothing('python3 poc/tools/proof-check.py --write-report', inWorld)).toBe(false)
+  expect(bashWritesNothing('python3 /tmp/x/proof-check.py', inWorld)).toBe(false)
+  expect(bashWritesNothing('python3 .claude/fleet/checks/proof-check.py', inWorld)).toBe(true)
+  expect(bashWritesNothing('python3 .claude/fleet/checks/proof-check.py', inWorld, () => false)).toBe(false)
+  expect(bashWritesNothing('python3 /Users/x/proj/.claude/fleet/checks/proof-check.py', inWorld, s => s === '/Users/x/proj/.claude/fleet/checks/proof-check.py')).toBe(true)
+  for (const c of ['curl -oboard/x.json https://example.invalid/x', 'curl -sSoboard/x.json https://example.invalid/x', 'curl -sD board/h.txt https://example.invalid/x', 'ssh -Eboard/log.txt build.example.invalid ls', 'ssh -vE board/log.txt build.example.invalid ls']) {
+    expect([c, bashWritesNothing(c, inWorld)]).toEqual([c, false])
+  }
+  for (const c of ['curl -o/tmp/x.json https://example.invalid/x', 'curl -sSXPOST https://example.invalid/x', 'ssh -E/tmp/log build.example.invalid ls', 'ssh -oBatchMode=yes build.example.invalid ls']) {
+    expect([c, bashWritesNothing(c, inWorld)]).toEqual([c, true])
+  }
 })

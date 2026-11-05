@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""The proposal template's proofs check: a finding or a result says what it rests on, and this checks that it holds.
+# proof-check-version: 2 (fleet's /fleet status says when a project's copy lacks this line: an older one)
+r"""The proposal template's proofs check: a finding or a result says what it rests on, and this checks that it holds.
 
-    python3 .claude/fleet/checks/proof-check.py [--budget SECONDS] FILE...
+    python3 .claude/fleet/checks/proof-check.py [--budget SECONDS] [FILE...]
 
 world.json's "checks" runs it from the project's folder after each landing of a finding (findings/) or a result
-(poc/results/), with the files as its last arguments. fleet runs a check as the person, with no prompt, so it runs this
+(poc/results/), with the files as its last arguments, and again on a finding when the source it quotes lands. With no
+file named it checks every file under world.json's proofs.paths and says on standard error how many: the verifier's
+full sweep. fleet runs a check as the person, with no prompt, so it runs this
 one only after he types /fleet accept checks, and only while the checks and this script stay as he stamped them.
 
 The convention, in a record's front matter (between --- lines) or among its first 30 lines, a value wrapped whole in
-quotes or not:
+quotes or not (inside double quotes, \" is a quote and \\ a backslash):
 
     kind: result                                  kind: finding
     run: python3 poc/area-a/bench.py --n 1000     source: notes/sheet.md (a path in the project, or a URL)
@@ -22,7 +25,8 @@ next quote:.
 What fails a record:
 - a run: with no sha: after it, or one that isn't 12 to 64 hex digits; a source: with no quote:, or a shorter one;
 - a local source outside the project (an absolute path elsewhere, a ../ that leaves it), or not there; a text source
-  the quote isn't in (spaces and line breaks aside; a :12 or #part after the path is ignored);
+  the quote isn't in (spaces and line breaks aside; a :12 or #part after the path is ignored), said "no longer in"
+  when the source changed after the file that quotes it;
 - a run: world.json's proofs.rerun lists whose output's sha256 doesn't start with its sha:, or that can't start.
 
 What it leaves to the verifier role, never failing for it: a URL, a source that isn't text, and every run: it doesn't
@@ -67,17 +71,58 @@ def note(text):
 
 
 def settings():
-    """proofs.rerun and proofs.timeoutS from the project's world.json (nothing re-runs without them)"""
+    """proofs.rerun, proofs.timeoutS and proofs.paths from the project's world.json (nothing re-runs without them)"""
     try:
         proofs = json.loads(Path('.claude/fleet/world.json').read_text()).get('proofs') or {}
     except (OSError, ValueError, AttributeError):
-        return [], 30.0
+        return [], 30.0, []
     if not isinstance(proofs, dict):
-        return [], 30.0
+        return [], 30.0, []
     rerun = proofs.get('rerun')
     rerun = [p for p in rerun if isinstance(p, str) and p.strip()] if isinstance(rerun, list) else []
     t = proofs.get('timeoutS')
-    return rerun, float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0 else 30.0
+    paths = proofs.get('paths')
+    paths = [p for p in paths if isinstance(p, str) and p.strip()] if isinstance(paths, list) else []
+    return rerun, float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0 else 30.0, paths
+
+
+def glob_regex(glob):
+    """A world.json glob as fleet reads it: ** any depth, * and ? within a name, {a,b} either"""
+    out, i = '', 0
+    while i < len(glob):
+        c = glob[i]
+        if glob.startswith('**/', i):
+            out, i = out + '(?:.*/)?', i + 3
+            continue
+        if glob.startswith('**', i):
+            out, i = out + '.*', i + 2
+            continue
+        if c == '*':
+            out += '[^/]*'
+        elif c == '?':
+            out += '[^/]'
+        elif c == '{' and '}' in glob[i:]:
+            end = glob.index('}', i)
+            out += '(?:' + '|'.join(re.escape(x) for x in glob[i + 1:end].split(',')) + ')'
+            i = end
+        else:
+            out += re.escape(c)
+        i += 1
+    return re.compile(f'^{out}$')
+
+
+def files_under(globs, root):
+    """Every file under the globs, from the project's folder (not into .git or fleet's own folder), sorted"""
+    res = [glob_regex(g) for g in globs]
+    out = []
+    for folder, dirs, names in os.walk(root):
+        rel = Path(folder).relative_to(root).as_posix()
+        dirs[:] = [d for d in dirs if d != '.git' and (rel, d) != ('.claude', 'fleet')]
+        for n in names:
+            p = n if rel == '.' else f'{rel}/{n}'
+            if any(r.match(p) for r in res):
+                out.append(p)
+    return sorted(out)
 
 
 def scope(text):
@@ -91,11 +136,14 @@ def scope(text):
 
 
 def value(raw):
-    """A value as written, or what's inside the quotes that wrap it whole ("…" or '…': a command that ends on a quote,
-    printf 'x', keeps it)"""
+    r"""A value as written, or what's inside the quotes that wrap it whole ("…" or '…': a command that ends on a quote,
+    printf 'x', keeps it); inside double quotes, \" is a quote and \\ a backslash"""
     v = raw.strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+        double = v[0] == '"'
         v = v[1:-1].strip()
+        if double:
+            v = re.sub(r'\\(["\\])', r'\1', v)
     return v
 
 
@@ -160,8 +208,9 @@ def inside(path, root):
     return path == root or root in path.parents
 
 
-def check_source(src, quote, root):
-    """None when it holds or isn't this script's to check; else why it fails"""
+def check_source(src, quote, root, since=None):
+    """None when it holds or isn't this script's to check; else why it fails (since: when the file that quotes it was
+    last written, to tell a source that changed after it)"""
     if URL.match(src):
         return None
     path = Path(src)
@@ -186,6 +235,8 @@ def check_source(src, quote, root):
         return None
     if normal(quote) in normal(text):
         return None
+    if since is not None and full.stat().st_mtime > since:
+        return f'quote no longer in {short(src)} (it changed after this file)'
     return f'quote not found in {short(src)}'
 
 
@@ -250,18 +301,26 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding='utf-8', errors='replace')
     root = Path.cwd().resolve()
-    patterns, timeout = settings()
+    patterns, timeout, paths = settings()
     runs = Runs(patterns, timeout, args.budget)
     failed = False
-    for name in args.files:
+    files = args.files
+    if not files:
+        if not paths:
+            note('no file named, and world.json has no proofs.paths: nothing to check')
+            sys.exit(0)
+        files = files_under(paths, root)
+        note(f'checked {len(files)} file(s) under proofs.paths')
+    for name in files:
         try:
             text = (root / name).read_text(encoding='utf-8', errors='replace')
+            since = (root / name).stat().st_mtime
         except OSError as e:
             note(f"can't read a file it was given ({short(name)}: {e.strerror or e})")
             continue
         pairs, wrong = proofs_of(text)
         for kind, a, b in pairs:
-            why = runs.check(a, b, root) if kind == 'run' else check_source(a, b, root)
+            why = runs.check(a, b, root) if kind == 'run' else check_source(a, b, root, since)
             if why:
                 wrong.append(why)
         if wrong:
