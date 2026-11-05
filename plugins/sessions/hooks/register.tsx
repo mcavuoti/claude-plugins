@@ -720,17 +720,23 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
 // window (one of its viewers, or an agent view) asks which window is in front: most background sessions are shown in
 // none, and ask Terminal nothing, which a quit Terminal would also take as a reason to start. Where the front window
 // can't be known (Linux without X11), a session counts as seen only when you type in it, use its panel or arrive there
+// A session no window shows (no viewer of it, no agent view) past the first minute after its answer is checked again a
+// minute later (seenQuietUntil), with a listing up to a minute old once the answer is 10 minutes old: arriving there with
+// ccc or Enter marks it seen anyway
 let seenCheckedAt = 0
+let seenQuietUntil = 0
 async function markSeenIfLooking($: any) {
   if (!platform.frontKnown) return
   const { finished, seen } = await ownSeenState($)
   if (finished <= seen) return
   const now = await $.clock.now()
-  if (now < nextSeenCheck(finished, seenCheckedAt)) return
+  if (now < nextSeenCheck(finished, seenCheckedAt) || now < seenQuietUntil) return
   seenCheckedAt = now
   // In the first minute after a finish the person may well be opening a window on it: a listing at most 5 s old then
-  const v = await sharedWindows($, now - finished < 60000 ? 5000 : SEEN_WINDOWS_MS)
+  const age = now - finished
+  const v = await sharedWindows($, age < 60000 ? 5000 : age < 600000 ? SEEN_WINDOWS_MS : 2 * SEEN_WINDOWS_MS)
   const mine = myWindowsIn(v)
+  seenQuietUntil = mine.length === 0 && v.agentsViews.length === 0 && age >= 60000 ? now + 60000 : 0
   if (mine.length === 0 && v.agentsViews.length === 0) return
   const tty = await sharedFront($, v)
   if (!tty) return
@@ -1201,7 +1207,7 @@ async function scheduleSeen($: any) {
   seenTimer?.cancel()
   seenTimer = null
   if (finished <= seen) return
-  const due = nextSeenCheck(finished, seenCheckedAt)
+  const due = Math.max(nextSeenCheck(finished, seenCheckedAt), seenQuietUntil)
   seenTimer = $.clock.after(Math.max(0, due - (await $.clock.now())), () => {
     seenTimer = null
     bg(
