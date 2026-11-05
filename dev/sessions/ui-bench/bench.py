@@ -5,7 +5,12 @@ after the same way. README.md in this folder says what each number means and how
     <python with pyte> bench.py --plugin <copy>/plugins/sessions --folder <trusted test folder> --out result.json
                                 [--label TEXT] [--sessions 6] [--scenarios idle,propagation,switch,ccc]
                                 [--idle-seconds 120] [--rounds 5] [--warmup 30] [--platform portable|macos]
-                                [--model haiku] [--env KEY=VALUE]... [--keep]
+                                [--model haiku] [--env KEY=VALUE]... [--keep] [--reload-from <older copy>]
+
+Two more scenarios, run only when named: crash (the session that leads the machine-wide work is killed, SIGKILL: how
+long until another one leads and the killed one's row is gone from a panel) and reload (two more sessions start on
+--reload-from, an older copy, which is then updated in place into --plugin: whether the panel says it needs a restart,
+and how fast it follows a change before and after a /clear).
 
 It starts the sessions "TEST A", "TEST B", ... in <folder>/mod with the copy loaded inline, and "TEST CTRL" in
 <folder>/ctrl without it (the cost of a session with no mod). Every one of them starts from an empty environment, with
@@ -127,10 +132,13 @@ class Bench:
         self.mod_dir = os.path.join(self.folder, 'mod')
         self.ctrl_dir = os.path.join(self.folder, 'ctrl')
         self.made_dirs = [d for d in (self.mod_dir, self.ctrl_dir) if not os.path.isdir(d)]
+        # The transcripts' folders of the folders it makes (a /clear in a test session starts a conversation of its own)
+        self.made_projects = [project_dir(d) for d in (self.mod_dir, self.ctrl_dir, os.path.join(self.folder, 'reload')) if not os.path.isdir(project_dir(d))]
         for d in (self.mod_dir, self.ctrl_dir):
             os.makedirs(d, exist_ok=True)
         self.sessions = []
         self.control = None
+        self.extra = []  # the reload scenario's sessions
         self.terminals = []
         self.result = {'label': a.label, 'plugin': self.plugin, 'version': plugin_version(self.plugin),
                        'date': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
@@ -143,10 +151,10 @@ class Bench:
 
     # The settings a test session starts with (--settings): the copy inline (or no panel at all), every location the
     # mod acts on pointed into the temporary folder
-    def settings(self, mod):
+    def settings(self, mod, plugin=None):
         env = {'SESSIONS_DATA_DIR': self.data, 'SESSIONS_JOBS_DIR': self.jobs, 'SESSIONS_DAEMON_LOG': self.daemon_log}
         if mod:
-            env['CLAUDE_CODE_PLUGIN_DIRS'] = self.plugin
+            env['CLAUDE_CODE_PLUGIN_DIRS'] = plugin or self.plugin
         if self.a.platform == 'portable':
             env['SESSIONS_PORTABLE'] = '1'
         for kv in self.a.env:
@@ -333,15 +341,22 @@ class Bench:
         return res
 
     def propagation(self):
-        a, b = self.by_name('A'), self.by_name('B')
+        b = self.by_name('B')
         x = self.viewer_of_a()
         y = self.terminal('typist', ['claude', 'attach', b.id])
         if y.wait(lambda t: t.current() == 'TEST B', timeout=60) is None:
             raise RuntimeError("TEST B's viewer never showed its panel")
         time.sleep(3)
+        rounds = self.turns(x, y, b, self.a.rounds)
+        y.close()
+        self.terminals.remove(y)
+        return dict(propagation_stats(rounds), note="otherBusy/otherDone: from TEST B's registry status changing (~/.claude/sessions/<pid>.json, read every 10 ms) to TEST A's panel drawing TEST B's dot in the new colour; own*: TEST B's own row in its own panel")
+
+    # Turns of session b, typed in its viewer y, as x (another session's viewer) and y draw them: one record per round
+    def turns(self, x, y, b, n):
         rounds = []
-        for i in range(self.a.rounds):
-            log('propagation round %d' % (i + 1))
+        for i in range(n):
+            log('%s: turn %d' % (b.name, i + 1))
             y.keys(BUSY_PROMPT, 'ENTER')
             sent = y.last_key_time('ENTER')
             r = {'sent': sent, 'busy': None, 'idle': None, 'aBusy': None, 'aDone': None, 'ownBusy': None, 'ownDone': None}
@@ -356,30 +371,174 @@ class Bench:
                     if st == 'idle' and r['busy'] is not None and r['idle'] is None:
                         r['idle'] = now
                     last = st
-                x.pump(lambda t, term=x: watch_row(r, term, t, 'TEST B', 'aBusy', 'aDone'))
-                y.pump(lambda t, term=y: watch_row(r, term, t, 'TEST B', 'ownBusy', 'ownDone'))
-                if r['idle'] and all(r[d] or (r[b] is None and now - r['idle'] > 20) or now - r['idle'] > 60
-                                     for b, d in (('aBusy', 'aDone'), ('ownBusy', 'ownDone'))):
+                x.pump(lambda t, term=x: watch_row(r, term, t, b.name, 'aBusy', 'aDone'))
+                y.pump(lambda t, term=y: watch_row(r, term, t, b.name, 'ownBusy', 'ownDone'))
+                if r['idle'] and all(r[d] or (r[k] is None and now - r['idle'] > 20) or now - r['idle'] > 60
+                                     for k, d in (('aBusy', 'aDone'), ('ownBusy', 'ownDone'))):
                     break
                 time.sleep(0.01)
             rounds.append(r)
             time.sleep(random.uniform(1.5, 3.5))
-        y.close()
-        self.terminals.remove(y)
+        return rounds
 
-        def delta(r, k, base):
-            return r[k] - r[base] if r[k] is not None and r[base] is not None else None
-        return {
-            'rounds': len(rounds),
-            'otherBusy': stats([delta(r, 'aBusy', 'busy') for r in rounds]),
-            'otherDone': stats([delta(r, 'aDone', 'idle') for r in rounds]),
-            'ownBusy': stats([delta(r, 'ownBusy', 'busy') for r in rounds]),
-            'ownDone': stats([delta(r, 'ownDone', 'idle') for r in rounds]),
-            'enterToBusy': stats([delta(r, 'busy', 'sent') for r in rounds]),
-            'busyMissed': sum(1 for r in rounds if r['busy'] and r['aBusy'] is None),
-            'turnSeconds': stats([delta(r, 'idle', 'busy') for r in rounds]),
-            'note': "otherBusy/otherDone: from TEST B's registry status changing (~/.claude/sessions/<pid>.json, read every 10 ms) to TEST A's panel drawing TEST B's dot in the new colour; own*: TEST B's own row in its own panel",
-        }
+    # The session that leads the machine-wide work (<data>/leader.json) is killed: when another one leads, when the
+    # killed one's registry file goes (only a claude agents listing removes it: the new leader's, or any other
+    # listing on the machine), when its row leaves another session's panel (or turns gray), and when the new leader
+    # listed (its debug log)
+    def crash(self):
+        for t in list(self.terminals):
+            t.close()
+            self.terminals.remove(t)
+        record = leader_record(self.data)
+        victim = next((s for s in self.sessions if record and s.pid == record.get('pid')), None)
+        if not victim:
+            raise RuntimeError('no test session leads (leader.json: %s)' % record)
+        watcher = next(s for s in self.sessions if s is not victim)
+        x = self.terminal('crash-viewer', ['bash', os.path.join(self.plugin, 'hooks', 'visor.sh'), 'attach', watcher.id])
+        if x.wait(lambda t: t.current() == watcher.name and t.colour_of(victim.name) is not None, timeout=60) is None:
+            raise RuntimeError("%s's viewer never showed %s's row" % (watcher.name, victim.name))
+        time.sleep(3)
+        log('crash: SIGKILL to %s (pid %d), the leader' % (victim.name, victim.pid))
+        killed = time.time()
+        os.kill(victim.pid, signal.SIGKILL)
+        r = {'leader': victim.name, 'registryGone': None, 'newLeader': None, 'newLeaderName': None, 'rowGone': None,
+             'reconcile': None}
+        deadline = killed + 240
+        while time.time() < deadline and not (r['registryGone'] and r['newLeader'] and r['rowGone']):
+            now = time.time()
+            if r['registryGone'] is None and not os.path.exists(os.path.join(REGISTRY, '%d.json' % victim.pid)):
+                r['registryGone'] = now - killed
+            rec = leader_record(self.data)
+            if r['newLeader'] is None and rec and rec.get('pid') != victim.pid:
+                r['newLeader'] = now - killed
+                r['newLeaderName'] = next((s.name for s in self.sessions if s.pid == rec.get('pid')), str(rec.get('pid')))
+            x.pump()
+            if r['rowGone'] is None and x.colour_of(victim.name) in (None, 'gray'):
+                r['rowGone'] = now - killed
+            time.sleep(0.05)
+        heir = next((s for s in self.sessions if s.name == r['newLeaderName']), None)
+        if heir:
+            spawns = [t for t, text in log_lines(heir.log, killed) if SPAWN.search(text) and re.search(r'claude with 3 args', text)]
+            r['reconcile'] = round(spawns[0] - killed, 3) if spawns else None
+        for k in ('registryGone', 'newLeader', 'rowGone'):
+            r[k] = round(r[k], 3) if r[k] is not None else None
+        x.close()
+        self.terminals.remove(x)
+        self.sessions.remove(victim)
+        self.extra.append(victim)
+        # A leader that stops working but keeps its registry file (SIGSTOP: its process is there, no listing sweeps it):
+        # the next one takes over once its heartbeat goes stale or its record is two passes old; once it runs again it
+        # follows the record (no fight for the lead)
+        if heir and heir.pid:
+            log('crash: SIGSTOP to %s (pid %d), the new leader' % (heir.name, heir.pid))
+            stopped = time.time()
+            os.kill(heir.pid, signal.SIGSTOP)
+            taken = None
+            try:
+                while time.time() < stopped + 300 and taken is None:
+                    rec = leader_record(self.data)
+                    if rec and rec.get('pid') not in (heir.pid, victim.pid):
+                        taken = time.time() - stopped
+                    time.sleep(0.2)
+            finally:
+                os.kill(heir.pid, signal.SIGCONT)
+            r['stuckLeaderReplaced'] = round(taken, 3) if taken is not None else None
+            after = leader_record(self.data)
+            changes, last = 0, after.get('pid') if after else None
+            until = time.time() + 75
+            while time.time() < until:
+                rec = leader_record(self.data)
+                if rec and rec.get('pid') != last:
+                    changes += 1
+                    last = rec.get('pid')
+                time.sleep(0.5)
+            r['leaderChangesAfterItRuns'] = changes
+            r['leaderAfter'] = next((s.name for s in self.sessions if s.pid == last), str(last))
+        r['note'] = ("seconds from the SIGKILL: registryGone, its <pid>.json removed (by the background service for one of "
+                     "its sessions, else by a claude agents listing: the new leader's reconcile, or any other on the "
+                     "machine); newLeader, leader.json naming another session; rowGone, its row gone from (or gray in) "
+                     "%s's panel; reconcile, the new leader's listing. stuckLeaderReplaced: from a SIGSTOP of the new "
+                     "leader to leader.json naming a third; leaderChangesAfterItRuns: changes of leader in the 75 s after "
+                     "its SIGCONT" % watcher.name)
+        return r
+
+    # Two more sessions on an older copy (--reload-from), then that copy updated in place into --plugin (the files
+    # replaced: the engine reloads an inline plugin by itself, raising no SessionStart, as an update in place does).
+    # Whether the panel says live updates need a restart, how fast it follows the other's turns on the short timer,
+    # then after a reload of the same version (still live? not here: never live) and after a /clear (live: events)
+    def reload(self):
+        if not self.a.reload_from:
+            raise RuntimeError('reload needs --reload-from <an older copy of plugins/sessions>')
+        for t in list(self.terminals):
+            t.close()
+            self.terminals.remove(t)
+        staging = os.path.join(self.tmp, 'reload-copy', 'sessions')
+        os.makedirs(os.path.dirname(staging), exist_ok=True)
+        copy_tree(self.a.reload_from, staging)
+        folder = os.path.join(self.folder, 'reload')
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+            self.made_dirs.append(folder)
+        pair = []
+        for name in ('TEST RA', 'TEST RB'):
+            s = Session(name, folder, True, os.path.join(self.tmp, 'debug', name.replace(' ', '_') + '.log'))
+            code, out, err = run(['claude', '--bg', '--model', self.a.model, '--debug-file', s.log, '--settings',
+                                  json.dumps(self.settings(True, staging)), '-n', name, FIRST_PROMPT], cwd=folder, timeout=120)
+            m = re.search(r'\b([0-9a-f]{8})\b', out)
+            if code != 0 or not m:
+                raise RuntimeError('claude --bg for %s failed: %s %s' % (name, out.strip(), err.strip()))
+            s.id = m.group(1)
+            pair.append(s)
+            self.extra.append(s)
+        deadline = time.time() + 240
+        while time.time() < deadline:
+            rows = {r.get('id'): r for r in agents()}
+            for s in pair:
+                r = rows.get(s.id) or {}
+                s.pid, s.session_id = r.get('pid'), r.get('sessionId')
+            if all(s.pid and (rows.get(s.id) or {}).get('status') == 'idle' for s in pair) and all(count(s.log, PANE_RENDER) for s in pair):
+                break
+            time.sleep(2)
+        else:
+            raise RuntimeError('the reload sessions did not come up idle with their panel drawn')
+        r1, r2 = pair
+        x = self.terminal('reload-viewer', ['claude', 'attach', r1.id], cwd=folder)
+        y = self.terminal('reload-typist', ['claude', 'attach', r2.id], cwd=folder)
+        for t, s in ((x, r1), (y, r2)):
+            if t.wait(lambda term, n=s.name: term.current() == n, timeout=60) is None:
+                raise RuntimeError("%s's viewer never showed its panel" % s.name)
+        time.sleep(3)
+        res = {'from': plugin_version(self.a.reload_from), 'to': plugin_version(self.plugin)}
+        before = self.turns(x, y, r2, 2)
+        res['before'] = propagation_stats(before)
+        # The update in place: the new copy's files over the old ones
+        loads = count(r1.log, MODULE_LOADED)
+        copy_tree(self.plugin, staging)
+        updated = time.time()
+        deadline = updated + 60
+        while time.time() < deadline and count(r1.log, MODULE_LOADED) <= loads:
+            time.sleep(0.2)
+        res['reloaded'] = count(r1.log, MODULE_LOADED) > loads
+        notice = x.wait(lambda t: any(NOTICE_OFF in row for row in t.rows.values()), after=updated, timeout=30)
+        res['noticeShown'] = notice is not None
+        res['noticeAfter'] = round(notice - updated, 3) if notice else None
+        res['noticeText'] = next((part.strip() for row in x.rows.values() for part in row.split('│') if NOTICE_OFF in part), None)
+        time.sleep(3)
+        res['afterReload'] = propagation_stats(self.turns(x, y, r2, self.a.rounds))
+        # /clear in RA: a SessionStart, with this copy's paths: live
+        x.keys('/clear', 'ENTER')
+        cleared = x.last_key_time('ENTER') or time.time()
+        gone = x.wait(lambda t: not any(NOTICE_OFF in row for row in t.rows.values()), after=cleared, timeout=60)
+        res['noticeGoneAfterClear'] = round(gone - cleared, 3) if gone else None
+        time.sleep(5)
+        res['afterClear'] = propagation_stats(self.turns(x, y, r2, self.a.rounds))
+        for t in (x, y):
+            t.close()
+            self.terminals.remove(t)
+        res['note'] = ("before: TEST RA's panel following TEST RB's turns on the older copy; afterReload: the same once RA's "
+                       "mod was updated in place (no SessionStart: the short timer, with the notice %r); afterClear: after "
+                       "a /clear in RA (a SessionStart: the engine watches, file events)" % NOTICE_OFF)
+        return res
 
     def switch(self):
         x = self.viewer_of_a()
@@ -419,7 +578,7 @@ class Bench:
         time.sleep(3)
         script = os.path.join(self.plugin, 'setup', 'ccc')
         shim = self.claude_shim()
-        totals, attaches, opened = [], [], []
+        totals, attaches, focuses, opened = [], [], [], []
         roots = os.path.join(self.tmp, 'roots-ccc')
         out = os.path.join(self.tmp, 'procs-ccc.jsonl')
         open(roots, 'w').close()
@@ -431,7 +590,9 @@ class Bench:
             started = z.started_at()
             pane = z.wait(lambda t: (t.current() or '').startswith('TEST '), timeout=60)
             attach = z.first_since(started, lambda t: any('Claude Code v' in row for row in t.rows.values()))
+            focus = z.wait(lambda t: t.focused() is not None, after=started, timeout=10)
             totals.append(pane - started if pane else None)
+            focuses.append(focus - started if focus else None)
             attaches.append(attach - started if attach else None)
             opened.append(z.current())
             windows.append((z.proc.pid, started, pane or time.time()))
@@ -447,9 +608,46 @@ class Bench:
         for pid, t0, t1 in windows:
             mine = [r for r in sampled if r['root'] == pid and t0 <= r['start'] <= t1]
             per_run.append(tally(sampled_key(r) for r in mine))
-        return {'toPanel': stats(totals), 'toAttach': stats(attaches), 'opened': opened,
+        return {'toPanel': stats(totals), 'toAttach': stats(attaches), 'toFocus': stats(focuses), 'opened': opened,
                 'sampledCommandsUntilPanel': per_run,
-                'note': "from the hidden terminal starting the copy's setup/ccc (claude's plugin lookup included) to the first frame of the opened session's panel with its current row; toAttach: to Claude Code's header"}
+                'note': "from the hidden terminal starting the copy's setup/ccc (claude's plugin lookup included) to the first frame of the opened session's panel with its current row; toAttach: to Claude Code's header; toFocus: to the panel holding the keyboard (ccc's focus request, through the session's inbox)"}
+
+    # ccc's requests to a running session (its inbox, as the launcher writes them): a bring of a window that isn't
+    # there, which the session answers in replies/ (failed, at once): from the request written to the answer
+    def inbox(self):
+        target = self.by_name('B')
+        times, results = [], []
+        for i in range(self.a.rounds):
+            reply = os.path.join(self.data, 'replies', 'bench-%d-%d' % (os.getpid(), i))
+            os.makedirs(os.path.dirname(reply), exist_ok=True)
+            request = 'format=3\naction=bring\nat=%d\ntty=/dev/ttys999\ntitle=nowhere\nreply=%s\n' % (int(time.time() * 1000), reply)
+            path = os.path.join(self.data, 'inbox', target.session_id)
+            tmp = path + '.tmp-bench'
+            with open(tmp, 'w') as f:
+                f.write(request)
+            sent = time.time()
+            os.replace(tmp, path)
+            answered = None
+            while time.time() < sent + 5:
+                try:
+                    with open(reply) as f:
+                        text = f.read()
+                    if 'result=' in text:
+                        answered = time.time()
+                        results.append(re.search(r'result=(\w+)', text).group(1))
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.005)
+            times.append(answered - sent if answered else None)
+            log('inbox %d: %s' % (i + 1, '%.3f s' % (answered - sent) if answered else 'no answer'))
+            try:
+                os.remove(reply)
+            except OSError:
+                pass
+            time.sleep(random.uniform(1.0, 2.0))
+        return {'toAnswer': stats(times), 'results': results,
+                'note': "a bring request in TEST B's inbox (as ccc writes it, for a window that isn't there) to its answer in replies/; ccc waits up to 3 s for one"}
 
     # ---- terminals ---------------------------------------------------------------------------------------------------
 
@@ -500,10 +698,10 @@ class Bench:
             log('kept: %s and the sessions in %s' % (self.tmp, self.folder))
             return
         subprocess.run(['bash', CLEAN, self.folder], capture_output=True, text=True, env=clean_env())
-        for s in self.sessions + ([self.control] if self.control else []):
+        for s in self.sessions + self.extra + ([self.control] if self.control else []):
             if not s.session_id:
                 continue
-            project = os.path.join(PROJECTS, re.sub(r'[^A-Za-z0-9]', '-', s.cwd))
+            project = project_dir(s.cwd)
             for p in (os.path.join(project, s.session_id + '.jsonl'), os.path.join(project, s.session_id)):
                 if os.path.isdir(p):
                     shutil.rmtree(p, ignore_errors=True)
@@ -514,6 +712,8 @@ class Bench:
                     os.rmdir(p)
                 except OSError:
                     pass
+        for d in self.made_projects:
+            shutil.rmtree(d, ignore_errors=True)
         for d in self.made_dirs:
             try:
                 os.rmdir(d)
@@ -522,8 +722,50 @@ class Bench:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
+# Where Claude keeps a folder's transcripts
+def project_dir(folder):
+    return os.path.join(PROJECTS, re.sub(r'[^A-Za-z0-9]', '-', folder))
+
+
 def sh_quote(s):
     return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def propagation_stats(rounds):
+    def delta(r, k, base):
+        return r[k] - r[base] if r[k] is not None and r[base] is not None else None
+    return {
+        'rounds': len(rounds),
+        'otherBusy': stats([delta(r, 'aBusy', 'busy') for r in rounds]),
+        'otherDone': stats([delta(r, 'aDone', 'idle') for r in rounds]),
+        'ownBusy': stats([delta(r, 'ownBusy', 'busy') for r in rounds]),
+        'ownDone': stats([delta(r, 'ownDone', 'idle') for r in rounds]),
+        'enterToBusy': stats([delta(r, 'busy', 'sent') for r in rounds]),
+        'busyMissed': sum(1 for r in rounds if r['busy'] and r['aBusy'] is None),
+        'turnSeconds': stats([delta(r, 'idle', 'busy') for r in rounds]),
+    }
+
+
+# The leader file the copy writes in its data folder (leader.ts), as key=value lines; None without one
+def leader_record(data):
+    try:
+        with open(os.path.join(data, 'leader.json')) as f:
+            k = dict(line.split('=', 1) for line in f.read().split('\n') if '=' in line)
+        return {'pid': int(k.get('pid') or 0), 'at': int(k.get('at') or 0)}
+    except (OSError, ValueError):
+        return None
+
+
+# A copy of a plugin folder over another one, file by file (the engine reloads an inline plugin when its files change),
+# without the types the engine writes into .claude-plugin/types
+def copy_tree(src, dst):
+    for root, dirs, files in os.walk(src):
+        if os.path.normpath(root) == os.path.normpath(os.path.join(src, '.claude-plugin')):
+            dirs[:] = [d for d in dirs if d != 'types']
+        rel = os.path.relpath(root, src)
+        os.makedirs(os.path.join(dst, rel), exist_ok=True)
+        for name in files:
+            shutil.copy2(os.path.join(root, name), os.path.join(dst, rel, name))
 
 
 def plugin_version(plugin):
@@ -573,6 +815,8 @@ ANY_RENDER = re.compile(r'hooks module sessions@\S+ ui\.render settled in ([\d.]
 SPAWN = re.compile(r'\$\.process\.(?:run|spawn) \(sessions\): (.+?) with (\d+) args? in .* \(pid (\d+)\)')
 STORE = re.compile(r'\$\.store\.(?:set|delete) \(sessions@\S+\): (\S+)')
 FS_WRITE = re.compile(r'\$\.fs\.write \(sessions\): (\S+)')
+MODULE_LOADED = re.compile(r'hooks module sessions@\S+ .*loaded')
+NOTICE_OFF = 'Live updates off'
 
 
 def stamp(text):
@@ -866,11 +1110,12 @@ def main(argv):
     p.add_argument('--model', default='haiku')
     p.add_argument('--env', action='append', default=[], help='KEY=VALUE added to every test session (a counter the copy exposes)')
     p.add_argument('--keep', action='store_true', help='leave the sessions, their transcripts and the temporary folder')
+    p.add_argument('--reload-from', help='the reload scenario: an older copy of plugins/sessions the sessions start on')
     a = p.parse_args(argv)
     scenarios = [s for s in a.scenarios.split(',') if s]
     if a.sessions < 2:
         p.error('--sessions must be 2 or more')
-    if a.platform == 'macos' and set(scenarios) & {'switch', 'ccc'}:
+    if a.platform == 'macos' and set(scenarios) & {'switch', 'ccc', 'crash', 'reload'}:
         p.error("--platform macos runs only idle and propagation: an Enter in a panel there could open a Terminal window")
     if not os.path.isfile(os.path.join(a.plugin, '.claude-plugin', 'plugin.json')):
         p.error('%s is not a copy of the sessions plugin' % a.plugin)
@@ -892,6 +1137,12 @@ def main(argv):
                     b.result['scenarios']['switch'] = b.switch()
                 elif s == 'ccc':
                     b.result['scenarios']['ccc'] = b.ccc()
+                elif s == 'inbox':
+                    b.result['scenarios']['inbox'] = b.inbox()
+                elif s == 'crash':
+                    b.result['scenarios']['crash'] = b.crash()
+                elif s == 'reload':
+                    b.result['scenarios']['reload'] = b.reload()
                 else:
                     b.result['errors'].append('unknown scenario %s' % s)
             except Exception as e:  # one scenario failing doesn't lose the others

@@ -32,7 +32,8 @@ reloads an inline plugin whenever a file of it changes.
   and `propagation`, which press no key in a panel (an Enter could open a Terminal window).
 - **Its own folder.** It refuses to start if `<folder>` already has background sessions, because at the end it stops
   and removes every one of them (`../clean-test-sessions.sh <folder>`), then deletes the transcripts of the sessions it
-  started, the subfolders it made and the temporary folder. `--keep` leaves all of it for a look.
+  started (the transcript folders it made, whole: a `/clear` starts a conversation of its own), the subfolders it made
+  and the temporary folder. `--keep` leaves all of it for a look.
 
 ## The scenarios
 
@@ -41,7 +42,10 @@ reloads an inline plugin whenever a file of it changes.
 | `idle` | nothing for `--idle-seconds` (120), with no viewer, then again with `TEST A` open in a hidden terminal (`idleWithViewer`) | pane and band renders, the mod's spawns by command, what those spawned in turn, CPU, store and file writes |
 | `propagation` | `TEST B`, open in a second hidden terminal, runs `sleep 6` through Bash (`--rounds`, 5) | from `TEST B`'s registry status changing to `TEST A`'s panel drawing its dot in the new colour, for busy and for done; the same in `TEST B`'s own panel |
 | `switch` | Enter on `TEST B`'s row in `TEST A`'s panel, then back (`--rounds` each way) | from the key to the target's own panel showing it as the current session; the row focused on arrival |
-| `ccc` | the copy's `setup/ccc` in a fresh hidden terminal in `<folder>/mod` (`--rounds`) | from the terminal starting to the opened session's panel; the commands it ran |
+| `ccc` | the copy's `setup/ccc` in a fresh hidden terminal in `<folder>/mod` (`--rounds`) | from the terminal starting to the opened session's panel, and to the panel holding the keyboard (ccc's focus request, through the session's inbox); the commands it ran |
+| `inbox` (only when named) | a bring request in `TEST B`'s inbox, as `ccc` writes it (`--rounds`), for a window that isn't there | from the request to `TEST B`'s answer in `replies/` (`ccc` waits up to 3 s for one) |
+| `crash` (only when named) | the session that leads the machine-wide work (`<data>/leader.json`) gets SIGKILL; then the one that took over gets SIGSTOP, and SIGCONT once a third leads | from the kill to its registry file gone, to `leader.json` naming another session, to its row gone from (or gray in) another session's panel, and to the new leader's `claude agents`; from the stop to a third leading, and how often the leader changes in the 75 s after it runs again |
+| `reload` (only when named, with `--reload-from <older copy>`) | `TEST RA` and `TEST RB` start in `<folder>/reload` on the older copy, which is then replaced by `--plugin`'s files (Claude reloads an inline plugin by itself, raising no SessionStart: an update in place); then `/clear` in `TEST RA` | `TEST RB`'s turns as `TEST RA`'s panel draws them before, after the reload (the short timer) and after the `/clear` (watched); whether, and how soon, the panel says live updates are off, and when that goes |
 
 ## Where each number comes from
 
