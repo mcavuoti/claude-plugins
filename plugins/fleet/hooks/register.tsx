@@ -10323,7 +10323,6 @@ async function rosterStatus($: any): Promise<string[]> {
   }
   if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
   lines.push(classicLine(await read($, classicSeen)))
-  lines.push(liveLine())
   const loose = await unstamped($)
   if (loose.length) lines.push(`changed outside fleet (not through a change you applied): ${loose.join(', ')}: /fleet accept <path> stamps your own edit as yours`)
   return lines
@@ -12067,6 +12066,7 @@ async function statusCommand($: any, all = false): Promise<string> {
     const waiting = records.filter(r => knownKind(r) && progress(r.id, slots(r), present).complete).length
     lines.push(`project: ${heldCount(records, present, alikeQuestion)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
     lines.push((await sweeperState($)).line)
+    lines.push(liveLine())
     await ensureWorld($)
     const spent = await judgeLedger($, await $.clock.now())
     const liveAreas = Object.keys((await judgesStateNow($)).live).sort()
