@@ -5035,7 +5035,11 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
   if (path && (await configFiles($)).includes(cfg)) {
     if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (${originWords(origin)})`
     await writeStamps($, [cfg])
-    if (cfg === '.claude/fleet/roster.json') roster = null
+    if (cfg === '.claude/fleet/roster.json') {
+      roster = null
+      const took = await rosterTakesEffect($)
+      return [`${cfg}: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).${took.length ? ' It takes effect now:' : ''}`, ...took].join('\n')
+    }
     return `${cfg}: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).`
   }
   if (!worldOn()) return worldProblem || 'This project has no world (world.json): /fleet world add <glob> starts one.'
@@ -5329,9 +5333,69 @@ type Heartbeat = {
   budget?: { day: string; usd: number; cap: number | null; state: BudgetState } | null
   /** The main thread's Bash commands running in the background (their text, when each started): told after a restart */
   bg?: { command: string; at: number }[]
+  /** The roster's model or effort the account refused in this process: its requests run the session's own */
+  modelRefused?: string
+  effortRefused?: string
+  /** The model its last request named (the roster's once fleet asked for it): a different one answered, the account's */
+  asked?: string
 }
 // That model, from turn.step (B4: a roster model the account lacks ran the org default, and nothing said so)
 let stepModel: string | null = null
+// The model its last main-loop request named (the roster's, once fleet asked for it)
+let stepAsked: string | null = null
+// The roster's model and effort the account refused in this process, not asked for again till a restart
+let stepRefused: StepWant | null = null
+
+type StepWant = { model?: string; effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
+
+/** What an instance's main-loop request should name that it doesn't: the roster's model (an alias that picks for
+ * itself never differs) and its effort, unless the account refused them in this process */
+function stepWant(inst: Instance, e: { model: string; effort?: unknown }): StepWant | null {
+  const want: StepWant = {}
+  if (inst.model && modelDiffers(inst.model, e.model)) want.model = inst.model
+  // Effort where the request carries one, or along with a model fleet switches to (a model without effort drops it)
+  if (inst.effort && e.effort !== inst.effort && (e.effort !== undefined || want.model)) want.effort = inst.effort as StepWant['effort']
+  if (!want.model && !want.effort) return null
+  return stepRefused && refusalKey(stepRefused) === refusalKey(want) ? null : want
+}
+
+function refusalKey(w: StepWant): string {
+  return `${w.model ?? ''}|${w.effort ?? ''}`
+}
+
+function wantWords(w: StepWant): string {
+  return [w.model, w.effort ? `effort ${w.effort}` : null].filter(Boolean).join(' at ')
+}
+
+/** What an instance runs, as its heartbeat says, beside the roster's model: the same; the account refused the
+ * roster's; the account answered with its own though fleet asked for the roster's; or not asked for yet (the roster
+ * changed since its last request: its next one names it) */
+function modelLine(inst: Instance, hb: { model?: unknown; modelRefused?: unknown; asked?: unknown }): string {
+  const runs = String(hb.model)
+  if (!inst.model || !modelDiffers(inst.model, runs)) return `runs ${runs}`
+  if (typeof hb.modelRefused === 'string' && !modelDiffers(hb.modelRefused, inst.model) && !modelDiffers(inst.model, hb.modelRefused))
+    return `runs ${runs}, roster says ${inst.model} (the account refused ${inst.model}: its requests run the session's own model; fleet asks for ${inst.model} again after a restart)`
+  if (typeof hb.asked === 'string' && (hb.asked === inst.model || !modelDiffers(inst.model, hb.asked))) return `runs ${runs}, roster says ${inst.model} (a model the account lacks falls back)`
+  return `runs ${runs}, roster says ${inst.model} (its next request asks for ${inst.model})`
+}
+
+/** An instance's settings file as a restart matters for it: without its model and effort, which reach a running
+ * instance at its next request (turn.step), so a change of those alone needs no restart */
+function settingsCoreHash(text: string): string {
+  try {
+    const s = JSON.parse(text)
+    if (s && typeof s === 'object' && !Array.isArray(s) && ('model' in s || 'effortLevel' in s)) {
+      const { model: _m, effortLevel: _e, ...rest } = s
+      return hashText(settingsText(rest))
+    }
+  } catch {}
+  return hashText(text)
+}
+
+/** A step that got no response at all: no usage, no stop reason, nothing said (the API refused the request) */
+function noResponse(r: any): boolean {
+  return !!r && !r.usage && (r.stopReason === null || r.stopReason === undefined) && !r.answer && !(r.toolUses?.length > 0)
+}
 // The tokens its context held at the last heartbeat (the idle compaction reads it)
 let lastContextTokens: number | null = null
 // Why a pending restart (/fleet up --restart-when-idle) hasn't happened yet, for its heartbeat; null: none pending
@@ -5441,7 +5505,7 @@ async function bind($: any) {
   bindWhy = bound ? '' : `it runs as ${type}, and the roster gives ${inst.name} the role file ${inst.agent}`
   if (settingsHash === null) {
     const t = await readText($, settingsPath(inst.slug))
-    settingsHash = t === null ? '' : hashText(t)
+    settingsHash = t === null ? '' : settingsCoreHash(t)
   }
   if (was !== inst.name) log($, `instance ${inst.name} (${inst.role})${bound ? '' : `, unbound: ${bindWhy}`}`)
 }
@@ -5552,6 +5616,9 @@ async function heartbeat($: any) {
     remote: await remoteControl($),
     contextTokens,
     model: stepModel,
+    ...(stepAsked ? { asked: stepAsked } : {}),
+    ...(stepRefused?.model ? { modelRefused: stepRefused.model } : {}),
+    ...(stepRefused?.effort ? { effortRefused: stepRefused.effort } : {}),
     failed: turnFailed,
     classicStart: !!(await read($, classicSeen)).SessionStart,
     ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
@@ -7725,7 +7792,8 @@ async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, n
 }
 
 function effectOf(path: string): string {
-  if (path === '.claude/fleet/roster.json') return '. It takes effect at the next /fleet up (a running instance takes new settings when restarted, u)'
+  // roster.json: rosterTakesEffect says, instance by instance, what happens now
+  if (path === '.claude/fleet/roster.json') return ''
   if (path === '.claude/fleet/world.json') return '. Every session of the project follows it within 2 s'
   if (path.startsWith('.claude/agents/')) return '. Running instances of that role take it when restarted (u)'
   return ''
@@ -7810,7 +7878,10 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   const present = await answerNames($)
   const rivals = records.filter(r => r.id !== rec.id && r.kind === 'change' && r.change?.path === spec.path && !progress(r.id, slots(r), present).complete).map(r => r.id)
   const stale = rivals.length ? ` ${rivals.join(', ')} ${rivals.length === 1 ? 'changes' : 'change'} ${spec.path} too, drafted on the version it just left, so ${rivals.length === 1 ? "it can't" : "they can't"} apply: /fleet ${rivals.map(id => `${id} reject`).join(' ')} closes ${rivals.length === 1 ? 'it' : 'them'} as stale (${rivals.length === 1 ? 'its asker hears' : 'their askers hear'} the file moved, and can draft again)` : ''
-  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effectOf(spec.path)}. ${who} hears it.${stale}`, done: true, applied: true }
+  // roster.json takes effect now: instance by instance, what changes (P26)
+  const took = spec.path === '.claude/fleet/roster.json' ? await rosterTakesEffect($) : []
+  const effect = spec.path === '.claude/fleet/roster.json' ? (took.length ? '. It takes effect now:\n' + took.join('\n') + '\n' : '. No instance\'s settings changed') : effectOf(spec.path)
+  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effect}. ${who} hears it.${stale}`, done: true, applied: true }
 }
 
 // What follows fleet's write of a command-level file the person answered for (an applied change, the outbound.json of
@@ -7841,6 +7912,63 @@ async function landApplied($: any, path: string, before: string | null, drafter?
   if (spec.path === '.claude/fleet/roster.json') roster = null
   if (spec.path === '.claude/fleet/slots.json') slotsCfg = null
   if (spec.path === '.claude/fleet/outbound.json') outboundCfg = null
+}
+
+/** A roster change the person accepted or applied takes effect by itself (P26): each instance's settings file is
+ * written anew; a running one whose settings a restart carries changed restarts once idle (instances/<slug>/restart.json,
+ * as /fleet up --restart-when-idle asks); a model or an effort alone reaches it at its next request (turn.step), no
+ * restart. Instances down, or never started, only get their file. One line per instance it changed something for */
+async function rosterTakesEffect($: any): Promise<string[]> {
+  if (await freshRoster($)) return []
+  const all = (roster as { instances: Instance[] }).instances
+  const down = await downSet($)
+  const level = await commandLevelNow($)
+  const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
+  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
+  const at = await $.clock.now()
+  const out: string[] = []
+  let wrote = false
+  for (const inst of all) {
+    const next = settingsText(settingsFor(inst, root as string, deny))
+    const before = await readText($, settingsPath(inst.slug))
+    if (before === next) continue
+    const { running, stopped } = st?.ready ? rowsOf(inst, st.rows) : { running: null, stopped: null }
+    // Never started and no file yet: /fleet up writes it when it starts the instance
+    if (before === null && !running && !stopped) continue
+    if (!wrote) await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
+    wrote = true
+    await $.fs.write(settingsPath(inst.slug), next)
+    if (!running || down.has(inst.slug)) {
+      out.push(`  ${inst.name}: settings rewritten (it takes them when it ${running ? 'restarts' : 'starts or wakes'})`)
+      continue
+    }
+    const hb = await heartbeatOf($, inst.slug)
+    const core = settingsCoreHash(next)
+    const restart = hb?.settingsHash ? hb.settingsHash !== core : before !== null && settingsCoreHash(before) !== core
+    const old = parseJson(before)
+    const parts: string[] = []
+    if (restart) {
+      await run($, ['mkdir', '-p', instDir(inst.slug)])
+      await replace($, `${instDir(inst.slug)}/restart.json`, json({ format: FORMAT, at }))
+      parts.push('restarts with its new settings once idle (nothing in flight)')
+    }
+    const said: string[] = []
+    if (inst.model && old?.model !== inst.model) said.push(`model ${inst.model}`)
+    if (inst.effort && old?.effortLevel !== inst.effort) said.push(`effort ${inst.effort}`)
+    if (said.length) parts.push(`${said.join(', ')} at its next request${restart ? '' : ' (no restart)'}`)
+    if (parts.length) out.push(`  ${inst.name}: ${parts.join('; ')}`)
+  }
+  if (out.length) log($, `roster.json took effect: ${out.map(l => l.trim()).join('; ')}`)
+  return out
+}
+
+function parseJson(text: string | null): any {
+  if (text === null) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
 }
 
 // ---- The sweeper's part: marks on the instances' rows, and wakes of retired ones (coalesced) ----
@@ -8517,13 +8645,14 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
   // A running instance whose settings this writes anew takes them only when restarted
   const rewritten = new Set<string>()
-  // A running instance whose requests name another model than the roster's (one the account lacks falls back)
-  const fallback = new Map<string, string>()
+  // A running instance that runs another model than the roster's (the account refused it, or answers with its own, or
+  // its next request asks for the roster's new one)
+  const fallback = new Map<string, Heartbeat>()
   for (const p of plan) {
     if (p.action !== 'running') continue
     const hb = await heartbeatOf($, p.inst.slug)
-    if (hb?.settingsHash && hb.settingsHash !== hashText(settingsText(settingsFor(p.inst, root as string, deny)))) rewritten.add(p.inst.slug)
-    if (typeof hb?.model === 'string' && modelDiffers(p.inst.model, hb.model)) fallback.set(p.inst.slug, hb.model)
+    if (hb?.settingsHash && hb.settingsHash !== settingsCoreHash(settingsText(settingsFor(p.inst, root as string, deny)))) rewritten.add(p.inst.slug)
+    if (hb && typeof hb.model === 'string' && modelDiffers(p.inst.model, hb.model)) fallback.set(p.inst.slug, hb)
     // A big context with nothing to shrink it (G22): every wake reloads it
     const huge = hugeContext(p.inst, hb)
     if (huge) lint.warnings.push(`${p.inst.name}: ${huge}`)
@@ -8581,7 +8710,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     const i = p.inst
     const where = `${i.section ? i.section.title : 'no section'}${i.parent ? `, under ${i.parent}` : ''}`
     const actual = fallback.get(i.slug)
-    const runs = `${i.model ?? 'the default model'}${i.effort ? ` (${i.effort})` : ''}${actual ? ` (runs ${actual}, roster says ${i.model}: a model the account lacks falls back)` : ''}`
+    const runs = `${i.model ?? 'the default model'}${i.effort ? ` (${i.effort})` : ''}${actual ? ` (${modelLine(i, actual)})` : ''}`
     const size = sizes[i.slug]
     const w = wakeUsd(i.model, effectivePerDay(wakes), size)
     const pw = i.poll ? wakeUsd(i.model, pollsPerDay(i.poll), size) : null
@@ -8869,7 +8998,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (hb.mode) parts.push(`mode ${hb.mode}${modeWaits(hb.mode) ? ' (it asks: a mode that doesn’t lets it work unattended)' : ''}`)
         if (hb.waitingOn?.kind === 'permission' && running.state === 'waiting') parts.push(`waiting on a permission prompt (${hb.waitingOn.tool}) since ${ago(now - hb.waitingOn.at)}: Enter in the panel answers it`)
         if (hb.remote) parts.push('Remote Control')
-        if (typeof hb.model === 'string' && hb.model) parts.push(modelDiffers(inst.model, hb.model) ? `runs ${hb.model}, roster says ${inst.model} (a model the account lacks falls back)` : `runs ${hb.model}`)
+        if (typeof hb.model === 'string' && hb.model) parts.push(modelLine(inst, hb))
         if (hb.failed) parts.push(`last turn failed ${ago(now - hb.failed.at)} ago: ${hb.failed.why}`)
         if (hb.classicStart === false) parts.push('its classic hooks are sent on past fleet (a managed plugin): fleet tells it who it is in its prompts')
         if (hb.orgAsk?.length) parts.push(`asks you on every call to ${hb.orgAsk.join(', ')} (an organisation's setting: allow rules don't lift it)`)
@@ -8882,7 +9011,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (inst.pin) parts.push(pinnedRefs.has(running.ref) ? 'pinned' : (await has($, 'pin')) ? 'to pin' : "pin: the sessions here can't pin (an older sessions): it may be retired when idle")
         else if (pinnedRefs.has(running.ref)) parts.push('pinned by fleet before: to unpin (roster.json no longer pins it)')
         const t = await readText($, settingsPath(inst.slug))
-        if (hb.settingsHash !== null && t !== null && hb.settingsHash !== hashText(t)) parts.push('its settings changed since it started: u restarts it with them')
+        if (hb.settingsHash !== null && t !== null && hb.settingsHash !== settingsCoreHash(t)) parts.push('its settings changed since it started: u restarts it with them')
         if (hb.ref && (await exists($, `${instDir(inst.slug)}/seed-${hb.ref}.json`))) parts.push('seeded')
       }
     } else if (retired && why !== 'person' && inst.poll && hb) {
@@ -11053,13 +11182,34 @@ export const register: Register = on => {
   // the network (in a background session); after it, or for any other command, it fails open as the rest of fleet
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => bashHook($, e, next)).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
-  // The model each main-loop request names, as the engine resolved it (the session's, or a fallback's): the heartbeat
-  // reports it, and /fleet status and the dry run say when it isn't the roster's. Only watches: the stream passes as is
+  // An instance's main-loop requests run the roster's model and effort (B24/G32): a respawn replays the launch's
+  // --model whatever the settings file says now, and /model in a background session waits on a dialog nobody answers,
+  // so each request names them itself. A model the account refuses (no response at all) is sent again as the session
+  // named it, and not asked for again in this process. The model that answered goes to the heartbeat
   on('turn.step', async function* ($, e, next) {
-    const r = yield* next(e)
+    // A request before the instance's first binding (a respawn's first turn): bound now, the roster read once
+    if (e.agentId === undefined && !myInstance && jobRef && root) {
+      try {
+        await bind($)
+      } catch {}
+    }
+    const want = e.agentId === undefined && myInstance ? stepWant(myInstance, e) : null
+    let r: any = yield* next(want ? { ...e, ...want } : e)
+    if (want && noResponse(r)) {
+      const again: any = yield* next(e)
+      // Refused for what fleet asked, not for some other reason: the session's own request went through
+      if (!noResponse(again)) {
+        stepRefused = want
+        log($, `the account refused ${wantWords(want)} for ${myInstance?.name}: its requests run ${e.model}${e.effort !== undefined ? ` (${e.effort})` : ''}`)
+      }
+      r = again
+    }
     // The model that answered (usage.model, as the API reports it), else the one the request named
-    const m = (r as { usage?: { model?: string } | null } | undefined)?.usage?.model ?? e.model
-    if (e.agentId === undefined && typeof m === 'string' && m) stepModel = m
+    const m = r?.usage?.model ?? (want && !noResponse(r) && stepRefused !== want ? (want.model ?? e.model) : e.model)
+    if (e.agentId === undefined && typeof m === 'string' && m) {
+      stepModel = m
+      stepAsked = want?.model && !noResponse(r) && stepRefused !== want ? want.model : e.model
+    }
     return r
   })
 
