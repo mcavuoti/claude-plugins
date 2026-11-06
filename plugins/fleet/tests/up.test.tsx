@@ -142,7 +142,7 @@ test('/fleet up --dry-run: the plan, the cost and the lints, and nothing started
   // cache-write price), in the plan and in /fleet status
   w.files.set(`${FLEET}/instances/owner-a/state.json`, JSON.stringify({ format: 1, instance: 'Owner A', slug: 'owner-a', ref: 'aaaaaaa1', sessionId: 'aaaaaaa1-0000-0000-0000-000000000000', at: w.clock.now(), cwd: ROOT, bound: true, settingsHash: 'h0000000', agentType: 'owner', cost: 0, contextTokens: 400000 }))
   const plan = await fleet($, 'up --dry-run')
-  expect(plan).toContain('$1.00/day, wakes ~$0.40/day (its context: 400k) · mode default · running (idle): placed, not started again; its settings would be rewritten: u restarts it with them')
+  expect(plan).toContain('$1.00/day, wakes ~$0.40/day (its context: 400k) · mode default · running (idle): placed, not started again (fleet doesn\'t restart a running session: a model or effort change reaches it at its next request); its settings would be rewritten: u restarts it with them')
   expect(await fleet($, 'status')).toContain('context 400k')
 })
 
@@ -170,7 +170,7 @@ test('/fleet down: no wakes, /fleet up skips them until named; /fleet remove for
   await startSession($, w)
   const down = await fleet($, 'down "Owner B"')
   expect(down).toContain('Down: Owner B.')
-  expect(down).toContain('Still running: Owner B: s in the panel stops one (fleet never stops a session).')
+  expect(down).toContain('Still running: Owner B: it keeps working; fleet only stops waking and nudging it until /fleet up names it (s in the panel stops the session).')
   expect(Object.keys(json(w, `${STATE}/down.json`).instances)).toEqual(['owner-b'])
   expect(await fleet($, 'up --dry-run')).toContain('down: skipped (/fleet up <name> brings it back)')
   expect(await fleet($, 'remove owner-b')).toContain('Owner B is still running: /fleet down "Owner B", stop it with s in the panel, then /fleet remove again.')

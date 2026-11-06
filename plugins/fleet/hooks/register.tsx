@@ -2844,6 +2844,12 @@ async function gate($: any, e: any, next: any) {
       await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: cur.v as string } }))
       if (mine && cur.v) await update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } }))
       texts.push(gateText(v, w.rel, last && last.to === cur.v ? last : null, cur.mtimeMs, me))
+      // A new board item someone else just made under the id this thread meant for its own (ids race): the next free one
+      const item = /^board\/B-(\d+)\.md$/.exec(w.rel)
+      if (v === 'unread' && item && last && last.to === cur.v && last.from === null) {
+        const taken = (await names($, `${root}/board`)).map(x => /^B-(\d+)\.md$/.exec(x)).filter((m): m is RegExpExecArray => !!m).map(m => Number(m[1]))
+        texts.push(`B-${item[1]} is a new item ${last.by?.name || 'another session'} just created: if yours is another item, the next free id is B-${Math.max(Number(item[1]), ...taken) + 1}.`)
+      }
     }
     if (fresh.length) {
       await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [`pins:${w.rel}`]: [...new Set([...said, ...refusedKeys])].join('\n') } }))
@@ -4746,7 +4752,7 @@ async function slotCall($: any, e: any): Promise<any> {
       const l: Lease = { ...v.lease, until: r.until, ...(why ? { why } : {}) }
       await replace($, slotDir(name, `${v.lease.n}.json`), json(l))
       await update($, slotTold, m => ({ ...m, [leaseKey(l)]: now }))
-      return { result: `You hold ${name} (${v.lease.n + 1} of ${spec.count}) until ${clock(l.until, me.offsetMin)} now${r.capped ? ` (no later: ${others} wait${others === 1 ? 's' : ''} for it, and a lease lasts ${spec.leaseMin} min from when you took it)` : ''}. Release it with mcp__fleet__slot release as soon as you're done.` }
+      return { result: `You hold ${name} (unit ${v.lease.n + 1} of ${spec.count}; ${(await leasesOf($, name)).filter(x => x.lease.until > now).length} of ${spec.count} taken) until ${clock(l.until, me.offsetMin)} now${r.capped ? ` (no later: ${others} wait${others === 1 ? 's' : ''} for it, and a lease lasts ${spec.leaseMin} min from when you took it)` : ''}. Release it with mcp__fleet__slot release as soon as you're done.` }
     }
     if (v.kind === 'grant') {
       const old = leases.find(x => x.lease.n === v.n)
@@ -4763,7 +4769,7 @@ async function slotCall($: any, e: any): Promise<any> {
         await update($, slotTold, m => ({ ...m, [leaseKey(lease)]: now }))
         await update($, slotWait, l => l.filter(x => x !== name))
         log($, `slot ${name}: taken by ${slotHolderWords(holder)} (${v.n + 1} of ${spec.count})`)
-        return { result: `Yours: ${name} (${v.n + 1} of ${spec.count}) until ${clock(lease.until, me.offsetMin)} (${minutes} min). Release it with mcp__fleet__slot release as soon as you're done; take it again to extend it. Once it runs out, fleet takes it back.` }
+        return { result: `Yours: ${name} (unit ${v.n + 1} of ${spec.count}; ${(await leasesOf($, name)).filter(x => x.lease.until > now).length} of ${spec.count} taken) until ${clock(lease.until, me.offsetMin)} (${minutes} min). Release it with mcp__fleet__slot release as soon as you're done; take it again to extend it. Once it runs out, fleet takes it back.` }
       }
       leases = await leasesOf($, name)
       waiters = await waitersOf($, name)
@@ -4988,6 +4994,16 @@ async function alertsTick($: any) {
   const long = records.filter(r => knownKind(r) && !progress(r.id, slots(r), present).complete && now - r.at >= person.waitingMin * 60000).sort((a, b) => a.at - b.at)
   const oldest = long[0]
   if (oldest) due.push({ key: `waiting:${day}:${DAY_PARTS[Math.floor(minute / 360)]}`, kind: 'waiting', text: `${long.length} decision(s) have waited over ${ago(person.waitingMin * 60000)} (the oldest, ${oldest.id} from ${view(oldest).name}, ${ago(now - oldest.at)})` })
+  // An instance stopped at a permission prompt nobody sees, or in one call that may hang, past waitingMin (a call: past
+  // half an hour too): once per prompt or call
+  for (const inst of roster?.instances ?? []) {
+    const hb = await heartbeatOf($, inst.slug)
+    if (!hb || now - hb.at >= HEARTBEAT_STALE_MS) continue
+    const w = hb.waitingOn
+    if (w?.kind === 'permission' && now - w.at >= person.waitingMin * 60000) due.push({ key: `prompt:${inst.slug}:${w.at}`, kind: 'waiting', text: `${inst.name} has waited on a permission prompt (${w.tool}) for ${ago(now - w.at)}: Enter on its row in the panel answers it` })
+    const c = hungCall(hb, now)
+    if (c && now - c.since >= person.waitingMin * 60000) due.push({ key: `call:${inst.slug}:${c.since}`, kind: 'waiting', text: `${inst.name} has been in one call to ${c.tool} for ${ago(now - c.since)}: it may be hung` })
+  }
   // A budget used up (an instance's own, the project's, intake's)
   budgetCache.at = 0
   for (const b of await budgets($)) if (b.own === 'over') due.push({ key: `budget:${b.inst.slug}:${day}`, kind: 'budget', text: `${b.inst.name} used up its budget (${usd(b.usd)} today)` })
@@ -5187,7 +5203,11 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
   if (path && (await configFiles($)).includes(cfg)) {
     if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (${originWords(origin)})`
     await writeStamps($, [cfg])
-    if (cfg === '.claude/fleet/roster.json') roster = null
+    if (cfg === '.claude/fleet/roster.json') {
+      roster = null
+      const took = await rosterTakesEffect($)
+      return [`${cfg}: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).${took.length ? ' It takes effect now:' : ''}`, ...took].join('\n')
+    }
     return `${cfg}: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).`
   }
   if (!worldOn()) return worldProblem || 'This project has no world (world.json): /fleet world add <glob> starts one.'
@@ -5481,9 +5501,90 @@ type Heartbeat = {
   budget?: { day: string; usd: number; cap: number | null; state: BudgetState } | null
   /** The main thread's Bash commands running in the background (their text, when each started): told after a restart */
   bg?: { command: string; at: number }[]
+  /** The main thread's oldest tool call in flight (one that runs past STUCK_MS may hang: a call that never returns) */
+  call?: { tool: string; since: number }
+  /** The roster's model or effort the account refused in this process: its requests run the session's own */
+  modelRefused?: string
+  effortRefused?: string
+  /** The model its last request named (the roster's once fleet asked for it): a different one answered, the account's */
+  asked?: string
 }
 // That model, from turn.step (B4: a roster model the account lacks ran the org default, and nothing said so)
 let stepModel: string | null = null
+// The model its last main-loop request named (the roster's, once fleet asked for it)
+let stepAsked: string | null = null
+// The roster's model and effort the account refused in this process, not asked for again till a restart
+let stepRefused: StepWant | null = null
+
+type StepWant = { model?: string; effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
+
+/** What an instance's main-loop request should name that it doesn't: the roster's model (an alias that picks for
+ * itself never differs) and its effort, unless the account refused them in this process */
+function stepWant(inst: Instance, e: { model: string; effort?: unknown }): StepWant | null {
+  const want: StepWant = {}
+  if (inst.model && modelDiffers(inst.model, e.model)) want.model = inst.model
+  // Effort where the request carries one, or along with a model fleet switches to (a model without effort drops it)
+  if (inst.effort && e.effort !== inst.effort && (e.effort !== undefined || want.model)) want.effort = inst.effort as StepWant['effort']
+  if (!want.model && !want.effort) return null
+  return stepRefused && refusalKey(stepRefused) === refusalKey(want) ? null : want
+}
+
+function refusalKey(w: StepWant): string {
+  return `${w.model ?? ''}|${w.effort ?? ''}`
+}
+
+function wantWords(w: StepWant): string {
+  return [w.model, w.effort ? `effort ${w.effort}` : null].filter(Boolean).join(' at ')
+}
+
+/** What an instance runs, as its heartbeat says, beside the roster's model: the same; the account refused the
+ * roster's; the account answered with its own though fleet asked for the roster's; or not asked for yet (the roster
+ * changed since its last request: its next one names it) */
+function modelLine(inst: Instance, hb: { model?: unknown; modelRefused?: unknown; asked?: unknown }): string {
+  const runs = String(hb.model)
+  if (!inst.model || !modelDiffers(inst.model, runs)) return `runs ${runs}`
+  if (typeof hb.modelRefused === 'string' && !modelDiffers(hb.modelRefused, inst.model) && !modelDiffers(inst.model, hb.modelRefused))
+    return `runs ${runs}, roster says ${inst.model} (the account refused ${inst.model}: its requests run the session's own model; fleet asks for ${inst.model} again after a restart)`
+  if (typeof hb.asked === 'string' && (hb.asked === inst.model || !modelDiffers(inst.model, hb.asked))) return `runs ${runs}, roster says ${inst.model} (a model the account lacks falls back)`
+  return `runs ${runs}, roster says ${inst.model} (its next request asks for ${inst.model})`
+}
+
+/** An instance's settings file as a restart matters for it: without its model and effort, which reach a running
+ * instance at its next request (turn.step), so a change of those alone needs no restart */
+function settingsCoreHash(text: string): string {
+  try {
+    const s = JSON.parse(text)
+    if (s && typeof s === 'object' && !Array.isArray(s) && ('model' in s || 'effortLevel' in s)) {
+      const { model: _m, effortLevel: _e, ...rest } = s
+      return hashText(settingsText(rest))
+    }
+  } catch {}
+  return hashText(text)
+}
+
+/** One tool call in flight this long may hang (a subagent's is its own work, and a permission prompt has its mark) */
+const STUCK_MS = 30 * 60000
+const OWN_PACE_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task'])
+function hungCall(hb: { call?: { tool: string; since: number }; waitingOn?: unknown } | null, now: number): { tool: string; since: number } | null {
+  const c = hb?.call
+  if (!c || typeof c.tool !== 'string' || typeof c.since !== 'number' || hb?.waitingOn || OWN_PACE_TOOLS.has(c.tool)) return null
+  return now - c.since >= STUCK_MS ? c : null
+}
+
+/** "2026-11-02 09:00 here, UTC-03:00": the date and time where the session runs, for what it writes */
+async function clockStamp($: any): Promise<string> {
+  const now = await $.clock.now()
+  const off = (await meNow($)).offsetMin
+  const d = new Date(now + off * 60000)
+  const two = (n: number) => String(n).padStart(2, '0')
+  const a = Math.abs(off)
+  return `${d.getUTCFullYear()}-${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())} here, UTC${off < 0 ? '-' : '+'}${two(Math.floor(a / 60))}:${two(a % 60)}`
+}
+
+/** A step that got no response at all: no usage, no stop reason, nothing said (the API refused the request) */
+function noResponse(r: any): boolean {
+  return !!r && !r.usage && (r.stopReason === null || r.stopReason === undefined) && !r.answer && !(r.toolUses?.length > 0)
+}
 // The tokens its context held at the last heartbeat (the idle compaction reads it)
 let lastContextTokens: number | null = null
 // Why a pending restart (/fleet up --restart-when-idle) hasn't happened yet, for its heartbeat; null: none pending
@@ -5498,6 +5599,14 @@ let turnFailed: { at: number; why: string } | null = null
 // permission prompt it waits on now (classic.PermissionRequest, until its tool ran or was refused, or the turn ended)
 let permissionMode: string | null = null
 let permissionWait: { kind: 'permission'; tool: string; at: number } | null = null
+// The main thread's tool calls in flight (parallel calls each), for the heartbeat: the oldest says which one may hang
+const callsInFlight = new Map<number, { tool: string; since: number }>()
+let callSeq = 0
+function oldestCall(): { tool: string; since: number } | null {
+  let o: { tool: string; since: number } | null = null
+  for (const c of callsInFlight.values()) if (!o || c.since < o.since) o = c
+  return o
+}
 // What this instance's heartbeat carried over from the one before it (once per process)
 const carried = { done: false, startedAt: 0, lastLanding: 0, lastWork: 0, budgetOver: '' }
 type BudgetRow = { inst: Instance; usd: number; cap: number | null; own: BudgetState; state: BudgetState }
@@ -5593,7 +5702,7 @@ async function bind($: any) {
   bindWhy = bound ? '' : `it runs as ${type}, and the roster gives ${inst.name} the role file ${inst.agent}`
   if (settingsHash === null) {
     const t = await readText($, settingsPath(inst.slug))
-    settingsHash = t === null ? '' : hashText(t)
+    settingsHash = t === null ? '' : settingsCoreHash(t)
   }
   if (was !== inst.name) log($, `instance ${inst.name} (${inst.role})${bound ? '' : `, unbound: ${bindWhy}`}`)
 }
@@ -5701,9 +5810,13 @@ async function heartbeat($: any) {
     intakeSeen: intakeSeen.at || null,
     mode: permissionMode ?? (await configuredMode($)),
     waitingOn: permissionWait,
+    ...(oldestCall() ? { call: oldestCall() as { tool: string; since: number } } : {}),
     remote: await remoteControl($),
     contextTokens,
     model: stepModel,
+    ...(stepAsked ? { asked: stepAsked } : {}),
+    ...(stepRefused?.model ? { modelRefused: stepRefused.model } : {}),
+    ...(stepRefused?.effort ? { effortRefused: stepRefused.effort } : {}),
     failed: turnFailed,
     classicStart: !!(await read($, classicSeen)).SessionStart,
     ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
@@ -5832,7 +5945,7 @@ type WorkFile = {
  * oldest waits, the slots free, the runs in flight and those finished but not recorded; flags: an idle instance an
  * item that waits FLAG_AFTER_MS fits (the band's red flag, and the front's hourly note); nobody: open items nobody owns
  * that no instance can be offered (no for:, and the roster has no front door), waiting FLAG_AFTER_MS */
-type Capacity = { idle: string[]; unowned: number; oldest: number | null; slotsFree: number | null; slotsTotal: number | null; runs: number; unrecorded: number; flags: { inst: string; item: string }[]; nobody?: string[] }
+type Capacity = { idle: string[]; unowned: number; oldest: number | null; slotsFree: number | null; slotsTotal: number | null; runs: number; unrecorded: number; flags: { inst: string; item: string }[]; nobody?: string[]; stuck?: { inst: string; tool: string; since: number }[] }
 
 /** An item offered to one instance is offered to the next after this long while still nobody owns it; each instance it's
  * for once (a round), and again only when its file changed: a later round counts within the wakes' daily cap */
@@ -5869,6 +5982,102 @@ async function boardItems($: any): Promise<({ id: string; mtime: number } & Retu
 
 async function readWork($: any): Promise<WorkFile | null> {
   return readWire<WorkFile>($, stateDir('work.json'))
+}
+
+// ---- Results to reproduce (G30): world.json's reproduce rules; the one board item fleet writes itself ----
+
+/** <project>/.claude/fleet/state/reproduce.json (the sweeper's, replaced with mv): since when it watches (results landed
+ * before it started open nothing), and the item it opened for each result, by path */
+type ReproduceFile = { format: number; since: number; made: Record<string, { item: string; at: number; writer: string; v: string; opened?: true }> }
+
+/** world.json's "reproduce": [{ "glob": "poc/results/**", "for": "tester" }]: a result (front matter kind: result) an
+ * instance of another role lands under the glob becomes a board item for that role, once per file */
+async function reproduceRules($: any): Promise<{ re: RegExp; glob: string; for: string }[]> {
+  const raw = parseJson(await readText($, `${fleetDir()}/world.json`))
+  const list = Array.isArray(raw?.reproduce) ? raw.reproduce : []
+  return list
+    .filter((r: any) => r && typeof r.glob === 'string' && r.glob.trim() && typeof r.for === 'string' && r.for.trim())
+    .map((r: any) => ({ glob: r.glob.trim(), re: globRegex(r.glob.trim(), insensitive), for: r.for.trim() }))
+}
+
+/** The sweeper: each result a rule names that landed since it started watching, by an instance whose role isn't the
+ * rule's, with no item for it on the board (one naming its path or id) and none fleet opened, gets board/B-<n>.md: owner
+ * open, for: the rule's role, landed as fleet's own (via fleet). B14's offers take it from there; its writer hears it */
+async function reproduceTick($: any, now: number) {
+  if (!root || !roster || !worldOn()) return
+  const rules = await reproduceRules($)
+  if (!rules.length) return
+  const had = await readWire<ReproduceFile>($, stateDir('reproduce.json'))
+  const file: ReproduceFile = had ?? { format: FORMAT, since: now, made: {} }
+  let changed = !had
+  await pullEvents($)
+  const board = await boardItems($)
+  for (const e of [...latest.values()].sort((a, b) => a.at - b.at)) {
+    if (e.at < file.since || e.to === null || file.made[e.path] || (e.via !== 'tool' && e.via !== 'bash') || !e.by || e.probably) continue
+    const rule = rules.find(r => r.re.test(e.path))
+    if (!rule) continue
+    const writer = roster.instances.find(i => i.name === e.by?.name)
+    if (!writer || writer.role.toLowerCase() === rule.for.toLowerCase() || writer.name.toLowerCase() === rule.for.toLowerCase()) continue
+    const text = await readText($, `${root}/${e.path}`)
+    if (text === null || !/^\s*kind\s*:\s*result\b/im.test(text.split('\n').slice(0, 40).join('\n'))) continue
+    const id = records ? idOf(e.path, records) : null
+    const cite = id && e.rev ? `${id}@${e.rev}` : null
+    // The board names it already (an item a lead wrote for it, open or closed)
+    const named = await (async () => {
+      for (const b of board) {
+        const t = await readText($, `${root}/board/${b.id}.md`)
+        if (t && (t.includes(e.path) || (id && new RegExp(`\\b${id}\\b`).test(t)))) return b.id
+      }
+      return null
+    })()
+    if (named) {
+      file.made[e.path] = { item: named, at: now, writer: writer.slug, v: e.to }
+      changed = true
+      continue
+    }
+    const item = await openReproduceItem($, e, writer, rule, cite, now)
+    if (!item) continue
+    file.made[e.path] = { item, at: now, writer: writer.slug, v: e.to, opened: true }
+    changed = true
+    log($, `reproduce: ${item} opened for ${e.path} (${writer.name}'s result), for ${rule.for}`)
+  }
+  if (changed && !(await replace($, stateDir('reproduce.json'), json(file)))) {
+    await run($, ['mkdir', '-p', stateDir()])
+    await replace($, stateDir('reproduce.json'), json(file))
+  }
+}
+
+async function openReproduceItem($: any, e: ChangeEvent, writer: Instance, rule: { glob: string; for: string }, cite: string | null, now: number): Promise<string | null> {
+  const dir = `${root}/board`
+  await run($, ['mkdir', '-p', dir])
+  const me = await meNow($)
+  const body = [
+    '---',
+    'owner: open',
+    'status: open',
+    `for: ${rule.for}`,
+    '---',
+    `# Reproduce ${e.path}`,
+    '',
+    `fleet opened this item (world.json's reproduce: ${rule.glob}, for: ${rule.for}): ${writer.name} landed ${e.path}${cite ? ` (${cite})` : ''} at ${clock(e.at, me.offsetMin)}, a result, and nothing on the board reproduces it yet.`,
+    '',
+    `Reproduce it on your own: rerun its \`run:\` (or the same experiment) where it says, and land a result of yours with its proof, citing ${cite ?? e.path}; then set this item done with where your result is, pass or fail. If it needs no reproduction, ${writer.name} or the front door sets it done saying why.`,
+    '',
+  ].join('\n')
+  let n = Math.max(0, ...(await names($, dir)).map(x => /^B-(\d+)\.md$/.exec(x)).filter((m): m is RegExpExecArray => !!m).map(m => Number(m[1]))) + 1
+  for (let tries = 0; tries < 20; tries++, n++) {
+    const rel = `board/B-${n}.md`
+    const w = await publish($, `${root}/${rel}`, body)
+    if (w === 'exists') continue
+    if (w === 'failed') return null
+    const after = await versionOf($, `${root}/${rel}`)
+    const fields = await landRecord($, rel, after, 'fleet', null)
+    await writeEvent($, { path: rel, from: null, to: after.v, via: 'fleet', blind: false, by: null, ...fields, made: `a reproduction item for ${e.path}` })
+    setKnown(rel, { mtimeMs: after.mtimeMs, size: after.size, v: after.v, pins: fields.pins ?? [] })
+    unexplained.delete(rel)
+    return `B-${n}`
+  }
+  return null
 }
 
 /** The runs declared in this project, with whether each finished and whether its owner recorded it; recorded ones only
@@ -6072,7 +6281,17 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     if (c) flags.push({ inst: c.name, item: id })
   }
   const ages = Object.values(unowned).map(u => u.since)
-  const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}) }
+  // Running instances in one call past STUCK_MS (their own fresh heartbeat says so): the front door hears it
+  const stuck: { inst: string; tool: string; since: number }[] = []
+  for (const i of insts) {
+    const { running } = rowsOf(i, rows)
+    if (!running) continue
+    const hb = await heartbeatOf($, i.slug)
+    if (!hb || now - hb.at >= HEARTBEAT_STALE_MS) continue
+    const c = hungCall(hb, now)
+    if (c) stuck.push({ inst: i.name, tool: c.tool, since: c.since })
+  }
+  const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}), ...(stuck.length ? { stuck } : {}) }
   const next: WorkFile = { format: FORMAT, at: now, unowned, capacity, ...(Object.keys(quiet).length ? { quiet } : {}) }
   const same = !!had && JSON.stringify({ ...had, at: 0 }) === JSON.stringify({ ...next, at: 0 })
   if (!same || now - had.at > 10 * 60000) {
@@ -6147,6 +6366,14 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     // A first round is urgent, like an answer; a later one (its file changed) waits within the wakes' caps
     if (offers.some(x => x.round <= 1)) urgent = true
   }
+  // Its results fleet opened a reproduction item for (G30): once each
+  const repro = await readWire<ReproduceFile>($, stateDir('reproduce.json'))
+  for (const [path, m] of Object.entries(repro?.made ?? {})) {
+    if (m.writer !== inst.slug || told[`repro|${path}`] !== undefined || now - m.at > 24 * HOUR) continue
+    if (!m.opened) continue
+    lines.push(`fleet: ${path} is a result world.json says needs reproducing, so fleet opened ${m.item} for its reproduction (offered to the ones it's for). If it needs none, set ${m.item} done saying why.`)
+    keys.push(`repro|${path}`)
+  }
   for (const v of await runViews($)) {
     if (v.run.owner.slug !== inst.slug) continue
     // Its log quiet RUN_QUIET_MS with no done-file: once per log time
@@ -6165,6 +6392,25 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     const k = `capacity|${Math.floor(now / HOUR)}`
     if (told[k] === undefined) {
       lines.push(`fleet: idle while work waits: ${work.capacity.flags.map(f => `${f.inst} could take ${f.item}`).join('; ')}. Give each item an owner (or the right for:), or say in your journal why it waits.`)
+      keys.push(k)
+    }
+  }
+  // Another instance in one call past STUCK_MS: the front door hears it once per call
+  if (work?.capacity.stuck?.length && frontOf(roster?.r ?? null, roster?.instances ?? [])?.slug === inst.slug) {
+    for (const s of work.capacity.stuck) {
+      const k = `stuck|${s.inst}|${s.since}`
+      if (s.inst === inst.name || told[k] !== undefined) continue
+      lines.push(`fleet: ${s.inst} has been in one call to ${s.tool} for ${ago(now - s.since)}: it may be hung (a call that never returns, a prompt nobody sees). What waits on it (a post, a reply) isn't moving; the person can look at it in the panel.`)
+      keys.push(k)
+    }
+  }
+  // The others idle with nothing on the board for them (G27): the front door turns the backlog into items, once an hour
+  if (work && frontOf(roster?.r ?? null, roster?.instances ?? [])?.slug === inst.slug) {
+    const waiting = new Set(work.capacity.flags.map(f => f.inst))
+    const bare = work.capacity.idle.filter(n => n !== inst.name && !waiting.has(n))
+    const k = `nothing|${Math.floor(now / HOUR)}`
+    if (bare.length && told[k] === undefined) {
+      lines.push(`fleet: idle with no item to take: ${bare.slice(0, 8).join(', ')}${bare.length > 8 ? ` and ${bare.length - 8} more` : ''}. Turn what the charter and the plan still need into board items (for:, what done looks like), or say in your journal why they wait.`)
       keys.push(k)
     }
   }
@@ -6265,13 +6511,22 @@ async function setInFlight($: any, how: 'restarted' | 'compacted', commands: rea
   const inst = myInstance
   if (!inst) return
   const runs = (await runViews($)).filter(v => v.run.owner.slug === inst.slug && !v.done)
-  if (!commands.length && !runs.length) return
+  // The slots it still holds (a restart doesn't give them back: the new process may not know)
+  const now = await $.clock.now()
+  const me = await meNow($)
+  const holder = await holderNow($)
+  const held: string[] = []
+  for (const spec of await loadSlots($)) for (const x of await leasesOf($, spec.name)) if (sameHolder(x.lease.holder, holder) && x.lease.until > now) held.push(`${spec.name} (unit ${x.lease.n + 1} of ${spec.count}, until ${clock(x.lease.until, me.offsetMin)})`)
+  if (!commands.length && !runs.length && !held.length) return
   const parts: string[] = []
+  if (held.length && how === 'restarted') parts.push(`the slots you hold: ${held.join(', ')}`)
   if (commands.length) parts.push(`background commands: ${commands.slice(0, 6).map(c => `\`${c}\``).join('; ')}${commands.length > 6 ? ` and ${commands.length - 6} more` : ''}`)
   if (runs.length) parts.push(`your declared runs: ${runs.map(v => `${v.run.id} (${v.run.what}${v.run.host ? `, on ${v.run.host}` : ''})`).join(', ')}`)
   // A restart ends the old process's background commands, never a detached run; a compaction ends neither
   const survived = how === 'restarted' ? ": a background command of the old process didn't survive a restart, a detached run did" : ''
-  await update($, inFlightNote, () => `fleet: your conversation was ${how} while these were in flight: ${parts.join('; ')}. Check their outputs (their logs, their done-files) before going on${survived}. Record what finished (mcp__fleet__run record).`)
+  if (!parts.length) return
+  const release = held.length && how === 'restarted' ? '; release a slot you no longer need (mcp__fleet__slot release)' : ''
+  await update($, inFlightNote, () => `fleet: your conversation was ${how} while these were in flight: ${parts.join('; ')}. Check their outputs (their logs, their done-files) before going on${survived}. Record what finished (mcp__fleet__run record)${release}.`)
   await update($, inFlightQuiet, () => quiet)
   log($, `in flight after ${how === 'restarted' ? 'a restart' : 'a compaction'} for ${inst.name}: ${commands.length} command(s), ${runs.length} run(s)${quiet ? ' (said at its next step)' : ''}`)
 }
@@ -6350,12 +6605,18 @@ async function heartbeatOf($: any, slug: string): Promise<Heartbeat | null> {
 async function contextSizes($: any, instances: readonly Instance[]): Promise<Record<string, number>> {
   const now = await $.clock.now()
   const out: Record<string, number> = {}
+  stoppedSizes.clear()
   for (const i of instances) {
     const hb = await heartbeatOf($, i.slug)
-    if (hb && now - hb.at < HEARTBEAT_STALE_MS && typeof hb.contextTokens === 'number' && hb.contextTokens > 0) out[i.slug] = hb.contextTokens
+    if (!hb || typeof hb.contextTokens !== 'number' || hb.contextTokens <= 0) continue
+    out[i.slug] = hb.contextTokens
+    // Its heartbeat is old: it isn't running, and a wake or a restart reloads the conversation it had (B26)
+    if (now - hb.at >= HEARTBEAT_STALE_MS) stoppedSizes.add(i.slug)
   }
   return out
 }
+/** The instances contextSizes priced at their last heartbeat's context (not running now) */
+const stoppedSizes = new Set<string>()
 
 // Today's spend and cap of every instance (instances/<slug>/spend.json, state/lifts.json) and of the project; an
 // instance is over when its own budget or the project's is. A few seconds' cache: the band reads it every 10 s
@@ -6639,7 +6900,9 @@ async function nudgeTick($: any) {
     // One that owns nothing hears the open items nobody owns that fit it (B14)
     const fits = owns.length ? [] : await fitsMe($, inst)
     log($, `cadence nudge to ${inst.name} (${hoursText(c.hours)} since its last landing${owns.length ? `, owns ${owns.length} open item(s)` : fits.length ? `, ${fits.length} open item(s) fit it` : ''})`)
-    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns, cadenceCap, fits), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: ownCadence + 1 }), now)
+    // With nothing on the board to take: it proposes an item to the front door, and the front door makes the items (G27)
+    const front = frontOf(roster?.r ?? null, roster?.instances ?? [])
+    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns, cadenceCap, fits, { front: front?.name ?? null, self: front?.slug === inst.slug }), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: ownCadence + 1 }), now)
     return
   }
   // Its budget's line too: past 80% it's nothing, used up it's never here (no nudge then), raised again it's to resume
@@ -6809,6 +7072,7 @@ async function instanceContext($: any, inst: Instance): Promise<string> {
     ...(await derivedFor(inst)),
     (await loadSlots($)).length ? `The project's scarce resources (${(await loadSlots($)).map(x => `${x.name} ×${x.count}`).join(', ')}) are taken with mcp__fleet__slot take and given back with release; with none free you wait in line, and fleet tells you when one is yours.` : '',
     dateLine(await $.clock.now(), (await meNow($)).offsetMin, false),
+    "A time you write (in your journal, a record) comes from `date` or from fleet's clock, never a guess: every mcp__fleet__ result ends with it.",
   ]
     .filter(Boolean)
     .join(' ')
@@ -7956,7 +8220,8 @@ async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, n
 }
 
 function effectOf(path: string): string {
-  if (path === '.claude/fleet/roster.json') return '. It takes effect at the next /fleet up (a running instance takes new settings when restarted, u)'
+  // roster.json: rosterTakesEffect says, instance by instance, what happens now
+  if (path === '.claude/fleet/roster.json') return ''
   if (path === '.claude/fleet/world.json') return '. Every session of the project follows it within 2 s'
   if (path.startsWith('.claude/agents/')) return '. Running instances of that role take it when restarted (u)'
   return ''
@@ -8041,7 +8306,10 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   const present = await answerNames($)
   const rivals = records.filter(r => r.id !== rec.id && r.kind === 'change' && r.change?.path === spec.path && !progress(r.id, slots(r), present).complete).map(r => r.id)
   const stale = rivals.length ? ` ${rivals.join(', ')} ${rivals.length === 1 ? 'changes' : 'change'} ${spec.path} too, drafted on the version it just left, so ${rivals.length === 1 ? "it can't" : "they can't"} apply: /fleet ${rivals.map(id => `${id} reject`).join(' ')} closes ${rivals.length === 1 ? 'it' : 'them'} as stale (${rivals.length === 1 ? 'its asker hears' : 'their askers hear'} the file moved, and can draft again)` : ''
-  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effectOf(spec.path)}. ${who} hears it.${stale}`, done: true, applied: true }
+  // roster.json takes effect now: instance by instance, what changes (P26)
+  const took = spec.path === '.claude/fleet/roster.json' ? await rosterTakesEffect($) : []
+  const effect = spec.path === '.claude/fleet/roster.json' ? (took.length ? '. It takes effect now:\n' + took.join('\n') + '\n' : '. No instance\'s settings changed') : effectOf(spec.path)
+  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effect}. ${who} hears it.${stale}`, done: true, applied: true }
 }
 
 // What follows fleet's write of a command-level file the person answered for (an applied change, the outbound.json of
@@ -8072,6 +8340,63 @@ async function landApplied($: any, path: string, before: string | null, drafter?
   if (spec.path === '.claude/fleet/roster.json') roster = null
   if (spec.path === '.claude/fleet/slots.json') slotsCfg = null
   if (spec.path === '.claude/fleet/outbound.json') outboundCfg = null
+}
+
+/** A roster change the person accepted or applied takes effect by itself (P26): each instance's settings file is
+ * written anew; a running one whose settings a restart carries changed restarts once idle (instances/<slug>/restart.json,
+ * as /fleet up --restart-when-idle asks); a model or an effort alone reaches it at its next request (turn.step), no
+ * restart. Instances down, or never started, only get their file. One line per instance it changed something for */
+async function rosterTakesEffect($: any): Promise<string[]> {
+  if (await freshRoster($)) return []
+  const all = (roster as { instances: Instance[] }).instances
+  const down = await downSet($)
+  const level = await commandLevelNow($)
+  const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
+  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
+  const at = await $.clock.now()
+  const out: string[] = []
+  let wrote = false
+  for (const inst of all) {
+    const next = settingsText(settingsFor(inst, root as string, deny))
+    const before = await readText($, settingsPath(inst.slug))
+    if (before === next) continue
+    const { running, stopped } = st?.ready ? rowsOf(inst, st.rows) : { running: null, stopped: null }
+    // Never started and no file yet: /fleet up writes it when it starts the instance
+    if (before === null && !running && !stopped) continue
+    if (!wrote) await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
+    wrote = true
+    await $.fs.write(settingsPath(inst.slug), next)
+    if (!running || down.has(inst.slug)) {
+      out.push(`  ${inst.name}: settings rewritten (it takes them when it ${running ? 'restarts' : 'starts or wakes'})`)
+      continue
+    }
+    const hb = await heartbeatOf($, inst.slug)
+    const core = settingsCoreHash(next)
+    const restart = hb?.settingsHash ? hb.settingsHash !== core : before !== null && settingsCoreHash(before) !== core
+    const old = parseJson(before)
+    const parts: string[] = []
+    if (restart) {
+      await run($, ['mkdir', '-p', instDir(inst.slug)])
+      await replace($, `${instDir(inst.slug)}/restart.json`, json({ format: FORMAT, at }))
+      parts.push('restarts with its new settings once idle (nothing in flight)')
+    }
+    const said: string[] = []
+    if (inst.model && old?.model !== inst.model) said.push(`model ${inst.model}`)
+    if (inst.effort && old?.effortLevel !== inst.effort) said.push(`effort ${inst.effort}`)
+    if (said.length) parts.push(`${said.join(', ')} at its next request${restart ? '' : ' (no restart)'}`)
+    if (parts.length) out.push(`  ${inst.name}: ${parts.join('; ')}`)
+  }
+  if (out.length) log($, `roster.json took effect: ${out.map(l => l.trim()).join('; ')}`)
+  return out
+}
+
+function parseJson(text: string | null): any {
+  if (text === null) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
 }
 
 // ---- The sweeper's part: marks on the instances' rows, and wakes of retired ones (coalesced) ----
@@ -8195,6 +8520,8 @@ async function rosterTick($: any) {
   const swept: WakesFile = had && had.day === day ? had : { format: FORMAT, day, instances: {} }
   let woke = false
   // The open items nobody owns, offered; the runs' done-files; the capacity line (B14, B16, P19)
+  // A result that needs reproducing becomes a board item first, so this pass offers it (G30)
+  await reproduceTick($, now).catch(err => log($, `reproduce: ${String(err).slice(0, 200)}`))
   const work = await workTick($, st.rows, list, down, now).catch(err => {
     log($, `work: ${String(err).slice(0, 200)}`)
     return { offered: new Map<string, string[]>(), later: new Map<string, string[]>(), finished: new Map<string, string[]>() }
@@ -8229,6 +8556,7 @@ async function rosterTick($: any) {
       }
       // A permission prompt it waits on, as its own fleet saw it, while sessions sees it waiting too
       const prompt = fresh && running.state === 'waiting' && hb?.waitingOn?.kind === 'permission'
+      const hung = fresh && !prompt ? hungCall(hb, now) : null
       const old = fresh && typeof hb?.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0 ? hb.fleet : ''
       const asks = asking.get(running.ref) ?? 0
       // Auto mode's blocks piling up today (a mark, never a hold: the brief says what would allow them)
@@ -8239,6 +8567,8 @@ async function rosterTick($: any) {
         ? { badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true }
         : prompt
           ? { badge: '!', tint: 'warning', line: 'waiting on a permission prompt: Enter answers it', needsPerson: true }
+          : hung
+            ? { badge: '⧗', tint: 'warning', line: `one call to ${hung.tool} for ${ago(now - hung.since)}: it may be hung`, needsPerson: true }
           : b?.state === 'over'
             ? { badge: '$', tint: 'error', line: overBudgetLine(inst.name, inst.slug), needsPerson: true }
             : asks
@@ -8748,13 +9078,14 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
   // A running instance whose settings this writes anew takes them only when restarted
   const rewritten = new Set<string>()
-  // A running instance whose requests name another model than the roster's (one the account lacks falls back)
-  const fallback = new Map<string, string>()
+  // A running instance that runs another model than the roster's (the account refused it, or answers with its own, or
+  // its next request asks for the roster's new one)
+  const fallback = new Map<string, Heartbeat>()
   for (const p of plan) {
     if (p.action !== 'running') continue
     const hb = await heartbeatOf($, p.inst.slug)
-    if (hb?.settingsHash && hb.settingsHash !== hashText(settingsText(settingsFor(p.inst, root as string, deny)))) rewritten.add(p.inst.slug)
-    if (typeof hb?.model === 'string' && modelDiffers(p.inst.model, hb.model)) fallback.set(p.inst.slug, hb.model)
+    if (hb?.settingsHash && hb.settingsHash !== settingsCoreHash(settingsText(settingsFor(p.inst, root as string, deny)))) rewritten.add(p.inst.slug)
+    if (hb && typeof hb.model === 'string' && modelDiffers(p.inst.model, hb.model)) fallback.set(p.inst.slug, hb)
     // A big context with nothing to shrink it (G22): every wake reloads it
     const huge = hugeContext(p.inst, hb)
     if (huge) lint.warnings.push(`${p.inst.name}: ${huge}`)
@@ -8812,16 +9143,16 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     const i = p.inst
     const where = `${i.section ? i.section.title : 'no section'}${i.parent ? `, under ${i.parent}` : ''}`
     const actual = fallback.get(i.slug)
-    const runs = `${i.model ?? 'the default model'}${i.effort ? ` (${i.effort})` : ''}${actual ? ` (runs ${actual}, roster says ${i.model}: a model the account lacks falls back)` : ''}`
+    const runs = `${i.model ?? 'the default model'}${i.effort ? ` (${i.effort})` : ''}${actual ? ` (${modelLine(i, actual)})` : ''}`
     const size = sizes[i.slug]
     const w = wakeUsd(i.model, effectivePerDay(wakes), size)
     const pw = i.poll ? wakeUsd(i.model, pollsPerDay(i.poll), size) : null
-    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day${pw !== null ? `, polls ~${usd(pw)}/day (${pollsPerDay(i.poll as { everyMin: number })} a day)` : ''}${size !== undefined ? ` (its context: ${tokensText(size)})` : ''}` : ''}`
+    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day${pw !== null ? `, polls ~${usd(pw)}/day (${pollsPerDay(i.poll as { everyMin: number })} a day)` : ''}${size !== undefined ? ` (its context${stoppedSizes.has(i.slug) ? ' when it stopped' : ''}: ${tokensText(size)})` : ''}` : ''}`
     const now =
       p.action === 'start'
         ? 'to start'
         : p.action === 'running'
-          ? `running (${p.state}): placed, not started again${rewritten.has(i.slug) ? `; ${c.dryRun ? 'its settings would be rewritten' : 'settings rewritten'}: ${c.restartWhenIdle ? 'it restarts with them once idle' : 'u restarts it with them, or /fleet up --restart-when-idle restarts it once idle'}` : ''}`
+          ? `running (${p.state}): placed, not started again (fleet doesn't restart a running session: a model or effort change reaches it at its next request)${rewritten.has(i.slug) ? `; ${c.dryRun ? 'its settings would be rewritten' : 'settings rewritten'}: ${c.restartWhenIdle ? 'it restarts with them once idle' : 'u restarts it with them, or /fleet up --restart-when-idle restarts it once idle'}` : ''}`
           : p.action === 'wake'
             ? p.why === 'person'
               ? 'stopped by you: not woken (Enter or u in the panel restarts it)'
@@ -8913,7 +9244,7 @@ async function downCommand($: any, names: string[], origin: string): Promise<str
   const running = st?.ready ? p.picked.filter(i => rowsOf(i, st.rows).running) : []
   return [
     `Down: ${p.picked.map(i => i.name).join(', ')}. fleet won't wake or nudge them, and /fleet up skips them (/fleet up <name> brings one back).`,
-    running.length ? `Still running: ${running.map(i => i.name).join(', ')}: s in the panel stops one (fleet never stops a session).` : 'None of them is running.',
+    running.length ? `Still running: ${running.map(i => i.name).join(', ')}: ${running.length === 1 ? 'it keeps' : 'they keep'} working; fleet only stops waking and nudging ${running.length === 1 ? 'it' : 'them'} until /fleet up names ${running.length === 1 ? 'it' : 'them'} (s in the panel stops the session).` : 'None of them is running.',
   ].join('\n')
 }
 
@@ -9099,8 +9430,10 @@ async function rosterStatus($: any): Promise<string[]> {
         if (typeof hb.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0) parts.push(`runs fleet ${hb.fleet}, installed ${version}: u restarts it`)
         if (hb.mode) parts.push(`mode ${hb.mode}${modeWaits(hb.mode) ? ' (it asks: a mode that doesn’t lets it work unattended)' : ''}`)
         if (hb.waitingOn?.kind === 'permission' && running.state === 'waiting') parts.push(`waiting on a permission prompt (${hb.waitingOn.tool}) since ${ago(now - hb.waitingOn.at)}: Enter in the panel answers it`)
+        const hung = hungCall(hb, now)
+        if (hung) parts.push(`one call to ${hung.tool} for ${ago(now - hung.since)}: it may be hung (a call that never returns, a prompt nobody sees): look at it in the panel`)
         if (hb.remote) parts.push('Remote Control')
-        if (typeof hb.model === 'string' && hb.model) parts.push(modelDiffers(inst.model, hb.model) ? `runs ${hb.model}, roster says ${inst.model} (a model the account lacks falls back)` : `runs ${hb.model}`)
+        if (typeof hb.model === 'string' && hb.model) parts.push(modelLine(inst, hb))
         if (hb.failed) parts.push(`last turn failed ${ago(now - hb.failed.at)} ago: ${hb.failed.why}`)
         if (hb.classicStart === false) parts.push('its classic hooks are sent on past fleet (a managed plugin): fleet tells it who it is in its prompts')
         if (hb.orgAsk?.length) parts.push(`asks you on every call to ${hb.orgAsk.join(', ')} (an organisation's setting: allow rules don't lift it)`)
@@ -9113,7 +9446,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (inst.pin) parts.push(pinnedRefs.has(running.ref) ? 'pinned' : (await has($, 'pin')) ? 'to pin' : "pin: the sessions here can't pin (an older sessions): it may be retired when idle")
         else if (pinnedRefs.has(running.ref)) parts.push('pinned by fleet before: to unpin (roster.json no longer pins it)')
         const t = await readText($, settingsPath(inst.slug))
-        if (hb.settingsHash !== null && t !== null && hb.settingsHash !== hashText(t)) parts.push('its settings changed since it started: u restarts it with them')
+        if (hb.settingsHash !== null && t !== null && hb.settingsHash !== settingsCoreHash(t)) parts.push('its settings changed since it started: u restarts it with them')
         if (hb.ref && (await exists($, `${instDir(inst.slug)}/seed-${hb.ref}.json`))) parts.push('seeded')
       }
     } else if (retired && why !== 'person' && inst.poll && hb) {
@@ -10719,6 +11052,8 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
       const retiredHere = !running && !!rows.stopped && stopReason(rows.stopped) !== 'person'
       if ((fresh || retiredHere) && inst.poll && pollOverdue(inst, hb, now)) polls.push({ name: inst.name, last: hb.lastPoll ?? null, everyMin: inst.poll.everyMin })
       if (fresh && running.state === 'waiting' && hb.waitingOn?.kind === 'permission') prompts.push({ name: inst.name, tool: hb.waitingOn.tool, at: hb.waitingOn.at })
+      const hung = fresh ? hungCall(hb, now) : null
+      if (hung) prompts.push({ name: inst.name, tool: hung.tool, at: hung.since, hung: true })
       const p = parseReads((await readText($, readsPath(hb.sessionId))) ?? '')
       if (p && 'threads' in p && p.threads.main) {
         const n = untoldStale(p.threads.main).length
@@ -11331,15 +11666,36 @@ export const register: Register = on => {
   // the network (in a background session); after it, or for any other command, it fails open as the rest of fleet
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => bashHook($, e, next)).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
-  // The model each main-loop request names, as the engine resolved it (the session's, or a fallback's): the heartbeat
-  // reports it, and /fleet status and the dry run say when it isn't the roster's. Only watches: the stream passes as is
+  // An instance's main-loop requests run the roster's model and effort (B24/G32): a respawn replays the launch's
+  // --model whatever the settings file says now, and /model in a background session waits on a dialog nobody answers,
+  // so each request names them itself. A model the account refuses (no response at all) is sent again as the session
+  // named it, and not asked for again in this process. The model that answered goes to the heartbeat
   on('turn.step', async function* ($, e, next) {
     // The loop's step now: the calls of one batch come from one step, so the gate's "once" is spent only from a later one
     stepOf.set(typeof e.agentId === 'string' && e.agentId ? e.agentId : 'main', `${e.turnId}#${e.index}`)
-    const r = yield* next(e)
+    // A request before the instance's first binding (a respawn's first turn): bound now, the roster read once
+    if (e.agentId === undefined && !myInstance && jobRef && root) {
+      try {
+        await bind($)
+      } catch {}
+    }
+    const want = e.agentId === undefined && myInstance ? stepWant(myInstance, e) : null
+    let r: any = yield* next(want ? { ...e, ...want } : e)
+    if (want && noResponse(r)) {
+      const again: any = yield* next(e)
+      // Refused for what fleet asked, not for some other reason: the session's own request went through
+      if (!noResponse(again)) {
+        stepRefused = want
+        log($, `the account refused ${wantWords(want)} for ${myInstance?.name}: its requests run ${e.model}${e.effort !== undefined ? ` (${e.effort})` : ''}`)
+      }
+      r = again
+    }
     // The model that answered (usage.model, as the API reports it), else the one the request named
-    const m = (r as { usage?: { model?: string } | null } | undefined)?.usage?.model ?? e.model
-    if (e.agentId === undefined && typeof m === 'string' && m) stepModel = m
+    const m = r?.usage?.model ?? (want && !noResponse(r) && stepRefused !== want ? (want.model ?? e.model) : e.model)
+    if (e.agentId === undefined && typeof m === 'string' && m) {
+      stepModel = m
+      stepAsked = want?.model && !noResponse(r) && stepRefused !== want ? want.model : e.model
+    }
     return r
   })
 
@@ -11440,6 +11796,14 @@ export const register: Register = on => {
     if (r && r.drop === undefined && d.lines.length) bg(d.told())
     if (r && r.drop === undefined && ids.length) bg(update($, identityTold, () => true))
     return r
+  }).catch(($, e, next) => next(e))
+
+  // fleet's own tools end each result with its clock: a role with no Bash has no other to stamp what it writes (an
+  // outer hook, so it sees what each tool's own hook below answered)
+  on('tool.call', { tool: /^mcp__fleet__/ }, async ($, e, next) => {
+    const r: any = await next(e)
+    // Beside its answer, as a line of context (the answer's own text stays as the tool wrote it)
+    return r && typeof r.result === 'string' ? { ...r, context: [...(Array.isArray(r.context) ? r.context : []), `fleet's clock: ${await clockStamp($)}`] } : r
   }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'mcp__fleet__decide' }, async ($, e) => {
@@ -11546,6 +11910,20 @@ export const register: Register = on => {
     if (!root || !jobRef) return next(e)
     log($, "refused: the model's PushNotification (only fleet and sessions notify the person)")
     return { deny: "fleet: in this project only fleet notifies the person (in the brief, the band and their channel, within their caps). Ask with mcp__fleet__decide, or write it in your journal; nothing was sent." }
+  }).catch(($, e, next) => next(e))
+
+  // The main thread's tool call in flight, for an instance's heartbeat: one that never returns (a hung read, a prompt
+  // nobody sees) shows on its row past STUCK_MS instead of looking like work (every tool: a matcher that takes any name,
+  // since one hook without a matcher is the MCP one below)
+  on('tool.call', { tool: /^/ }, async ($, e, next) => {
+    if (e.agentId !== undefined || !jobRef) return next(e)
+    const k = ++callSeq
+    callsInFlight.set(k, { tool: String((e as any).tool ?? '').slice(0, 80), since: await $.clock.now() })
+    try {
+      return await next(e)
+    } finally {
+      callsInFlight.delete(k)
+    }
   }).catch(($, e, next) => next(e))
 
   // Every MCP tool: one that would send the project's content outside is refused in a background session (the one hard

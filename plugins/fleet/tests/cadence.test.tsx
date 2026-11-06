@@ -66,7 +66,7 @@ test('nothing landed in its cadence period: a nudge from its own fleet each peri
   await tick(w, 8 * 60000)
   expect(w.submits.length).toBe(2)
   // With today's date after it (G5)
-  expect(w.submits[1]?.split('\n\nToday is ')[0]).toBe("fleet: 15 min since you last landed anything in the shared world (your cadence is 15 min). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (journals/owner-a.md) and where your work goes; or ask the person with mcp__fleet__decide. fleet nudges once each period while nothing lands, at most 3 a day.")
+  expect(w.submits[1]?.split('\n\nToday is ')[0]).toBe("fleet: 15 min since you last landed anything in the shared world (your cadence is 15 min). Nothing on the board fits you: land a result or a negative result where your work goes, or ask the person with mcp__fleet__decide what to take on. fleet nudges once each period while nothing lands, at most 3 a day.")
   expect(w.submits[1]).toContain('\n\nToday is ')
   expect(json(w, `${HB}/nudges.json`)).toMatchObject({ format: 1, count: 1, cadenceCount: 1 })
   // Not again in the same period; again in the next one (it was once ever, while nothing landed)

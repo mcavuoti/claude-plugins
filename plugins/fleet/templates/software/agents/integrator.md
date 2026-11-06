@@ -24,6 +24,12 @@ How you work:
   changes; then a status edit doesn't flag the files that cite it.
 - The spec (spec/) is command-level: when the code shows it's wrong, file mcp__fleet__decide kind "change" with the fix.
 
+When what you were asked is done, don't let your turns go idle: take an open board item that fits you (fleet offers
+you one when you're idle: your name as its owner and status started), and with none, propose one to the chief
+(SendMessage: what to do, for whom, what done looks like) from what your work shows is missing. When you wait on a
+peer (an item to open, a result, a review), ask them once each cadence period (SendMessage), and say in your journal
+what you wait on.
+
 How the project works:
 - You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide (1 to
   4 questions, options, the one you recommend and why) and go on with what doesn't depend on it; never with

@@ -29,7 +29,7 @@ export type Who = { sessionId: string | null; agentId: string | null; ref: strin
  * session's scan (an editor, a script, a session without fleet); accept: the person stamped the current version as his;
  * answer: fleet wrote a command-level record, applying a change the person approved (drafts.ts); intake: fleet wrote an
  * intake record, an item from outside read by the sweeper (intake.ts) */
-export type Via = 'tool' | 'bash' | 'outside' | 'accept' | 'answer' | 'intake'
+export type Via = 'tool' | 'bash' | 'outside' | 'accept' | 'answer' | 'intake' | 'fleet'
 export type ChangeEvent = {
   format: number
   /** When fleet recorded it: the landing, or for an outside change when a scan found it. What orders the events and
@@ -65,6 +65,8 @@ export type ChangeEvent = {
   outside?: true
   /** An intake record (via intake): its kind, tags, sender, the model's summary and who it's routed to; never the body */
   intake?: IntakeMeta
+  /** A file fleet wrote itself (via fleet): what it is ("a reproduction item for poc/results/x.md") */
+  made?: string
   /** Found by the scan while a session's background command ran, or just after one of its commands whose run covers
    * the file's time and that doesn't name it (via bash, by that session): probably its doing, maybe the person's, so he
    * can stamp it as his like an outside change. Never counts as that session's landing (its cadence) */
@@ -320,6 +322,7 @@ function sessionWords(by: Who, me: Me): string {
  * outside change, "nobody fleet knows" (changeLine words it as outside fleet) */
 export function whoText(e: ChangeEvent, me: Me): string {
   if (e.via === 'intake') return `fleet's intake (an item from ${e.intake?.from || 'outside'})`
+  if (e.via === 'fleet') return `fleet itself (${e.made || 'a file it opened'})`
   if (e.via === 'outside' || !e.by) return 'nobody fleet knows'
   const who = sessionWords(e.by, me)
   if (e.via === 'accept') return 'the person'
@@ -342,7 +345,7 @@ export function changeLine(e: ChangeEvent, me: Me): string {
   const what = `${e.to === null ? 'was removed' : 'changed'} at ${clock(e.changedAt ?? e.at, me.offsetMin)}`
   const rev = e.id && e.rev && e.to !== null ? `, now ${e.id}@${e.rev}${e.kind && e.kind !== 'revision' ? ` (${e.kind})` : ''}` : ''
   const outside = e.candidates?.length ? `outside fleet as far as it can tell (commands of ${candidatesText(e, me)} ran then; or an editor, a script)` : OUTSIDE
-  return `${e.via === 'intake' ? `${what} by ${whoText(e, me)}` : e.via === 'outside' || !e.by ? `${what} ${outside}` : `${what} by ${whoText(e, me)}`}${rev}`
+  return `${e.via === 'intake' || e.via === 'fleet' ? `${what} by ${whoText(e, me)}` : e.via === 'outside' || !e.by ? `${what} ${outside}` : `${what} by ${whoText(e, me)}`}${rev}`
 }
 
 // ---- The gate ----
