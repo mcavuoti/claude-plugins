@@ -115,7 +115,10 @@ test('the sweeper counts an instance with a background MCP task busy (no offer, 
   const work = json(v, `${FLEET}/state/work.json`)
   expect(work.capacity.idle).not.toContain('Tester 1')
   expect(work.unowned['B-5'].offers).toEqual([])
-  expect(await fleet($, 'status')).toMatch(/a background MCP task for 2\dm: it may be hung/)
+  const status = await fleet($, 'status')
+  expect(status).toMatch(/a background MCP task for 2\dm: it may be hung/)
+  // Its row doesn't say a bare "idle": the task keeps it at work
+  expect(status).toContain('idle, with a background MCP task running (busy for offers and capacity)')
 })
 
 // ---- 3. fleet's own deny rules restart nobody ----

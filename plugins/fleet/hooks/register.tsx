@@ -6146,6 +6146,15 @@ function busyTasks(hb: { tasks?: { kinds?: unknown } } | null): boolean {
   return Array.isArray(k) && k.some(x => BUSY_TASKS.has(x))
 }
 
+/** The background tasks busyTasks counts, in words: "a background MCP task", "2 background tasks (a subagent, an MCP task)" */
+function backgroundTasksText(hb: { tasks?: { count?: unknown; kinds?: unknown } } | null): string {
+  const kinds = (Array.isArray(hb?.tasks?.kinds) ? hb!.tasks!.kinds : []).filter((x): x is string => typeof x === 'string' && BUSY_TASKS.has(x))
+  const word = (k: string) => (k === 'mcp_task' ? 'an MCP task' : 'a subagent')
+  const n = typeof hb?.tasks?.count === 'number' && hb.tasks.count > 0 ? hb.tasks.count : kinds.length
+  if (n <= 1) return kinds[0] === 'agent' ? 'a background subagent' : 'a background MCP task'
+  return `${n} background tasks (${[...new Set(kinds)].map(word).join(', ')})`
+}
+
 /** Whether this background session has Remote Control on: Claude's background service keeps its connection in the
  * job's state.json (bridgeSessionId) while it's on. null: not a background session, or it can't be read */
 async function remoteControl($: any): Promise<boolean | null> {
@@ -9857,7 +9866,9 @@ async function rosterStatus($: any): Promise<string[]> {
                   ? 'closed for lack of memory (fleet wakes it once memory is back)'
                   : (retired as any)?.stopped === 'unknown'
                     ? 'stopped, and nothing says why (Enter or u in the panel restarts it)'
-                    : String(row.state),
+                    : row.state === 'idle' && running && busyTasks(hb)
+                      ? `idle, with ${backgroundTasksText(hb)} running (busy for offers and capacity)`
+                      : String(row.state),
     )
     const restartWake = swept && swept.day === day ? swept.instances[inst.slug] : undefined
     if (running && restartWake?.restartAt !== undefined && now - restartWake.restartAt < RESTART_SHOWN_MS) parts.push(`woken after a restart ${ago(now - restartWake.restartAt)} ago`)
