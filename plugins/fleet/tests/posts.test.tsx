@@ -61,13 +61,14 @@ async function liaison($: any, on: any, out: string, ready: string): Promise<{ w
 }
 
 let refuseNext = false
+let refuseCheck = false
 
 const post = ($: any, content: string) => $.tool.call({ tool: POST, chatId: '19:aaaa', content } as any) as Promise<any>
 
 // The engine's own verdict beneath fleet's: allow (a call on $ gets it as a value, the engine's own check as its result)
 let asking = false
 function verdicts(on: any) {
-  on('tool.check', () => ({ decision: 'allow' }))
+  on('tool.check', () => (refuseCheck ? { decision: 'deny', reason: 'a rule refuses it' } : { decision: 'allow' }))
 }
 async function ask($: any, tool: string, input: unknown, ceiling?: 'ask'): Promise<any> {
   asking = true
@@ -137,15 +138,37 @@ test('an approved post the session’s permission check refuses isn’t sent: it
   const { w, sent } = await liaison($, on, SOURCED, '# Ready\n\nWhich packet sizes matter most?\n')
   await $.tool.call({ tool: 'mcp__fleet__send', to: 'the team chat', why: 'a ready post', mcp_tool: POST, input: { chatId: '19:aaaa', content: 'Which packet sizes matter most?' } } as any)
   await fleet($, '')
-  refuseNext = true
+  // A rule refuses it at the permission check: it never ran
+  refuseCheck = true
   try {
-    expect(await fleet($, '1 send')).toContain("1: D-1 wasn't sent: The user denied this call. /fleet 1 send asks again")
+    expect(await fleet($, '1 send')).toContain("1: D-1 wasn't sent: ")
   } finally {
-    refuseNext = false
+    refuseCheck = false
   }
   expect(w.files.has(`${DEC}/applied/D-1.json`)).toBe(false)
   expect(sent).toEqual([])
   expect(await fleet($, '1 send')).toContain('1: sent D-1')
+  expect(sent).toEqual(['Which packet sizes matter most?'])
+})
+
+test('an approved post refused after the check (the prompt said no, or the tool refused it) may have gone out: kept, sent again only by its version', { plugins: [FAKE_SESSIONS], timeoutMs: 30000 }, async ($, on) => {
+  const { w, sent } = await liaison($, on, SOURCED, '# Ready\n\nWhich packet sizes matter most?\n')
+  await $.tool.call({ tool: 'mcp__fleet__send', to: 'the team chat', why: 'a ready post', mcp_tool: POST, input: { chatId: '19:aaaa', content: 'Which packet sizes matter most?' } } as any)
+  await fleet($, '')
+  refuseNext = true
+  let first = ''
+  try {
+    first = await fleet($, '1 send')
+  } finally {
+    refuseNext = false
+  }
+  expect(first).toContain('1: D-1 may have gone out: its call was refused, failed or had its result withheld (The user denied this call)')
+  expect(w.files.has(`${DEC}/applied/D-1.json`)).toBe(true)
+  expect(await fleet($, '')).toContain('⚠ D-1 may have gone out')
+  expect(await fleet($, '1 send')).toContain('D-1 may have gone out')
+  expect(sent).toEqual([])
+  const v = /\/fleet 1 send (h[0-9a-f]{8}) sends it again/.exec(first)?.[1] as string
+  expect(await fleet($, `1 send ${v}`)).toContain('1: sent D-1')
   expect(sent).toEqual(['Which packet sizes matter most?'])
 })
 
