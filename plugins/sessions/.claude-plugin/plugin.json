@@ -1,7 +1,7 @@
 {
   "name": "sessions",
-  "version": "0.14.1",
-  "description": "Side panel with this folder's sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, a notification when a session waits too long or spends far above its usual, spend and token usage, a status line, ccc tell and ccc section for scripts, and an API for other plugins",
+  "version": "0.15.0",
+  "description": "Side panel with this folder's sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, a notification when a session waits too long or spends far above its usual, spend and token usage, a status line, ccc tell and ccc section for scripts, ccc tidy to end the sessions you no longer need, and an API for other plugins",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
   "types": "./types/index.d.ts",

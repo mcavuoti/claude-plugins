@@ -5,6 +5,7 @@
     launcher.py pick [--tty TTY] [--new] [NAME...]      the decision only, as JSON (tests and debugging)
     launcher.py tell [--in DIR] [--wait[=S]] NAME|ID [TEXT... | -]   ccc tell: hand a background session text (tell())
     launcher.py section [--session NAME|ID] [TITLE | -]  ccc section: the person's section for a session (section())
+    launcher.py tidy [--here] [--pinned] [--days N] [--list]   ccc tidy: end the sessions no longer needed (tidy())
 
 start decides and, when something should open in this window, writes it to FILE (the window's file, which visor.sh
 reads): the project's top session, the session NAME (created if there's none), the agent view (--agents). In order:
@@ -25,6 +26,9 @@ The files it reads and writes are the mod's (hooks/state.ts has the formats): <d
 next), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), <data>/sections.json (the
 person's sections, which ccc section changes, ringing <data>/bell/sections for the panels that watch it), with
 <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
+Claude's own files, read only, by ccc tidy: <jobs>/pins.json and <jobs>/<id>/state.json (the background service's:
+~/.claude/jobs or SESSIONS_JOBS_DIR), <registry>/<pid>.json (the running sessions: ~/.claude/sessions or
+SESSIONS_REGISTRY_DIR).
 Other environment: SESSIONS_CLAUDE (the claude command), SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the
 installed plugin, from the ccc command), SESSIONS_START_WAIT (seconds to wait for a new session's mod).
 """
@@ -48,6 +52,8 @@ INBOX_FRESH_MS = 30000
 HOME = os.environ.get('HOME', '')
 DATA = os.environ.get('SESSIONS_DATA_DIR') or os.path.join(HOME, '.claude', 'mods', 'sessions-data')
 CLAUDE = os.environ.get('SESSIONS_CLAUDE') or 'claude'
+JOBS = os.environ.get('SESSIONS_JOBS_DIR') or os.path.join(HOME, '.claude', 'jobs')
+REGISTRY = os.environ.get('SESSIONS_REGISTRY_DIR') or os.path.join(HOME, '.claude', 'sessions')
 START_WAIT = float(os.environ.get('SESSIONS_START_WAIT') or '10')
 
 DIM, RESET, BOLD = '\033[2m', '\033[0m', '\033[1m'
@@ -248,10 +254,10 @@ def client_command(command):
     return ('claude ' + m.group(1) if m.group(1) else 'claude') if m else command
 
 
-# Which windows show which session, from ps (parseWindows in state.ts): viewers (claude attach <id>), launchers, and
-# every process's terminal (by_pid: a regular session's own window)
+# Which windows show which session, from ps (parseWindows in state.ts): viewers (claude attach <id>), launchers, agent
+# views (views), and every process's terminal (by_pid: a regular session's own window)
 def parse_windows(ps):
-    by_id, by_pid, clients, launchers = {}, {}, {}, {}
+    by_id, by_pid, clients, launchers, views = {}, {}, {}, {}, {}
     for line in ps.split('\n'):
         parts = line.split()
         if len(parts) < 3 or parts[1] in ('??', '?', '-'):
@@ -264,9 +270,10 @@ def parse_windows(ps):
             clients[tty] = pid
         if re.match(r'^(\S*/)?claude agents( |$)', command):
             clients[tty] = pid
+            views[tty] = pid
         if re.match(r'^(\S*/)?bash \S*/visor\.sh( |$)', command):
             launchers[tty] = pid
-    return {'by_id': by_id, 'by_pid': by_pid, 'clients': clients, 'launchers': launchers}
+    return {'by_id': by_id, 'by_pid': by_pid, 'clients': clients, 'launchers': launchers, 'views': views}
 
 
 def read_windows():
@@ -954,11 +961,381 @@ def ring(name):
         pass
 
 
+# --- ccc tidy ------------------------------------------------------------------------------------------------------
+#
+# ccc tidy [--here] [--pinned] [--days N] [--list] lists the sessions of every folder (--here: of this folder's project,
+# by the root ccc uses) from `claude agents --json --all`, and ends the ones the person picks by number: a stopped one is
+# removed from the list (claude rm), an idle background one is stopped and removed (claude stop, then claude rm). Never
+# offered, each with why: a session that works or waits for him, one with tasks in the background, one a window shows,
+# a pinned one (unless --pinned) and a regular one. Nothing is done without a pick, running sessions need a second yes,
+# and each one is checked again just before it's stopped. --days N offers only the stopped sessions started more than N
+# days ago; --list prints the list and asks nothing. It reads, never writes: pins.json and each job's state.json in the
+# service's folder (JOBS), the registry file of a running session for how long it's been idle (REGISTRY), ps for the
+# windows. Exits 0 when it ran, picked or not; 1 when the list can't be read or a claude stop or rm failed; 2 for usage.
+
+TIDY_USAGE = 'usage: ccc tidy [--here] [--pinned] [--days <n>] [--list]'
+
+
+def read_json(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# The pinned sessions' short ids (pins.json: Ctrl+T in claude agents writes it, and the mod for Remote Control): an
+# empty set without the file; None when it isn't a list of ids (then any session may be pinned)
+def read_pins():
+    path = os.path.join(JOBS, 'pins.json')
+    if not os.path.exists(path):
+        return set()
+    d = read_json(path)
+    if not isinstance(d, list) or not all(isinstance(x, str) for x in d):
+        return None
+    return set(d)
+
+
+# A background session's state in the service's folder (its tasks, its Remote Control), or None
+def job_state(short):
+    if not re.match(r'^[A-Za-z0-9_-]+$', short or ''):
+        return None
+    d = read_json(os.path.join(JOBS, short, 'state.json'))
+    return d if isinstance(d, dict) else None
+
+
+def number(x):
+    if isinstance(x, bool):
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+# realTasks in state.ts: what a session runs in the background beside its turn (an artifact watch isn't work), as
+# (count, kinds); none known is none
+def real_tasks(job):
+    flight = (job or {}).get('inFlight')
+    total = number(flight.get('tasks')) if isinstance(flight, dict) else None
+    if total is None:
+        return 0, []
+    drainable = number(flight.get('drainableMonitors')) or 0
+    kinds = []
+    for k in flight.get('kinds') if isinstance(flight.get('kinds'), list) else []:
+        if str(k) not in kinds and (str(k) != 'artifact_watch' or drainable == 0):
+            kinds.append(str(k))
+    return max(0, int(total - drainable)), kinds
+
+
+# Since when a running session has been idle: statusUpdatedAt in Claude's registry file of its process, when that file
+# is still its own and says idle (claude agents --json doesn't give it)
+def idle_since(s):
+    pid = s.get('pid')
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    d = read_json(os.path.join(REGISTRY, '%d.json' % pid))
+    if not isinstance(d, dict) or d.get('sessionId') != s['sessionId'] or d.get('status') != 'idle':
+        return None
+    t = number(d.get('statusUpdatedAt'))
+    return t if t and t > 0 else None
+
+
+def span(ms):
+    s = int(max(0, ms) // 1000)
+    if s < 60:
+        return '%d s' % s
+    if s < 3600:
+        return '%d min' % (s // 60)
+    if s < 48 * 3600:
+        return '%d h' % (s // 3600)
+    return '%d d' % (s // 86400)
+
+
+def started_ago(s, now):
+    t = number(s.get('startedAt'))
+    return 'started %s ago' % span(now - t) if t else 'start time unknown'
+
+
+# What ccc tidy may do with a session, and the words for it: ('stopped', when) it can be removed, ('running', when) it
+# can be stopped and removed, ('kept', why) it's never offered. windows: read_windows(); pins: read_pins(); job: its
+# job_state(); pinned_ok: --pinned
+def tidy_verdict(s, windows, pins, job, pinned_ok, now):
+    sid = s.get('id')
+    if s.get('kind') != 'background':
+        return 'kept', 'a regular session: /exit it in its window'
+    if not sid:
+        return 'kept', "no id: claude stop and claude rm can't name it"
+    shown = windows['by_id'].get(sid, [])
+    where = 'shown in a window now (%s)' % ', '.join(t.replace('/dev/', '') for t in shown)
+    remote = bool(s.get('pid') and job and isinstance(job.get('bridgeSessionId'), str) and job['bridgeSessionId'])
+    # pinned: why a pinned one is left alone; note: what an offered one says it is (--pinned)
+    pinned, note = None, ''
+    if pins is None and not pinned_ok:
+        pinned = "pins.json can't be read, so it may be pinned: --pinned to offer it"
+    elif pins is not None and sid in pins:
+        note = ' · pinned, Remote Control on' if remote else ' · pinned'
+        if not pinned_ok:
+            pinned = 'pinned: --pinned to offer it'
+            if s.get('pid'):
+                pinned = ('pinned, Remote Control on: turn off Remote Control, or --pinned to offer it' if remote
+                          else 'pinned: unpin it (Ctrl+T in claude agents), or --pinned to offer it')
+    if not s.get('pid'):
+        if shown:
+            return 'kept', where
+        if pinned:
+            return 'kept', pinned
+        return 'stopped', started_ago(s, now) + note
+    status = s.get('status')
+    if status == 'busy':
+        return 'kept', 'busy: never stopped while it works'
+    if status == 'waiting':
+        return 'kept', 'waiting for you (a question or a permission)'
+    if status != 'idle':
+        return 'kept', 'running, its status unknown'
+    count, kinds = real_tasks(job)
+    if count:
+        return 'kept', 'idle, but %s in the background%s' % (
+            '1 task runs' if count == 1 else '%d tasks run' % count, ' (%s)' % ', '.join(kinds) if kinds else '')
+    if shown:
+        return 'kept', where
+    if pinned:
+        return 'kept', pinned
+    since = idle_since(s)
+    return 'running', ('idle %s' % span(now - since) if since else 'idle, %s' % started_ago(s, now)) + note
+
+
+# A folder with the home folder as ~ (as it's written, or as its real path: the list has real paths)
+def short_path(p):
+    for home in (HOME, os.path.realpath(HOME) if HOME else ''):
+        if home and home != '/' and (p == home or p.startswith(home + '/')):
+            return '~' + p[len(home):]
+    return p
+
+
+def clip(text, width, left=False):
+    if len(text) <= width:
+        return text
+    return '…' + text[-(width - 1):] if left else text[:width - 1] + '…'
+
+
+# The inventory: the sessions to offer, numbered (stopped first, oldest first; then idle running ones, idle longest
+# first), the ones left alone with why, and how many stopped ones --days left out
+def tidy_inventory(sessions, windows, pins, pinned_ok, days, now):
+    stopped, running, kept, recent = [], [], [], 0
+    for s in sessions:
+        verdict, words = tidy_verdict(s, windows, pins, job_state(s.get('id')), pinned_ok, now)
+        item = {'session': s, 'group': verdict, 'words': words}
+        if verdict == 'stopped':
+            started = number(s.get('startedAt'))
+            if days is not None and (not started or now - started <= days * 86400000):
+                recent += 1
+                continue
+            stopped.append(item)
+        elif verdict == 'running':
+            running.append(item)
+        else:
+            kept.append(item)
+    stopped.sort(key=lambda i: number(i['session'].get('startedAt')) or 0)
+    running.sort(key=lambda i: idle_since(i['session']) or number(i['session'].get('startedAt')) or 0)
+    kept.sort(key=lambda i: (i['session']['cwd'], title_of(i['session']).casefold()))
+    for n, item in enumerate(stopped + running, 1):
+        item['n'] = n
+    return {'stopped': stopped, 'running': running, 'kept': kept, 'recent': recent}
+
+
+def tidy_print(inv, heading, days, windows, pinned_ok):
+    rows = inv['stopped'] + inv['running'] + inv['kept']
+    width = len(str(len(inv['stopped']) + len(inv['running'])))
+    names = min(32, max([len(title_of(i['session'])) for i in rows] or [0]))
+    folders = min(48, max([len(short_path(i['session']['cwd'])) for i in rows] or [0]))
+
+    def line(item):
+        n = str(item['n']).rjust(width) if 'n' in item else ' ' * width
+        folder = clip(short_path(item['session']['cwd']), folders, left=True).ljust(folders)
+        say('  %s%s%s  %s  %s%s  %s%s' % (BOLD, n, RESET, clip(title_of(item['session']), names).ljust(names), DIM, folder, item['words'], RESET))
+    say('%sSessions · %s%s' % (DIM, heading, RESET))
+    if not rows and not inv['recent']:
+        say('No sessions.')
+        return
+    if inv['stopped'] or inv['recent']:
+        say('Stopped (no process: a list entry and its conversation on disk) · remove')
+        for item in inv['stopped']:
+            line(item)
+        if inv['recent']:
+            say('  %s%d more stopped, started in the last %g days (--days %g)%s' % (DIM, inv['recent'], days, days, RESET))
+    if inv['running']:
+        say('Running in the background, idle%s · stop and remove' % ('' if pinned_ok else ', not pinned'))
+        for item in inv['running']:
+            line(item)
+    if inv['kept']:
+        say('Left alone')
+        for item in inv['kept']:
+            line(item)
+    if windows['views']:
+        say('%sAn agent view is open (%s): a session open in it doesn\'t count as shown in a window.%s' % (
+            DIM, ', '.join(sorted(t.replace('/dev/', '') for t in windows['views'])), RESET))
+
+
+# A pick: numbers and ranges (1 3-5), s for every stopped one. The numbers picked, or None and why not
+def parse_pick(text, count, stopped):
+    picked = set()
+    for word in re.split(r'[\s,]+', text.strip()):
+        if not word:
+            continue
+        if word.lower() == 's':
+            if not stopped:
+                return None, 's: no stopped session is offered'
+            picked.update(range(1, stopped + 1))
+            continue
+        m = re.match(r'^(\d+)(?:-(\d+))?$', word)
+        if not m:
+            return None, '%s: not a number or a range' % word
+        a, b = sorted((int(m.group(1)), int(m.group(2) or m.group(1))))
+        if a < 1 or b > count:
+            return None, '%s: the numbers go from 1 to %d' % (word, count)
+        picked.update(range(a, b + 1))
+    return sorted(picked), None
+
+
+def cli_failure(code, out, err):
+    text = (err or '').strip() or (out or '').strip()
+    return text.replace('\n', '\n      ') if text else 'claude exited with %d' % code
+
+
+def tidy_result(item, outcome):
+    say('  %s%s%s  %s  %s' % (BOLD, item['n'], RESET, title_of(item['session']), outcome))
+
+
+# Acts on one picked session, on what it is now (fresh: the list, windows and pins just read). True unless the list
+# couldn't be read again or a claude stop or rm failed
+def tidy_act(item, fresh, pinned_ok):
+    rows, windows, pins = fresh
+    if rows is None:
+        tidy_result(item, "skipped: couldn't read the session list again")
+        return False
+    s = next((x for x in rows if x['sessionId'] == item['session']['sessionId']), None)
+    if not s:
+        tidy_result(item, 'skipped: it left the list meanwhile')
+        return True
+    verdict, words = tidy_verdict(s, windows, pins, job_state(s.get('id')), pinned_ok, now_ms())
+    if verdict == 'kept':
+        tidy_result(item, 'skipped: %s' % words)
+        return True
+    if verdict == 'running' and item['group'] == 'stopped':
+        tidy_result(item, "skipped: it's running again")
+        return True
+    if verdict == 'running':
+        code, out, err = run([CLAUDE, 'stop', s['id']], timeout=60)
+        if code != 0:
+            tidy_result(item, 'failed: %s' % cli_failure(code, out, err))
+            return False
+    code, out, err = run([CLAUDE, 'rm', s['id']], timeout=60)
+    if code != 0:
+        tidy_result(item, '%s: %s' % ('stopped, but not removed' if verdict == 'running' else 'failed', cli_failure(code, out, err)))
+        return False
+    if verdict == 'running':
+        tidy_result(item, 'stopped and removed')
+    else:
+        tidy_result(item, 'removed%s' % (' (it had stopped meanwhile)' if item['group'] == 'running' else ''))
+    return True
+
+
+def tidy_fresh():
+    return list_sessions(), read_windows(), read_pins()
+
+
+def tidy(argv):
+    here = pinned_ok = only_list = False
+    days = None
+    words = list(argv)
+    while words:
+        flag = words.pop(0)
+        value = None
+        if flag.startswith('--days='):
+            flag, value = '--days', flag[7:]
+        elif flag == '--days':
+            value = words.pop(0) if words else ''
+        if flag == '--here':
+            here = True
+        elif flag == '--pinned':
+            pinned_ok = True
+        elif flag == '--list':
+            only_list = True
+        elif flag == '--days' and re.match(r'^\d+(\.\d+)?$', value or ''):
+            days = float(value)
+        elif flag in ('-h', '--help'):
+            say(TIDY_USAGE)
+            return 0
+        else:
+            say(TIDY_USAGE)
+            return 2
+    sessions = list_sessions()
+    if sessions is None:
+        say("Couldn't read the session list (claude agents --json --all)")
+        return 1
+    now = now_ms()
+    heading = 'every folder'
+    if here:
+        root = project_root(os.path.realpath(os.getcwd()))
+        sessions = [s for s in sessions if in_project(s['cwd'], root, HOME)]
+        heading = os.path.basename(root) or root
+    windows = read_windows()
+    inv = tidy_inventory(sessions, windows, read_pins(), pinned_ok, days, now)
+    tidy_print(inv, heading, days, windows, pinned_ok)
+    offered = inv['stopped'] + inv['running']
+    if only_list:
+        return 0
+    if not offered:
+        if inv['kept']:
+            say('Nothing to offer: each session above is left alone for the reason beside it.')
+        return 0
+    hint = 'numbers or ranges (e.g. 1 3-5)%s, Enter = nothing' % (', s = every stopped one' if inv['stopped'] else '')
+    say('%s%s%s' % (DIM, hint, RESET))
+    while True:
+        try:
+            text = input('Remove which? ').strip()
+        except (EOFError, KeyboardInterrupt):
+            say()
+            text = ''
+        if not text:
+            say('Nothing changed.')
+            return 0
+        numbers, problem = parse_pick(text, len(offered), len(inv['stopped']))
+        if problem:
+            say('%s%s%s' % (DIM, problem, RESET))
+            continue
+        break
+    picked = [offered[n - 1] for n in numbers]
+    running = [i for i in picked if i['group'] == 'running']
+    declined = False
+    if running:
+        for item in running:
+            say('  %s%s%s  %s  %s%s  %s%s' % (BOLD, item['n'], RESET, title_of(item['session']), DIM, short_path(item['session']['cwd']), item['words'], RESET))
+        declined = not ask_yes('Stop and remove %s?' % ('this running session' if len(running) == 1 else 'these %d running sessions' % len(running)), False)
+    ok = True
+    try:
+        # The stopped ones on one fresh look; each running one on its own, just before it's stopped
+        fresh = tidy_fresh() if any(i['group'] == 'stopped' for i in picked) else None
+        for item in picked:
+            if item['group'] == 'running' and declined:
+                tidy_result(item, 'skipped: not confirmed')
+                continue
+            ok = tidy_act(item, fresh if item['group'] == 'stopped' else tidy_fresh(), pinned_ok) and ok
+    except KeyboardInterrupt:
+        say()
+        say('Interrupted: nothing more was done (the one it was on may be stopped and still in the list).')
+        return 1
+    return 0 if ok else 1
+
+
 def main(argv):
     if argv[:1] == ['tell']:
         return tell(argv[1:])
     if argv[:1] == ['section']:
         return section(argv[1:])
+    if argv[:1] == ['tidy']:
+        return tidy(argv[1:])
     import argparse
     parser = argparse.ArgumentParser(prog='launcher.py')
     parser.add_argument('mode', choices=['start', 'pick'])

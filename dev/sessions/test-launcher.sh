@@ -23,12 +23,29 @@ cat > "$work/bin/claude" <<'SH'
 #!/usr/bin/env bash
 # A stand-in for claude: answers from $FIX, logs every call to $FIX/calls.log, and to $FIX/leaks.log a call that still
 # sees what ccc hands the launcher (a claude would pass it on to the background service, and on to every session);
-# $EVERY_CALL and $LEAKS outlive the fixtures' resets
+# $EVERY_CALL and $LEAKS outlive the fixtures' resets. $FIX/agents-next.json, when there, is the list from the second
+# listing on (a session that changed meanwhile); stop and rm change the list as Claude would, or fail with the message
+# in $FIX/<stop|rm>-error-<id>
 echo "$*" >> "$FIX/calls.log"
 echo "$*" >> "$EVERY_CALL"
 if [ -n "${SESSIONS_PLUGIN_VERSION+x}" ] || [ -n "${SESSIONS_PLUGIN_SINCE+x}" ]; then echo "$*" >> "$LEAKS"; fi
 case "$1 $2" in
-  "agents --json") cat "$FIX/agents.json" ;;
+  "agents --json")
+    cat "$FIX/agents.json"
+    if [ -f "$FIX/agents-next.json" ]; then mv -f "$FIX/agents-next.json" "$FIX/agents.json"; fi ;;
+  "stop "*|"rm "*)
+    if [ -f "$FIX/$1-error-$2" ]; then cat "$FIX/$1-error-$2" >&2; exit 1; fi
+    FIXDIR="$FIX" WHAT="$1" ID="$2" python3 - <<'PY'
+import json, os
+path = os.path.join(os.environ['FIXDIR'], 'agents.json')
+rows = [r for r in json.load(open(path)) if os.environ['WHAT'] == 'stop' or r.get('id') != os.environ['ID']]
+for r in rows:
+    if os.environ['WHAT'] == 'stop' and r.get('id') == os.environ['ID']:
+        r.pop('pid', None)
+        r.pop('status', None)
+json.dump(rows, open(path, 'w'))
+PY
+    ;;
   "plugin list") cat "$FIX/plugins.json" 2>/dev/null || echo '[]' ;;
   "attach "*) exit "$(cat "$FIX/attach-exit-$2" 2>/dev/null || echo 0)" ;;
   "respawn "*) exit 0 ;;
@@ -57,6 +74,8 @@ for a in "$@"; do
   prev=$a
 done
 cat "$FIX/ps.txt" 2>/dev/null
+# $FIX/ps-next.txt, when there, is what the next ps lists (a window that opened meanwhile)
+if [ -f "$FIX/ps-next.txt" ]; then mv -f "$FIX/ps-next.txt" "$FIX/ps.txt"; fi
 SH
 chmod +x "$work/bin/claude" "$work/bin/ps"
 
@@ -428,10 +447,182 @@ grep -q "from a newer sessions" <<<"$(sect --session alpha Renders || true)" || 
 grep -q '"sectionsFormat": 2' "$data/sections.json" || fail "section" "a newer sections.json was rewritten"
 pass "section: the window's session or --session, as the person's, refused without one window, a newer file untouched"
 
+# 14. ccc tidy: every folder's sessions from the list, grouped and numbered (stopped, then idle running ones), and the
+#     ones it leaves alone with why (working, waiting, tasks in the background, a window, pinned, regular); --here,
+#     --days, --list; a pick of numbers and ranges or s, a second yes for running ones, each checked again just before
+#     it's stopped; never an unpin, never a regular session; the CLI's failures said, and exit 1
+other="$work/home/projects/other"
+mkdir -p "$other"
+other="$(cd "$other" && pwd -P)"
+tidy_world() {
+  rm -rf "$HOME/.claude/sessions" "$HOME/.claude/jobs"
+  NOW="$(now_ms)" PROJ="$proj" OTHER="$other" python3 - > "$fix/agents.json" <<'PY'
+import json, os
+now, proj, other = int(os.environ['NOW']), os.environ['PROJ'], os.environ['OTHER']
+day, hour = 86400000, 3600000
+def bg(i, name, cwd, age, status=None, pid=None):
+    row = {'id': i, 'sessionId': i + '-0000-0000-0000-000000000000', 'name': name, 'cwd': cwd, 'kind': 'background', 'startedAt': now - age}
+    if status:
+        row.update(status=status, pid=pid)
+    return row
+print(json.dumps([
+    bg('aaaaaaa1', 'old notes', proj, 20 * day), bg('aaaaaaa2', 'fresh stop', other, 2 * day),
+    bg('bbbbbbb1', 'idle one', proj, 5 * hour, 'idle', 2001), bg('bbbbbbb2', 'idle other', other, 4 * hour, 'idle', 2002),
+    bg('ccccccc1', 'worker', proj, hour, 'busy', 2003), bg('ccccccc2', 'asker', other, hour, 'waiting', 2004),
+    bg('ddddddd1', 'viewed', proj, hour, 'idle', 2005), bg('eeeeeee1', 'pinned remote', proj, day, 'idle', 2006),
+    bg('eeeeeee2', 'pinned by hand', other, day, 'idle', 2007), bg('fffffff1', 'with tasks', proj, hour, 'idle', 2008),
+    {'sessionId': '99999999-0000-0000-0000-000000000000', 'name': 'myapp-1f', 'cwd': proj, 'kind': 'interactive', 'pid': 2009,
+     'status': 'idle', 'startedAt': now - hour},
+]))
+PY
+  # Claude's own files: the registry says since when "idle one" is idle; two pins, one with Remote Control on; a session
+  # with tasks in the background (an artifact watch isn't one); a window showing "viewed"
+  mkdir -p "$HOME/.claude/sessions" "$HOME/.claude/jobs/eeeeeee1" "$HOME/.claude/jobs/fffffff1"
+  printf '{"pid": 2001, "sessionId": "bbbbbbb1-0000-0000-0000-000000000000", "status": "idle", "statusUpdatedAt": %s}\n' "$(($(now_ms) - 3 * 3600000 - 60000))" > "$HOME/.claude/sessions/2001.json"
+  printf '[\n  "eeeeeee1",\n  "eeeeeee2"\n]' > "$HOME/.claude/jobs/pins.json"
+  printf '{"bridgeSessionId": "session_x", "inFlight": {"tasks": 0}}\n' > "$HOME/.claude/jobs/eeeeeee1/state.json"
+  printf '{"inFlight": {"tasks": 3, "drainableMonitors": 1, "kinds": ["agent", "shell", "artifact_watch"]}}\n' > "$HOME/.claude/jobs/fffffff1/state.json"
+  printf '  501 ttys901  bash /x/hooks/visor.sh start\n  502 ttys901  claude attach ddddddd1\n' > "$fix/ps.txt"
+}
+# tidy_run <answers> <args...>: ccc tidy from the project (or $TIDY_IN), the answers on stdin; the output without its
+# colours, and a line break after each question as a terminal shows once the answer is typed, in $work/out.txt; prints
+# the exit code
+tidy_run() {
+  local answers="$1" code=0
+  shift
+  printf '%b' "$answers" | (cd "${TIDY_IN:-$proj}" && env -u SESSIONS_TTY /bin/bash "$hooks/visor.sh" start tidy "$@") > "$work/raw.txt" 2>&1 || code=$?
+  python3 -c 'import re, sys; t = re.sub(r"\x1b\[[0-9;]*m", "", open(sys.argv[1]).read()); open(sys.argv[2], "w").write(re.sub(r"(Remove which\? |\[y/N\] )", "\\1\n", t))' "$work/raw.txt" "$work/out.txt"
+  echo "$code"
+}
+has() { grep -Eq -- "$1" "$work/out.txt" || fail "tidy" "$2: no line like /$1/ in: $(cat "$work/out.txt")"; }
+lacks() { if grep -Eq -- "$1" "$work/out.txt"; then fail "tidy" "$2: /$1/ in: $(cat "$work/out.txt")"; fi; }
+acts() { grep -E '^(stop|rm) ' "$fix/calls.log" | tr '\n' ';' || true; }
+reset
+tidy_world
+expect "$(tidy_run '' --list)" 0 "tidy --list"
+has '^Sessions · every folder$' "the heading"
+has '^Stopped \(no process: a list entry and its conversation on disk\) · remove$' "the stopped group"
+has '^  1  old notes +~/projects/myapp +started 20 d ago$' "the oldest stopped one first"
+has '^  2  fresh stop +~/projects/other +started 2 d ago$' "a stopped one in another folder"
+has '^Running in the background, idle, not pinned · stop and remove$' "the running group"
+has '^  3  idle other +~/projects/other +idle, started 4 h ago$' "idle with no registry time: since it started"
+has '^  4  idle one +~/projects/myapp +idle 3 h$' "idle since the registry's statusUpdatedAt"
+has '^Left alone$' "the group left alone"
+has '^     worker +~/projects/myapp +busy: never stopped while it works$' "busy"
+has '^     asker +~/projects/other +waiting for you \(a question or a permission\)$' "waiting"
+has '^     viewed +~/projects/myapp +shown in a window now \(ttys901\)$' "shown in a window"
+has '^     pinned remote +~/projects/myapp +pinned, Remote Control on: turn off Remote Control, or --pinned to offer it$' "pinned with Remote Control"
+has '^     pinned by hand +~/projects/other +pinned: unpin it \(Ctrl\+T in claude agents\), or --pinned to offer it$' "pinned by hand"
+has '^     with tasks +~/projects/myapp +idle, but 2 tasks run in the background \(agent, shell\)$' "tasks in the background"
+has '^     myapp-1f +~/projects/myapp +a regular session: /exit it in its window$' "a regular session"
+lacks 'Remove which' "--list asks nothing"
+expect "$(acts)" "" "--list does nothing"
+# --here: this project only (by the root ccc uses: a subfolder belongs to it); --days: only stopped ones older than that
+TIDY_IN="$proj/src" expect "$(TIDY_IN="$proj/src" tidy_run '' --here --list)" 0 "tidy --here --list"
+has '^Sessions · myapp$' "--here: the project's name"
+has '^  1  old notes ' "--here: the project's stopped one"
+has '^  2  idle one ' "--here: the project's idle one"
+lacks 'fresh stop|idle other|asker|pinned by hand' "--here: another folder's sessions"
+expect "$(tidy_run '' --days 7 --list)" 0 "tidy --days 7"
+has '^  1  old notes ' "--days: the old one"
+has '^  1 more stopped, started in the last 7 days \(--days 7\)$' "--days: says what it left out"
+has '^  2  idle other ' "--days doesn't filter running ones"
+lacks 'fresh stop' "--days: the recent one isn't listed"
+# A pick of a number and a range, with the second yes for the running ones
+export SESSIONS_PLUGIN_VERSION=0.10.0 SESSIONS_PLUGIN_SINCE=0
+expect "$(tidy_run '1 3-4\ny\n')" 0 "a pick"
+unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
+has '^numbers or ranges \(e\.g\. 1 3-5\), s = every stopped one, Enter = nothing$' "the hint"
+has 'Remove which\? ' "the prompt"
+has 'Stop and remove these 2 running sessions\? \[y/N\]' "the second question names how many"
+has '^  1  old notes  removed$' "a stopped one: removed"
+has '^  3  idle other  stopped and removed$' "a running one: stopped and removed"
+has '^  4  idle one  stopped and removed$' "the range's end"
+expect "$(acts)" "rm aaaaaaa1;stop bbbbbbb2;rm bbbbbbb2;stop bbbbbbb1;rm bbbbbbb1;" "what a pick does, in order"
+# s: every stopped one, with no second question
+reset
+tidy_world
+expect "$(tidy_run 's\n')" 0 "s"
+expect "$(acts)" "rm aaaaaaa1;rm aaaaaaa2;" "s removes every stopped one, and only those"
+lacks 'running sessions\?' "s asks nothing more"
+# Enter does nothing; an answer it doesn't understand is asked again
+: > "$fix/calls.log"
+tidy_world
+expect "$(tidy_run '\n')" 0 "Enter"
+has '^Nothing changed\.$' "Enter: nothing changed"
+expect "$(tidy_run '9\nx\n\n')" 0 "out of range, then not a number, then Enter"
+has '9: the numbers go from 1 to 4$' "out of range"
+has 'x: not a number or a range$' "not a number"
+expect "$(acts)" "" "nothing done without a pick"
+# Running ones need the yes: No (or Enter) skips them, the stopped ones picked with them still go
+expect "$(tidy_run '1 4\nn\n')" 0 "running ones declined"
+has 'Stop and remove this running session\? \[y/N\]' "one running session"
+has '^  1  old notes  removed$' "the stopped one picked with it"
+has '^  4  idle one  skipped: not confirmed$' "declined"
+expect "$(acts)" "rm aaaaaaa1;" "only the stopped one"
+: > "$fix/calls.log"
+tidy_world
+expect "$(tidy_run '3\n\n')" 0 "Enter at the second question"
+expect "$(acts)" "" "Enter at the second question is No"
+# Checked again just before it's stopped: one that turned busy, one a window opened on, is skipped
+python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])); [r.update(status="busy") for r in rows if r.get("id")=="bbbbbbb1"]; json.dump(rows, open(sys.argv[2], "w"))' "$fix/agents.json" "$fix/agents-next.json"
+printf '  503 ttys902  claude attach bbbbbbb2\n' > "$fix/ps-next.txt"
+expect "$(tidy_run '3-4\ny\n')" 0 "changed meanwhile"
+has '^  3  idle other  skipped: shown in a window now \(ttys902\)$' "a window opened meanwhile"
+has '^  4  idle one  skipped: busy: never stopped while it works$' "busy meanwhile"
+expect "$(acts)" "" "nothing stopped that changed meanwhile"
+# --pinned offers the pinned idle ones too, and stopping one needs no unpin (pins.json is never written); a regular
+# session is never offered
+reset
+tidy_world
+cp "$HOME/.claude/jobs/pins.json" "$work/pins.before"
+expect "$(tidy_run '' --pinned --list)" 0 "--pinned --list"
+has '^Running in the background, idle · stop and remove$' "--pinned: the heading"
+has '^  3  pinned remote +~/projects/myapp +idle, started 24 h ago · pinned, Remote Control on$' "--pinned: the pinned ones offered"
+has '^  4  pinned by hand +~/projects/other +idle, started 24 h ago · pinned$' "--pinned: the hand pin too"
+has '^     myapp-1f .*a regular session' "--pinned: a regular session is still left alone"
+expect "$(tidy_run '3-4\ny\n' --pinned)" 0 "--pinned pick"
+expect "$(acts)" "stop eeeeeee1;rm eeeeeee1;stop eeeeeee2;rm eeeeeee2;" "--pinned: stopped and removed"
+cmp -s "$HOME/.claude/jobs/pins.json" "$work/pins.before" || fail "tidy" "pins.json was written"
+grep -q 99999999 "$fix/calls.log" && fail "tidy" "a regular session was acted on"
+# pins.json that can't be read: any session may be pinned, so none is offered without --pinned; SESSIONS_JOBS_DIR
+reset
+tidy_world
+printf 'not json' > "$HOME/.claude/jobs/pins.json"
+tidy_run '' --list > /dev/null
+has "^     old notes .*pins\.json can't be read, so it may be pinned: --pinned to offer it$" "unreadable pins: stopped ones kept"
+has "^     idle one .*pins\.json can't be read" "unreadable pins: running ones kept"
+mkdir -p "$work/jobs"
+printf '["aaaaaaa1"]' > "$work/jobs/pins.json"
+SESSIONS_JOBS_DIR="$work/jobs" tidy_run '' --list > /dev/null
+has '^     old notes .*pinned: --pinned to offer it$' "SESSIONS_JOBS_DIR: its pins.json"
+has '^  1  fresh stop ' "SESSIONS_JOBS_DIR: the rest offered"
+# The CLI's failures, in its words, and exit 1: a remove refused, a stop that failed (then no rm)
+reset
+tidy_world
+printf "Couldn't remove: its worktree has unpushed commits\n" > "$fix/rm-error-aaaaaaa1"
+printf 'Not running\n' > "$fix/stop-error-bbbbbbb1"
+expect "$(tidy_run '1-2 4\ny\n')" 1 "failures: exit 1"
+has "^  1  old notes  failed: Couldn't remove: its worktree has unpushed commits$" "rm's message"
+has '^  2  fresh stop  removed$' "the others go on"
+has '^  4  idle one  failed: Not running$' "stop's message"
+expect "$(acts)" "rm aaaaaaa1;rm aaaaaaa2;stop bbbbbbb1;" "no rm after a failed stop"
+# Nothing offered; a list it can't read; a bad option
+reset
+sessions cccccccc:busy:busy:600
+expect "$(tidy_run '')" 0 "nothing offered"
+has '^Nothing to offer: each session above is left alone for the reason beside it\.$' "nothing offered"
+echo 'not json' > "$fix/agents.json"
+expect "$(tidy_run '')" 1 "an unreadable list"
+has "^Couldn't read the session list" "an unreadable list"
+expect "$(tidy_run '' --days)" 2 "--days without a number"
+expect "$(tidy_run '' --bogus)" 2 "an unknown option"
+pass "tidy: groups and reasons, --here, --days, --list, picks, s, Enter, the second yes, checked again, --pinned, failures"
+
 # What ccc hands the launcher (the installed version and since when) never reaches a claude it runs: a viewer or a
 # start that brings up the background service would pass it on to every session the service starts
 [ ! -s "$LEAKS" ] || fail "environment" "claude saw SESSIONS_PLUGIN_VERSION/SINCE: $(sort -u "$LEAKS" | head -5 | tr '\n' ';')"
-for kind in '--bg' 'attach ' 'respawn '; do
+for kind in '--bg' 'attach ' 'respawn ' 'stop ' 'rm '; do
   grep -q -- "^$kind" "$EVERY_CALL" || fail "environment" "the check never saw a claude $kind"
 done
 pass "environment: no claude the launcher runs (start, viewer, respawn, list) sees SESSIONS_PLUGIN_VERSION/SINCE"
