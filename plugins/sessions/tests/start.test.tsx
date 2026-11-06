@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { storeNamespace } from '../hooks/state'
+import { abbreviate, heartbeatText, storeNamespace } from '../hooks/state'
 import { BAND, COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // How the mod starts in a session (the world it sees is in world.ts)
@@ -440,23 +440,197 @@ test("a worktree of the project is the project: a session there keeps the main c
   expect(r.text).toContain(`project: ${ROOT}`)
 })
 
-test('the root follows the session to another folder, and a root folder that\'s gone gives way to its current one', async ($, on) => {
+// A session belongs to the project it started in, wherever it goes afterwards: Claude lists it where it is now (its
+// registry file and claude agents follow EnterWorktree with a path, ExitWorktree and /cd), which alone took it out of
+// its project's panels and put its own panel on the other folder
+const OUTSIDE = '/Users/x/wt-outside'
+const OTHER = '/Users/x/other'
+const drawnPanel = async ($: any) => {
+  const ui = await $.ui.mount(PANEL)
+  const drawn = JSON.stringify(await ui.drawn())
+  await ui.unmount()
+  return drawn
+}
+// The commands that look a session's transcript up by its id (firstCwds)
+const lookups = (w: World) => w.runs.filter(a => a[0] === '/bin/sh' && String(a[2]).includes(`'"cwd":"'`))
+
+// A linked worktree of the project's repository that lives outside it, with its own copy of the CLAUDE.md the repository
+// checks in (so it would be a project of its own)
+function outsideWorktree(w: World) {
+  w.files.set(`${ROOT}/CLAUDE.md`, '# myapp')
+  w.files.set(`${OUTSIDE}/CLAUDE.md`, '# myapp')
+  w.dirs.add(OUTSIDE)
+}
+
+test('a session that moves to a worktree outside its project stays in it: its list, order file and heartbeat, and a line says where it works', async ($, on) => {
+  const list = folderList()
+  list[2].cwd = OTHER
+  const w = world(on, { list })
+  outsideWorktree(w)
+  await startSession($, w)
+  expect(w.store.get(`project:${SID}`)).toMatchObject({ root: ROOT, from: ROOT })
+  // EnterWorktree with a path outside the project: $.session.root() and its row in the list move there
+  await move(w, list, OUTSIDE)
+  expect(w.files.has(`${DATA}/order/${OUTSIDE.replace(/\//g, '_')}`)).toBe(false)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
+  expect(w.files.get(`${DATA}/alive/${SID}`)).toContain(`root=${ROOT}\n`)
+  let drawn = await drawnPanel($)
+  expect(drawn).toContain('two')
+  expect(drawn).not.toContain('three')
+  expect(drawn).toContain('Working in ~/wt-outside, outside this project')
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  expect(r.text).toContain(`project: ${ROOT} (where it started) · working in ${OUTSIDE}, outside it`)
+  // The worktree is removed under it: nothing runs there, and nothing fails
+  w.dirs.delete(OUTSIDE)
+  w.files.delete(`${OUTSIDE}/CLAUDE.md`)
+  const before = w.runs.length
+  await w.clock.advance(20000)
+  expect(w.runs.length).toBeGreaterThan(before)
+  expect(w.cwds.slice(before).filter(c => c !== '/Users/x')).toEqual([])
+  drawn = await drawnPanel($)
+  expect(drawn).toContain('two')
+  expect(drawn).not.toContain("Couldn't read the session list")
+  // ExitWorktree: back in the project, and the line goes
+  await move(w, list, ROOT)
+  drawn = await drawnPanel($)
+  expect(drawn).toContain('two')
+  expect(drawn).not.toContain('Working in')
+})
+
+test('/cd anywhere, inside the project or out of it: the session stays in the project it started in, its line only outside it', async ($, on) => {
   const SUB = `${ROOT}/sub`
   const list = folderList()
   list[2].cwd = SUB
   const w = world(on, { list })
   w.dirs.add(SUB)
+  w.dirs.add(OTHER)
   await startSession($, w)
-  // /cd into a folder of its own (no marker above it): that folder is its project now
+  // Into a folder of the project with no marker above it (it used to become the project): the same project, no line
   await move(w, list, SUB)
-  expect(orderIds(w, SUB)).toEqual(['aaaaaaaa', 'cccccccc'])
-  // The session's root still names that folder, which was deleted; the session itself is back in the main checkout
-  w.dirs.delete(SUB)
-  await move(w, list, SUB, ROOT)
+  expect(w.files.has(`${DATA}/order/${SUB.replace(/\//g, '_')}`)).toBe(false)
   expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
-  const ui = await $.ui.mount(PANEL)
-  expect(JSON.stringify(await ui.drawn())).toContain('two')
+  expect(await drawnPanel($)).not.toContain('Working in')
+  // Into another folder altogether
+  await move(w, list, OTHER)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb', 'cccccccc'])
+  const drawn = await drawnPanel($)
+  expect(drawn).toContain('two')
+  expect(drawn).toContain('Working in ~/other, outside this project')
+})
+
+test("another panel of the project keeps a session that moved out of it, by its heartbeat's root: its list, its order file and New's name check", async ($, on) => {
+  const list = folderList()
+  const TWO = list[1].sessionId
+  // EnterWorktree with a path outside the project: Claude lists it there now. Its own mod says where it belongs
+  list[1].cwd = OUTSIDE
+  list[2].cwd = OTHER
+  const w = world(on, { list })
+  outsideWorktree(w)
+  w.write(`${DATA}/alive/${TWO}`, heartbeatText({ pid: 4243, at: w.clock.now(), version: '0.15.0', via: 'session.start', root: ROOT }))
+  await startSession($, w)
+  await w.clock.advance(4000)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
+  const drawn = await drawnPanel($)
+  expect(drawn).toContain('two')
+  expect(drawn).not.toContain('three')
+  // Its name is the project's: New doesn't make a second session with it
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  await $.ui.press({ plugin: 'sessions', key: 'new', requestId: 'sessions', surface: 'terminal' })
+  await $.ui.input({ plugin: 'sessions', key: 'name', text: 'two', requestId: 'sessions', surface: 'terminal' })
+  await w.clock.advance(1000)
+  expect(w.toasts).toContain('“two” is already a session of this project: type another name (Esc cancels)')
+  expect(w.runs.some(a => a[1] === '--bg')).toBe(false)
   await ui.unmount()
+  // A session that started in another project and moved into this one is that project's
+  list[2].cwd = `${ROOT}/sub`
+  w.write(`${DATA}/alive/${list[2].sessionId}`, heartbeatText({ pid: 4244, at: w.clock.now(), version: '0.15.0', via: 'session.start', root: OTHER }))
+  await w.clock.advance(4000)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
+})
+
+test("a session with no mod running belongs where its transcript started, looked up once by its id, wherever it's listed", async ($, on) => {
+  const list = folderList()
+  const TWO = list[1].sessionId
+  const THREE = list[2].sessionId
+  // Stopped after it moved out (no process, no heartbeat): Claude lists it outside, its transcript started here
+  list[1] = { ...list[1], cwd: OUTSIDE, status: undefined, pid: undefined }
+  // Listed in the project, on a mod with no root in its heartbeat: it started in another project and moved in
+  list[2].cwd = `${ROOT}/sub`
+  const w = world(on, { list })
+  outsideWorktree(w)
+  w.starts.set(TWO, ROOT)
+  w.starts.set(THREE, OTHER)
+  w.write(`${DATA}/alive/${THREE}`, heartbeatText({ pid: 4244, at: w.clock.now(), version: '0.14.1', via: 'session.start' }))
+  await startSession($, w)
+  await w.clock.advance(4000)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
+  const drawn = await drawnPanel($)
+  expect(drawn).toContain('two')
+  expect(drawn).not.toContain('three')
+  // Each one looked up once (this session's own at its start, the others together), not at every refresh
+  const looked = lookups(w).length
+  expect(looked).toBeLessThanOrEqual(2)
+  expect(lookups(w).flatMap(a => a.slice(5)).sort()).toEqual([SID, TWO, THREE].sort())
+  await w.clock.advance(180000)
+  expect(lookups(w).length).toBe(looked)
+})
+
+test("the project is recorded at the first start and kept: a restart where the session moved to, a /clear's new id", async ($, on) => {
+  // Restarted (claude respawn keeps the session id) where it was, in the worktree outside the project
+  const list = folderList()
+  list[0].cwd = OUTSIDE
+  list[2].cwd = OTHER
+  const w = world(on, { list, store: { [`project:${SID}`]: { root: ROOT, from: ROOT, at: 1 } } })
+  outsideWorktree(w)
+  w.root.value = OUTSIDE
+  w.cwd.value = OUTSIDE
+  await startSession($, w)
+  await w.clock.advance(4000)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
+  expect(w.files.get(`${DATA}/alive/${SID}`)).toContain(`root=${ROOT}\n`)
+  expect(lookups(w).some(a => a.includes(SID))).toBe(false)
+  // /clear: a new id; the record goes over to it, and so does the heartbeat's root
+  const NEW = 'dddddddd-0000-0000-0000-000000000000'
+  await $.session.end({ reason: 'clear', sessionId: SID } as any)
+  w.id.value = NEW
+  list[0].sessionId = NEW
+  await w.clock.advance(1000)
+  expect(w.store.get(`project:${NEW}`)).toMatchObject({ root: ROOT })
+  expect(w.store.get(`project:${SID}`)).toBe(undefined)
+  expect(w.files.get(`${DATA}/alive/${NEW}`)).toContain(`root=${ROOT}\n`)
+  await w.clock.advance(4000)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
+  expect(await drawnPanel($)).toContain('Working in ~/wt-outside, outside this project')
+})
+
+test("with no record, the first start goes by where the session started: its transcript's first row, else its folder", async ($, on) => {
+  // A session that moved before this version recorded anything, then restarted or reloaded where it was
+  const list = folderList()
+  list[0].cwd = OUTSIDE
+  list[2].cwd = OTHER
+  const w = world(on, { list })
+  outsideWorktree(w)
+  w.root.value = OUTSIDE
+  w.cwd.value = OUTSIDE
+  w.starts.set(SID, `${ROOT}/src`)
+  await startSession($, w)
+  expect(w.store.get(`project:${SID}`)).toMatchObject({ root: ROOT, from: `${ROOT}/src` })
+  await w.clock.advance(4000)
+  expect(orderIds(w, ROOT)).toEqual(['aaaaaaaa', 'bbbbbbbb'])
+})
+
+test("the usage view's project scope is the project the session started in, wherever it works now", async ($, on) => {
+  const list = folderList()
+  const w = world(on, { list, store: { usageView: { period: 'week', scope: 'project' } } })
+  outsideWorktree(w)
+  const summary = { format: 3, today: '1970-01-12', hour: '1970-01-12T13', days: { [ROOT]: { '1970-01-12': [1000, 2000, 0, 0, 0] }, [OUTSIDE]: { '1970-01-12': [70000, 80000, 0, 0, 0] } }, hours: {} }
+  w.write(`${DATA}/usage/summary.json`, JSON.stringify(summary))
+  await startSession($, w)
+  await move(w, list, OUTSIDE)
+  const drawn = await drawnPanel($)
+  expect(drawn).toContain(`in ${abbreviate(1000)}`)
+  expect(drawn).toContain(`out ${abbreviate(2000)}`)
+  expect(drawn).not.toContain(abbreviate(70000))
 })
 
 test('New in a session whose folder is gone: a clear notice, nothing created, and the session still in its own list', async ($, on) => {

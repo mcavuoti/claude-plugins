@@ -79,9 +79,22 @@ import {
   askRejection,
   UNSHOWN,
   worktreeBase,
+  sessionHome,
+  belongsTo,
+  parseTranscriptStarts,
+  outsideNote,
   wakeStagger,
   afterTick,
   rowsBelow,
+  diedWithService,
+  endedShown,
+  clockText,
+  endedText,
+  endedFolders,
+  bringBackQuestion,
+  bringBackOptions,
+  bringBackResult,
+  type EndedSession,
 } from '../hooks/state'
 
 // These run after every Claude update: if the mod API or the state format change, they fail here.
@@ -459,6 +472,57 @@ test('the log: last starts and the service finding workers dead are kept', () =>
   expect(l.reasons).toEqual({})
 })
 
+test('ended with the background service: only on its death after the session last ran, never a stop of its own or the person\'s', () => {
+  // The service's next start found its workers dead after the session last ran: when, the first such death
+  expect(diedWithService(undefined, undefined, 100, [50, 150, 250])).toBe(150)
+  // A death before it last ran, or none: not this
+  expect(diedWithService(undefined, undefined, 100, [50])).toBe(undefined)
+  expect(diedWithService(undefined, undefined, 100, [])).toBe(undefined)
+  // No sign of when it last ran: not this (fail closed)
+  expect(diedWithService(undefined, undefined, undefined, [150])).toBe(undefined)
+  // A line of its own after its last start: the service retired it, it closed for memory, the person's claude stop, or
+  // its process ended by itself (a crash): each is its own stop, not the service's
+  for (const why of ['idle', 'low-memory', 'stopped', 'ended'] as const) expect(diedWithService({ at: 120, why }, undefined, 100, [150])).toBe(undefined)
+  // The person stopped it from a panel after it last ran; or before, and it ran again before the death
+  expect(diedWithService(undefined, 120, 100, [150])).toBe(undefined)
+  expect(diedWithService(undefined, 80, 100, [150])).toBe(150)
+})
+
+test('ended with the background service: the line counts those after the death the person dismissed, says when and where', () => {
+  const s = (id: string, cwd: string, at: number): EndedSession => ({ sessionId: `${id}-0000-0000-0000-000000000000`, id, name: id, cwd, at })
+  const ended = [s('aaaaaaaa', '/Users/x/app', 100), s('bbbbbbbb', '/Users/x/app', 100), s('cccccccc', '/Users/x/site', 300)]
+  expect(endedShown(ended, undefined)).toHaveLength(3)
+  // Dismissed for the death at 100: that one's stay out, a later death's show
+  expect(endedShown(ended, 100).map(e => e.id)).toEqual(['cccccccc'])
+  expect(endedShown(ended, 300)).toEqual([])
+  expect(endedShown(ended, 'x')).toHaveLength(3)
+  // A time of day, local, with its day when it isn't today's
+  const at = new Date(2026, 10, 6, 9, 5)
+  expect(clockText(at, new Date(2026, 10, 6, 23, 0))).toBe('09:05')
+  expect(clockText(at, new Date(2026, 10, 7, 0, 10))).toBe('09:05 on Nov 6')
+  const now = new Date(2026, 10, 6, 10, 0).getTime()
+  const death = new Date(2026, 10, 6, 9, 5).getTime()
+  const two = [s('aaaaaaaa', '/Users/x/app', death), s('bbbbbbbb', '/Users/x/site', death)]
+  expect(endedText(two, now)).toEqual({ text: '2 sessions ended with the background service at 09:05', action: 'brings them back', at: death })
+  expect(endedText(two.slice(0, 1), now)).toEqual({ text: '1 session ended with the background service at 09:05', action: 'brings it back', at: death })
+  expect(endedText([], now)).toBe(null)
+  // Where: the folder with the most first, ~ for the home folder, three folders and then the rest counted
+  expect(endedFolders(ended, '/Users/x')).toBe('2 in ~/app, 1 in ~/site')
+  const many = ['a', 'b', 'c', 'd', 'e'].map((f, i) => s(`${f}aaaaaaa`, `/Users/x/${f}`, i))
+  expect(endedFolders([...many, s('ffffffff', '/Users/x/e', 9)], '/Users/x')).toBe('2 in ~/e, 1 in ~/a, 1 in ~/b, 2 in 2 other folders')
+  // The question: how many and from which folders; at most 4 answers, the dismissal among them
+  expect(bringBackQuestion(two, now, '/Users/x')).toBe(
+    'Bring back the 2 sessions that ended with the background service at 09:05 (1 in ~/app, 1 in ~/site)? Each one restarts with its conversation, one at a time. Leave them stopped hides this line until the service ends sessions again.',
+  )
+  expect(bringBackQuestion(two.slice(1), now, '/Users/x')).toBe(
+    'Bring back the session that ended with the background service at 09:05 (in ~/site)? It restarts with its conversation. Leave it stopped hides this line until the service ends sessions again.',
+  )
+  expect(bringBackOptions(2).options).toEqual(['Bring them back', 'Leave them stopped', 'Cancel'])
+  expect(bringBackOptions(1)).toEqual({ bring: 'Bring it back', leave: 'Leave it stopped', options: ['Bring it back', 'Leave it stopped', 'Cancel'] })
+  expect(bringBackResult(2, 1, 0)).toBe('Brought back 2 sessions, skipped 1, failed 0')
+  expect(bringBackResult(1, 0, 1)).toBe('Brought back 1 session, skipped 0, failed 1')
+})
+
 test('reopen: only those from the last 2 h count towards the limit', () => {
   const now = 10_000_000
   expect(recentReopens([now - 1000, now - 7_300_000, 'x'], now)).toEqual([now - 1000])
@@ -535,7 +599,11 @@ test('shared files: key=value lines, one value per key, line breaks flattened', 
 test('heartbeat: fresh, same format and same process is ok; old, missing or another process is missing', () => {
   const now = 1_000_000
   const h = parseHeartbeat(heartbeatText({ pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' }))
-  expect(h).toEqual({ format: 3, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' })
+  expect(h).toEqual({ format: 3, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start', root: '' })
+  // The project the session belongs to (0.15.0): a line of its own, which an older reader ignores
+  const text = heartbeatText({ pid: 42, at: now, version: '0.15.0', via: 'session.start', root: '/Users/x/myapp' })
+  expect(text).toContain('root=/Users/x/myapp\n')
+  expect(parseHeartbeat(text)?.root).toBe('/Users/x/myapp')
   expect(heartbeatStatus(h, 42, now)).toBe('ok')
   expect(heartbeatStatus(h, 43, now)).toBe('missing')
   expect(heartbeatStatus(h, undefined, now)).toBe('ok')
@@ -598,6 +666,42 @@ test("project root: a worktree under <x>/.claude/worktrees/ is <x>'s project, it
   expect(rootFrom('/Users/x/myapp/.claude/worktrees/area-a', ['/Users/x/myapp', '/Users/x/myapp/.claude/worktrees/area-a'])).toBe('/Users/x/myapp')
   // A marker above the repository still wins, as for the main checkout
   expect(rootFrom('/Users/x/work/myapp/.claude/worktrees/area-a/src', ['/Users/x/work'])).toBe('/Users/x/work')
+})
+
+test('the project a session belongs to: where its own mod recorded, else where its transcript started, else where it is listed', () => {
+  const ROOT = '/Users/x/myapp'
+  const OUT = '/Users/x/wt-outside'
+  expect(sessionHome({ recorded: ROOT, first: OUT, cwd: OUT })).toBe(ROOT)
+  expect(sessionHome({ recorded: '', first: `${ROOT}/src`, cwd: OUT })).toBe(`${ROOT}/src`)
+  expect(sessionHome({ recorded: null, first: undefined, cwd: OUT })).toBe(OUT)
+  expect(sessionHome({ cwd: 42 })).toBe('')
+  // Listed in a worktree outside the project (EnterWorktree with a path), or anywhere /cd took it: still the project's
+  expect(belongsTo({ recorded: ROOT, cwd: OUT }, ROOT, '/Users/x')).toBe(true)
+  expect(belongsTo({ first: `${ROOT}/src`, cwd: OUT }, ROOT, '/Users/x')).toBe(true)
+  expect(belongsTo({ recorded: ROOT, cwd: OUT }, OUT, '/Users/x')).toBe(false)
+  // One that started elsewhere and moved in isn't
+  expect(belongsTo({ recorded: '/Users/x/other', cwd: `${ROOT}/src` }, ROOT, '/Users/x')).toBe(false)
+  // The rest as before: a worktree under <project>/.claude/worktrees/ is the project, the home folder only itself
+  expect(belongsTo({ cwd: `${ROOT}/.claude/worktrees/w1` }, ROOT, '/Users/x')).toBe(true)
+  expect(belongsTo({ recorded: ROOT }, '/Users/x', '/Users/x')).toBe(false)
+  expect(belongsTo({}, ROOT, '/Users/x')).toBe(false)
+})
+
+test("a transcript's first cwd, as the lookup prints it: the row read as JSON, or its cwd alone when the row was cut", () => {
+  const row = JSON.stringify({ parentUuid: null, cwd: '/Users/x/my "app"', sessionId: 'aaaaaaaa', message: { content: 'hi' } })
+  const cut = `{"cwd":"/Users/x/myapp","message":{"content":"a long first prompt`
+  expect(parseTranscriptStarts(`aaaaaaaa-1\t${row}\nbbbbbbbb-1\t${cut}\ncccccccc-1\t\ndddddddd-1\t{"cwd":"relative"}\n`)).toEqual({ 'aaaaaaaa-1': '/Users/x/my "app"', 'bbbbbbbb-1': '/Users/x/myapp' })
+  expect(parseTranscriptStarts('')).toEqual({})
+})
+
+test('the line a session working outside its project shows: its folder from ~, cut from the start to fit; none inside it', () => {
+  expect(outsideNote('/Users/x/wt-outside', '/Users/x/myapp', '/Users/x')).toBe('Working in ~/wt-outside, outside this project')
+  expect(outsideNote('/Users/x/myapp/.claude/worktrees/w1', '/Users/x/myapp', '/Users/x')).toBe('')
+  expect(outsideNote('/Users/x/myapp/src', '/Users/x/myapp', '/Users/x')).toBe('')
+  expect(outsideNote('', '/Users/x/myapp', '/Users/x')).toBe('')
+  const narrow = outsideNote('/Users/x/work/clients/area/wt-outside', '/Users/x/myapp', '/Users/x', 48)
+  expect(narrow).toBe('Working in …rea/wt-outside, outside this project')
+  expect(narrow.length).toBe(48)
 })
 
 test('project root: the folders to look for a marker in, outermost first, below the top two levels', () => {

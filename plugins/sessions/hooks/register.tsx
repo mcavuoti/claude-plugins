@@ -3,6 +3,7 @@ import type { Register } from 'claude-code'
 
 import type {
   Color,
+  EndedNote,
   PaneNote,
   PanelSummary,
   RateLimit,
@@ -69,6 +70,13 @@ import {
   sparkline,
   stoppedKind,
   stopLog,
+  diedWithService,
+  endedShown,
+  endedText,
+  bringBackOptions,
+  bringBackQuestion,
+  bringBackResult,
+  type EndedSession,
   stopReasons,
   storeNamespace,
   wakeStagger,
@@ -117,6 +125,10 @@ import {
   rootFrom,
   rootCandidates,
   worktreeBase,
+  belongsTo,
+  outsideNote,
+  parseTranscriptStarts,
+  type Whereabouts,
   sortRows,
   windowTargetText,
   autoName,
@@ -208,6 +220,10 @@ const tellInFlight = atom({ plugin: 'sessions', key: 'tellInFlight' } as const, 
 // What this session's classic.SessionStart had the engine watch (watch.ts): in $.state, which a reload keeps as the
 // engine keeps the watched paths; null when no SessionStart of this mod came in this session
 const watching = atom({ plugin: 'sessions', key: 'watching' } as const, null as Watching)
+// The line about the sessions that ended with the background service (endedText), or null: in every session's panel
+const ended = atom({ plugin: 'sessions', key: 'ended' } as const, null as EndedNote)
+// The folder this session works in when that's outside its project (followHere), or '': its panel says so in one line
+const away = atom({ plugin: 'sessions', key: 'away' } as const, '')
 
 // Every write of a value the panel or the band reads draws them again, equal or not (the engine compares nothing): so
 // each one is written only when its data changed (sameData), and a refresh that finds nothing new draws nothing. The
@@ -216,8 +232,10 @@ const watching = atom({ plugin: 'sessions', key: 'watching' } as const, null as 
 let claude = 'claude'
 let myId = ''
 let myPid = 0
-// The project root, which follows the session when its folder changes (followFolder)
+// The project root: the project this session belongs to, the one it started in (settleProject), wherever it works now
+// (hereNow: the folder Claude lists it in, which a worktree move and /cd change; followHere)
 let myCwd = ''
+let hereNow = ''
 let home = ''
 // Where the mod keeps its files (heartbeats, the order file, the launcher's window files, requests, usage cache):
 // ~/.claude/mods/sessions-data, or SESSIONS_DATA_DIR. Claude's background service's folder and log are read from
@@ -431,7 +449,8 @@ function debugLine($: any, text: string) {
 
 // Data shared between sessions: the mod's official store ($.store), a JSON file managed by Claude. Keys:
 // state:<id> (SessionState: what each session publishes about itself), seen:<id> (seen at), title:<id> (title from the
-// first prompt), waiting:<id> (waiting since),
+// first prompt), waiting:<id> (waiting since), project:<id> (the project that session belongs to, recorded at its first
+// start: root, from, at; settleProject),
 // restarted:<id> (restarted from its own panel at), reopened:<id> (reopen times), list (the session list claude
 // agents gave: at, when the listing came back; sessions; sig, what Claude's registry and the service's folder looked
 // like just before; until, when a slow or failed listing pushed the next one back; one listing at a time, under the
@@ -452,7 +471,10 @@ function debugLine($: any, text: string) {
 // windowsList until, when a slow ps pushed the next one back),
 // answer:<id> (the answer to a Stop or Restart question that session asked, when the asked session couldn't send it as
 // a notice: format, sessionId, action, cameBack, at; that session's panel takes it and deletes it), personStop:<id>
-// (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again).
+// (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again),
+// endedDismissed (the time of the background service's death the person dismissed the panel's line for: Leave them
+// stopped), broughtBack (the sessions a panel is bringing back after such a death, by sessionId: since when, for two
+// minutes, so two panels never respawn the same one).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
@@ -1027,6 +1049,9 @@ async function flush($: any) {
           for (const id of news.changed) forgetStored(k => k.endsWith(`:${id}`))
           redraw ||= [...news.changed].some(inThisProject)
           if (!redraw && sessionFiles && !slowList && sessionFiles.usable(myId, myPid)) lastList = sessionFiles.list()
+          // A session came or went in another folder: the line about the sessions that ended with the background
+          // service counts every folder's (a refresh does it otherwise)
+          if (!redraw && news.membership) bg(solo('ended', () => readEnded($)))
         }
         // Who leads changes only when a session comes or goes; what the leader does, when a turn ends or Remote Control
         // moves (the rest waits for the pass)
@@ -1064,7 +1089,58 @@ async function flush($: any) {
 function inThisProject(sessionId: string): boolean {
   if (sessionId === myId || projectRows.some(f => f.sessionId === sessionId)) return true
   const s = (sessionFiles && !slowList ? sessionFiles.list() : lastList).find(x => x.sessionId === sessionId)
-  return !s || (typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home))
+  return !s || belongsHere(s)
+}
+
+// Where each session of the list belongs (sessionHome in state.ts): what its own mod recorded, its heartbeat's root,
+// kept once read (it never changes for a session id); else the first cwd row of its transcript, looked up once for
+// each session (every new one in one command, learnHomes; one without a transcript is looked for again only once it
+// runs, and then 10 minutes apart); else the folder Claude lists it in
+const recordedRoots = new Map<string, string>()
+const transcriptStarts = new Map<string, { cwd: string; live: boolean; at: number }>()
+function whereabouts(s: any): Whereabouts {
+  const id = String(s?.sessionId ?? '')
+  return { recorded: recordedRoots.get(id), first: transcriptStarts.get(id)?.cwd, cwd: s?.cwd }
+}
+
+// Whether a session of the list belongs to a project (this one's by default): this session always belongs to its own
+function belongsHere(s: any, root = myCwd): boolean {
+  if (typeof s?.sessionId !== 'string') return false
+  return (s.sessionId === myId && root === myCwd) || belongsTo(whereabouts(s), root, home)
+}
+
+// The project each session of the list belongs to, learnt from what's cheap first: the heartbeats (the files that
+// changed since they were last read), then the transcripts of the sessions none of them names, with one command for all
+// of them, and only for a session that hasn't been looked for (or one without a transcript that runs now: it may have
+// written one since)
+async function learnHomes($: any, list: readonly any[]) {
+  const unknown = list.filter(s => typeof s.sessionId === 'string' && s.sessionId !== myId && !recordedRoots.has(s.sessionId))
+  if (!unknown.length) return
+  const beats = await readHeartbeats($, unknown.map(s => s.sessionId))
+  for (const [id, h] of Object.entries(beats)) if (h.format === FORMAT && h.root.startsWith('/')) recordedRoots.set(id, h.root)
+  const now = await $.clock.now()
+  const ask = unknown.filter(s => {
+    if (recordedRoots.has(s.sessionId)) return false
+    const known = transcriptStarts.get(s.sessionId)
+    if (!known) return true
+    return !known.cwd && !!s.pid && (!known.live || now - known.at > 600000)
+  })
+  if (!ask.length || !home) return
+  const found = await firstCwds($, ask.map(s => s.sessionId))
+  if (found === null) return
+  if (transcriptStarts.size > 2000) transcriptStarts.clear()
+  for (const s of ask) transcriptStarts.set(s.sessionId, { cwd: found[s.sessionId] ?? '', live: !!s.pid, at: now })
+}
+
+// The first cwd row of each session's transcript, ~/.claude/projects/<folder>/<sessionId>.jsonl, looked for by its id in
+// every folder (a folder's name can't be read back into a path, and a move takes the file to another folder), one
+// command for all of them, with grep (no model, no tokens): parseTranscriptStarts. null: the command failed
+const STARTS_SCRIPT = `p=$1; shift; for id in "$@"; do for f in "$p"/*/"$id".jsonl; do if [ -f "$f" ]; then printf '%s\\t' "$id"; grep -m 1 -F '"cwd":"' "$f" | head -c 65536 | tr -d '\\n'; printf '\\n'; break; fi; done; done`
+async function firstCwds($: any, ids: string[]): Promise<Record<string, string> | null> {
+  const safe = ids.filter(id => /^[A-Za-z0-9-]+$/.test(id))
+  if (!safe.length || !home) return {}
+  const r = await runSafe($, ['/bin/sh', '-c', STARTS_SCRIPT, 'sh', `${home}/.claude/projects`, ...safe])
+  return r.exitCode === 0 ? parseTranscriptStarts(r.stdout) : null
 }
 
 async function bellRinger($: any, name: string): Promise<string> {
@@ -1390,11 +1466,11 @@ async function readHeartbeats($: any, ids: string[]): Promise<Record<string, Hea
   return out
 }
 
-// This session's heartbeat (see Heartbeat in state.ts), every 15 s
+// This session's heartbeat (see Heartbeat in state.ts), every 15 s, with the project it belongs to (settleProject)
 async function beat($: any) {
   if (!dataDir || !myId) return
   const at = await $.clock.now()
-  await $.fs.write(`${dataDir}/alive/${myId}`, heartbeatText({ pid: myPid, at, version: modVersion, via: startedVia }))
+  await $.fs.write(`${dataDir}/alive/${myId}`, heartbeatText({ pid: myPid, at, version: modVersion, via: startedVia, root: myCwd }))
   lastBeat = at
 }
 
@@ -1416,7 +1492,7 @@ async function prune($: any) {
   const ids = new Set<string>()
   const keys = await storeKeys($)
   for (const k of keys) {
-    const m = k.match(/^(state|seen|title|waiting|restarted|reopened|needsSince|pushed|spend|personStop):(.+)$/)
+    const m = k.match(/^(state|seen|title|waiting|restarted|reopened|needsSince|pushed|spend|personStop|project):(.+)$/)
     if (m?.[2] && !alive.has(m[2])) ids.add(m[2])
   }
   let files: string[] = []
@@ -1528,7 +1604,7 @@ async function readUsage($: any, maxAge = USAGE_SHARED_MS, always = false) {
     if (shared) next = { summary: shared, note: '' }
     else if (!py) next = { summary: null, note: 'Token usage needs python3' }
     else {
-      const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`], { timeoutMs: 120000 })
+      const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`, `${dataDir}/alive`], { timeoutMs: 120000 })
       let summary: UsageSummary | null = null
       try {
         if (r.exitCode === 0) summary = usageSummaryOf(JSON.parse(r.stdout))
@@ -1882,11 +1958,16 @@ async function reopenPass($: any) {
 
 // Why stopped sessions stopped, from the background service's log (stopLog), read right then. A log that can't be read
 // says nothing: no session reads as ended by itself (stoppedKind fails closed)
+let parsedLog: { text: string; log: StopLog } | null = null
 async function stopLogNow($: any): Promise<StopLog> {
   const none: StopLog = { reasons: {}, started: {}, deaths: [] }
   if (!daemonLog) return none
   const text = await daemonLogTail($)
-  return text === null ? none : stopLog(text)
+  if (text === null) return none
+  // The same tail as last time (the log didn't move): parsed once
+  if (parsedLog?.text === text) return parsedLog.log
+  parsedLog = { text, log: stopLog(text) }
+  return parsedLog.log
 }
 
 // The end of the background service's log (its last 4000 lines), read with tail only when the log changed (its time
@@ -1921,6 +2002,148 @@ async function stoppedOf($: any, s: any, log: StopLog): Promise<'person' | 'idle
   const beatAt = (await readHeartbeats($, [s.sessionId]))[s.sessionId]?.at
   const runs = [typeof s.id === 'string' ? log.started[s.id] : undefined, beatAt].filter((t): t is number => typeof t === 'number' && t > 0)
   return stoppedKind(reason, personAt, runs.length ? Math.max(...runs) : undefined, log.deaths)
+}
+
+// ---- The sessions that ended with the background service ----
+
+// The background sessions of every folder that ended with Claude's background service and are still stopped
+// (diedWithService: the service's log found workers dead after they last ran, with nothing of their own since and no
+// stop of the person's). From a list as it is (no command), the service's log (read again only when it changed), each
+// one's last heartbeat and the person's stops from a panel (personStop, read only for the sessions the store has one
+// for: keys, one read of the store's keys). No stopped background session, or a log with no death, reads nothing more
+async function endedSessions($: any, list: readonly any[], keys: ReadonlySet<string>): Promise<EndedSession[]> {
+  const stopped = list.filter(s => s.kind === 'background' && !s.pid && typeof s.id === 'string' && typeof s.sessionId === 'string' && s.sessionId !== myId)
+  if (stopped.length === 0 || !daemonLog) return []
+  const log = await stopLogNow($)
+  if (log.deaths.length === 0) return []
+  const beats = await readHeartbeats($, stopped.map(s => s.sessionId))
+  const out: EndedSession[] = []
+  for (const s of stopped) {
+    const personAt = keys.has(`personStop:${s.sessionId}`) ? await storeGet($, `personStop:${s.sessionId}`) : undefined
+    const runs = [log.started[s.id], beats[s.sessionId]?.at].filter((t): t is number => typeof t === 'number' && t > 0)
+    const at = diedWithService(log.reasons[s.id], personAt, runs.length ? Math.max(...runs) : undefined, log.deaths)
+    if (at === undefined) continue
+    out.push({ sessionId: s.sessionId, id: s.id, name: s.name && s.name !== s.id ? String(s.name) : s.id, cwd: typeof s.cwd === 'string' ? s.cwd : '', at })
+  }
+  return out
+}
+
+// The panel's line about them (endedText), the same in every session's panel: worked out again at each refresh, and
+// when a session came or went in any folder (the line counts every folder's). Those of the death the person dismissed
+// the line for, and of the ones before it, are left out (endedDismissed)
+async function readEnded($: any, keys?: ReadonlySet<string>) {
+  const k = keys ?? new Set(await storeKeys($))
+  const all = await endedSessions($, lastList, k)
+  const shown = all.length ? endedShown(all, k.has('endedDismissed') ? await storeGet($, 'endedDismissed') : undefined) : []
+  const line = endedText(shown, await $.clock.now())
+  const next: EndedNote = line ? { ...line, count: shown.length } : null
+  if (!sameData(await read($, ended), next)) await update($, ended, () => next)
+}
+
+// The b key, on that line: a question (how many, from which folders), then they're brought back one at a time,
+// BRING_BACK_STAGGER_MS apart, through the restart path (claude respawn; a window with a launcher that showed one is
+// told to reopen it). Each one is looked at again just before (stillEnded): one the person stopped since, one that runs
+// again, one gone from the list or that another panel is bringing back is skipped, and never one that didn't end with
+// the service. Leave them stopped dismisses the line for that death (endedDismissed): the next death shows it again
+const BRING_BACK_STAGGER_MS = 3000
+const BROUGHT_BACK_MS = 120000
+let bringingBack = false
+async function bringBack($: any) {
+  if (bringingBack) return
+  bringingBack = true
+  try {
+    const list = await officialList($, 2000)
+    if (typeof list === 'string') {
+      $.ui.toast(list)
+      return
+    }
+    const keys = new Set(await storeKeys($))
+    const found = endedShown(await endedSessions($, list, keys), keys.has('endedDismissed') ? await storeGet($, 'endedDismissed') : undefined)
+    if (found.length === 0) {
+      $.ui.toast('Nothing to bring back: those sessions run again, or were stopped or removed')
+      await readEnded($)
+      return
+    }
+    const { bring, leave, options } = bringBackOptions(found.length)
+    let answer = ''
+    try {
+      answer = await $.ui.ask(bringBackQuestion(found, await $.clock.now(), home), { options, header: 'Sessions' })
+    } catch (err) {
+      if (askRejection(err) === 'unshown') {
+        $.ui.toast(`Couldn't show the question in this session (its agent may have no AskUserQuestion): nothing was changed`)
+        return
+      }
+    }
+    // The keyboard back to the panel, on the row that was selected (as after s and u), whatever the answer
+    await focusRow($, selectedRow?.startsWith('s:') ? selectedRow.slice(2) : '', undefined)
+    if (answer === leave) {
+      await storeSet($, 'endedDismissed', Math.max(...found.map(s => s.at)))
+      await readEnded($)
+      return
+    }
+    if (answer !== bring) return
+    if (found.length > 1) $.ui.toast(`Bringing back ${found.length} sessions, one at a time…`)
+    let done = 0
+    let skipped = 0
+    let failed = 0
+    for (const s of found) {
+      if (done + failed > 0) await $.clock.sleep(BRING_BACK_STAGGER_MS)
+      const skip = await stillEnded($, s)
+      if (skip) {
+        skipped++
+        debugLine($, `bring back “${s.name}”: skipped, ${skip}`)
+        continue
+      }
+      const ok = await respawnWithWindows($, s.id, s.name)
+      debugLine($, `bring back “${s.name}”: ${ok ? 'restarted' : 'failed'}`)
+      if (ok) done++
+      else failed++
+      await invalidateList($)
+    }
+    $.ui.toast(bringBackResult(done, skipped, failed))
+    await requestRefresh($, false)
+  } finally {
+    bringingBack = false
+  }
+}
+
+// Whether a session to bring back still ended with the service, right before its respawn: '' if so, and then it's
+// claimed (broughtBack, under the <data>/bringback.lock folder, so another panel bringing it back too skips it); else
+// why not
+async function stillEnded($: any, s: EndedSession): Promise<string> {
+  if (!dataDir) return 'no data folder'
+  let why = 'another panel holds the lock'
+  await withLock($, `${dataDir}/bringback`, async () => {
+    const list = await officialList($, 2000)
+    if (typeof list === 'string') {
+      why = "the session list can't be read"
+      return
+    }
+    const now = list.find(x => x.sessionId === s.sessionId)
+    if (!now || now.id !== s.id) {
+      why = 'gone from the list'
+      return
+    }
+    if (now.pid) {
+      why = 'it runs again'
+      return
+    }
+    const at = await $.clock.now()
+    const claims = await storeGet($, 'broughtBack')
+    const held: Record<string, number> = {}
+    for (const [k, v] of Object.entries(claims && typeof claims === 'object' ? claims : {})) if (typeof v === 'number' && at - v < BROUGHT_BACK_MS) held[k] = v
+    if (held[s.sessionId] !== undefined) {
+      why = 'another panel is bringing it back'
+      return
+    }
+    if ((await endedSessions($, [now], new Set(await storeKeys($)))).length === 0) {
+      why = 'it no longer reads as ended with the service (stopped by you, or it ran since)'
+      return
+    }
+    await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at })
+    why = ''
+  })
+  return why
 }
 
 // Whether a session can be woken (another plugin's wake, ccc tell): running already, or stopped and wakeable. A
@@ -2227,18 +2450,17 @@ async function refresh($: any) {
     const next = myShortId()
     if (!sameData(await read($, shortId), next)) await update($, shortId, () => next)
   }
-  await followFolder($)
+  await followHere($)
+  await learnHomes($, list)
   const pinned = new Set((await pinsFromFile($)) ?? [])
   const now = await $.clock.now()
   const minute = labelMinute(now)
   // One read of the store's keys, and then only the keys that are there: most rows have no title, wait or needs record
   const keys = new Set(await storeKeys($))
   await readMarks($, now, [...keys])
-  // The project's sessions, and this one always, wherever it is (its status from its own turn hooks while they're ahead
-  // of the registry)
-  const project = list
-    .filter(s => typeof s.sessionId === 'string' && (s.sessionId === myId || (typeof s.cwd === 'string' && inProject(s.cwd, myCwd, home))))
-    .map(s => (s.sessionId === myId ? withOwnHint(s, now) : s))
+  // The project's sessions, each in the project it started in wherever it is now (belongsHere), and this one always
+  // (its status from its own turn hooks while they're ahead of the registry)
+  const project = list.filter(s => belongsHere(s)).map(s => (s.sessionId === myId ? withOwnHint(s, now) : s))
   const sinces: { since?: number; staleFrom?: number }[] = []
   const beats = await readHeartbeats($, project.map(s => s.sessionId))
   const plugin = await installedPlugin($)
@@ -2347,6 +2569,8 @@ async function refresh($: any) {
     collapsed = keys.has('collapsed') ? await readCollapsed($) : new Set()
   }
   await layout($, focused)
+  // Every folder's sessions that ended with the background service, for the panel's line
+  await readEnded($, keys)
   {
     const next = noticeText()
     if (!sameData(await read($, notice), next)) await update($, notice, () => next)
@@ -3066,7 +3290,7 @@ async function runLaunches($: any) {
   try {
     for (let l = launches.shift(); l; l = launches.shift()) {
       const list = await officialList($, 2000)
-      const taken = Array.isArray(list) && list.some(s => s.name === l.name && inProject(String(s.cwd), l.root, home))
+      const taken = Array.isArray(list) && list.some(s => s.name === l.name && belongsHere(s, l.root))
       const refusal = taken ? `a session named “${l.name}” is already in ${l.root}` : await launch($, l)
       debugLine($, `start “${l.name}” in ${l.cwd}: ${refusal || 'started'}`)
       if (refusal) $.ui.toast(`Couldn't start “${l.name}”: ${refusal}`)
@@ -3078,9 +3302,8 @@ async function runLaunches($: any) {
 }
 
 async function createSession($: any, name: string) {
-  // The new session starts in the project root: the current one, and only if it's still there
-  await followFolder($)
-  const taken = lastList.filter(x => typeof x.cwd === 'string' && inProject(x.cwd, myCwd, home)).flatMap(x => [x.name, x.id].filter(Boolean))
+  // The new session starts in the project root, the one this session started in, and only if it's still there
+  const taken = lastList.filter(x => belongsHere(x)).flatMap(x => [x.name, x.id].filter(Boolean))
   // A name the project already has would make a second session with it (ccc <name> then opens either): the field
   // stays open for another one
   const typed = name.trim()
@@ -3298,46 +3521,50 @@ async function openAgentsView($: any) {
   }
 }
 
-// The project root follows the session. Its folder is $.session.root(), which moves with /cd, a host's directory change
-// and a worktree (EnterWorktree, ExitWorktree): it's read on every refresh, and the root (rootFrom: the nearest folder
-// upwards with AGENTS.md or CLAUDE.md, else that folder) is worked out again when it moved or when the root folder is
-// gone. A folder that no longer exists gives way to the session's current folder, then to the one the official list
-// shows for it. The markers are looked for on disk from that folder: $.fs.ancestors walks from where the session
-// started, which it may have left. When the root changes, the order file moves with it
-let followedFrom = ''
-async function followFolder($: any) {
+// The project this session belongs to (sessionHome in state.ts), settled at the mod's start: its record in the store,
+// project:<sessionId> (root; from, the folder it was worked out from; at), kept across restarts (claude respawn keeps
+// the session id) and carried over by /clear and /resume (rebind). With none, this is its first start: the project is
+// worked out from where it started (rootOf), the first cwd row of its transcript when it has one already (a session
+// restarted or reloaded into this version after it moved: Claude starts it again where it was), else
+// $.session.root(), and recorded. It's published in the heartbeat (root), where the other panels and ccc read it
+async function settleProject($: any) {
+  if (!myId) return
+  const kept = await storeGet($, `project:${myId}`)
+  if (typeof kept?.root === 'string' && kept.root.startsWith('/')) {
+    myCwd = kept.root
+    return
+  }
+  let from = (await firstCwds($, [myId]))?.[myId] ?? ''
+  for (const ask of [() => $.session.root(), () => $.session.cwd()]) {
+    if (from.startsWith('/')) break
+    try {
+      from = String(await ask())
+    } catch {}
+  }
+  if (!from.startsWith('/')) return
+  myCwd = await rootOf($, from)
+  debugLine($, `project: ${myCwd} (where it started: ${from})`)
+  await storeSet($, `project:${myId}`, { root: myCwd, from, at: await $.clock.now() })
+}
+
+// Where the session works now: $.session.root(), which a worktree move (EnterWorktree, ExitWorktree), /cd and a host's
+// directory change move (a cd in a shell command doesn't), else the folder Claude lists it in; read on every refresh.
+// Its project stays the one it started in (myCwd), and when it works outside it its own panel says so in one line
+// (away, drawn with outsideNote). That folder can be gone (a worktree removed under it, or after it left): nothing
+// runs there, as every command the mod runs starts from the home folder (runSafe)
+async function followHere($: any) {
+  if (!myCwd) await settleProject($)
   let folder = ''
   try {
     folder = String(await $.session.root())
   } catch {}
-  if (folder && folder === followedFrom && myCwd && (await exists($, myCwd))) return
-  let current = ''
-  try {
-    current = String(await $.session.cwd())
-  } catch {}
-  const listed = lastList.find(s => s.sessionId === myId)?.cwd
-  let base = ''
-  for (const f of [folder, current, typeof listed === 'string' ? listed : '']) {
-    if (f.startsWith('/') && (await exists($, f))) {
-      base = f
-      break
-    }
+  if (!folder.startsWith('/')) {
+    const listed = lastList.find(s => s.sessionId === myId)?.cwd
+    folder = typeof listed === 'string' ? listed : ''
   }
-  // Nothing exists: keep the root there is (commands still run from the home folder)
-  if (!base) {
-    if (!myCwd) myCwd = folder || current
-    return
-  }
-  followedFrom = folder
-  const root = await rootOf($, base)
-  if (root === myCwd) return
-  const previous = myCwd
-  myCwd = root
-  debugLine($, `project root: ${previous || '(none)'} → ${root}`)
-  // The launcher reads the order file of each project root: the new one is written on this refresh. The old one stays
-  // for the project's other sessions, unless its folder is gone
-  lastOrder = ''
-  if (previous && dataDir && !(await exists($, previous))) await runSafe($, ['rm', '-f', `${dataDir}/order/${fileKey(previous)}`])
+  hereNow = folder
+  const next = folder && myCwd && !inProject(folder, myCwd, home) ? folder : ''
+  if (!sameData(await read($, away), next)) await update($, away, () => next)
 }
 
 // The project root of a folder (rootFrom), with the AGENTS.md and CLAUDE.md markers looked for on disk (from the
@@ -3706,13 +3933,17 @@ async function rebind($: any) {
   const existing = await readState($, id)
   const now = await $.clock.now()
   await storeSet($, `state:${id}`, existing ?? { created: previous?.created ?? now, model: previous?.model, context: undefined, version: previous?.version, agent: previous?.agent, root: previous?.root })
+  // The project the session belongs to is the process's, the one it started in: the record moves over
+  const project = await storeGet($, `project:${old}`)
+  if (project) await storeSet($, `project:${id}`, project)
+  else if (myCwd) await storeSet($, `project:${id}`, { root: myCwd, from: myCwd, at: now })
   const seen = await storeGet($, `seen:${old}`)
   if (seen && !(await storeGet($, `seen:${id}`))) await storeSet($, `seen:${id}`, seen)
   // What it spends an hour is the process's, whatever the conversation: its ledger carries over
   if (ledgerFor === old) ledgerFor = id
   const spent = await storeGet($, `spend:${old}`)
   if (spent && !(await storeGet($, `spend:${id}`))) await storeSet($, `spend:${id}`, spent)
-  for (const k of ['state', 'seen', 'title', 'waiting', 'restarted', 'needsSince', 'pushed', 'spend']) await storeDelete($, `${k}:${old}`)
+  for (const k of ['state', 'seen', 'title', 'waiting', 'restarted', 'needsSince', 'pushed', 'spend', 'project']) await storeDelete($, `${k}:${old}`)
   await runSafe($, ['rm', '-f', `${dataDir}/alive/${old}`, `${dataDir}/inbox/${old}`])
   // A regular session is named by its session id in sections.json (sid:<id>): its section moves to the new id. A
   // background one keeps its short id, and its section
@@ -3833,7 +4064,7 @@ async function statusText($: any): Promise<string> {
   const lines = [
     `sessions ${modVersion || '?'} · ${copy}`,
     `Running here: started ${ago(startedAt)} by ${startedVia || 'nothing'}${startedVia !== 'session.start' ? (sawSessionStart ? ' (session.start came later)' : ' (session.start never came)') : ''}`,
-    `Session: ${myId} · project: ${myCwd}`,
+    `Session: ${myId} · project: ${myCwd} (where it started)${hereNow && myCwd && !inProject(hereNow, myCwd, home) ? ` · working in ${hereNow}, outside it` : ''}`,
     `Heartbeat: ${lastBeat ? `written ${ago(lastBeat)}` : 'not written'} (${dataDir}/alive)`,
     silent.length ? `No panel running in: ${silent.join(', ')}` : 'Every session of the project that should run a panel does',
     `For other plugins: $.sessions api ${SESSIONS_API} · ${Object.keys(METHODS).join(', ')} (${ready() ? 'ready' : 'not ready yet'})`,
@@ -3948,7 +4179,8 @@ async function statusOf($: any, s: any, now: number, reasons: () => Promise<Stop
     name: shown ?? (typeof s.name === 'string' && s.name ? s.name : null),
     state,
     panel: hb === 'ok' ? 'ok' : hb === 'other-format' ? 'other-format' : 'none',
-    root: mine ? myCwd : typeof e?.root === 'string' ? e.root : null,
+    // The project it belongs to as its own mod recorded it (its heartbeat), else as its panel published it
+    root: mine ? myCwd : (recordedRoots.get(s.sessionId) ?? (typeof e?.root === 'string' ? e.root : null)),
     background: s.kind === 'background',
     agent: mine ? (agentFor === myId ? myAgent : null) : typeof e?.agent === 'string' ? e.agent : null,
     ...(state === 'stopped' && s.kind === 'background' && !s.pid ? { stopped: await stoppedOf($, s, await reasons()) } : {}),
@@ -4025,8 +4257,9 @@ function sessionsApi($: any): Sessions {
       if (!folder) return { ok: false, reason: 'invalid', detail: `${l.cwd} isn't a folder` }
       if (l.settings && !(await exists($, l.settings))) return { ok: false, reason: 'invalid', detail: `${l.settings} doesn't exist` }
       const root = await rootOf($, l.cwd)
-      const same = (name: unknown, cwd: unknown) => name === l.name && typeof cwd === 'string' && inProject(cwd, root, home)
-      if (lastList.some(s => same(s.name, s.cwd)) || launches.some(x => same(x.name, x.cwd))) return { ok: false, reason: 'refused', detail: `a session named “${l.name}” is already in ${root}` }
+      // Each session in the project it belongs to (belongsHere), a queued one in the folder it will start in
+      const taken = lastList.some(s => s.name === l.name && belongsHere(s, root)) || launches.some(x => x.name === l.name && inProject(x.cwd, root, home))
+      if (taken) return { ok: false, reason: 'refused', detail: `a session named “${l.name}” is already in ${root}` }
       launches.push({ ...l, root })
       kickQueue()
       return { ok: true, queued: true }
@@ -4199,7 +4432,7 @@ async function start($: any) {
       const sub = ['alive', 'order', 'inbox', 'windows', 'replies', 'debug', 'usage', 'tell'].map(d => `${dataDir}/${d}`)
       await runSafe($, ['mkdir', '-p', ...sub])
     }
-    await followFolder($)
+    await settleProject($)
   })
   await step('settings for the launcher', async () => {
     if (!dataDir) return
@@ -4662,12 +4895,20 @@ export const register: Register = (on, options) => {
     // above them, as Text too
     const plan = drawPlan(list)
     const shownRows = list.filter(f => !f.folded)
+    // The line about the sessions of every folder that ended with the background service, under the legend: one line,
+    // more where the panel is narrower than it (it wraps between words)
+    const endedNote = await read($, ended)
+    const endedLine = endedNote ? `${endedNote.text}${inTerminal ? ` · b: ${endedNote.action}` : ''}` : ''
+    // Where this session works when that's outside its project (one line under the legend): it stays in the project it
+    // started in, and in every panel of it, wherever it goes
+    const awayFolder = await read($, away)
+    const endedRows = (endedLine ? Math.ceil((displayWidth(endedLine) + 4) / Math.max(20, (e.props.bodyColumns ?? 48) - 1)) : 0) + (awayFolder ? 1 : 0)
     // While the list doesn't fit, the status lines of rows that don't need you are left out (their badges stay), so more
     // sessions fit; a row that waits for you, or that a plugin marked as needing you, keeps its line
-    const crowded = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0) + 6 + (note !== '' ? 1 : 0) > height
+    const crowded = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0) + 6 + (note !== '' ? 1 : 0) + endedRows > height
     const keepsLine = (f: Row) => !!f.line && (!crowded || f.color === 'red' || f.needsPerson === true)
     const lines = plan.length + shownRows.filter(keepsLine).length + (about.waitingOnly ? 1 : 0)
-    const overflows = lines + 6 + (note !== '' ? 1 : 0) > height
+    const overflows = lines + 6 + (note !== '' ? 1 : 0) + endedRows > height
     // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
     // and a flexible spacer pushes the block down
@@ -4677,7 +4918,7 @@ export const register: Register = (on, options) => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
+      lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
     // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
     const usageData = showUsage ? await read($, usage) : null
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
@@ -4826,6 +5067,18 @@ export const register: Register = (on, options) => {
         <Text dimColor>
           <Text color={TINT.red}>●</Text> Attention  <Text color={TINT.blue}>●</Text> Working  <Text color={TINT.yellow}>●</Text> Done  <Text color={TINT.green}>●</Text> Idle  <Text color={TINT.gray}>●</Text> Stopped
         </Text>
+        {awayFolder !== '' && <Text key="away" dimColor>{outsideNote(awayFolder, myCwd, home, total)}</Text>}
+        {/* Sessions of any folder that ended with the background service: b asks, then brings them back. Under the
+            legend, after every row and field: a line that comes and goes there moves nothing the arrows go through.
+            A word each, so a panel narrower than the line wraps it between words with the key flowing after them */}
+        {endedNote && (
+          <Box flexDirection="row" flexWrap="wrap">
+            {(inTerminal ? `${endedNote.text} ·` : endedNote.text).split(' ').map((word, i) => (
+              <Text key={`ended:${i}`} color="warning">{`${word} `}</Text>
+            ))}
+            {inTerminal && <Button key="bring-back" plain hotkey="b" label={endedNote.action} onPress={() => { bg(bringBack($)) }} />}
+          </Box>
+        )}
         {list.some(f => f.outdated) && (
           <Text dimColor>
             <Text color="claude">↑</Text>
@@ -4865,7 +5118,9 @@ export const register: Register = (on, options) => {
         {showUsage &&
           usageData?.summary &&
           (() => {
-            const includes = view.scope === 'all' ? () => true : (cwd: string) => inProject(cwd, myCwd, home)
+            // usage.py counts each response in the folder its session belongs to (sessionHome's rule), and this session's
+            // project is the one it started in: a session's tokens stay in its project wherever it worked
+            const includes = view.scope === 'all' ? () => true : (folder: string) => inProject(folder, myCwd, home)
             const w = usageWindow(usageData.summary, view.period, includes)
             const [input = 0, output = 0, cacheRead = 0, cacheWritten = 0, thinking = 0] = w.totals
             const sumLabel = abbreviate(input + output + cacheRead + cacheWritten)

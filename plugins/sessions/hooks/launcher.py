@@ -5,6 +5,7 @@
     launcher.py pick [--tty TTY] [--new] [NAME...]      the decision only, as JSON (tests and debugging)
     launcher.py tell [--in DIR] [--wait[=S]] NAME|ID [TEXT... | -]   ccc tell: hand a background session text (tell())
     launcher.py section [--session NAME|ID] [TITLE | -]  ccc section: the person's section for a session (section())
+    launcher.py tidy [--here] [--pinned] [--days N] [--list]   ccc tidy: end the sessions no longer needed (tidy())
 
 start decides and, when something should open in this window, writes it to FILE (the window's file, which visor.sh
 reads): the project's top session, the session NAME (created if there's none), the agent view (--agents). In order:
@@ -25,9 +26,17 @@ The files it reads and writes are the mod's (hooks/state.ts has the formats): <d
 next), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), <data>/sections.json (the
 person's sections, which ccc section changes, ringing <data>/bell/sections for the panels that watch it), with
 <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
+Claude's own files, read only: the first row of a session's transcript (~/.claude/projects/*/<sessionId>.jsonl, under
+HOME), for the project of a session whose heartbeat doesn't name one (session_homes); and by ccc tidy, <jobs>/pins.json
+and <jobs>/<id>/state.json (the background service's: ~/.claude/jobs or SESSIONS_JOBS_DIR), <registry>/<pid>.json (the
+running sessions: ~/.claude/sessions or SESSIONS_REGISTRY_DIR), when each stopped session's transcript was last
+written, and the background service's log for the stopped ones that ended with it (~/.claude/daemon.log or
+SESSIONS_DAEMON_LOG).
 Other environment: SESSIONS_CLAUDE (the claude command), SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the
 installed plugin, from the ccc command), SESSIONS_START_WAIT (seconds to wait for a new session's mod).
 """
+import collections
+import datetime
 import json
 import os
 import re
@@ -48,6 +57,10 @@ INBOX_FRESH_MS = 30000
 HOME = os.environ.get('HOME', '')
 DATA = os.environ.get('SESSIONS_DATA_DIR') or os.path.join(HOME, '.claude', 'mods', 'sessions-data')
 CLAUDE = os.environ.get('SESSIONS_CLAUDE') or 'claude'
+JOBS = os.environ.get('SESSIONS_JOBS_DIR') or os.path.join(HOME, '.claude', 'jobs')
+REGISTRY = os.environ.get('SESSIONS_REGISTRY_DIR') or os.path.join(HOME, '.claude', 'sessions')
+PROJECTS = os.path.join(HOME, '.claude', 'projects')
+DAEMON_LOG = os.environ.get('SESSIONS_DAEMON_LOG') or os.path.join(HOME, '.claude', 'daemon.log')
 START_WAIT = float(os.environ.get('SESSIONS_START_WAIT') or '10')
 
 DIM, RESET, BOLD = '\033[2m', '\033[0m', '\033[1m'
@@ -125,6 +138,31 @@ def in_project(cwd, root, home):
     return cwd.startswith(root + '/')
 
 
+# The folder that says which project a session belongs to (sessionHome in state.ts): the one it started in, wherever
+# it went afterwards (a worktree inside or outside the project, /cd), which `claude agents` lists it in. In order: the
+# project root its own mod recorded (its heartbeat's root, in this format, however old: a stopped session's too), the
+# first cwd row of its transcript, the folder it's listed in. {sessionId: folder}, for the sessions given
+def session_homes(sessions):
+    homes, missing = {}, []
+    for s in sessions:
+        beat = read_heartbeat(s['sessionId'])
+        root = beat['root'] if beat and beat['format'] == FORMAT else ''
+        if root.startswith('/'):
+            homes[s['sessionId']] = root
+        else:
+            missing.append(s['sessionId'])
+    starts = {sid: first_cwd(path) for sid, (path, _) in transcripts(missing).items()}
+    for s in sessions:
+        homes.setdefault(s['sessionId'], starts.get(s['sessionId']) or s['cwd'])
+    return homes
+
+
+# The sessions of the list that belong to the project at root (session_homes)
+def project_sessions(sessions, root):
+    homes = session_homes(sessions)
+    return [s for s in sessions if in_project(homes[s['sessionId']], root, HOME)]
+
+
 # What ccc hands the launcher (the installed plugin's version and since when) is for the launcher alone. A claude it ran
 # with them would pass them on: to the background service, when that call is what starts it, and from there to every
 # session the service starts, whose mod would keep its data apart (a store namespace, as a test session's). Every other
@@ -177,7 +215,7 @@ def read_heartbeat(session_id):
         pid = int(k.get('pid') or 0)
     except ValueError:
         pid = 0
-    return {'format': int(k['format']) if k['format'].isdigit() else 0, 'pid': pid, 'at': at, 'version': k.get('version', '')}
+    return {'format': int(k['format']) if k['format'].isdigit() else 0, 'pid': pid, 'at': at, 'version': k.get('version', ''), 'root': k.get('root', '')}
 
 
 # heartbeatStatus in state.ts
@@ -248,10 +286,10 @@ def client_command(command):
     return ('claude ' + m.group(1) if m.group(1) else 'claude') if m else command
 
 
-# Which windows show which session, from ps (parseWindows in state.ts): viewers (claude attach <id>), launchers, and
-# every process's terminal (by_pid: a regular session's own window)
+# Which windows show which session, from ps (parseWindows in state.ts): viewers (claude attach <id>), launchers, agent
+# views (views), and every process's terminal (by_pid: a regular session's own window)
 def parse_windows(ps):
-    by_id, by_pid, clients, launchers = {}, {}, {}, {}
+    by_id, by_pid, clients, launchers, views = {}, {}, {}, {}, {}
     for line in ps.split('\n'):
         parts = line.split()
         if len(parts) < 3 or parts[1] in ('??', '?', '-'):
@@ -264,9 +302,10 @@ def parse_windows(ps):
             clients[tty] = pid
         if re.match(r'^(\S*/)?claude agents( |$)', command):
             clients[tty] = pid
+            views[tty] = pid
         if re.match(r'^(\S*/)?bash \S*/visor\.sh( |$)', command):
             launchers[tty] = pid
-    return {'by_id': by_id, 'by_pid': by_pid, 'clients': clients, 'launchers': launchers}
+    return {'by_id': by_id, 'by_pid': by_pid, 'clients': clients, 'launchers': launchers, 'views': views}
 
 
 def read_windows():
@@ -280,7 +319,7 @@ def context(tty, exclude=()):
     root = project_root(cwd)
     now = now_ms()
     sessions = list_sessions()
-    rows = [s for s in (sessions or []) if in_project(s['cwd'], root, HOME) and s.get('id') not in exclude]
+    rows = [s for s in project_sessions(sessions or [], root) if s.get('id') not in exclude]
     rows = order_rows(rows, read_order(root, now))
     beats = {s['sessionId']: read_heartbeat(s['sessionId']) for s in rows}
     return {
@@ -643,7 +682,7 @@ def find_tell_target(sessions, target, folder):
     def named(rows):
         exact = [s for s in rows if s.get('name') == target]
         return exact or [s for s in rows if str(s.get('name') or '').casefold() == target.casefold()]
-    found = named([s for s in background if in_project(s['cwd'], root, HOME)]) or named(background)
+    found = named(project_sessions(background, root)) or named(background)
     if len(found) == 1:
         return found[0], None
     if found:
@@ -738,7 +777,8 @@ def tell(argv):
         # Stopped: a running session's mod wakes it, if the rules allow (retired for being idle)
         others = [x for x in sessions if x['sessionId'] != s['sessionId'] and is_live(x)
                   and heartbeat_status(read_heartbeat(x['sessionId']), x.get('pid'), now) == 'ok']
-        answer = ask_helpers(sorted(others, key=lambda x: not in_project(x['cwd'], s['cwd'], HOME)), 'wake', ref=ref)
+        homes = session_homes(others + [s])
+        answer = ask_helpers(sorted(others, key=lambda x: not in_project(homes[x['sessionId']], homes[s['sessionId']], HOME)), 'wake', ref=ref)
         if not answer or answer.get('state') not in ('running', 'queued'):
             reason = answer.get('reason') if answer else 'it is stopped, and no session with a running panel answered to wake it'
             for ending in ('.req', '.txt'):
@@ -899,7 +939,7 @@ def section(argv):
         say("Couldn't read the session list (claude agents --json)")
         return 1
     root = project_root(os.path.realpath(os.getcwd()))
-    rows = [s for s in sessions if in_project(s['cwd'], root, HOME)]
+    rows = project_sessions(sessions, root)
     s, why = section_target(sessions, rows, name, root)
     if not s:
         say(why)
@@ -954,11 +994,540 @@ def ring(name):
         pass
 
 
+# --- ccc tidy ------------------------------------------------------------------------------------------------------
+#
+# ccc tidy [--here] [--pinned] [--days N] [--list] lists the sessions of every folder (--here: of this folder's project,
+# by the root ccc uses) from `claude agents --json --all`, and ends the ones the person picks by number: a stopped one is
+# removed from the list (claude rm), an idle background one is stopped and removed (claude stop, then claude rm). Never
+# offered, each with why: a session that works or waits for him, one with tasks in the background, one a window shows,
+# a pinned one (unless --pinned) and a regular one. Nothing is done without a pick, running sessions need a second yes,
+# and each one is checked again just before it's stopped. --days N offers only the stopped sessions last used more than
+# N days ago (their transcript's time; without one, when they started); --list prints the list and asks nothing. It
+# reads, never writes: pins.json and each job's state.json in the service's folder (JOBS), the registry file of a running
+# session for how long it's been idle (REGISTRY), when each stopped session's transcript was last written (PROJECTS),
+# the service's log for the stopped ones that ended with the service, marked as such (DAEMON_LOG), ps for the windows.
+# Exits 0 when it ran, picked or not; 1 when the list can't be read or a claude stop or rm failed; 2 for usage.
+
+TIDY_USAGE = 'usage: ccc tidy [--here] [--pinned] [--days <n>] [--list]'
+
+
+def read_json(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# The pinned sessions' short ids (pins.json: Ctrl+T in claude agents writes it, and the mod for Remote Control): an
+# empty set without the file; None when it isn't a list of ids (then any session may be pinned)
+def read_pins():
+    path = os.path.join(JOBS, 'pins.json')
+    if not os.path.exists(path):
+        return set()
+    d = read_json(path)
+    if not isinstance(d, list) or not all(isinstance(x, str) for x in d):
+        return None
+    return set(d)
+
+
+# A background session's state in the service's folder (its tasks, its Remote Control), or None
+def job_state(short):
+    if not re.match(r'^[A-Za-z0-9_-]+$', short or ''):
+        return None
+    d = read_json(os.path.join(JOBS, short, 'state.json'))
+    return d if isinstance(d, dict) else None
+
+
+def number(x):
+    if isinstance(x, bool):
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+# realTasks in state.ts: what a session runs in the background beside its turn (an artifact watch isn't work), as
+# (count, kinds); none known is none
+def real_tasks(job):
+    flight = (job or {}).get('inFlight')
+    total = number(flight.get('tasks')) if isinstance(flight, dict) else None
+    if total is None:
+        return 0, []
+    drainable = number(flight.get('drainableMonitors')) or 0
+    kinds = []
+    for k in flight.get('kinds') if isinstance(flight.get('kinds'), list) else []:
+        if str(k) not in kinds and (str(k) != 'artifact_watch' or drainable == 0):
+            kinds.append(str(k))
+    return max(0, int(total - drainable)), kinds
+
+
+# Since when a running session has been idle: statusUpdatedAt in Claude's registry file of its process, when that file
+# is still its own and says idle (claude agents --json doesn't give it)
+def idle_since(s):
+    pid = s.get('pid')
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    d = read_json(os.path.join(REGISTRY, '%d.json' % pid))
+    if not isinstance(d, dict) or d.get('sessionId') != s['sessionId'] or d.get('status') != 'idle':
+        return None
+    t = number(d.get('statusUpdatedAt'))
+    return t if t and t > 0 else None
+
+
+def span(ms):
+    s = int(max(0, ms) // 1000)
+    if s < 60:
+        return '%d s' % s
+    if s < 3600:
+        return '%d min' % (s // 60)
+    if s < 48 * 3600:
+        return '%d h' % (s // 3600)
+    return '%d d' % (s // 86400)
+
+
+def started_ago(s, now):
+    t = number(s.get('startedAt'))
+    return 'started %s ago' % span(now - t) if t else 'start time unknown'
+
+
+# Each session's transcript, <projects>/<folder>/<sessionId>.jsonl, and when it was last written (ms). Found by its name
+# in every folder, one listing of each for all the sessions at once: a folder's name is the project's path with each
+# character other than a letter or a digit written as -, which can't be read back, and Claude moves the file to another
+# folder when the session moves (/cd, a worktree). {sessionId: (path, ms)}, the newest file when there are two; a
+# session missing has no transcript
+def transcripts(session_ids):
+    wanted = {sid + '.jsonl': sid for sid in session_ids if re.match(r'^[A-Za-z0-9-]+$', sid or '')}
+    found = {}
+    if not wanted:
+        return found
+    try:
+        with os.scandir(PROJECTS) as entries:
+            folders = [e.path for e in entries if e.is_dir()]
+    except OSError:
+        return found
+    for folder in folders:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in wanted.keys() & set(names):
+            path = os.path.join(folder, name)
+            try:
+                t = os.stat(path).st_mtime * 1000
+            except OSError:
+                continue
+            if t >= found.get(wanted[name], ('', -1))[1]:
+                found[wanted[name]] = (path, t)
+    return found
+
+
+# When each session was last used: the modification time of its transcript (transcripts), in ms. {sessionId: ms}
+def last_used(session_ids):
+    return {sid: t for sid, (_, t) in transcripts(session_ids).items()}
+
+
+# The cwd of a transcript's first row that has one: where its session started (the rows after a move carry the new
+# folder, and the file moves, but the first row stays); '' without one (usage.py's first_cwd)
+def first_cwd(path):
+    try:
+        with open(path, 'rb') as f:
+            for n, line in enumerate(f):
+                if b'"cwd":"' in line:
+                    try:
+                        cwd = json.loads(line).get('cwd')
+                    except (ValueError, AttributeError):
+                        return ''
+                    return cwd if isinstance(cwd, str) and cwd.startswith('/') else ''
+                if n >= 1000:
+                    break
+    except OSError:
+        pass
+    return ''
+
+
+# A stopped session's time: when it was last used (its transcript), else when it started, saying why
+def stopped_ago(s, used, now):
+    if used:
+        return 'last used %s ago' % span(now - used)
+    return "%s (its transcript wasn't found)" % started_ago(s, now)
+
+
+# stopLog in state.ts: from the background service's log (its last 4000 lines, as the mod reads it), why each stopped
+# session stopped (retire: the service retired it; settled with no retire before: its process ended, killed by a claude
+# stop or by itself), when each last started (claimed-spare, spawned: that clears its stop), and when the service found
+# its workers dead (adopt: … dead=N, at its next start). Nothing when the log can't be read
+LOG_EVENT = re.compile(r'^\[([^\]]+)\] \[bg\] bg (retire|settled|claimed-spare|spawned) ([0-9a-f]{8})\b(.*)$')
+LOG_ADOPT = re.compile(r'^\[([^\]]+)\] \[bg\] bg adopt: .*\bdead=(\d+)')
+
+
+def log_time(text):
+    try:
+        return datetime.datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp() * 1000
+    except ValueError:
+        return 0
+
+
+def stop_log(lines):
+    reasons, started, deaths = {}, {}, []
+    for line in lines:
+        line = line.rstrip('\n')
+        m = LOG_ADOPT.match(line)
+        if m:
+            if int(m.group(2)) > 0:
+                deaths.append(log_time(m.group(1)))
+            continue
+        m = LOG_EVENT.match(line)
+        if not m:
+            continue
+        at, event, sid, rest = log_time(m.group(1)), m.group(2), m.group(3), m.group(4)
+        if event == 'retire':
+            reasons[sid] = 'low-memory' if re.search(r'\[low memory', rest) else 'idle'
+        elif event == 'settled':
+            reasons.setdefault(sid, 'stopped' if re.match(r'^\s*\(killed\)', rest) else 'ended')
+        else:
+            reasons.pop(sid, None)
+            started[sid] = at
+    return reasons, started, deaths
+
+
+def read_stop_log():
+    try:
+        with open(DAEMON_LOG, encoding='utf-8', errors='replace') as f:
+            return stop_log(collections.deque(f, maxlen=4000))
+    except OSError:
+        return {}, {}, []
+
+
+# diedWithService in state.ts: a stopped background session ended with the background service when nothing of its own
+# came after it last ran (no retire, no end of its process: a claude stop's is the person's) and the service found
+# workers dead at or after that; when: the first such death. The mod also leaves out one the person stopped from a
+# panel once the log no longer shows that stop (it keeps it in Claude's store, which ccc doesn't read): here it's a
+# mark beside the session, nothing is done with it
+def died_with_service(reason, last_run, deaths):
+    if reason or not last_run or last_run <= 0:
+        return None
+    after = [t for t in deaths if t >= last_run]
+    return min(after) if after else None
+
+
+# The stopped background sessions that ended with the service: {sessionId: when}. When each one last ran: its last start
+# in the log, or its mod's last heartbeat
+def ended_with_service(sessions):
+    stopped = [s for s in sessions if s.get('kind') == 'background' and not s.get('pid') and s.get('id')]
+    if not stopped:
+        return {}
+    reasons, started, deaths = read_stop_log()
+    if not deaths:
+        return {}
+    out = {}
+    for s in stopped:
+        beat = read_heartbeat(s['sessionId'])
+        runs = [t for t in (started.get(s['id']), beat['at'] if beat else None) if t]
+        at = died_with_service(reasons.get(s['id']), max(runs) if runs else None, deaths)
+        if at is not None:
+            out[s['sessionId']] = at
+    return out
+
+
+# clockText in state.ts: a time of day, local ("14:05"), with its day when it isn't today's ("14:05 on Oct 30")
+MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+
+
+def clock_text(ms, now):
+    at, today = time.localtime(ms / 1000), time.localtime(now / 1000)
+    hm = '%02d:%02d' % (at.tm_hour, at.tm_min)
+    if (at.tm_year, at.tm_yday) == (today.tm_year, today.tm_yday):
+        return hm
+    return '%s on %s %d' % (hm, MONTHS[at.tm_mon - 1], at.tm_mday)
+
+
+# What ccc tidy may do with a session, and the words for it: ('stopped', when) it can be removed, ('running', when) it
+# can be stopped and removed, ('kept', why) it's never offered. windows: read_windows(); pins: read_pins(); job: its
+# job_state(); pinned_ok: --pinned; used: when it was last used (last_used), if known; ended: when it ended with the
+# background service (ended_with_service), if it did
+def tidy_verdict(s, windows, pins, job, pinned_ok, now, used=None, ended=None):
+    sid = s.get('id')
+    if s.get('kind') != 'background':
+        return 'kept', 'a regular session: /exit it in its window'
+    if not sid:
+        return 'kept', "no id: claude stop and claude rm can't name it"
+    shown = windows['by_id'].get(sid, [])
+    where = 'shown in a window now (%s)' % ', '.join(t.replace('/dev/', '') for t in shown)
+    remote = bool(s.get('pid') and job and isinstance(job.get('bridgeSessionId'), str) and job['bridgeSessionId'])
+    # pinned: why a pinned one is left alone; note: what an offered one says it is (--pinned)
+    pinned, note = None, ''
+    if pins is None and not pinned_ok:
+        pinned = "pins.json can't be read, so it may be pinned: --pinned to offer it"
+    elif pins is not None and sid in pins:
+        note = ' · pinned, Remote Control on' if remote else ' · pinned'
+        if not pinned_ok:
+            pinned = 'pinned: --pinned to offer it'
+            if s.get('pid'):
+                pinned = ('pinned, Remote Control on: turn off Remote Control, or --pinned to offer it' if remote
+                          else 'pinned: unpin it (Ctrl+T in claude agents), or --pinned to offer it')
+    if not s.get('pid'):
+        if shown:
+            return 'kept', where
+        if pinned:
+            return 'kept', pinned
+        why = ' · ended with the background service at %s' % clock_text(ended, now) if ended else ''
+        return 'stopped', stopped_ago(s, used, now) + why + note
+    status = s.get('status')
+    if status == 'busy':
+        return 'kept', 'busy: never stopped while it works'
+    if status == 'waiting':
+        return 'kept', 'waiting for you (a question or a permission)'
+    if status != 'idle':
+        return 'kept', 'running, its status unknown'
+    count, kinds = real_tasks(job)
+    if count:
+        return 'kept', 'idle, but %s in the background%s' % (
+            '1 task runs' if count == 1 else '%d tasks run' % count, ' (%s)' % ', '.join(kinds) if kinds else '')
+    if shown:
+        return 'kept', where
+    if pinned:
+        return 'kept', pinned
+    since = idle_since(s)
+    return 'running', ('idle %s' % span(now - since) if since else 'idle, %s' % started_ago(s, now)) + note
+
+
+# A folder with the home folder as ~ (as it's written, or as its real path: the list has real paths)
+def short_path(p):
+    for home in (HOME, os.path.realpath(HOME) if HOME else ''):
+        if home and home != '/' and (p == home or p.startswith(home + '/')):
+            return '~' + p[len(home):]
+    return p
+
+
+def clip(text, width, left=False):
+    if len(text) <= width:
+        return text
+    return '…' + text[-(width - 1):] if left else text[:width - 1] + '…'
+
+
+# The inventory: the sessions to offer, numbered (stopped first, used longest ago first; then idle running ones, idle
+# longest first), the ones left alone with why, and how many stopped ones --days left out. used: last_used(); ended:
+# ended_with_service()
+def tidy_inventory(sessions, windows, pins, pinned_ok, days, now, used, ended=None):
+    stopped, running, kept, recent = [], [], [], 0
+    for s in sessions:
+        verdict, words = tidy_verdict(s, windows, pins, job_state(s.get('id')), pinned_ok, now, used.get(s['sessionId']),
+                                      (ended or {}).get(s['sessionId']))
+        item = {'session': s, 'group': verdict, 'words': words}
+        if verdict == 'stopped':
+            # When it was last used, or else when it started
+            item['at'] = used.get(s['sessionId']) or number(s.get('startedAt'))
+            if days is not None and (not item['at'] or now - item['at'] <= days * 86400000):
+                recent += 1
+                continue
+            stopped.append(item)
+        elif verdict == 'running':
+            running.append(item)
+        else:
+            kept.append(item)
+    stopped.sort(key=lambda i: i['at'] or 0)
+    running.sort(key=lambda i: idle_since(i['session']) or number(i['session'].get('startedAt')) or 0)
+    kept.sort(key=lambda i: (i['session']['cwd'], title_of(i['session']).casefold()))
+    for n, item in enumerate(stopped + running, 1):
+        item['n'] = n
+    return {'stopped': stopped, 'running': running, 'kept': kept, 'recent': recent}
+
+
+def tidy_print(inv, heading, days, windows, pinned_ok):
+    rows = inv['stopped'] + inv['running'] + inv['kept']
+    width = len(str(len(inv['stopped']) + len(inv['running'])))
+    names = min(32, max([len(title_of(i['session'])) for i in rows] or [0]))
+    folders = min(48, max([len(short_path(i['session']['cwd'])) for i in rows] or [0]))
+
+    def line(item):
+        n = str(item['n']).rjust(width) if 'n' in item else ' ' * width
+        folder = clip(short_path(item['session']['cwd']), folders, left=True).ljust(folders)
+        say('  %s%s%s  %s  %s%s  %s%s' % (BOLD, n, RESET, clip(title_of(item['session']), names).ljust(names), DIM, folder, item['words'], RESET))
+    say('%sSessions · %s%s' % (DIM, heading, RESET))
+    if not rows and not inv['recent']:
+        say('No sessions.')
+        return
+    if inv['stopped'] or inv['recent']:
+        say('Stopped (no process: a list entry and its conversation on disk) · remove')
+        for item in inv['stopped']:
+            line(item)
+        if inv['recent']:
+            say('  %s%d more stopped, used in the last %g days (--days %g)%s' % (DIM, inv['recent'], days, days, RESET))
+    if inv['running']:
+        say('Running in the background, idle%s · stop and remove' % ('' if pinned_ok else ', not pinned'))
+        for item in inv['running']:
+            line(item)
+    if inv['kept']:
+        say('Left alone')
+        for item in inv['kept']:
+            line(item)
+    if windows['views']:
+        say('%sAn agent view is open (%s): a session open in it doesn\'t count as shown in a window.%s' % (
+            DIM, ', '.join(sorted(t.replace('/dev/', '') for t in windows['views'])), RESET))
+
+
+# A pick: numbers and ranges (1 3-5), s for every stopped one. The numbers picked, or None and why not
+def parse_pick(text, count, stopped):
+    picked = set()
+    for word in re.split(r'[\s,]+', text.strip()):
+        if not word:
+            continue
+        if word.lower() == 's':
+            if not stopped:
+                return None, 's: no stopped session is offered'
+            picked.update(range(1, stopped + 1))
+            continue
+        m = re.match(r'^(\d+)(?:-(\d+))?$', word)
+        if not m:
+            return None, '%s: not a number or a range' % word
+        a, b = sorted((int(m.group(1)), int(m.group(2) or m.group(1))))
+        if a < 1 or b > count:
+            return None, '%s: the numbers go from 1 to %d' % (word, count)
+        picked.update(range(a, b + 1))
+    return sorted(picked), None
+
+
+def cli_failure(code, out, err):
+    text = (err or '').strip() or (out or '').strip()
+    return text.replace('\n', '\n      ') if text else 'claude exited with %d' % code
+
+
+def tidy_result(item, outcome):
+    say('  %s%s%s  %s  %s' % (BOLD, item['n'], RESET, title_of(item['session']), outcome))
+
+
+# Acts on one picked session, on what it is now (fresh: the list, windows and pins just read). True unless the list
+# couldn't be read again or a claude stop or rm failed
+def tidy_act(item, fresh, pinned_ok):
+    rows, windows, pins = fresh
+    if rows is None:
+        tidy_result(item, "skipped: couldn't read the session list again")
+        return False
+    s = next((x for x in rows if x['sessionId'] == item['session']['sessionId']), None)
+    if not s:
+        tidy_result(item, 'skipped: it left the list meanwhile')
+        return True
+    verdict, words = tidy_verdict(s, windows, pins, job_state(s.get('id')), pinned_ok, now_ms())
+    if verdict == 'kept':
+        tidy_result(item, 'skipped: %s' % words)
+        return True
+    if verdict == 'running' and item['group'] == 'stopped':
+        tidy_result(item, "skipped: it's running again")
+        return True
+    if verdict == 'running':
+        code, out, err = run([CLAUDE, 'stop', s['id']], timeout=60)
+        if code != 0:
+            tidy_result(item, 'failed: %s' % cli_failure(code, out, err))
+            return False
+    code, out, err = run([CLAUDE, 'rm', s['id']], timeout=60)
+    if code != 0:
+        tidy_result(item, '%s: %s' % ('stopped, but not removed' if verdict == 'running' else 'failed', cli_failure(code, out, err)))
+        return False
+    if verdict == 'running':
+        tidy_result(item, 'stopped and removed')
+    else:
+        tidy_result(item, 'removed%s' % (' (it had stopped meanwhile)' if item['group'] == 'running' else ''))
+    return True
+
+
+def tidy_fresh():
+    return list_sessions(), read_windows(), read_pins()
+
+
+def tidy(argv):
+    here = pinned_ok = only_list = False
+    days = None
+    words = list(argv)
+    while words:
+        flag = words.pop(0)
+        value = None
+        if flag.startswith('--days='):
+            flag, value = '--days', flag[7:]
+        elif flag == '--days':
+            value = words.pop(0) if words else ''
+        if flag == '--here':
+            here = True
+        elif flag == '--pinned':
+            pinned_ok = True
+        elif flag == '--list':
+            only_list = True
+        elif flag == '--days' and re.match(r'^\d+(\.\d+)?$', value or ''):
+            days = float(value)
+        elif flag in ('-h', '--help'):
+            say(TIDY_USAGE)
+            return 0
+        else:
+            say(TIDY_USAGE)
+            return 2
+    sessions = list_sessions()
+    if sessions is None:
+        say("Couldn't read the session list (claude agents --json --all)")
+        return 1
+    now = now_ms()
+    heading = 'every folder'
+    if here:
+        root = project_root(os.path.realpath(os.getcwd()))
+        sessions = project_sessions(sessions, root)
+        heading = os.path.basename(root) or root
+    windows = read_windows()
+    used = last_used([s['sessionId'] for s in sessions if not s.get('pid')])
+    inv = tidy_inventory(sessions, windows, read_pins(), pinned_ok, days, now, used, ended_with_service(sessions))
+    tidy_print(inv, heading, days, windows, pinned_ok)
+    offered = inv['stopped'] + inv['running']
+    if only_list:
+        return 0
+    if not offered:
+        if inv['kept']:
+            say('Nothing to offer: each session above is left alone for the reason beside it.')
+        return 0
+    hint = 'numbers or ranges (e.g. 1 3-5)%s, Enter = nothing' % (', s = every stopped one' if inv['stopped'] else '')
+    say('%s%s%s' % (DIM, hint, RESET))
+    while True:
+        try:
+            text = input('Remove which? ').strip()
+        except (EOFError, KeyboardInterrupt):
+            say()
+            text = ''
+        if not text:
+            say('Nothing changed.')
+            return 0
+        numbers, problem = parse_pick(text, len(offered), len(inv['stopped']))
+        if problem:
+            say('%s%s%s' % (DIM, problem, RESET))
+            continue
+        break
+    picked = [offered[n - 1] for n in numbers]
+    running = [i for i in picked if i['group'] == 'running']
+    declined = False
+    if running:
+        for item in running:
+            say('  %s%s%s  %s  %s%s  %s%s' % (BOLD, item['n'], RESET, title_of(item['session']), DIM, short_path(item['session']['cwd']), item['words'], RESET))
+        declined = not ask_yes('Stop and remove %s?' % ('this running session' if len(running) == 1 else 'these %d running sessions' % len(running)), False)
+    ok = True
+    try:
+        # The stopped ones on one fresh look; each running one on its own, just before it's stopped
+        fresh = tidy_fresh() if any(i['group'] == 'stopped' for i in picked) else None
+        for item in picked:
+            if item['group'] == 'running' and declined:
+                tidy_result(item, 'skipped: not confirmed')
+                continue
+            ok = tidy_act(item, fresh if item['group'] == 'stopped' else tidy_fresh(), pinned_ok) and ok
+    except KeyboardInterrupt:
+        say()
+        say('Interrupted: nothing more was done (the one it was on may be stopped and still in the list).')
+        return 1
+    return 0 if ok else 1
+
+
 def main(argv):
     if argv[:1] == ['tell']:
         return tell(argv[1:])
     if argv[:1] == ['section']:
         return section(argv[1:])
+    if argv[:1] == ['tidy']:
+        return tidy(argv[1:])
     import argparse
     parser = argparse.ArgumentParser(prog='launcher.py')
     parser.add_argument('mode', choices=['start', 'pick'])

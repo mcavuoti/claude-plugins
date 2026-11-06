@@ -1,11 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 
-import { addSpend, dueWaits, inQuietHours, median, parseQuietHours, spendBurst, spendIsHigh, spendLine, spendText, usualHour, waitText, type SpendAlert } from '../hooks/state'
+import { addSpend, clockText, dueWaits, inQuietHours, median, parseQuietHours, spendBurst, spendIsHigh, spendLine, spendText, usualHour, waitText, type SpendAlert } from '../hooks/state'
 import { COMMAND, ROOT, SID, startSession, world, type World, SLOW } from './world'
 
 // Telling the person: a push when a session of the project waits too long (once per wait, one session for the
-// project, quiet hours and a cap a day), the ⧗ on rows working or unseen for long, and a session whose spend runs far
-// above its own usual hour. Nothing here ever stops a session or reaches the model
+// project, quiet hours and a cap a day), the ⧗ on rows working or unseen for long, a session whose spend runs far
+// above its own usual hour, and the line about the sessions that ended with the background service, whose b brings
+// them back once the person says so. Nothing here ever stops a session or reaches the model
 
 const BRAVO = 'bbbbbbbb-0000-0000-0000-000000000000'
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
@@ -301,5 +302,193 @@ test('a session that spends far from its first hour is told by the usual hour it
   await w.clock.advance(3000)
   expect(await drawn($)).toContain("$8.50 last hour · project's usual $0.50")
   expect(await status($)).toContain("the project's sessions usually $0.50 (it has too few active hours of its own yet)")
+})
+
+// ---- The sessions that ended with the background service ----
+
+// The service's log as it reads after a death: each session's last start, then the service's next start finding its
+// workers dead (at DIED). The world's clock is at 13:46:40 that day
+const STARTED = '1970-01-12T13:00:00.000Z'
+const DIED = '1970-01-12T13:30:00.000Z'
+const OTHER = '/Users/x/other'
+const sid = (id: string) => `${id}-0000-0000-0000-000000000000`
+const stoppedRow = (id: string, cwd: string, name: string) => ({ id, sessionId: sid(id), cwd, kind: 'background', name })
+function serviceLog(extra: string[] = []): string {
+  return [
+    ...['dddddddd', 'eeeeeeee', 'ffffffff', '11111111', '22222222', '33333333', 'cdcdcdcd'].map(id => `[${STARTED}] [bg] bg claimed-spare ${id} (spare)`),
+    // The person's claude stop; the service retiring an idle one; a crash: stops of their own, before the death
+    '[1970-01-12T13:10:00.000Z] [bg] bg settled ffffffff (killed)',
+    '[1970-01-12T13:12:00.000Z] [bg] bg retire 22222222: idle-prompt, idle 1h',
+    '[1970-01-12T13:12:01.000Z] [bg] bg settled 22222222 (done)',
+    '[1970-01-12T13:15:00.000Z] [bg] bg settled 33333333 (crashed): SIGKILL (137) before init',
+    `[${DIED}] [supervisor] ─── daemon start ─── version=2.1.300 pid=100 origin=transient`,
+    `[${DIED}] [bg] bg adopt: adopted=0 respawned=0 dead=5`,
+    ...extra,
+  ].join('\n')
+}
+// This session and bravo run; delta (here) and echo (another folder) ended with the service; foxtrot was stopped by
+// the person (the log), 11111111 from a panel (personStop), 22222222 retired, 33333333 crashed
+function endedList(): any[] {
+  return [
+    ...list('idle'),
+    stoppedRow('dddddddd', ROOT, 'delta'),
+    stoppedRow('eeeeeeee', OTHER, 'echo'),
+    stoppedRow('ffffffff', OTHER, 'foxtrot'),
+    stoppedRow('11111111', ROOT, 'stopped from a panel'),
+    stoppedRow('22222222', ROOT, 'retired'),
+    stoppedRow('33333333', ROOT, 'crashed'),
+  ]
+}
+const PERSON_STOP = { [`personStop:${sid('11111111')}`]: Date.parse('1970-01-12T13:20:00.000Z') }
+// The line as the panel draws it: the row that holds its key (a plain Button on b: "b: …"), its words (a Text each)
+// and then the key; '' when there's none
+async function endedLineOf($: any): Promise<string> {
+  const ui = await $.ui.mount(PANEL)
+  const tree = await ui.drawn()
+  await ui.unmount()
+  let line = ''
+  const walk = (n: any) => {
+    if (!n || typeof n !== 'object') return
+    const kids: any[] = Array.isArray(n.children) ? n.children : []
+    if (kids.some(c => c?.props?.key === 'bring-back')) {
+      line = kids.map(c => (c?.type === 'Button' ? `${c.props.hotkey}: ${c.props.label}` : (c?.children ?? []).join(''))).join('')
+    }
+    for (const c of kids) walk(c)
+  }
+  walk(tree)
+  return line.trim()
+}
+const respawned = (w: World) => w.runs.filter(a => a[0] === '/bin/claude' && a[1] === 'respawn').map(a => a[2])
+
+test("the line: every folder's sessions that ended with the background service, never one stopped, retired or crashed", SLOW, async ($, on) => {
+  const sessions = endedList()
+  const w = world(on, { list: sessions, store: PERSON_STOP })
+  w.files.set('/Users/x/daemon.log', serviceLog())
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const when = clockText(new Date(Date.parse(DIED)), new Date(w.clock.now()))
+  expect(await endedLineOf($)).toBe(`2 sessions ended with the background service at ${when} · b: brings them back`)
+  // Echo, in the other folder, came back: one left
+  ;(sessions.find(s => s.id === 'eeeeeeee') as any).pid = 4300
+  await w.clock.advance(65000)
+  expect(await endedLineOf($)).toBe(`1 session ended with the background service at ${when} · b: brings it back`)
+  // Delta came back too: the line goes
+  ;(sessions.find(s => s.id === 'dddddddd') as any).pid = 4301
+  await w.clock.advance(65000)
+  expect(await endedLineOf($)).toBe('')
+  expect(await drawn($)).not.toContain('"bring-back"')
+  // Nothing was brought back without the key
+  expect(respawned(w)).toEqual([])
+})
+
+test('the line: none with no death in the log, and none once the person removed them', SLOW, async ($, on) => {
+  const sessions = endedList()
+  const w = world(on, { list: sessions, store: PERSON_STOP })
+  w.files.set('/Users/x/daemon.log', serviceLog().split('\n').filter(l => !l.includes('adopt')).join('\n'))
+  await startSession($, w)
+  await w.clock.advance(4000)
+  expect(await endedLineOf($)).toBe('')
+  w.write('/Users/x/daemon.log', serviceLog())
+  await w.clock.advance(65000)
+  expect(await endedLineOf($)).toMatch(/^2 sessions ended with the background service at /)
+  // Removed from the list (claude rm): gone from the line
+  sessions.splice(sessions.findIndex(s => s.id === 'dddddddd'), 1)
+  sessions.splice(sessions.findIndex(s => s.id === 'eeeeeeee'), 1)
+  await w.clock.advance(65000)
+  expect(await endedLineOf($)).toBe('')
+})
+
+// The respawns, with when each ran by the world's clock
+const respawnTimes = (w: World): { id: string; at: number }[] =>
+  w.runs.flatMap((a, i) => (a[0] === '/bin/claude' && a[1] === 'respawn' ? [{ id: String(a[2]), at: w.runAt[i] ?? 0 }] : []))
+
+test('b: asks how many and from where, then brings back only those, one at a time a few seconds apart', SLOW, async ($, on) => {
+  const sessions = [...endedList(), stoppedRow('cdcdcdcd', OTHER, 'golf')]
+  const w = world(on, { list: sessions, store: PERSON_STOP })
+  w.files.set('/Users/x/daemon.log', serviceLog())
+  const asked: any[] = []
+  on('tool.call', { tool: 'AskUserQuestion' }, (_: any, e: any) => {
+    asked.push(e.questions[0])
+    return { result: { answers: { [e.questions[0].question]: 'Bring them back' } } }
+  })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const ui = await $.ui.mount(PANEL)
+  await ui.press({ key: 'bring-back' })
+  await w.clock.advance(20000)
+  await ui.unmount()
+  const when = clockText(new Date(Date.parse(DIED)), new Date(w.clock.now()))
+  expect(asked).toHaveLength(1)
+  expect(asked[0].question).toBe(
+    `Bring back the 3 sessions that ended with the background service at ${when} (2 in ~/other, 1 in ~/myapp)? Each one restarts with its conversation, one at a time. Leave them stopped hides this line until the service ends sessions again.`,
+  )
+  expect(asked[0].header).toBe('Sessions')
+  expect(asked[0].options.map((o: any) => o.label ?? o)).toEqual(['Bring them back', 'Leave them stopped', 'Cancel'])
+  // Only the three that ended with the service, never one the person stopped, one retired or one that crashed
+  const times = respawnTimes(w)
+  expect(times.map(t => t.id).sort()).toEqual(['cdcdcdcd', 'dddddddd', 'eeeeeeee'])
+  for (let i = 1; i < times.length; i++) expect(times[i]!.at - times[i - 1]!.at).toBeGreaterThanOrEqual(3000)
+  expect(w.toasts).toContain('Brought back 3 sessions, skipped 0, failed 0')
+  // Pressed again before the list shows them running: nothing is respawned twice
+  const again = await $.ui.mount(PANEL)
+  await again.press({ key: 'bring-back' })
+  await w.clock.advance(20000)
+  await again.unmount()
+  expect(respawnTimes(w)).toHaveLength(3)
+  expect(w.toasts).toContain('Brought back 0 sessions, skipped 3, failed 0')
+})
+
+test('b: each one is checked again just before: one the person opened and stopped, or that runs again, is skipped', SLOW, async ($, on) => {
+  const sessions = [...endedList(), stoppedRow('cdcdcdcd', OTHER, 'golf')]
+  const w = world(on, { list: sessions, store: PERSON_STOP })
+  w.files.set('/Users/x/daemon.log', serviceLog())
+  on('tool.call', { tool: 'AskUserQuestion' }, (_: any, e: any) => {
+    // While the question was up: the person opened echo and stopped it (the log says so), and golf runs again
+    w.write('/Users/x/daemon.log', serviceLog(['[1970-01-12T13:40:00.000Z] [bg] bg claimed-spare eeeeeeee (spare)', '[1970-01-12T13:41:00.000Z] [bg] bg settled eeeeeeee (killed)']))
+    ;(sessions.find(s => s.id === 'cdcdcdcd') as any).pid = 4400
+    return { result: { answers: { [e.questions[0].question]: 'Bring them back' } } }
+  })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const ui = await $.ui.mount(PANEL)
+  await ui.press({ key: 'bring-back' })
+  await w.clock.advance(20000)
+  await ui.unmount()
+  expect(respawned(w)).toEqual(['dddddddd'])
+  expect(w.toasts).toContain('Brought back 1 session, skipped 2, failed 0')
+})
+
+test('b: Leave them stopped hides the line for that death only; Cancel or Esc changes nothing', SLOW, async ($, on) => {
+  const sessions = endedList()
+  const w = world(on, { list: sessions, store: PERSON_STOP })
+  w.files.set('/Users/x/daemon.log', serviceLog())
+  let answer: string | null = 'Cancel'
+  on('tool.call', { tool: 'AskUserQuestion' }, (_: any, e: any) =>
+    answer === null ? { result: "Error: The user doesn't want to proceed with this tool use.", isError: true } : { result: { answers: { [e.questions[0].question]: answer } } },
+  )
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const press = async () => {
+    const ui = await $.ui.mount(PANEL)
+    await ui.press({ key: 'bring-back' })
+    await w.clock.advance(4000)
+    await ui.unmount()
+  }
+  await press()
+  answer = null
+  await press()
+  expect(await endedLineOf($)).toMatch(/^2 sessions ended with the background service at /)
+  answer = 'Leave them stopped'
+  await press()
+  expect(w.store.get('endedDismissed')).toBe(Date.parse(DIED))
+  expect(await endedLineOf($)).toBe('')
+  await w.clock.advance(65000)
+  expect(await endedLineOf($)).toBe('')
+  // The service dies again, with a session started after the first death: the line is back, for that one alone
+  sessions.push(stoppedRow('abababab', ROOT, 'hotel'))
+  w.write('/Users/x/daemon.log', serviceLog(['[1970-01-12T13:40:00.000Z] [bg] bg claimed-spare abababab (spare)', '[1970-01-12T13:45:00.000Z] [bg] bg adopt: adopted=0 respawned=0 dead=1']))
+  await w.clock.advance(65000)
+  expect(await endedLineOf($)).toMatch(/^1 session ended with the background service at .* · b: brings it back$/)
+  expect(respawned(w)).toEqual([])
 })
 

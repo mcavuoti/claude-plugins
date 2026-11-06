@@ -3,17 +3,19 @@
 
 Reads the conversation logs (~/.claude/projects/**/*.jsonl): each response carries its usage (input, output, cache
 read and written, and thinking as part of the output). Reads only what's new in each file since the previous run and
-keeps totals per day (35 days) and per hour (48 hours), split by the session's folder (cwd).
+keeps totals per day (35 days) and per hour (48 hours), split by the folder each response's session belongs to: the
+project it started in, wherever it worked (home_of: the rule of sessionHome in hooks/state.ts).
 
 The same response shows up several times (one line per block) and is also copied into another file when a session is
 resumed: it's counted only once, by its message id and request id (the same thing ccusage does).
 
 Prints a JSON: {"format", "generated", "today", "hour", "days": {cwd: {day: [in, out, cache_read, cache_written,
 thinking]}}, "hours": ...}
-Usage: usage.py [logs folder] [cache folder]
+Usage: usage.py [logs folder] [cache folder] [heartbeats folder]
 
 The cache file (in the cache folder) is shared by every session: files = each log's read position (offset read up to,
-size at that point), seen = responses already counted (by day), days and hours = the totals. It's rewritten only when
+size at that point), seen = responses already counted (by day), starts = each session transcript's first folder (where
+it started), days and hours = the totals. It's rewritten only when
 a run changed it (most runs find nothing new). summary.json beside it is what the last run printed, without
 `generated`: rewritten when it changed and touched on every run, so a session that finds it from the last minute reads
 it instead of running this again. `format` is the format of the output, the summary and the cache (the panel reads
@@ -57,10 +59,66 @@ def read_cache(text):
     try:
         c = json.loads(text) if text is not None else None
         if isinstance(c, dict) and c.get('format') == FORMAT:
+            c.setdefault('starts', {})
             return c
     except ValueError:
         pass
-    return {'format': FORMAT, 'files': {}, 'seen': {}, 'days': {}, 'hours': {}}
+    return {'format': FORMAT, 'files': {}, 'seen': {}, 'starts': {}, 'days': {}, 'hours': {}}
+
+
+# The project each session's own mod recorded (its heartbeat's root= line, in this format): {sessionId: root}
+def recorded_roots(folder):
+    roots = {}
+    try:
+        names = os.listdir(folder) if folder else []
+    except OSError:
+        return roots
+    for name in names:
+        keys = {}
+        for line in (read_text(os.path.join(folder, name)) or '').split('\n'):
+            k, sep, v = line.partition('=')
+            if sep and k and k not in keys:
+                keys[k] = v
+        if keys.get('format') == str(FORMAT) and keys.get('root', '').startswith('/'):
+            roots[name] = keys['root']
+    return roots
+
+
+# The cwd of a transcript's first row that has one: where its session started (the rows after a move carry the new
+# folder, and the file moves to another folder, but the first row stays); '' without one
+def first_cwd(path):
+    try:
+        with open(path, 'rb') as f:
+            for n, line in enumerate(f):
+                if b'"cwd":"' in line:
+                    try:
+                        cwd = json.loads(line).get('cwd')
+                    except (ValueError, AttributeError):
+                        return ''
+                    return cwd if isinstance(cwd, str) and cwd.startswith('/') else ''
+                if n >= 1000:
+                    break
+    except OSError:
+        pass
+    return ''
+
+
+# The folder a file's responses count in (sessionHome in hooks/state.ts): its session's recorded project, else where
+# its session started (its transcript's first cwd; a subagent's file, <folder>/<sessionId>/subagents/*.jsonl, goes by
+# <folder>/<sessionId>.jsonl), else '': each row's own cwd
+def home_of(path, c, roots):
+    start = path
+    if os.path.basename(os.path.dirname(path)) == 'subagents':
+        start = os.path.dirname(os.path.dirname(path)) + '.jsonl'
+    session_id = os.path.basename(start)[:-len('.jsonl')]
+    if roots.get(session_id):
+        return roots[session_id]
+    if not c['starts'].get(start):
+        found = first_cwd(start)
+        if not found:
+            return ''
+        c['starts'][start] = found
+    return c['starts'][start]
 
 
 # Writes a file whole (a temporary file that then replaces it) only when its text changed; else, with touch, only its
@@ -90,7 +148,7 @@ def prune(c, now):
     c['seen'] = {k: d for k, d in c['seen'].items() if d >= first_day}
 
 
-def process_line(line, c, since):
+def process_line(line, c, since, home=''):
     # Quick filter before parsing the JSON: only responses with usage
     if b'"usage"' not in line or b'"assistant"' not in line:
         return
@@ -127,12 +185,12 @@ def process_line(line, c, since):
     ]
     if not any(values):
         return
-    cwd = r.get('cwd') if isinstance(r.get('cwd'), str) else ''
+    cwd = home or (r.get('cwd') if isinstance(r.get('cwd'), str) else '')
     add(c['days'].setdefault(cwd, {}), day, values)
     add(c['hours'].setdefault(cwd, {}), hour_key(t), values)
 
 
-def update(root, c, now):
+def update(root, c, now, roots=None):
     since = (now - timedelta(days=DAYS)).replace(hour=0, minute=0, second=0, microsecond=0)
     cutoff = since.timestamp()
     present = set()
@@ -159,18 +217,23 @@ def update(root, c, now):
                 data = f.read()
             # Only complete lines: the last one may still be being written
             end = data.rfind(b'\n') + 1
+            home = home_of(path, c, roots or {}) if end else ''
             for line in data[:end].splitlines():
-                process_line(line, c, since)
+                process_line(line, c, since, home)
             c['files'][path] = {'offset': start_byte + end, 'size': st.st_size}
     for path in list(c['files']):
         if path not in present:
             del c['files'][path]
+    for path in list(c['starts']):
+        if path not in present:
+            del c['starts'][path]
 
 
 def main():
     home = os.path.expanduser('~')
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(home, '.claude', 'projects')
     folder = sys.argv[2] if len(sys.argv) > 2 else os.path.join(home, '.claude', 'mods', 'sessions-data', 'usage')
+    alive = sys.argv[3] if len(sys.argv) > 3 else ''
     os.makedirs(folder, exist_ok=True)
     cache_path = os.path.join(folder, 'cache.json')
     summary_path = os.path.join(folder, 'summary.json')
@@ -180,7 +243,7 @@ def main():
         now = datetime.now().astimezone()
         before = read_text(cache_path)
         c = read_cache(before)
-        update(root, c, now)
+        update(root, c, now, recorded_roots(alive))
         prune(c, now)
         write_if_changed(cache_path, json.dumps(c, separators=(',', ':')), before)
         summary = {'format': FORMAT, 'today': day_key(now), 'hour': hour_key(now), 'days': c['days'], 'hours': c['hours']}

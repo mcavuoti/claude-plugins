@@ -480,6 +480,65 @@ export function rootCandidates(start: string): string[] {
   return out
 }
 
+// The project a session belongs to is the one it started in, wherever it goes afterwards: a worktree inside or outside
+// the project, of its repository or of another one, a folder /cd took it to. Claude lists it where it is now (its
+// registry file and `claude agents` follow a worktree move and /cd), so that folder alone would take it out of its
+// project's list. The folder that says which project, from the best source there is:
+// - recorded: the project root its own mod recorded at its first start, from the folder it started in, and kept across
+//   restarts, /clear and /resume (the store's project:<sessionId>), published as its heartbeat's root (Heartbeat);
+// - first: the cwd of the first row of its transcript that has one (where it started: the rows after a move carry the
+//   new folder, and the file itself moves, but the first row stays), for a session whose mod doesn't run (stopped, or
+//   an older mod);
+// - cwd: the folder Claude lists it in now, the last resort.
+// inProject takes any of them, a project root or a folder in it. hooks/launcher.py (session_home) and hooks/usage.py
+// (home_of) go by the same rule
+export type Whereabouts = { recorded?: string | null; first?: string | null; cwd?: unknown }
+export function sessionHome(w: Whereabouts): string {
+  for (const f of [w.recorded, w.first, w.cwd]) if (typeof f === 'string' && f.startsWith('/')) return f
+  return ''
+}
+
+export function belongsTo(w: Whereabouts, root: string, home: string): boolean {
+  const folder = sessionHome(w)
+  return folder !== '' && inProject(folder, root, home)
+}
+
+// The first cwd of each session's transcript, from the command that looks for them (`<sessionId>\t<its first row with
+// a "cwd">` per line, the row cut at 64 KiB): the row read as JSON, or its cwd field alone when it was cut
+export function parseTranscriptStarts(text: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const line of text.split('\n')) {
+    const tab = line.indexOf('\t')
+    if (tab <= 0) continue
+    const id = line.slice(0, tab)
+    const row = line.slice(tab + 1)
+    let cwd: unknown
+    try {
+      cwd = JSON.parse(row)?.cwd
+    } catch {
+      const m = row.match(/"cwd":"((?:[^"\\]|\\.)*)"/)
+      try {
+        cwd = m ? JSON.parse(`"${m[1]}"`) : undefined
+      } catch {}
+    }
+    if (typeof cwd === 'string' && cwd.startsWith('/')) out[id] = cwd
+  }
+  return out
+}
+
+// The session's own panel says so when it works outside its project (a worktree outside it, a folder /cd took it to):
+// "Working in ~/x/wt, outside this project", the folder cut from its start to fit width. Nothing inside the project
+// (a subfolder, a worktree under <project>/.claude/worktrees/)
+export function outsideNote(here: string, root: string, home: string, width = Infinity): string {
+  if (!here || !root || inProject(here, root, home)) return ''
+  const before = 'Working in '
+  const after = ', outside this project'
+  const folder = Array.from(tildePath(here, home))
+  const room = Math.max(8, width - before.length - after.length)
+  const shown = folder.length <= room ? folder.join('') : `…${folder.slice(folder.length - room + 1).join('')}`
+  return `${before}${shown}${after}`
+}
+
 // The pinned sessions (Ctrl+T in `claude agents`): ~/.claude/jobs/pins.json, a list of ids the background service
 // doesn't close for being idle. If the file changes shape, null: it isn't touched
 export function parsePins(text: string): string[] | null {
@@ -667,6 +726,86 @@ export function stoppedKind(reason: StopReason | undefined, personAt: unknown, l
   return 'unknown'
 }
 
+// When the background service goes down with its sessions (a machine that restarted, a service killed or crashed),
+// each session it ran stops with it, and nothing starts them again until the person opens each one. A stopped
+// background session ended with the service when it reads as ended by itself (stoppedKind) on the service's death
+// alone: no line of its own after it last ran (a crash's `settled <id> (done)` is a stop of its own), the person didn't
+// stop it, and the service's log found workers dead at or after it last ran. When: the first such death (the service's
+// next start, which is when the log says so). undefined: not one of those
+export function diedWithService(reason: StopReason | undefined, personAt: unknown, lastRun: number | undefined, deaths: readonly number[]): number | undefined {
+  if (reason || typeof lastRun !== 'number' || stoppedKind(reason, personAt, lastRun, deaths) !== 'ended') return undefined
+  const after = deaths.filter(t => t >= lastRun)
+  return after.length ? Math.min(...after) : undefined
+}
+
+// A session that ended with the background service, for the panel's line and its question (at: diedWithService)
+export type EndedSession = { sessionId: string; id: string; name: string; cwd: string; at: number }
+
+// The ones the panel's line counts: those that ended after the death the person dismissed the line for (dismissed: that
+// death's time, the store's endedDismissed), so a dismissal holds for that death only and the next one shows again
+export function endedShown(ended: readonly EndedSession[], dismissed: unknown): EndedSession[] {
+  const before = typeof dismissed === 'number' && Number.isFinite(dismissed) ? dismissed : 0
+  return ended.filter(s => s.at > before)
+}
+
+// A time of day, local: "14:05", with its day when it isn't today's ("14:05 on Oct 30")
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+export function clockText(at: Date, now: Date): string {
+  const two = (x: number) => String(x).padStart(2, '0')
+  const time = `${two(at.getHours())}:${two(at.getMinutes())}`
+  return dayOf(at) === dayOf(now) ? time : `${time} on ${MONTHS[at.getMonth()]} ${at.getDate()}`
+}
+
+// The panel's line about them: "3 sessions ended with the background service at 14:05", at the latest death's time
+// (several deaths are rare: the latest is the one the person would remember); action: what the key does, said after it
+export function endedText(ended: readonly EndedSession[], now: number): { text: string; action: string; at: number } | null {
+  if (ended.length === 0) return null
+  const at = Math.max(...ended.map(s => s.at))
+  const count = ended.length === 1 ? '1 session' : `${ended.length} sessions`
+  return { text: `${count} ended with the background service at ${clockText(new Date(at), new Date(now))}`, action: ended.length === 1 ? 'brings it back' : 'brings them back', at }
+}
+
+// A folder as the person writes it, with the home folder as ~
+export function tildePath(path: string, home: string): string {
+  if (home && home !== '/' && (path === home || path.startsWith(`${home}/`))) return `~${path.slice(home.length)}`
+  return path
+}
+
+// Where they were, for the question: "2 in ~/x/app, 1 in ~/x/site", the folder with the most first, three folders at
+// most and then how many in how many others
+export function endedFolders(ended: readonly EndedSession[], home: string): string {
+  const by = new Map<string, number>()
+  for (const s of ended) by.set(s.cwd, (by.get(s.cwd) ?? 0) + 1)
+  const folders = [...by].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+  const shown = folders.slice(0, folders.length > 4 ? 3 : 4).map(([cwd, n]) => `${n} in ${tildePath(cwd, home)}`)
+  const rest = folders.slice(shown.length)
+  if (rest.length) shown.push(`${rest.reduce((sum, [, n]) => sum + n, 0)} in ${rest.length} other folders`)
+  return shown.join(', ')
+}
+
+// The question the key asks, and its answers: bring them back, leave them stopped (the line goes until the service ends
+// sessions again: the dismissal), or nothing (Cancel, Esc or typed text)
+export function bringBackOptions(count: number): { bring: string; leave: string; options: string[] } {
+  const them = count === 1 ? 'it' : 'them'
+  const bring = `Bring ${them} back`
+  const leave = `Leave ${them} stopped`
+  return { bring, leave, options: [bring, leave, 'Cancel'] }
+}
+export function bringBackQuestion(ended: readonly EndedSession[], now: number, home: string): string {
+  if (ended.length === 0) return ''
+  const when = clockText(new Date(Math.max(...ended.map(s => s.at))), new Date(now))
+  const { leave } = bringBackOptions(ended.length)
+  if (ended.length === 1) {
+    return `Bring back the session that ended with the background service at ${when} (in ${tildePath(ended[0]?.cwd ?? '', home)})? It restarts with its conversation. ${leave} hides this line until the service ends sessions again.`
+  }
+  return `Bring back the ${ended.length} sessions that ended with the background service at ${when} (${endedFolders(ended, home)})? Each one restarts with its conversation, one at a time. ${leave} hides this line until the service ends sessions again.`
+}
+
+// What the key did, as its toast says
+export function bringBackResult(done: number, skipped: number, failed: number): string {
+  return `Brought back ${done === 1 ? '1 session' : `${done} sessions`}, skipped ${skipped}, failed ${failed}`
+}
+
 // The times the mod reopened a session in the last 2 h (so it doesn't insist if memory fills up again)
 export function recentReopens(previous: unknown, now: number): number[] {
   return Array.isArray(previous) ? previous.filter((t): t is number => typeof t === 'number' && now - t < 7200000) : []
@@ -752,17 +891,19 @@ export function fileKey(path: string): string {
 // The heartbeat: <data>/alive/<sessionId>, rewritten by the session's own mod every 15 s while it runs. It's how the
 // launcher and the other panels tell a session whose mod is running from one whose mod never started (a pre-started
 // process that was claimed with stale state, for one). pid: the session's process as the official list shows it;
-// via: what started the mod (session.start, or the first draw, turn or prompt when that didn't come)
-export type Heartbeat = { format: number; pid: number; at: number; version: string; via: string }
-export function heartbeatText(h: Omit<Heartbeat, 'format'>): string {
-  return keyLines({ format: FORMAT, pid: h.pid || '', at: h.at, version: h.version, via: h.via })
+// via: what started the mod (session.start, or the first draw, turn or prompt when that didn't come); root: the project
+// the session belongs to (sessionHome's recorded: where it started, whatever folder it's in now; 0.15.0, absent from
+// older mods, whose readers ignore it)
+export type Heartbeat = { format: number; pid: number; at: number; version: string; via: string; root: string }
+export function heartbeatText(h: Omit<Heartbeat, 'format' | 'root'> & { root?: string }): string {
+  return keyLines({ format: FORMAT, pid: h.pid || '', at: h.at, version: h.version, via: h.via, root: h.root || undefined })
 }
 
 export function parseHeartbeat(text: string): Heartbeat | null {
   const k = parseKeyLines(text)
   const at = Number(k.at)
   if (!k.format || !Number.isFinite(at) || at <= 0) return null
-  return { format: Number(k.format) || 0, pid: Number(k.pid) || 0, at, version: k.version ?? '', via: k.via ?? '' }
+  return { format: Number(k.format) || 0, pid: Number(k.pid) || 0, at, version: k.version ?? '', via: k.via ?? '', root: k.root ?? '' }
 }
 
 // A heartbeat is fresh for 45 s (three beats). ok: fresh, same format, same process; other-format: a session on
