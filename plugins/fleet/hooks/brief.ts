@@ -20,7 +20,7 @@ export type BriefFacts = {
   /** Answered, not delivered yet */
   waiting: number
   /** Instances waiting on a permission prompt, with nobody at them (their tool, since when) */
-  prompts?: { name: string; tool: string; at: number }[]
+  prompts?: { name: string; tool: string; at: number; hung?: true }[]
   /** Open board items nobody owns that no instance can be offered (no for: that names one, no front door), and why */
   forNobody?: { id: string; why: string }[]
   /** The landings of the window, any order (the newest per file is shown) */
@@ -116,8 +116,11 @@ export function briefText(f: BriefFacts, chief: string[] = []): string {
   if (f.needs.length > SHOWN) out.push(`   - and ${f.needs.length - SHOWN} more`)
   // Instances stopped at a permission prompt nobody sees
   const prompts = f.prompts ?? []
-  if (prompts.length && !f.needs.length) out[needsAt] = `1. Needs you: ${kindWords(prompts.length, 'permission prompt', 'permission prompts')}`
-  for (const p of prompts) out.push(`   - ${p.name} waits on a permission prompt (${p.tool}) · ${ago(f.now - p.at)}: Enter on its row in the panel answers it`)
+  const asked = prompts.filter(p => !p.hung)
+  const hung = prompts.filter(p => p.hung)
+  if (prompts.length && !f.needs.length) out[needsAt] = `1. Needs you: ${[kindWords(asked.length, 'permission prompt', 'permission prompts'), kindWords(hung.length, 'call that may hang', 'calls that may hang')].filter(Boolean).join(', ')}`
+  for (const p of asked) out.push(`   - ${p.name} waits on a permission prompt (${p.tool}) · ${ago(f.now - p.at)}: Enter on its row in the panel answers it`)
+  for (const p of hung) out.push(`   - ${p.name}: one call to ${p.tool} for ${ago(f.now - p.at)}: it may be hung (look at it in the panel)`)
   // Open items no instance can be offered: nobody takes them until the person says whom they're for
   const nobody = f.forNobody ?? []
   if (nobody.length && !f.needs.length && !prompts.length) out[needsAt] = `1. Needs you: ${kindWords(nobody.length, 'open item for nobody', 'open items for nobody')}`

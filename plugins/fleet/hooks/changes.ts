@@ -29,7 +29,7 @@ export type Who = { sessionId: string | null; agentId: string | null; ref: strin
  * session's scan (an editor, a script, a session without fleet); accept: the person stamped the current version as his;
  * answer: fleet wrote a command-level record, applying a change the person approved (drafts.ts); intake: fleet wrote an
  * intake record, an item from outside read by the sweeper (intake.ts) */
-export type Via = 'tool' | 'bash' | 'outside' | 'accept' | 'answer' | 'intake'
+export type Via = 'tool' | 'bash' | 'outside' | 'accept' | 'answer' | 'intake' | 'fleet'
 export type ChangeEvent = {
   format: number
   /** When fleet recorded it: the landing, or for an outside change when a scan found it. What orders the events and
@@ -65,6 +65,8 @@ export type ChangeEvent = {
   outside?: true
   /** An intake record (via intake): its kind, tags, sender, the model's summary and who it's routed to; never the body */
   intake?: IntakeMeta
+  /** A file fleet wrote itself (via fleet): what it is ("a reproduction item for poc/results/x.md") */
+  made?: string
   /** Found by the scan while a session's background command ran, or just after one of its commands whose run covers
    * the file's time and that doesn't name it (via bash, by that session): probably its doing, maybe the person's, so he
    * can stamp it as his like an outside change. Never counts as that session's landing (its cadence) */
@@ -297,6 +299,17 @@ export function clock(ms: number, offsetMin: number): string {
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** A time as the person reads it, in his own time: its clock, and its day when that isn't today ("18:57 on 3 Nov"), so
+ * a time two days old doesn't read as one still to come */
+export function clockOn(ms: number, offsetMin: number, now: number): string {
+  const d = new Date(ms + offsetMin * 60000)
+  const today = new Date(now + offsetMin * 60000)
+  const same = d.getUTCFullYear() === today.getUTCFullYear() && d.getUTCMonth() === today.getUTCMonth() && d.getUTCDate() === today.getUTCDate()
+  return same ? clock(ms, offsetMin) : `${clock(ms, offsetMin)} on ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`
+}
+
 export type Me = { sessionId: string; offsetMin: number }
 
 function sessionWords(by: Who, me: Me): string {
@@ -309,6 +322,7 @@ function sessionWords(by: Who, me: Me): string {
  * outside change, "nobody fleet knows" (changeLine words it as outside fleet) */
 export function whoText(e: ChangeEvent, me: Me): string {
   if (e.via === 'intake') return `fleet's intake (an item from ${e.intake?.from || 'outside'})`
+  if (e.via === 'fleet') return `fleet itself (${e.made || 'a file it opened'})`
   if (e.via === 'outside' || !e.by) return 'nobody fleet knows'
   const who = sessionWords(e.by, me)
   if (e.via === 'accept') return 'the person'
@@ -331,7 +345,7 @@ export function changeLine(e: ChangeEvent, me: Me): string {
   const what = `${e.to === null ? 'was removed' : 'changed'} at ${clock(e.changedAt ?? e.at, me.offsetMin)}`
   const rev = e.id && e.rev && e.to !== null ? `, now ${e.id}@${e.rev}${e.kind && e.kind !== 'revision' ? ` (${e.kind})` : ''}` : ''
   const outside = e.candidates?.length ? `outside fleet as far as it can tell (commands of ${candidatesText(e, me)} ran then; or an editor, a script)` : OUTSIDE
-  return `${e.via === 'intake' ? `${what} by ${whoText(e, me)}` : e.via === 'outside' || !e.by ? `${what} ${outside}` : `${what} by ${whoText(e, me)}`}${rev}`
+  return `${e.via === 'intake' || e.via === 'fleet' ? `${what} by ${whoText(e, me)}` : e.via === 'outside' || !e.by ? `${what} ${outside}` : `${what} by ${whoText(e, me)}`}${rev}`
 }
 
 // ---- The gate ----
@@ -380,7 +394,7 @@ export function duringText(rel: string, last: ChangeEvent | null, me: Me): strin
 
 // Programs that only read, unless a flag or an operand below names a file they write. env and the like aren't here:
 // the shell reader takes them off and judges the command they run. ps, kill and the like write no file
-const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'printenv', 'id', 'whoami', 'hostname', 'uname', 'ps', 'pgrep', 'uptime', 'kill', 'qstat', 'nproc'])
+const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'printenv', 'id', 'whoami', 'hostname', 'uname', 'ps', 'pgrep', 'uptime', 'kill', 'qstat', 'nproc', 'read', 'wdiff'])
 const AWKS = new Set(['awk', 'gawk', 'mawk', 'nawk'])
 
 /** A project's check script as a command names it, from the project's folder */
@@ -453,9 +467,10 @@ export function bashWritesNothing(command: string, inWorld?: (target: string) =>
   const c = command.trim()
   if (!c || c.includes('`')) return false
   const targets: string[] = []
+  const ops: string[] = []
   let cmds: string[][]
   try {
-    cmds = commandsOf(c, 0, targets)
+    cmds = commandsOf(c, 0, targets, ops)
   } catch {
     return false
   }
@@ -466,17 +481,23 @@ export function bashWritesNothing(command: string, inWorld?: (target: string) =>
     if (/[$`*?]/.test(t)) return true
     return inWorld ? inWorld(t) : true
   }
-  if (targets.some(writes)) return false
+  // A file fed in (< file) is read; a here-string's word (<<< text) is no file; every other redirection writes
+  if (targets.some((t, k) => ops[k] !== '<' && ops[k] !== '<<<' && writes(t))) return false
   for (const words of cmds) {
+    // A loop's head (for f in a b; select f in …) runs nothing: its body's commands are judged as they come
+    if (words[0] === 'for' || words[0] === 'select') continue
     const w = stripPrefixes(words)
     if (!w.length) continue
     const prog = (w[0] as string).split('/').pop() as string
     const args = w.slice(1)
     if (prog === 'sed') {
-      if (args.some(a => /^-[a-zA-Z]*i/.test(a) || a.startsWith('--in-place') || /^-[a-zA-Z]*f/.test(a) || a === '--file')) return false
-      // A script's w or W command (/x/w file, 1,5w file) or an s command's w flag (s/a/b/gw file) writes a file: a w
-      // after a non-letter or after a / and flags (a pattern like /what/ counts too: the safe side)
-      if (args.some(a => !a.startsWith('-') && (/(^|[^A-Za-z])[wW]/.test(a) || /\/[gpiImMe0-9]*[wW]/.test(a)))) return false
+      // In place: GNU's -i, BSD's -I, --in-place (or a prefix only it has, --in)
+      const long = (a: string) => (a.startsWith('--') ? sedLong(a) : a)
+      if (args.some(a => /^-[a-zA-Z]*[iI]/.test(a) || long(a).startsWith('--in-place'))) return false
+      // Its scripts alone say whether it writes (a w or W command, an s command's w or e flag, the e command): never the
+      // names of the files it reads. A script from a file (-f) can't be seen
+      const scripts = sedScripts(args)
+      if (scripts === null || scripts.some(sedScriptWrites)) return false
       continue
     }
     if (prog === 'find') {
@@ -630,6 +651,173 @@ export function bashWritesNothing(command: string, inWorld?: (target: string) =>
     if (!READ_ONLY_PROGRAMS.has(prog)) return false
   }
   return true
+}
+
+/** sed's scripts among its words: the values of -e (--expression), else its first operand; null when one comes from a
+ * file (-f) or none is there */
+function sedScripts(args: readonly string[]): string[] | null {
+  const scripts: string[] = []
+  let first: string | undefined
+  for (let i = 0; i < args.length; i++) {
+    const raw = args[i] as string
+    if (raw === '--') {
+      first ??= args[i + 1]
+      break
+    }
+    const a = raw.startsWith('--') ? sedLong(raw) : raw
+    if (a.startsWith('--expression=')) scripts.push(a.slice('--expression='.length))
+    else if (a === '--expression') scripts.push(String(args[++i] ?? ''))
+    else if (a === '--file' || a.startsWith('--file=')) return null
+    else if (a === '--line-length') i++
+    else if (a.startsWith('--')) continue
+    else if (a.startsWith('-') && a !== '-') {
+      // A cluster of short options: e takes the rest or the next word, f a file; l (GNU's line length) a number when
+      // one follows, and nothing in BSD, where -l is a flag
+      for (let k = 1; k < a.length; k++) {
+        const ch = a[k]
+        if (ch === 'f') return null
+        if (ch === 'e') {
+          scripts.push(k + 1 < a.length ? a.slice(k + 1) : String(args[++i] ?? ''))
+          break
+        }
+        if (ch === 'l') {
+          // GNU's number attached (-l80) ends the cluster; other letters after it are BSD's flags, read on (-le, -nle)
+          if (/^\d+$/.test(a.slice(k + 1))) break
+          if (k + 1 < a.length) continue
+          if (/^\d+$/.test(args[i + 1] ?? '')) i++
+          break
+        }
+      }
+    } else first ??= a
+  }
+  if (scripts.length) return scripts
+  return first === undefined ? null : [first]
+}
+
+/** A GNU long option as written, or a prefix of one only one option has (--expr=x is --expression=x, --in is
+ * --in-place) as that option */
+const SED_LONG = ['--expression', '--file', '--in-place', '--line-length', '--quiet', '--silent', '--null-data', '--zero-terminated', '--separate', '--sandbox', '--debug', '--posix', '--regexp-extended', '--unbuffered', '--follow-symlinks', '--help', '--version']
+function sedLong(a: string): string {
+  const eq = a.indexOf('=')
+  const name = eq < 0 ? a : a.slice(0, eq)
+  const all = SED_LONG.filter(o => o.startsWith(name))
+  return all.length === 1 && all[0] !== name ? `${all[0]}${eq < 0 ? '' : a.slice(eq)}` : a
+}
+
+/** Whether a sed script writes a file or runs a command: a w, W or e command, or an s command's w or e flag, as GNU sed
+ * reads it or as BSD sed (macOS) does: a script that writes in either counts. They differ where a label ends (GNU: at
+ * a ;) and in a bracket expression (BSD reads [/] whole, a delimiter inside it included) */
+export function sedScriptWrites(script: string): boolean {
+  return sedReadWrites(script, 'gnu') || sedReadWrites(script, 'bsd')
+}
+
+/** One reading of a sed script, command by command (addresses, regexes with their own delimiters and escapes, s and
+ * y's parts, text and labels); one it can't read counts as writing */
+function sedReadWrites(script: string, dialect: 'gnu' | 'bsd'): boolean {
+  const s = script
+  let i = 0
+  const space = () => {
+    while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++
+  }
+  // Past a regex or an s/y part ending at d (escapes kept whole; in BSD's reading of a regex, a bracket expression
+  // whole, ] first in it a member); false when it doesn't end on the line
+  const part = (d: string, regex = true): boolean => {
+    while (i < s.length && s[i] !== d) {
+      if (s[i] === '\n') return false
+      if (dialect === 'bsd' && regex && s[i] === '[') {
+        let j = i + 1
+        if (s[j] === '^') j++
+        if (s[j] === ']') j++
+        while (j < s.length && s[j] !== ']' && s[j] !== '\n') j += s[j] === '[' && /[:.=]/.test(s[j + 1] ?? '') ? Math.max(2, s.indexOf(']', j + 2) - j + 1) : 1
+        if (s[j] !== ']') return false
+        i = j + 1
+        continue
+      }
+      i += s[i] === '\\' ? 2 : 1
+    }
+    if (i >= s.length) return false
+    i++
+    return true
+  }
+  const address = (): boolean => {
+    space()
+    if (s[i] === '$') i++
+    else if (/[0-9]/.test(s[i] ?? '')) while (/[0-9~]/.test(s[i] ?? '')) i++
+    else if (s[i] === '/' || s[i] === '\\') {
+      const d = s[i] === '\\' ? (s[i + 1] ?? '') : '/'
+      i += s[i] === '\\' ? 2 : 1
+      if (!d || !part(d)) return false
+      while (/[IM]/.test(s[i] ?? '')) i++
+    }
+    return true
+  }
+  const toEnd = (alsoSemicolon: boolean) => {
+    while (i < s.length && s[i] !== '\n' && !(alsoSemicolon && (s[i] === ';' || s[i] === '}'))) i++
+  }
+  while (i < s.length) {
+    space()
+    const c0 = s[i]
+    if (c0 === undefined) break
+    if (c0 === ';' || c0 === '\n' || c0 === '}' || c0 === '{') {
+      i++
+      continue
+    }
+    if (c0 === '#') {
+      toEnd(false)
+      continue
+    }
+    if (!address()) return true
+    space()
+    if (s[i] === ',') {
+      i++
+      space()
+      if (s[i] === '+' || s[i] === '~') {
+        i++
+        while (/[0-9]/.test(s[i] ?? '')) i++
+      } else if (!address()) return true
+    }
+    space()
+    while (s[i] === '!') {
+      i++
+      space()
+    }
+    const c = s[i]
+    i++
+    if (c === undefined) break
+    if (c === '{' || c === '}' || c === ';' || c === '\n') continue
+    if (c === 'w' || c === 'W' || c === 'e') return true
+    if (c === 's' || c === 'y') {
+      const d = s[i]
+      if (d === undefined || d === '\n' || d === '\\') return true
+      i++
+      if (!part(d, c === 's') || !part(d, false)) return true
+      if (c === 's') {
+        // Its flags: a w (a file follows) or an e writes or runs
+        while (i < s.length && !/[;\n}\s]/.test(s[i] as string)) {
+          if (s[i] === 'w' || s[i] === 'e') return true
+          i++
+        }
+      }
+      continue
+    }
+    // Text (a, i, c) or a file read (r, R) runs to the line's end; a label (:) too in BSD, to the next ; in GNU; a
+    // branch or an exit to the next ;
+    if ('aicrR'.includes(c) || (c === ':' && dialect === 'bsd')) {
+      toEnd(false)
+      continue
+    }
+    if (c === ':') {
+      toEnd(true)
+      continue
+    }
+    if ('btTqQlLv'.includes(c)) {
+      toEnd(true)
+      continue
+    }
+    if ('=dDgGhHnNpPxzF'.includes(c)) continue
+    return true
+  }
+  return false
 }
 
 /** Whether a command names a world file (rel): one of its words resolves to the file or to a folder it's in, or is a

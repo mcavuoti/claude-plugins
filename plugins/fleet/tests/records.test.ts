@@ -140,7 +140,7 @@ test('the gate asks for a read: a stale pin not read as it is, a new pin never r
       'fleet: this write cites records you need to read first (this write was not made):',
       "- R-1@1: R-1 is at v2 now (a revision at 14:02 by TEST R). Read req/R-1.md, decide whether your work still holds, then cite R-1@2, or say in your record why v1 still holds (files of yours you aren't rewriting: once checked, mcp__fleet__confirm with of R-1 clears their flags with no new version).",
       "- R-2@1: you haven't read R-2 in this conversation. Read req/R-2.md first.",
-      'A read is the Read tool or a plain cat of the file. Then write again. If what changed contradicts your task, ask the person with mcp__fleet__decide.',
+      'A read is the Read tool, or one file shown by cat, head, tail, nl or sed -n N,Mp alone (a grep or a pipe doesn\'t count). Then write again. If what changed contradicts your task, ask the person with mcp__fleet__decide.',
     ].join('\n'),
   )
   expect(landedText('board/B-1.md', 'B-1', 3, [{ id: 'R-9', rev: 1 }], [])).toBe('fleet: board/B-1.md is now B-1@3; it cites R-9@1, which no shared file is (a record\'s file name starts with its id).')
@@ -365,6 +365,6 @@ test("B24, G20, quotes: a version's author corrected; an Edit's note for pins it
   expect(fixed.suspect).toBe(undefined)
   const p = { pin: { id: 'F-7', rev: 2 }, why: 'stale' as const, state: { pin: { id: 'F-7', rev: 2 }, state: 'stale' as const, now: 3, moved: rev(3) }, path: 'findings/F-7.md' }
   expect(elsewhereText('notes/plan.md', [p])).toBe('fleet: notes/plan.md still cites F-7@2 (F-7 is at v3), outside what you edited. It stays flagged to you until that\'s checked: read what it cites, then re-pin it, or say it holds with mcp__fleet__confirm.')
-  expect(pinsText([p], ME, false)).toContain('A read is the Read tool or a plain cat of the file. Then write again.')
+  expect(pinsText([p], ME, false)).toContain('A read is the Read tool, or one file shown by cat, head, tail, nl or sed -n N,Mp alone (a grep or a pipe doesn\'t count). Then write again.')
   expect(quoteSources('---\nkind: finding\nsource: notes/sheet.md:12\nquote: "x"\nsource: https://example.invalid/a\nquote: "y"\nsource: ./notes/b.md\n---\n')).toEqual(['notes/sheet.md:12', 'notes/sheet.md', 'notes/b.md'])
 })

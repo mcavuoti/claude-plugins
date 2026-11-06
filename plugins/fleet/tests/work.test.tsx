@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
+import { hashText, hourFolder } from '../hooks/changes'
 import { BAND, FAKE_LOG, FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 import { OWNER, PROJECT, ROSTER } from './up.test'
 
@@ -280,10 +281,15 @@ test('an item nobody takes is offered to each instance it’s for once, then no 
   expect(again.offers.length).toBe(1)
 })
 
-test('an open item with no for: in a roster with no front door: status says it’s for nobody, the band flags it, the brief says it needs the person', WITH_SESSIONS, async ($, on) => {
+test('an open item with no for: in a roster with no front door, written by its only instance: status says it’s for nobody, the band flags it, the brief says it needs the person', WITH_SESSIONS, async ($, on) => {
   const w = world(on, {
     background: false,
-    files: { ...PROJECT, [`${ROOT}/board/B-3.md`]: item('none', 'open'), [`${FLEET}/instances/owner-a/state.json`]: beat('Owner A', 'owner-a', 'aaaaaaa1') },
+    worldPaths: ['board/**', 'notes/**'],
+    files: { ...PROJECT, [`${FLEET}/roster.json`]: JSON.stringify({ ...ROSTER, instances: ROSTER.instances.filter((i: any) => i.name === 'Owner A') }), [`${ROOT}/board/B-3.md`]: item('none', 'open'), [`${FLEET}/instances/owner-a/state.json`]: beat('Owner A', 'owner-a', 'aaaaaaa1'),
+      // Its writer is the only instance: an item with no for: goes to anyone but its writer, and there is nobody else
+      [`${FLEET}/events/${hourFolder(T0 - 60000)}/${T0 - 60000}-bbbbbbbb-1.json`]: JSON.stringify({ format: 1, at: T0 - 60000, path: 'board/B-3.md', from: null, to: hashText(item('none', 'open')), via: 'tool', tool: 'Write', blind: false, by: { sessionId: 'aaaaaaa1-0000-0000-0000-000000000000', ref: 'aaaaaaa1', name: 'Owner A', agentId: null } }),
+      [`${FLEET}/events/latest`]: JSON.stringify({ format: 1, last: `${T0 - 60000}-bbbbbbbb-1.json` }),
+    },
   })
   sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'idle') } })
   await startSession($, w)

@@ -31,6 +31,9 @@
 //   reads/<sessionId>.json               wire: what that session's threads read of the world, the outside content its
 //                                        conversation read and the Bash commands it runs now, written only by it
 //   state/revs/<id>/<n>.json             wire: version n of the record <id> (records.ts), published no-clobber
+//   state/writing/<hash>-<sid8>-<thread>.json  wire: a Write or Edit of a world file in flight (the text it will leave,
+//                                        when first marked), put in place (mv) by its session every 10 s while it
+//                                        waits, done after its event; gone 10 min on
 //   state/suspects.json                  wire: the suspect files, written by the sweeper
 //   state/checks/<hash>.json             wire: the last results of the checks on one file (the last run wins)
 //   state/checks-stamp.json              wire: the checks the person stamped (/fleet accept checks)
@@ -102,8 +105,13 @@ export type QueueRecord = {
   reversible?: boolean
   touchesMoney?: boolean
   outsideWorld?: boolean
-  /** The decision this one replaces (decide's supersedes): /fleet says so beside it */
+  /** The decision this one replaces (decide's supersedes): /fleet says so beside it; supersedesAll: every one it
+   * replaces, when it names several (supersedes is the first) */
   supersedes?: string
+  supersedesAll?: string[]
+  /** A ruling the person typed unasked in his own session (decide kind ruling): its one question is what it's about,
+   * its answer his words; closed as it's filed */
+  ruling?: true
 }
 /** origin: how the person typed it (composer: a terminal; bridge: over Remote Control); session: the session it was
  * typed in. pre: a change applied as it was filed, because the person typed the turn that filed it, or a choice he
@@ -156,8 +164,11 @@ export type RegisterRecord = {
   judge?: JudgeEntry
   /** A taste record's what, about, principle and provenance */
   taste?: TasteSpec
-  /** The decision this one replaced (its asker filed it with supersedes) */
+  /** The decision this one replaced (its asker filed it with supersedes), and every one when it named several */
   supersedes?: string
+  supersedesAll?: string[]
+  /** The person's ruling, typed unasked (decide kind ruling) */
+  ruling?: true
 }
 export type DialogQuestion = { question: string; header?: string; options: Option[]; multiSelect?: boolean }
 export type Config = { configFormat: number; template: string; commitRegister: boolean; [key: string]: unknown }
@@ -299,9 +310,9 @@ export const DECIDE_SCHEMA = {
   properties: {
     kind: {
       type: 'string',
-      enum: ['choice', 'change', 'resource', 'answered', 'wait', 'withdraw'],
+      enum: ['choice', 'change', 'resource', 'answered', 'wait', 'withdraw', 'ruling'],
       description:
-        "choice (the default): questions for the person. change: a change to a command-level file of this project (the charter, roster.json, world.json, outbound.json, a role file in .claude/agents/, a check script, or the records world.json lists under command), which your own tools can't write: fleet writes your draft once the person applies it. resource: something only the person can get for you (a license, an access, a machine, more budget), with what, why and optionally cost, byWhen and alternatives. answered: with id (and q when it has several questions open), one of your own open questions the person just answered by typing in this session (fleet records their words as its answer and takes it off their queue). wait: with id, another session's decision (D-<n>) your work waits on: fleet tells you at your next step once it closes, with its outcome. withdraw: with id and why, one of your own open decisions you no longer need (asked wrong, settled by your own work): it leaves the person's queue, no judge looks at it, and the register keeps it as withdrawn",
+        "choice (the default): questions for the person. change: a change to a command-level file of this project (the charter, roster.json, world.json, outbound.json, a role file in .claude/agents/, a check script, or the records world.json lists under command), which your own tools can't write: fleet writes your draft once the person applies it. resource: something only the person can get for you (a license, an access, a machine, more budget), with what, why and optionally cost, byWhen and alternatives. answered: with id (and q when it has several questions open), one of your own open questions the person just answered by typing in this session (fleet records their words as its answer and takes it off their queue). wait: with id, another session's decision (D-<n>) your work waits on: fleet tells you at your next step once it closes, with its outcome. withdraw: with id and why, one of your own open decisions you no longer need (asked wrong, settled by your own work): it leaves the person's queue, no judge looks at it, and the register keeps it as withdrawn. ruling: with about, what the person just ruled unasked by typing in their own session (a rule, a choice made, a no that settles something): fleet records their words as typed this turn as a decision they answered, closed at once, which the judges read as their record",
     },
     questions: {
       type: 'array',
@@ -355,13 +366,17 @@ export const DECIDE_SCHEMA = {
     byWhen: { type: 'string', maxLength: 200, description: 'kind resource, optional: when you need it by' },
     alternatives: { type: 'string', maxLength: 500, description: 'kind resource, optional: what you would do without it' },
     id: { type: 'string', description: 'kind answered: the decision (D-<n>) the person just answered here; kind wait: the decision your work waits on; kind withdraw: your own open decision to take back' },
-    supersedes: { type: 'string', description: 'kind choice, change or resource, optional: your own open decision (D-<n>) this one replaces: fleet withdraws it, and /fleet shows the person this one replaces it' },
+    supersedes: {
+      anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' }, maxItems: 8 }],
+      description: 'kind choice, change or resource, optional: your own open decision (D-<n>) this one replaces, or a list of them: fleet withdraws each, and /fleet shows the person which this one replaces',
+    },
+    about: { type: 'string', maxLength: 300, description: 'kind ruling: one line on what the person ruled (their own words, as fleet saw them typed, are the ruling)' },
     q: { type: 'integer', minimum: 1, description: 'kind answered: which of its questions their words answer (1 for the first); needed when it has several open, once per question' },
   },
 } as const
 
 export const DECIDE_DESCRIPTION =
-  "Ask the person to decide something without stopping your work. This is a background session: nobody may be watching it, so AskUserQuestion or a question in your reply would leave the work waiting until the person comes by. Use this tool instead whenever you need the person's choice, after settling first what running something or reading the project's files can settle: send the person only decisions of taste, product or priority. It answers at once with a ticket (D-<n>); the person answers from any session of this project, and the answer reaches you later as a message from the fleet plugin that starts with [D-<n>]. Meanwhile keep working on whatever doesn't depend on the answer, or end your turn. 1-4 questions, each with 2-4 options, the option you recommend and one line on why; give its area (one of the project's tags) and say honestly whether it's reversible and whether it touchesMoney or reaches the outsideWorld: a judge may propose an answer from what the person decided before, and never touches one that spends money, reaches outside or can't be undone. The flags are the whole call's: ask a question that touches money or reaches the outside world in a call of its own, so it doesn't hold the other questions from the judge. With kind change, it files a change to a command-level file instead (path, summary, and edits or content): the person reads its diff and applies it, and fleet writes your draft if the file is still as it was. With kind resource, it asks the person for something only they can get (a license, an access, hardware, budget: what, why, and optionally cost, byWhen, alternatives), apart from the questions of taste. If the person answers one of your open questions by typing in this session instead, call it with kind answered and its id (and q, the question's number, when it has several open): fleet records what they typed as the answer and takes it off their queue. If your work waits on another session's decision (one it said in its journal or the board), call it with kind wait and that id: fleet tells you at your next step once it closes, with its outcome, so you never act on it as still open."
+  "Ask the person to decide something without stopping your work. This is a background session: nobody may be watching it, so AskUserQuestion or a question in your reply would leave the work waiting until the person comes by. Use this tool instead whenever you need the person's choice, after settling first what running something or reading the project's files can settle: send the person only decisions of taste, product or priority. It answers at once with a ticket (D-<n>); the person answers from any session of this project, and the answer reaches you later as a message from the fleet plugin that starts with [D-<n>]. Meanwhile keep working on whatever doesn't depend on the answer, or end your turn. 1-4 questions, each with 2-4 options, the option you recommend and one line on why; give its area (one of the project's tags) and say honestly whether it's reversible and whether it touchesMoney or reaches the outsideWorld: a judge may propose an answer from what the person decided before, and never touches one that spends money, reaches outside or can't be undone. The flags are the whole call's: ask a question that touches money or reaches the outside world in a call of its own, so it doesn't hold the other questions from the judge. With kind change, it files a change to a command-level file instead (path, summary, and edits or content): the person reads its diff and applies it, and fleet writes your draft if the file is still as it was. With kind resource, it asks the person for something only they can get (a license, an access, hardware, budget: what, why, and optionally cost, byWhen, alternatives), apart from the questions of taste. If the person answers one of your open questions by typing in this session instead, call it with kind answered and its id (and q, the question's number, when it has several open): fleet records what they typed as the answer and takes it off their queue. If your work waits on another session's decision (one it said in its journal or the board), call it with kind wait and that id: fleet tells you at your next step once it closes, with its outcome, so you never act on it as still open. If the person rules something unasked by typing in their own session (a rule from now on, a choice made, a no that settles a question), call it with kind ruling and about (one line naming it): fleet records their words as typed as a decision they answered, which the judges and the other sessions read as theirs."
 
 /** Checks and tidies decide's input. The engine may not enforce the schema, so this is what holds */
 /** The asker's own word on a choice, which only the judges' gates read (a flag that isn't a boolean says nothing) */

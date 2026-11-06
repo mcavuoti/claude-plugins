@@ -73,7 +73,7 @@ test('the person typing in an instance’s session hears whose instance it is: o
   await tick(w)
   // He attached to it (a viewer): what he types there is his
   w.files.set(`${JOB}/state.json`, JSON.stringify({ sessionId: SID, intent: '', firstTerminalAt: '2026-11-02T11:00:00Z' }))
-  const LINE = "fleet: you're typing to the Owner A instance (role owner): what you say here steers its work"
+  const LINE = "you're typing to the Owner A instance (role owner): what you say here steers its work"
   const typed = async (text: string, turnId: string) => {
     await $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false } as any)
     await $.turn.start({ text, turnId })

@@ -495,19 +495,51 @@ function sentencesIn(t: string): string[] {
     .filter(Boolean)
 }
 
-/** The sentences a ready post may be made of, in the file's order: every block's, less a block marked not to post and
- * every block under a heading marked so (to the next heading of its level or above) */
+/** A hold line: a block that starts by saying its part isn't to go out, after any decoration (a bracket, an emoji, bold):
+ * the words that can only mean it ("DO NOT POST until QA signs off", "**[Not ready]**"), or hold, held or unready set
+ * off as a marker: in capitals ("[HOLD] waiting"), or followed by a separator (a hyphen or a dash only with a space
+ * before it: "Held-out accuracy" is a term), until, pending, for, off or nothing ("(Held) waiting", "Held until D-12",
+ * "Hold: QA", "Held - QA"); holding only before until, pending, for or off ("Holding until QA signs off"). Either may
+ * follow a short label of one to three words ("Status: not ready", "Note: do not post until …", "Pending QA: hold").
+ * It holds the whole section it's in, not only itself. An ordinary sentence that starts so ("Hold the date: …", "Held
+ * on Friday, …", "Holding costs fall") holds nothing, and a block that only mentions it further on ("Notes (internal,
+ * never post): …") marks only itself */
+const HOLD_LABEL = String.raw`(?:\p{L}+(?:\s+\p{L}+){0,2}\s*[:=][^\p{L}\p{N}]*)?`
+const HOLD_PHRASE = new RegExp(String.raw`^[^\p{L}\p{N}]*${HOLD_LABEL}(?:do not post|don'?t post|never post(?:ed)?|not ready|not for posting|not to be posted)\b`, 'iu')
+const HOLD_WORD = new RegExp(String.raw`^[^\p{L}\p{N}]*${HOLD_LABEL}(?:(?:on hold|hold|held|unready)(?=\s*$|\s*[:–—\])}.!,;]|\s+[-–—]\s|\s+(?:until|pending|for|off)\b)|holding(?=\s+(?:until|pending|for|off)\b))`, 'iu')
+const HOLD_CAPS = /^[^\p{L}\p{N}]*(?:ON HOLD|HOLD|HELD|UNREADY)\b(?!-)/u
+
+function holdsSection(block: { text: string; heading?: number }): boolean {
+  if (block.heading) return false
+  const t = plainText(block.text)
+  return HOLD_PHRASE.test(t) || HOLD_WORD.test(t) || HOLD_CAPS.test(t)
+}
+
+/** The sentences a ready post may be made of, in the file's order: every block's, less a block marked not to post,
+ * every block under a heading marked so (to the next heading of its level or above), and every block of a section a
+ * hold line is in (the section of its nearest heading, its subsections with it; before any heading, the lines up to
+ * the first one) */
 export function postableSentences(source: string): string[] {
+  const blocks = blocksOf(source)
+  // The sections a hold line holds: by the index of their heading (-1, the lines before any heading)
+  const held = new Set<number>()
+  let section = -1
+  for (const [i, b] of blocks.entries()) {
+    if (b.heading) section = i
+    else if (holdsSection(b)) held.add(section)
+  }
   const out: string[] = []
   let skipBelow = 0
-  for (const b of blocksOf(source)) {
+  let before = held.has(-1)
+  for (const [i, b] of blocks.entries()) {
     if (b.heading) {
+      before = false
       if (skipBelow && b.heading > skipBelow) continue
-      skipBelow = notPosted(b) ? b.heading : 0
+      skipBelow = notPosted(b) || held.has(i) ? b.heading : 0
       if (!skipBelow) out.push(...sentencesIn(b.text))
       continue
     }
-    if (skipBelow || notPosted(b)) continue
+    if (before || skipBelow || notPosted(b)) continue
     out.push(...sentencesIn(b.text))
   }
   return out
@@ -771,14 +803,16 @@ export function classifyMcp(tool: string, input: Record<string, unknown>, c: Out
 
 /** The simple commands of a shell line, each as its words (quotes taken off), with what $(…), `…`, bash -c and eval
  * run as commands of their own. Redirections and their targets are left out of the words; targets, when given, gets
- * the targets (a file, /dev/tcp/host/port). A best effort, not a shell */
-export function commandsOf(line: string, depth = 0, targets: string[] = []): string[][] {
+ * the targets (a file, /dev/tcp/host/port), and ops, when given, each target's operator (<, <<<, >, >>, <>…) at the same
+ * place. A best effort, not a shell */
+export function commandsOf(line: string, depth = 0, targets: string[] = [], ops?: string[]): string[][] {
   const out: string[][] = []
   if (depth > 4) return out
   let seg: string[] = []
   let word = ''
   let inWord = false
   let skip = false
+  let op = ''
   const heredocs: { delim: string; strip: boolean }[] = []
   const bodies: string[] = []
   const endWord = () => {
@@ -786,6 +820,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
       if (skip) {
         skip = false
         targets.push(word)
+        ops?.push(op)
       } else seg.push(word)
     }
     word = ''
@@ -829,7 +864,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
         }
         if (line[j] === '$' && line[j + 1] === '(') {
           const s = sub(j + 1)
-          out.push(...commandsOf(s.inner, depth + 1, targets))
+          out.push(...commandsOf(s.inner, depth + 1, targets, ops))
           word += `$(${s.inner})`
           j = s.end + 1
           continue
@@ -837,7 +872,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
         if (line[j] === '`') {
           const end = line.indexOf('`', j + 1)
           const inner = line.slice(j + 1, end < 0 ? line.length : end)
-          out.push(...commandsOf(inner, depth + 1, targets))
+          out.push(...commandsOf(inner, depth + 1, targets, ops))
           word += `\`${inner}\``
           j = end < 0 ? line.length : end + 1
           continue
@@ -859,7 +894,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
     }
     if ((ch === '$' || ch === '<' || ch === '>') && line[i + 1] === '(') {
       const s = sub(i + 1)
-      out.push(...commandsOf(s.inner, depth + 1, targets))
+      out.push(...commandsOf(s.inner, depth + 1, targets, ops))
       word += `${ch}(${s.inner})`
       inWord = true
       i = s.end + 1
@@ -868,7 +903,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
     if (ch === '`') {
       const end = line.indexOf('`', i + 1)
       const inner = line.slice(i + 1, end < 0 ? line.length : end)
-      out.push(...commandsOf(inner, depth + 1, targets))
+      out.push(...commandsOf(inner, depth + 1, targets, ops))
       word += `\`${inner}\``
       inWord = true
       i = end < 0 ? line.length : end + 1
@@ -911,8 +946,8 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
       } else endWord()
       let j = i
       while (j < line.length && (line[j] === '<' || line[j] === '>')) j++
-      const op = line.slice(i, j)
-      if (op === '<<') {
+      const rop = line.slice(i, j)
+      if (rop === '<<') {
         // A here-document (<<EOF, <<-'EOF'): its delimiter, without quotes; its lines are skipped at the next line
         const strip = line[j] === '-'
         if (strip) j++
@@ -941,9 +976,10 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
         j++
         while (j < line.length && /[\d-]/.test(line[j] as string)) j++
       } else {
-        // A file: >file, and >&file (both outputs to it)
+        // A file: >file, and >&file (both outputs to it); a here-string's word (<<<) is text
         if (line[j] === '&') j++
         skip = true
+        op = rop
       }
       i = j
       continue
@@ -967,12 +1003,12 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
     const cmd = baseName(w[0] ?? '')
     if (SHELLS.includes(cmd)) {
       const k = w.findIndex((x, n) => n > 0 && /^-[a-z]*c[a-z]*$/.test(x))
-      if (k > 0 && w[k + 1] !== undefined) more.push(...commandsOf(w[k + 1] as string, depth + 1, targets))
+      if (k > 0 && w[k + 1] !== undefined) more.push(...commandsOf(w[k + 1] as string, depth + 1, targets, ops))
       else if (!w.slice(1).some(x => !x.startsWith('-')) || w.includes('-s')) script = true
-    } else if (cmd === 'eval' && w.length > 1) more.push(...commandsOf(w.slice(1).join(' '), depth + 1, targets))
+    } else if (cmd === 'eval' && w.length > 1) more.push(...commandsOf(w.slice(1).join(' '), depth + 1, targets, ops))
     else if (cmd === 'ssh') script = true
   }
-  if (script) for (const b of bodies) more.push(...commandsOf(b, depth + 1, targets))
+  if (script) for (const b of bodies) more.push(...commandsOf(b, depth + 1, targets, ops))
   return [...out, ...more]
 }
 
@@ -1647,6 +1683,16 @@ export const SEND_DESCRIPTION =
 
 export type SendInput = { to: string; why: string; command?: string; tool?: string; input?: Record<string, unknown>; files: string[]; blocks?: string }
 
+/** The keys of a tool call that the call itself sets (which tool, its id, its loop, its consent): an MCP draft's input
+ * can't carry them, or the call fleet makes would be another than the one the person approved */
+export const RESERVED_KEYS = ['tool', 'tool_use_id', 'agentId', 'consent', 'requestMeta'] as const
+
+/** The first reserved key an input sets, if any */
+export function reservedKey(input: unknown): string | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  return RESERVED_KEYS.find(k => Object.prototype.hasOwnProperty.call(input, k)) ?? null
+}
+
 /** mcp__fleet__send's input, tidied, or what to fix. The MCP call's name is mcp_tool: a tool call's own "tool" is the
  * name of the tool called (mcp__fleet__send itself) */
 export function checkSend(input: any): { ok: true; send: SendInput } | { ok: false; reason: string } {
@@ -1661,6 +1707,8 @@ export function checkSend(input: any): { ok: true; send: SendInput } | { ok: fal
   if (tool && !mcpParts(tool)) return { ok: false, reason: 'mcp_tool: an MCP tool, mcp__<server>__<tool>' }
   if (tool && /^mcp__fleet__/.test(tool)) return { ok: false, reason: "mcp_tool: fleet's own tools send nothing outside" }
   if (tool && input?.input !== undefined && (typeof input.input !== 'object' || input.input === null || Array.isArray(input.input))) return { ok: false, reason: "input: the tool's input, as an object" }
+  const reserved = tool ? reservedKey(input?.input) : null
+  if (reserved) return { ok: false, reason: `input: ${reserved} is a key the call itself sets (with ${RESERVED_KEYS.filter(k => k !== reserved).join(', ')}), so a draft can't carry it: fleet would make another call than the one the person approves. A tool whose own argument is named so can't be sent through /fleet: say in your journal what should go out, and the person sends it himself` }
   const files = strings(input?.files).slice(0, 20)
   const blocks = typeof input?.blocks === 'string' ? cut(input.blocks.trim(), 200) : ''
   return {
@@ -1671,7 +1719,9 @@ export function checkSend(input: any): { ok: true; send: SendInput } | { ok: fal
 
 /** The outbound a queue record carries: what it is, where it goes, why; the exact call (its draft file, relative to
  * <project>/.claude/fleet/, which the person may edit), the files it sends with their versions when it was drafted,
- * the folder it runs from, and the version the person approves: the draft and the files together */
+ * the folder it runs from, and the version the person approves: the draft and the files together. sources: the files
+ * a calls entry checks a ready post against (its source), with their versions when it was drafted: not sent, so not
+ * in the version; the post is checked against them again when the person sends it */
 export type OutboundSpec = {
   to: string
   why: string
@@ -1681,6 +1731,7 @@ export type OutboundSpec = {
   files: { path: string; v: string | null }[]
   cwd: string
   hash: string
+  sources?: { path: string; v: string | null }[]
 }
 
 /** The draft file's text: the exact call, as fleet will make it */
@@ -1699,6 +1750,8 @@ export function parseDraft(text: string): { command: string } | { tool: string; 
   if (d && typeof d.command === 'string' && d.command.trim()) return { command: d.command }
   if (d && typeof d.tool === 'string' && mcpParts(d.tool) && !/^mcp__fleet__/.test(d.tool)) {
     if (d.input !== undefined && (typeof d.input !== 'object' || d.input === null || Array.isArray(d.input))) return { problem: "the draft's input isn't an object" }
+    const reserved = reservedKey(d.input)
+    if (reserved) return { problem: `its input sets ${reserved}, which the call itself sets` }
     return { tool: d.tool, input: d.input ?? {} }
   }
   return { problem: 'the draft holds neither a command nor an MCP tool and its input' }
