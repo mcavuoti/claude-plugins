@@ -12255,6 +12255,8 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
     ...next,
     isolation,
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
+    // Claude watches only what SessionStart named, and this project's folders didn't exist then
+    fresh && !live ? "This session reads fleet's files on timers until /clear (or u): then the band and answers come live, in about a second." : '',
     dropped,
     ...uninstalled.lines,
     ...planB,
