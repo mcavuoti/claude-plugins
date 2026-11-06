@@ -58,6 +58,8 @@ export const FAKE_SESSIONS = {
         contract: async () => ({ api: 1, version: '0.13.0', format: 2, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', ...((await world()).extra ?? [])] }),
         current: async () => (await world()).current ?? { ready: false, ref: null, sessionId: '', name: '', root: '', background: false, agent: null },
         status: async input => {
+          // Logged too, so a test can count a session's status calls
+          await note({ status: input })
           const w = await world()
           if (!w.rows) return { ready: false, rows: [] }
           const refs = input.refs ?? []

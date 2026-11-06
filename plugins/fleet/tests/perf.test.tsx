@@ -117,9 +117,9 @@ test('the overrules folder, missing, is listed every half a minute, not every 2 
   expect(mine.result).toContain('run-1')
 })
 
-test("git: the repository's own facts once per process; its worktree list again only when the worktrees folder moves", WITH_SESSIONS, async ($, on) => {
+test("git: the repository's own facts once per process; its worktree list again when the worktrees folder moves, and every 10 minutes", WITH_SESSIONS, async ($, on) => {
   const w = await instance($, on)
-  await tick(w, 12 * MIN)
+  await tick(w, 9 * MIN)
   const revs = () => w.runs.filter(a => a[0] === 'git' && a.includes('rev-parse') && a.includes('--git-common-dir')).length
   const lists = () => w.runs.filter(a => a[0] === 'git' && a.includes('worktree') && a.includes('list')).length
   expect(revs()).toBe(1)
@@ -129,6 +129,9 @@ test("git: the repository's own facts once per process; its worktree list again 
   await tick(w, 70000)
   expect(lists()).toBe(2)
   expect(revs()).toBe(1)
+  // And every 10 minutes whatever the folder says (a worktree moved rewrites a file in place)
+  await tick(w, 10 * MIN)
+  expect(lists()).toBe(3)
 })
 
 test('a session that does not sweep looks at the world every 10 s while the watcher brings landings; back to 2 s once it missed two', WITH_SESSIONS, async ($, on) => {
@@ -265,11 +268,34 @@ test("the code watch's poll after failures: everyMin, doubled for each failure i
   expect(codeEveryMs(60, { ok: false, failures: 9 })).toBe(60 * MIN)
 })
 
-test("an instance's budgets read every instance's spend about once a minute, not 18 times", WITH_SESSIONS, async ($, on) => {
+test("an instance's budgets read every instance's spend a few times a minute (its heartbeat, its nudges' look), not 18", WITH_SESSIONS, async ($, on) => {
   const w = await instance($, on)
   await tick(w, 2 * MIN)
   w.readCount.clear()
   await tick(w, 10 * MIN)
-  expect(count(w.readCount, `${FLEET}/instances/owner-b/spend.json`)).toBeLessThanOrEqual(25)
+  expect(count(w.readCount, `${FLEET}/instances/owner-b/spend.json`)).toBeLessThanOrEqual(40)
   expect(OWNER).toContain('mcp__fleet__*')
+})
+
+test('after a /clear (a new conversation: Claude starts its state afresh) the classic hooks that reach fleet are looked at again, not taken as noted', WITH_SESSIONS, async ($, on) => {
+  // (the test kit keeps $.state across a /clear; Claude doesn't, so what fleet noted before must be looked at again:
+  // counted here as the reads of the classic hooks seen)
+  let looks = 0
+  on('state.get' as any, async (_: any, e: any, next: any) => {
+    if (JSON.stringify(e).includes('classicSeen')) looks++
+    return next(e)
+  })
+  const w = await instance($, on)
+  await tick(w)
+  await $.classic.FileChanged({ file_path: `${ROOT}/somewhere`, event: 'change' } as any)
+  await tick(w)
+  expect(await fleet($, 'status')).toContain('classic hooks reaching fleet here: FileChanged, SessionStart')
+  await $.session.end({ reason: 'clear', sessionId: SID } as any)
+  w.id.value = 'cccccccc-0000-0000-0000-000000000000'
+  await w.clock.settle()
+  const before = looks
+  await $.classic.SessionStart({ source: 'clear', agent_type: 'owner' } as any)
+  await $.classic.FileChanged({ file_path: `${ROOT}/somewhere`, event: 'change' } as any)
+  await w.clock.settle()
+  expect(looks - before).toBeGreaterThanOrEqual(2)
 })
