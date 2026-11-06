@@ -27,6 +27,8 @@
 //   decisions/tmp/                       files about to be published or moved into place (events' too)
 //   events/YYYY-MM-DD/HH/<ms>-<sid8>-<n>.json  wire: one landing on a world file, written once by the session that saw it
 //   events/latest                        wire: the last event's name, rewritten by each writer; every session watches it
+//   bell/<kind>                          wire: live updates' bells (work, runs, restart, budget, probe): who rang and
+//                                        when, rewritten in place by whoever made the change; every session watches the folder
 //   events/claims/<hash>                 wire: an outside change claimed no-clobber, so one session records it
 //   reads/<sessionId>.json               wire: what that session's threads read of the world, the outside content its
 //                                        conversation read and the Bash commands it runs now, written only by it
