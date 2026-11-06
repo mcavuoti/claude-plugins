@@ -3869,9 +3869,10 @@ async function startWorld($: any) {
   await lease($)
 }
 
-// Every 2 s; every WORLD_SLOW_MS instead in a session that doesn't sweep (and isn't taking the lease) while the engine
-// watches events/latest for it (classic.SessionStart returned it): the watcher brings landings at once, so the tick
-// is only the fallback. A reload of the module (no SessionStart of its own) starts at 2 s again
+// Every 2 s; every WORLD_SLOW_MS instead while the engine watches events/latest for this session (classic.SessionStart
+// returned it) in a session that doesn't sweep, or sweeps with live updates on (FileChanged rings its sweep), and isn't
+// taking the lease: the watcher brings landings at once, so the tick is only the fallback. A reload of the module (no
+// SessionStart of its own) starts at 2 s again, unless its SessionStart's set is in $.state (live)
 const WORLD_SLOW_MS = 10000
 let watchingLatest = false
 let watchMisses = 0
@@ -3882,7 +3883,9 @@ let unwatched = 0
 let worldTickAt = 0
 async function worldTick($: any) {
   if (!root) return
-  if (watchingLatest && !sweep.holding && !sweep.takenAt) {
+  // The sweeping session too once live updates are on: a landing, an inbox item, a question or an answer rings its sweep
+  // at once (FileChanged), so its tick is the safety pass. Taking the lease stays at 2 s (the 2 s check of a take)
+  if (watchingLatest && (!sweep.holding || live) && !sweep.takenAt) {
     const now = await $.clock.now()
     if (now - worldTickAt < WORLD_SLOW_MS - 500) return
     worldTickAt = now
@@ -12471,11 +12474,16 @@ export const register: Register = on => {
         (async () => {
           fileChangedAt = await $.clock.now()
           await eventsTick($)
+          // The sweeper's suspects follow a landing at once (live: its own tick comes only every 10 s)
+          if (live && sweep.holding) ringHere($, ['sweep'])
         })(),
       )
     }
-    // A poller dropped an item: the sweeper reads it at its next tick
-    if (root && String(e.file_path).endsWith('/.claude/fleet/inbox/latest')) sweep.intakeDirty = true
+    // A poller dropped an item: the sweeper reads it at its next tick (live: now)
+    if (root && String(e.file_path).endsWith('/.claude/fleet/inbox/latest')) {
+      sweep.intakeDirty = true
+      if (live && sweep.holding) ringHere($, ['sweep'])
+    }
     // Live updates: an answer, an overrule or a note reaches its asker now; a question asked or closed reaches the band
     // and the sweeper's marks now (and an answer to a retired asker wakes it now); a bell says what else moved
     // The engine brought a bell: it watches fleet's paths in this session
