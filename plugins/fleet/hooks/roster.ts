@@ -864,7 +864,9 @@ export function hoursText(h: number): string {
 
 /** The cadence nudge: its own open items when it has some (then the cap doesn't apply), else the open items nobody owns
  * that fit it, else land what it has. perDay: the roster's cadence.perDay (Infinity: no cap) */
-export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number, items: readonly string[] = [], perDay: number = CADENCE_PER_DAY, fits: readonly string[] = []): string {
+/** door: the front door's name (null: the roster has none) and whether this instance is it, for an instance with
+ * nothing on the board to take (G27: it proposes an item, the front door turns the backlog into items) */
+export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number, items: readonly string[] = [], perDay: number = CADENCE_PER_DAY, fits: readonly string[] = [], door: { front: string | null; self: boolean } | null = null): string {
   const often = Number.isFinite(perDay) ? `fleet nudges once each period while nothing lands, at most ${perDay} a day.` : 'fleet nudges once each period while nothing lands.'
   if (!items.length && fits.length) {
     const shown = fits.slice(0, 8)
@@ -874,7 +876,11 @@ export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, h
     const shown = items.slice(0, 8)
     return `fleet: ${hoursText(hours)} since you last landed work in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}; a line in your journal doesn't count while you own open items). Your open items: ${shown.join(', ')}${items.length > shown.length ? ` and ${items.length - shown.length} more` : ''}. They're your work: take the first one that needs nobody's decision and land a step of it, or ask the person with mcp__fleet__decide what blocks it. ${often}`
   }
-  return `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. ${often}`
+  const since = `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}).`
+  if (door?.self) return `${since} Nothing on the board fits you: turn what the charter and the plan still need into board items (board/B-<n>.md: for: who should take it, what done looks like, owner open), so the instances have work to take; or ask the person with mcp__fleet__decide. ${often}`
+  if (door?.front) return `${since} Nothing on the board fits you: propose an item to ${door.front} (SendMessage: what to do and what done looks like) from what your work shows is missing, or land a result or a negative result where your work goes; a line in your journal saying you wait isn't work. ${often}`
+  if (door) return `${since} Nothing on the board fits you: land a result or a negative result where your work goes, or ask the person with mcp__fleet__decide what to take on. ${often}`
+  return `${since} Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. ${often}`
 }
 
 /** Decision 4a: an instance that doesn't keep a long context starts each fresh period (freshH, cadenceH by default)

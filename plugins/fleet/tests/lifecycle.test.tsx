@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText } from '../hooks/changes'
-import { settingsText } from '../hooks/roster'
+import { cadenceNudgeText, settingsText } from '../hooks/roster'
 import { FLEET, ROOT, decide, fleet, json, row, sessionsSay, startSession, world, WITH_SESSIONS } from './world'
 
 // An instance's lifecycle as the roster changes it (P26): an applied or accepted roster change takes effect by
@@ -80,4 +80,39 @@ test('an applied change to roster.json takes effect by itself too, and the apply
   const s = JSON.parse(w.files.get(`${FLEET}/instances/owner-a.json`) as string)
   expect([s.model, s.effortLevel]).toEqual(['sonnet', 'high'])
   expect(w.files.has(`${HB}/restart.json`)).toBe(false)
+})
+
+// ---- G27: an idle fleet beside an unbuilt backlog ----
+
+test('the cadence nudge of an instance with nothing to take says to propose an item to the front door, not to write that it waits', () => {
+  const nudge = cadenceNudgeText({ cadenceH: 1, journal: 'journals/tester-1.md' }, 1, [], 3, [], { front: 'Chief', self: false })
+  expect(nudge).toContain('Nothing on the board fits you: propose an item to Chief (SendMessage: what to do and what done looks like)')
+  expect(nudge).toContain("a line in your journal saying you wait isn't work")
+  expect(nudge).not.toContain("where you're blocked and why, in your journal")
+  // The front door itself: it turns the deliverables into items
+  const front = cadenceNudgeText({ cadenceH: 1, journal: 'journals/chief.md' }, 1, [], 3, [], { front: 'Chief', self: true })
+  expect(front).toContain('turn what the charter and the plan still need into board items')
+  // No front door: the person
+  expect(cadenceNudgeText({ cadenceH: 1, journal: 'journals/a.md' }, 1, [], 3, [], { front: null, self: false })).toContain('ask the person with mcp__fleet__decide what to take on')
+})
+
+test('the front door hears, once an hour, the instances idle with no item to take', WITH_SESSIONS, async ($, on) => {
+  const TEAM = { rosterFormat: 1, sections: [{ id: 'work', title: 'Work' }], roles: { chief: { agent: 'owner', model: 'haiku' }, tester: { agent: 'owner', model: 'haiku' } }, instances: [{ name: 'Chief', role: 'chief', section: 'work' }, { name: 'Tester 1', role: 'tester', section: 'work' }, { name: 'Tester 2', role: 'tester', section: 'work' }], wakes: { everyMin: 5, perDay: 8 } }
+  const work = { format: 1, at: NOW, unowned: {}, capacity: { idle: ['Tester 1', 'Tester 2'], unowned: 0, oldest: null, slotsFree: null, slotsTotal: null, runs: 0, unrecorded: 0, flags: [] } }
+  const w = world(on, {
+    worldPaths: ['notes/**', 'board/**'],
+    env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Chief', FLEET_ROLE: 'chief' },
+    files: { [`${FLEET}/roster.json`]: JSON.stringify(TEAM), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${FLEET}/instances/chief.json`]: '{"env":{}}\n', [`${FLEET}/state/work.json`]: JSON.stringify(work), [`${ROOT}/notes/plan.md`]: '# plan\n' },
+  })
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
+  on('classic.SessionStart', () => ({}))
+  sessionsSay(w, { current: { ready: true, ref: 'aaaaaaaa', sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', name: 'Chief', root: ROOT, background: true, agent: 'owner' }, rows: { aaaaaaaa: row('aaaaaaaa', 'Chief', 'working'), ttttttt1: row('ttttttt1', 'Tester 1', 'idle'), ttttttt2: row('ttttttt2', 'Tester 2', 'idle') } })
+  await startSession($, w)
+  await $.classic.SessionStart({ source: 'startup', agent_type: 'owner' } as any)
+  await w.clock.advance(2100)
+  await w.clock.settle()
+  const told = ((await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/plan.md` } as any)).context ?? []).join('\n')
+  expect(told).toContain('fleet: idle with no item to take: Tester 1, Tester 2. Turn what the charter and the plan still need into board items (for:, what done looks like), or say in your journal why they wait.')
+  const again = ((await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/plan.md` } as any)).context ?? []).join('\n')
+  expect(again).not.toContain('idle with no item to take')
 })

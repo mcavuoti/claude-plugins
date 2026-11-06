@@ -6083,6 +6083,16 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
       keys.push(k)
     }
   }
+  // The others idle with nothing on the board for them (G27): the front door turns the backlog into items, once an hour
+  if (work && frontOf(roster?.r ?? null, roster?.instances ?? [])?.slug === inst.slug) {
+    const waiting = new Set(work.capacity.flags.map(f => f.inst))
+    const bare = work.capacity.idle.filter(n => n !== inst.name && !waiting.has(n))
+    const k = `nothing|${Math.floor(now / HOUR)}`
+    if (bare.length && told[k] === undefined) {
+      lines.push(`fleet: idle with no item to take: ${bare.slice(0, 8).join(', ')}${bare.length > 8 ? ` and ${bare.length - 8} more` : ''}. Turn what the charter and the plan still need into board items (for:, what done looks like), or say in your journal why they wait.`)
+      keys.push(k)
+    }
+  }
   if (!lines.length) return none
   return {
     lines,
@@ -6554,7 +6564,9 @@ async function nudgeTick($: any) {
     // One that owns nothing hears the open items nobody owns that fit it (B14)
     const fits = owns.length ? [] : await fitsMe($, inst)
     log($, `cadence nudge to ${inst.name} (${hoursText(c.hours)} since its last landing${owns.length ? `, owns ${owns.length} open item(s)` : fits.length ? `, ${fits.length} open item(s) fit it` : ''})`)
-    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns, cadenceCap, fits), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: ownCadence + 1 }), now)
+    // With nothing on the board to take: it proposes an item to the front door, and the front door makes the items (G27)
+    const front = frontOf(roster?.r ?? null, roster?.instances ?? [])
+    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns, cadenceCap, fits, { front: front?.name ?? null, self: front?.slug === inst.slug }), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: ownCadence + 1 }), now)
     return
   }
   // Its budget's line too: past 80% it's nothing, used up it's never here (no nudge then), raised again it's to resume
