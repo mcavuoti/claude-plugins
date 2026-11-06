@@ -28,11 +28,14 @@ person's sections, which ccc section changes, ringing <data>/bell/sections for t
 <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
 Claude's own files, read only, by ccc tidy: <jobs>/pins.json and <jobs>/<id>/state.json (the background service's:
 ~/.claude/jobs or SESSIONS_JOBS_DIR), <registry>/<pid>.json (the running sessions: ~/.claude/sessions or
-SESSIONS_REGISTRY_DIR), and when each stopped session's transcript was last written (~/.claude/projects/*/<sessionId>.jsonl,
-under HOME).
+SESSIONS_REGISTRY_DIR), when each stopped session's transcript was last written (~/.claude/projects/*/<sessionId>.jsonl,
+under HOME), and the background service's log for the stopped ones that ended with it (~/.claude/daemon.log or
+SESSIONS_DAEMON_LOG).
 Other environment: SESSIONS_CLAUDE (the claude command), SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the
 installed plugin, from the ccc command), SESSIONS_START_WAIT (seconds to wait for a new session's mod).
 """
+import collections
+import datetime
 import json
 import os
 import re
@@ -56,6 +59,7 @@ CLAUDE = os.environ.get('SESSIONS_CLAUDE') or 'claude'
 JOBS = os.environ.get('SESSIONS_JOBS_DIR') or os.path.join(HOME, '.claude', 'jobs')
 REGISTRY = os.environ.get('SESSIONS_REGISTRY_DIR') or os.path.join(HOME, '.claude', 'sessions')
 PROJECTS = os.path.join(HOME, '.claude', 'projects')
+DAEMON_LOG = os.environ.get('SESSIONS_DAEMON_LOG') or os.path.join(HOME, '.claude', 'daemon.log')
 START_WAIT = float(os.environ.get('SESSIONS_START_WAIT') or '10')
 
 DIM, RESET, BOLD = '\033[2m', '\033[0m', '\033[1m'
@@ -974,8 +978,8 @@ def ring(name):
 # N days ago (their transcript's time; without one, when they started); --list prints the list and asks nothing. It
 # reads, never writes: pins.json and each job's state.json in the service's folder (JOBS), the registry file of a running
 # session for how long it's been idle (REGISTRY), when each stopped session's transcript was last written (PROJECTS),
-# ps for the windows. Exits 0 when it ran, picked or not; 1 when the list can't be read or a claude stop or rm failed;
-# 2 for usage.
+# the service's log for the stopped ones that ended with the service, marked as such (DAEMON_LOG), ps for the windows.
+# Exits 0 when it ran, picked or not; 1 when the list can't be read or a claude stop or rm failed; 2 for usage.
 
 TIDY_USAGE = 'usage: ccc tidy [--here] [--pinned] [--days <n>] [--list]'
 
@@ -1096,10 +1100,100 @@ def stopped_ago(s, used, now):
     return "%s (its transcript wasn't found)" % started_ago(s, now)
 
 
+# stopLog in state.ts: from the background service's log (its last 4000 lines, as the mod reads it), why each stopped
+# session stopped (retire: the service retired it; settled with no retire before: its process ended, killed by a claude
+# stop or by itself), when each last started (claimed-spare, spawned: that clears its stop), and when the service found
+# its workers dead (adopt: … dead=N, at its next start). Nothing when the log can't be read
+LOG_EVENT = re.compile(r'^\[([^\]]+)\] \[bg\] bg (retire|settled|claimed-spare|spawned) ([0-9a-f]{8})\b(.*)$')
+LOG_ADOPT = re.compile(r'^\[([^\]]+)\] \[bg\] bg adopt: .*\bdead=(\d+)')
+
+
+def log_time(text):
+    try:
+        return datetime.datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp() * 1000
+    except ValueError:
+        return 0
+
+
+def stop_log(lines):
+    reasons, started, deaths = {}, {}, []
+    for line in lines:
+        line = line.rstrip('\n')
+        m = LOG_ADOPT.match(line)
+        if m:
+            if int(m.group(2)) > 0:
+                deaths.append(log_time(m.group(1)))
+            continue
+        m = LOG_EVENT.match(line)
+        if not m:
+            continue
+        at, event, sid, rest = log_time(m.group(1)), m.group(2), m.group(3), m.group(4)
+        if event == 'retire':
+            reasons[sid] = 'low-memory' if re.search(r'\[low memory', rest) else 'idle'
+        elif event == 'settled':
+            reasons.setdefault(sid, 'stopped' if re.match(r'^\s*\(killed\)', rest) else 'ended')
+        else:
+            reasons.pop(sid, None)
+            started[sid] = at
+    return reasons, started, deaths
+
+
+def read_stop_log():
+    try:
+        with open(DAEMON_LOG, encoding='utf-8', errors='replace') as f:
+            return stop_log(collections.deque(f, maxlen=4000))
+    except OSError:
+        return {}, {}, []
+
+
+# diedWithService in state.ts: a stopped background session ended with the background service when nothing of its own
+# came after it last ran (no retire, no end of its process: a claude stop's is the person's) and the service found
+# workers dead at or after that; when: the first such death. The mod also leaves out one the person stopped from a
+# panel once the log no longer shows that stop (it keeps it in Claude's store, which ccc doesn't read): here it's a
+# mark beside the session, nothing is done with it
+def died_with_service(reason, last_run, deaths):
+    if reason or not last_run or last_run <= 0:
+        return None
+    after = [t for t in deaths if t >= last_run]
+    return min(after) if after else None
+
+
+# The stopped background sessions that ended with the service: {sessionId: when}. When each one last ran: its last start
+# in the log, or its mod's last heartbeat
+def ended_with_service(sessions):
+    stopped = [s for s in sessions if s.get('kind') == 'background' and not s.get('pid') and s.get('id')]
+    if not stopped:
+        return {}
+    reasons, started, deaths = read_stop_log()
+    if not deaths:
+        return {}
+    out = {}
+    for s in stopped:
+        beat = read_heartbeat(s['sessionId'])
+        runs = [t for t in (started.get(s['id']), beat['at'] if beat else None) if t]
+        at = died_with_service(reasons.get(s['id']), max(runs) if runs else None, deaths)
+        if at is not None:
+            out[s['sessionId']] = at
+    return out
+
+
+# clockText in state.ts: a time of day, local ("14:05"), with its day when it isn't today's ("14:05 on Oct 30")
+MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+
+
+def clock_text(ms, now):
+    at, today = time.localtime(ms / 1000), time.localtime(now / 1000)
+    hm = '%02d:%02d' % (at.tm_hour, at.tm_min)
+    if (at.tm_year, at.tm_yday) == (today.tm_year, today.tm_yday):
+        return hm
+    return '%s on %s %d' % (hm, MONTHS[at.tm_mon - 1], at.tm_mday)
+
+
 # What ccc tidy may do with a session, and the words for it: ('stopped', when) it can be removed, ('running', when) it
 # can be stopped and removed, ('kept', why) it's never offered. windows: read_windows(); pins: read_pins(); job: its
-# job_state(); pinned_ok: --pinned; used: when it was last used (last_used), if known
-def tidy_verdict(s, windows, pins, job, pinned_ok, now, used=None):
+# job_state(); pinned_ok: --pinned; used: when it was last used (last_used), if known; ended: when it ended with the
+# background service (ended_with_service), if it did
+def tidy_verdict(s, windows, pins, job, pinned_ok, now, used=None, ended=None):
     sid = s.get('id')
     if s.get('kind') != 'background':
         return 'kept', 'a regular session: /exit it in its window'
@@ -1124,7 +1218,8 @@ def tidy_verdict(s, windows, pins, job, pinned_ok, now, used=None):
             return 'kept', where
         if pinned:
             return 'kept', pinned
-        return 'stopped', stopped_ago(s, used, now) + note
+        why = ' · ended with the background service at %s' % clock_text(ended, now) if ended else ''
+        return 'stopped', stopped_ago(s, used, now) + why + note
     status = s.get('status')
     if status == 'busy':
         return 'kept', 'busy: never stopped while it works'
@@ -1159,11 +1254,13 @@ def clip(text, width, left=False):
 
 
 # The inventory: the sessions to offer, numbered (stopped first, used longest ago first; then idle running ones, idle
-# longest first), the ones left alone with why, and how many stopped ones --days left out. used: last_used()
-def tidy_inventory(sessions, windows, pins, pinned_ok, days, now, used):
+# longest first), the ones left alone with why, and how many stopped ones --days left out. used: last_used(); ended:
+# ended_with_service()
+def tidy_inventory(sessions, windows, pins, pinned_ok, days, now, used, ended=None):
     stopped, running, kept, recent = [], [], [], 0
     for s in sessions:
-        verdict, words = tidy_verdict(s, windows, pins, job_state(s.get('id')), pinned_ok, now, used.get(s['sessionId']))
+        verdict, words = tidy_verdict(s, windows, pins, job_state(s.get('id')), pinned_ok, now, used.get(s['sessionId']),
+                                      (ended or {}).get(s['sessionId']))
         item = {'session': s, 'group': verdict, 'words': words}
         if verdict == 'stopped':
             # When it was last used, or else when it started
@@ -1322,7 +1419,7 @@ def tidy(argv):
         heading = os.path.basename(root) or root
     windows = read_windows()
     used = last_used([s['sessionId'] for s in sessions if not s.get('pid')])
-    inv = tidy_inventory(sessions, windows, read_pins(), pinned_ok, days, now, used)
+    inv = tidy_inventory(sessions, windows, read_pins(), pinned_ok, days, now, used, ended_with_service(sessions))
     tidy_print(inv, heading, days, windows, pinned_ok)
     offered = inv['stopped'] + inv['running']
     if only_list:

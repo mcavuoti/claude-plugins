@@ -449,7 +449,8 @@ pass "section: the window's session or --session, as the person's, refused witho
 
 # 14. ccc tidy: every folder's sessions from the list, grouped and numbered (stopped, then idle running ones), and the
 #     ones it leaves alone with why (working, waiting, tasks in the background, a window, pinned, regular); a stopped
-#     one's time from its transcript (found by its id), else its start; --here, --days, --list; a pick of numbers and ranges or s, a second yes for running ones, each checked again just before
+#     one's time from its transcript (found by its id), else its start, and whether it ended with the background
+#     service; --here, --days, --list; a pick of numbers and ranges or s, a second yes for running ones, each checked again just before
 #     it's stopped; never an unpin, never a regular session; the CLI's failures said, and exit 1
 other="$work/home/projects/other"
 mkdir -p "$other"
@@ -544,6 +545,41 @@ has '^  2  old notes +~/projects/myapp +last used 24 h ago$' "last used yesterda
 tidy_run '' --days 7 --list > /dev/null
 lacks 'old notes|fresh stop' "--days: by when it was last used, not when it started"
 has '^  2 more stopped, used in the last 7 days \(--days 7\)$' "--days: both left out"
+# The stopped ones that ended with the background service are marked, with when: the service's log (at its place in
+# HOME, or SESSIONS_DAEMON_LOG) found its workers dead after they last ran (their last start there, or their mod's
+# heartbeat). Not one the person stopped (a claude stop the log shows), nor one with no sign of when it last ran, nor
+# one that ran since
+tidy_world
+iso_ago() { python3 -c 'import datetime as d, sys; t = d.datetime.now(d.timezone.utc).replace(hour=int(sys.argv[2]), minute=30, second=0, microsecond=0) - d.timedelta(days=int(sys.argv[1])); print(t.strftime("%Y-%m-%dT%H:%M:%S.000Z"))' "$1" "$2"; }
+ms_of() { python3 -c 'import datetime as d, sys; print(int(d.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")).timestamp() * 1000))' "$1"; }
+started_at="$(iso_ago 3 8)"
+died_at="$(iso_ago 3 9)"
+when="$(TZ=UTC python3 -c 'import datetime as d, sys; t = d.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")); print("%02d:%02d on %s %d" % (t.hour, t.minute, t.strftime("%b"), t.day))' "$died_at")"
+{
+  printf '[%s] [bg] bg claimed-spare aaaaaaa1 (spare)\n[%s] [bg] bg claimed-spare aaaaaaa2 (spare)\n' "$started_at" "$started_at"
+  printf '[%s] [bg] bg settled aaaaaaa2 (killed)\n' "$started_at"
+  printf '[%s] [supervisor] ─── daemon start ─── version=2.1.300 pid=100 origin=transient\n' "$died_at"
+  printf '[%s] [bg] bg adopt: adopted=0 respawned=0 dead=1\n' "$died_at"
+} > "$HOME/.claude/daemon.log"
+export TZ=UTC
+tidy_run '' --list > /dev/null
+has "^  1  old notes +~/projects/myapp +last used 10 d ago · ended with the background service at $when$" "ended with the service: marked, with when"
+has "^  2  fresh stop +~/projects/other +started 2 d ago \(its transcript wasn't found\)$" "stopped by the person: not marked"
+# The mod's heartbeat says when one last ran when the log has no start of it: before the death, marked; after, it ran
+# since; neither, no sign: not marked
+grep -v 'claimed-spare aaaaaaa1' "$HOME/.claude/daemon.log" > "$work/service.log"
+rm "$HOME/.claude/daemon.log"
+beat_at() { mkdir -p "$data/alive"; printf 'format=3\npid=0\nat=%s\nversion=0.10.0\nvia=session.start\n' "$2" > "$data/alive/$1-0000-0000-0000-000000000000"; }
+beat_at aaaaaaa1 "$(ms_of "$started_at")"
+SESSIONS_DAEMON_LOG="$work/service.log" tidy_run '' --list > /dev/null
+has "^  1  old notes .*last used 10 d ago · ended with the background service at $when$" "SESSIONS_DAEMON_LOG, and the heartbeat's time"
+beat_at aaaaaaa1 "$(now_ms)"
+SESSIONS_DAEMON_LOG="$work/service.log" tidy_run '' --list > /dev/null
+lacks 'ended with the background service' "ran since the death"
+rm -f "$data/alive/aaaaaaa1-0000-0000-0000-000000000000"
+SESSIONS_DAEMON_LOG="$work/service.log" tidy_run '' --list > /dev/null
+lacks 'ended with the background service' "no sign of when it last ran"
+unset TZ
 tidy_world
 # A pick of a number and a range, with the second yes for the running ones
 export SESSIONS_PLUGIN_VERSION=0.10.0 SESSIONS_PLUGIN_SINCE=0
@@ -634,7 +670,7 @@ expect "$(tidy_run '')" 1 "an unreadable list"
 has "^Couldn't read the session list" "an unreadable list"
 expect "$(tidy_run '' --days)" 2 "--days without a number"
 expect "$(tidy_run '' --bogus)" 2 "an unknown option"
-pass "tidy: groups and reasons, last used, --here, --days, --list, picks, s, Enter, the second yes, checked again, --pinned, failures"
+pass "tidy: groups and reasons, last used, --here, --days, ended with the background service, --list, picks, s, Enter, the second yes, checked again, --pinned, failures"
 
 # What ccc hands the launcher (the installed version and since when) never reaches a claude it runs: a viewer or a
 # start that brings up the background service would pass it on to every session the service starts
