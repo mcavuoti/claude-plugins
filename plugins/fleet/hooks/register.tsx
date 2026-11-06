@@ -391,6 +391,7 @@ import {
   blindText,
   bodyHashOf,
   bodyTextOf,
+  citingLines,
   confirmedBy,
   defaultKindOf,
   elsewhereText,
@@ -2906,7 +2907,7 @@ async function gate($: any, e: any, next: any) {
   // In flight until its event is out: a peer's command that names the file and ends meanwhile leaves it to the scan.
   // Rewritten every WRITING_REFRESH_MS while what runs beneath waits (a permission prompt can take minutes): its age is
   // the wait's, and a session that died stops refreshing it, so it goes stale in WRITING_MS
-  const mark = await inFlight($, w.rel, thread)
+  const mark = await inFlight($, w.rel, thread, text === null ? null : hashText(text))
   let r: any
   try {
     r = await next(e)
@@ -2994,20 +2995,22 @@ function writingPath(rel: string, sid8: string, thread: string): string {
 
 /** One write's mark: written now, rewritten every WRITING_REFRESH_MS until done() (which waits for a rewrite under
  * way, so done is the last word) */
-async function inFlight($: any, rel: string, thread: string): Promise<{ done: () => Promise<void> }> {
+async function inFlight($: any, rel: string, thread: string, to: string | null): Promise<{ done: () => Promise<void> }> {
   let pending = true
-  let chain: Promise<void> = markWriting($, rel, thread, false)
+  const since = await $.clock.now()
+  const mark = { since, ...(to ? { to } : {}) }
+  let chain: Promise<void> = markWriting($, rel, thread, false, mark)
   // Written before the write goes on
   await chain
   const timer = $.clock.every(WRITING_REFRESH_MS, () => {
-    if (pending) chain = chain.then(() => (pending ? markWriting($, rel, thread, false) : undefined))
+    if (pending) chain = chain.then(() => (pending ? markWriting($, rel, thread, false, mark) : undefined))
   })
   return {
     done: async () => {
       if (!pending) return
       pending = false
       timer.cancel()
-      chain = chain.then(() => markWriting($, rel, thread, true))
+      chain = chain.then(() => markWriting($, rel, thread, true, mark))
       await chain
     },
   }
@@ -3016,7 +3019,7 @@ async function inFlight($: any, rel: string, thread: string): Promise<{ done: ()
 let writingDirMade = false
 
 /** A mark put in place whole (a temporary file moved over it), so a reader never meets half of one */
-async function markWriting($: any, rel: string, thread: string, done: boolean) {
+async function markWriting($: any, rel: string, thread: string, done: boolean, mark: { since: number; to?: string }) {
   try {
     const sessionId = String(await $.session.id())
     const at = await $.clock.now()
@@ -3024,7 +3027,7 @@ async function markWriting($: any, rel: string, thread: string, done: boolean) {
       await run($, ['mkdir', '-p', stateDir('writing')])
       writingDirMade = true
     }
-    if (!(await replace($, writingPath(rel, sessionId.slice(0, 8), thread), json({ format: FORMAT, path: rel, sessionId, agentId: thread === 'main' ? null : thread, at, ...(done ? { done: true } : {}) })))) {
+    if (!(await replace($, writingPath(rel, sessionId.slice(0, 8), thread), json({ format: FORMAT, path: rel, sessionId, agentId: thread === 'main' ? null : thread, at, ...mark, ...(done ? { done: true } : {}) })))) {
       writingDirMade = false
       log($, `couldn't mark ${rel} in flight`)
     }
@@ -3033,20 +3036,61 @@ async function markWriting($: any, rel: string, thread: string, done: boolean) {
   }
 }
 
-/** The shared files a tool write is in flight for now, in any session (a mark at this format, not done, fresh): read
- * once per post-scan, whatever it changed */
-async function writingNow($: any): Promise<Set<string>> {
-  const out = new Set<string>()
+/** The tool writes in flight now for some of these files, in any session (a mark at this format, not done, rewritten
+ * under WRITING_MS ago), by path: the text each will leave (to), when it was first marked. The folder is listed once,
+ * and only the marks of these files are read */
+async function writingNow($: any, rels: readonly string[]): Promise<Map<string, { to: string | null; since: number }[]>> {
+  const out = new Map<string, { to: string | null; since: number }[]>()
+  const prefixes = new Set(rels.map(r => `${hashText(r).slice(1, 17)}-`))
   const now = await $.clock.now()
   for (const name of await names($, stateDir('writing'))) {
-    if (!name.endsWith('.json')) continue
+    if (!name.endsWith('.json') || !prefixes.has(name.slice(0, name.indexOf('-') + 1))) continue
     let m: any = null
     try {
       m = JSON.parse((await readText($, stateDir(`writing/${name}`))) ?? 'null')
     } catch {}
-    if (m && m.format === FORMAT && typeof m.path === 'string' && m.done !== true && typeof m.at === 'number' && now - m.at < WRITING_MS) out.add(m.path)
+    if (!m || m.format !== FORMAT || typeof m.path !== 'string' || m.done === true || typeof m.at !== 'number' || now - m.at >= WRITING_MS) continue
+    out.set(m.path, [...(out.get(m.path) ?? []), { to: typeof m.to === 'string' ? m.to : null, since: typeof m.since === 'number' ? m.since : m.at }])
   }
   return out
+}
+
+/** Whether a line (as citingLines gives it) citing key is a line of a shared file the command names that cites key
+ * too: the line index of the files read so far first, then the next unread file citing key, each read once a
+ * post-scan, until one has it */
+async function copyLine($: any, copy: { named: Map<string, boolean>; lines: Map<string, Set<string>>; read: Set<string>; sources: Map<string, string[]> }, names: (rel: string) => boolean, rel: string, line: string, key: string): Promise<boolean> {
+  if (copy.lines.get(line)?.has(key)) return true
+  let sources = copy.sources.get(key)
+  if (!sources) {
+    sources = []
+    for (const [p, kk] of known) {
+      if (p === rel || !(kk.pins ?? []).includes(key)) continue
+      let named = copy.named.get(p)
+      if (named === undefined) copy.named.set(p, (named = names(p)))
+      if (named) sources.push(p)
+    }
+    copy.sources.set(key, sources)
+  }
+  for (const p of sources) {
+    if (copy.read.has(p)) continue
+    copy.read.add(p)
+    const text = await readText($, `${realRoot}/${p}`)
+    if (text === null || !records) continue
+    for (const l of citingLines(text, records)) {
+      if (!l.pins.length) continue
+      const had = copy.lines.get(l.line) ?? new Set<string>()
+      for (const x of l.pins) had.add(x)
+      copy.lines.set(l.line, had)
+    }
+    if (copy.lines.get(line)?.has(key)) return true
+  }
+  return false
+}
+
+/** Whether a mark stands for the version a file is at: its write will leave that text (or, with no text to compare,
+ * it was first marked under WRITING_MS ago). A write of someone else's, meanwhile, is theirs */
+function standsFor(m: { to: string | null; since: number }, v: string | null, now: number): boolean {
+  return m.to !== null && v !== null && v.startsWith('h') ? m.to === v : now - m.since < WRITING_MS
 }
 
 let writingPrunedAt = 0
@@ -3187,7 +3231,9 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   // The other commands running now (this session's other ones, other sessions'), asked once: one that names a file
   // this one changed too may be its writer. And the tool writes in flight, read once
   let others: Running[] | null = null
-  let writing: Set<string> | null = null
+  let writing: Map<string, { to: string | null; since: number }[]> | null = null
+  // Copies: each named file a pin may come from read once, its lines indexed (copyLines), whatever the command wrote
+  const copy = { named: new Map<string, boolean>(), lines: new Map<string, Set<string>>(), read: new Set<string>(), sources: new Map<string, string[]>() }
   for (const rel of changed) {
     const s = after.get(rel)
     const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
@@ -3214,8 +3260,9 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
       continue
     }
     // Named, but a tool write of it is in flight (a peer's Edit whose event isn't out yet): the scan finds that event
-    writing ??= await writingNow($)
-    if (writing.has(rel)) {
+    writing ??= await writingNow($, changed)
+    const scanAt = await $.clock.now()
+    if ((writing.get(rel) ?? []).some(m => standsFor(m, v, scanAt))) {
       unnamed++
       continue
     }
@@ -3229,19 +3276,20 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     const mine = (await read($, reads))[thread]?.[rel]
     // The pins of what the command left, as the gate would have checked them (it isn't held: it's marked)
     let pc = f.text === null || isHistory(rel) ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []), isStrict(records, rel))
-    // A copy of a shared file the command names (cp, tail -n +N, sed -n, cat … > x): the pins it carries over were that
-    // file's already, so they need no read of their own (a stale one is still one)
+    // A copy from shared files the command names (cp, tail -n +N, cat a b > c, … >> log): a pin is carried when every
+    // line of what it wrote that cites it is a line of such a file citing it too (pins' numbers aside), so it needs no
+    // read of its own (a stale one is still one). A line added or rewritten that cites it isn't a copy
     if (pc?.problems.some(p => p.why === 'unread') && names && f.text !== null && records) {
-      const unread = new Set(pc.problems.filter(p => p.why === 'unread').map(p => pinKey(p.pin)))
-      const written = bodyTextOf(f.text, records).trim()
-      const inherited: string[] = []
-      for (const [p, kk] of known) {
-        if (p === rel || !(kk.pins ?? []).some(x => unread.has(x)) || !names(p)) continue
-        // Only a real copy: what was written is a span of that file as it is (pins' numbers and change lines aside)
-        const src = (await versionOf($, `${realRoot}/${p}`)).text
-        if (written && src !== null && bodyTextOf(src, records).includes(written)) inherited.push(...(kk.pins ?? []))
+      const carried: string[] = []
+      const lines = citingLines(f.text, records)
+      for (const p of pc.problems.filter(p => p.why === 'unread')) {
+        const key = pinKey(p.pin)
+        const citing = lines.filter(l => l.pins.includes(key))
+        let all = citing.length > 0
+        for (const l of citing) if (!(await copyLine($, copy, names, rel, l.line, key))) all = false
+        if (all) carried.push(key)
       }
-      if (inherited.length) pc = await checkPins($, thread, f.text, new Set([...(k?.pins ?? []), ...inherited]), isStrict(records, rel))
+      if (carried.length) pc = await checkPins($, thread, f.text, new Set([...(k?.pins ?? []), ...carried]), isStrict(records, rel))
     }
     const suspect = pc ? pc.problems.map(p => `${pinKey(p.pin)}:${p.why}`) : []
     const id = records ? idOf(rel, records) : null
@@ -3348,10 +3396,15 @@ async function bashResolver($: any): Promise<(target: string) => string | null |
 async function bashTargetPredicate($: any): Promise<(target: string) => boolean> {
   const resolve = await bashResolver($)
   const res = world ? world.res : null
+  // A folder that holds shared files (or may: a glob from the project's top) is written by a copy into it
+  const bases = world ? world.globs.map(globBase) : []
   return (target: string) => {
     if (!res) return true
     const rel = resolve(target)
-    return rel === undefined || (rel !== null && inWorld(rel, res))
+    if (rel === undefined) return true
+    if (rel === null) return false
+    const dir = rel.replace(/\/+$/, '')
+    return inWorld(dir, res) || bases.some(b => b === '' || b === dir || b.startsWith(`${dir}/`) || dir.startsWith(`${b}/`) || dir === '')
   }
 }
 
@@ -3998,19 +4051,26 @@ async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   const orphans: Suspect[] = []
   const janitor = !!myInstance && isJanitor(myInstance)
   const at = await $.clock.now()
+  // The told key of each reason of a suspect told, by the suspect's key as ownSuspectLines gives it
+  const perReason = new Map<string, string[]>()
   for (const s of directSuspects()) {
     if (derivedKinds.length && derivedKindOf(s.path, derivedKinds)) continue
     // A record still being revised (its last revision under REVISION_QUIET_MS old) is told once it's quiet: one line per
     // burst, at the version it came to, not one per revision (G33). Only that reason waits, and at most REVISION_WAIT_MS
     // from the record's first move: the file's other reasons are told now
-    const busy = (r: Reason) => r.why === 'stale' && !!r.moved && at - r.moved.at < REVISION_QUIET_MS && at - (r.first ?? r.moved.at) < REVISION_WAIT_MS
-    const ready = s.reasons.some(busy) ? { ...s, reasons: s.reasons.filter(r => !busy(r)) } : s
-    if (!ready.reasons.length || told[`s|${suspectKey(ready)}`]) continue
+    // from the burst's first move: the file's other reasons are told now. Each reason is told once
+    const busy = (r: Reason) => r.why === 'stale' && !!r.moved && at - r.moved.at < REVISION_QUIET_MS && at - (r.burst ?? r.first ?? r.moved.at) < REVISION_WAIT_MS
+    const one = (r: Reason) => suspectKey({ ...s, reasons: [r] })
+    const reasons = s.reasons.filter(r => !busy(r) && !told[`s|${one(r)}`])
+    if (!reasons.length) continue
+    const ready = reasons.length === s.reasons.length ? s : { ...s, reasons }
+    perReason.set(suspectKey(ready), reasons.map(one))
     if (ownedBy(ready.owner, me)) mine.push(ready)
     else if (janitor && untold(ready.owner) && movesOf(ready)) orphans.push(ready)
   }
-  const items = ownSuspectLines(mine, words).map(x => ({ keys: x.keys.map(k => `s|${k}`), line: x.line }))
-  const strays = ownSuspectLines(orphans, words).map(x => ({ keys: x.keys.map(k => `s|${k}`), line: x.line }))
+  const keysOf = (keys: string[]) => keys.flatMap(k => perReason.get(k) ?? [k]).map(k => `s|${k}`)
+  const items = ownSuspectLines(mine, words).map(x => ({ keys: keysOf(x.keys), line: x.line }))
+  const strays = ownSuspectLines(orphans, words).map(x => ({ keys: keysOf(x.keys), line: x.line }))
   for (const f of failing()) {
     if (!ownedBy(f.owner, me)) continue
     const key = `c|${f.path}|${f.check}|${f.hash}`

@@ -103,9 +103,15 @@ test("a derived copy made by a command (tail -n +N of a checked file) carries it
   expect((r.context ?? []).join('\n')).not.toContain('marked suspect')
   for (let i = 0; i < 3; i++) await tick(w, 10000)
   expect((json(w, `${STATE}/suspects.json`)?.suspects ?? []).map((s: any) => s.path)).not.toContain('notes/send.md')
-  // A pin the source doesn't carry still needs its read
-  w.bash.value = () => w.touch(SEND, 'The plan rests on R-1@1 and R-2@1.\n')
+  // A pin the copy adds on a line of its own still needs its read; the copied line's pin is still carried
+  w.bash.value = () => w.touch(SEND, 'The plan rests on R-1@1.\nand R-2@1\n')
   const more: any = await $.tool.call({ tool: 'Bash', command: '{ tail -n +4 notes/checked.md; echo and R-2@1; } > notes/send.md' } as any)
-  expect((more.context ?? []).join('\n')).toContain('R-2@1')
-  expect((more.context ?? []).join('\n')).toContain('marked suspect')
+  const told = (more.context ?? []).join('\n')
+  expect(told).toContain('R-2@1')
+  expect(told).toContain('marked suspect')
+  expect(told).not.toContain('R-1@1')
+  // A copied line rewritten (here: a pin added to it) isn't a copy: its pins need their reads
+  w.bash.value = () => w.touch(`${ROOT}/notes/send2.md`, 'The plan rests on R-1@1 and R-2@1.\n')
+  const merged: any = await $.tool.call({ tool: 'Bash', command: "sed 's/R-1@1/R-1@1 and R-2@1/' notes/checked.md | tail -n +4 > notes/send2.md" } as any)
+  expect((merged.context ?? []).join('\n')).toContain('R-1@1')
 })
