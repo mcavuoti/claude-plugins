@@ -2799,13 +2799,15 @@ function callInput(e: any): Record<string, unknown> {
   return input
 }
 
-/** In an instance of the roster (nobody sits at it), a call the gate lets out (a calls entry, the person's recipients) to
- * a tool its organisation asks the person about on every call (the ceiling ask): refused before that prompt opens. It
- * would wait there, maybe for hours, with its text as it is now, and go out when he answers, whatever its source says by
- * then; as a /fleet draft it's checked against its source when he sends it, and his organisation's prompt follows
- * there. A read of the tool's server, a query and the person's own sessions are left to the prompt */
-async function orgAskHold($: any, e: any): Promise<{ decision: 'deny'; reason: string } | null> {
-  if (e?.ceiling !== 'ask' || e?.approver !== 'person' || !e?.tool_use_id) return null
+/** In an instance of the roster (nobody sits at it), a call the gate lets out (a calls entry, the person's recipients)
+ * that would be put to the person at a permission prompt: its organisation's ceiling ask (org, before the check), or a
+ * verdict ask the person answers (rule: a settings rule, a hook's ask, a mode that asks; after the check). Refused
+ * before that prompt opens: it would wait there, maybe for hours, with its text as it is now, and go out when he
+ * answers, whatever its source says by then; as a /fleet draft it's checked against its source when he sends it, and
+ * the prompt follows there. A read of the tool's server, a query, fleet's own approved call and the person's own
+ * sessions are left to the prompt */
+async function orgAskHold($: any, e: any, why: 'org' | 'rule' = 'org'): Promise<{ decision: 'deny'; reason: string } | null> {
+  if ((why === 'org' && e?.ceiling !== 'ask') || e?.approver !== 'person' || !e?.tool_use_id) return null
   const tool = String(e.tool ?? '')
   if (!tool.startsWith('mcp__') || tool.startsWith('mcp__fleet__')) return null
   await locate($)
@@ -2819,10 +2821,11 @@ async function orgAskHold($: any, e: any): Promise<{ decision: 'deny'; reason: s
   if (!o.allowed) return null
   const sources = callSources(tool, input, c, myInstance.name)
   const where = sources.length ? sources.join(', ') : null
-  log($, `refused before the organisation's prompt: ${tool} from ${myInstance.name} (a background instance): to be drafted for the person instead`)
+  log($, `refused before ${why === 'org' ? "the organisation's" : 'a permission'} prompt: ${tool} from ${myInstance.name} (a background instance): to be drafted for the person instead`)
+  const asks = why === 'org' ? `Your organisation asks the person about every call of ${tool}` : `A permission rule puts every call of ${tool} to the person`
   return {
     decision: 'deny',
-    reason: `fleet: this wasn't sent. Your organisation asks the person about every call of ${tool}, and in this background session the call would wait at that prompt, maybe for hours, with its text as it is now, and go out when he answers${where ? ` even if ${where} changed meanwhile` : ''}. So draft it with mcp__fleet__send (mcp_tool "${tool}", the same input): the person approves it in /fleet${where ? `, where fleet checks it against ${where} as ${sources.length === 1 ? 'it is' : 'they are'} then` : ''}, and his organisation's prompt follows there.`,
+    reason: `fleet: this wasn't sent. ${asks}, and in this background session the call would wait at that prompt, maybe for hours, with its text as it is now, and go out when he answers${where ? ` even if ${where} changed meanwhile` : ''}. So draft it with mcp__fleet__send (mcp_tool "${tool}", the same input): the person approves it in /fleet${where ? `, where fleet checks it against ${where} as ${sources.length === 1 ? 'it is' : 'they are'} then` : ''}, and ${why === 'org' ? "his organisation's prompt" : 'the prompt'} follows there.`,
   }
 }
 
@@ -7563,6 +7566,8 @@ async function rulingHere($: any, e: any) {
   const about = field(e.about, 300, 'about')
   if ('reason' in about) return { deny: `${about.reason}. Nothing was recorded.` }
   if (!about.text) return { deny: "about: one line on what the person ruled (fleet records their words as the ruling; this line only names it). Nothing was recorded." }
+  // What it names, without a stop of its own: it goes inside a sentence and a parenthesis
+  const named = about.text.replace(/[\s.!?;:,]+$/, '')
   const words = (turn.text ?? turn.quoted).trim()
   if (!words) return { deny: "the person's words this turn are empty: nothing to record as a ruling. Nothing was recorded." }
   if (words.length > TYPED_MAX) return { deny: `the person's words this turn are over ${TYPED_MAX} characters, more than a ruling keeps whole: ask them to say it shorter, or write it in the charter. Nothing was recorded.` }
@@ -7573,7 +7578,7 @@ async function rulingHere($: any, e: any) {
   const asker = await askerNow($)
   const now = await $.clock.now()
   const here = await sessionName($)
-  const record = await allocate($, id => ({ format: FORMAT, fleet: version, id, at: now, asker, questions: [{ question: about.text, options: [], recommended: '', why: '' }], ruling: true as const, ...(area.area ? { area: area.area } : {}) }))
+  const record = await allocate($, id => ({ format: FORMAT, fleet: version, id, at: now, asker, questions: [{ question: named, options: [], recommended: '', why: '' }], ruling: true as const, ...(area.area ? { area: area.area } : {}) }))
   const file: AnswerFile = { format: FORMAT, id: record.id, q: 1, text: words, origin: turn.origin === 'bridge' ? 'bridge' : 'composer', session: here, at: now, pre: true, quoted: turn.quoted }
   if ((await publish($, dec(`answers/${answerName(record.id, 1)}`), json(file))) !== 'ok') {
     await remove($, [dec(`queue/${queueName(record.id)}`)])
@@ -7581,12 +7586,12 @@ async function rulingHere($: any, e: any) {
   }
   await close($, record.id, { state: 'delivered', how: 'result' })
   lastRuling = { key, id: record.id }
-  log($, `${record.id}: the person's ruling, typed here (${about.text.slice(0, 80)})`)
+  log($, `${record.id}: the person's ruling, typed here (${named.slice(0, 80)})`)
   try {
-    $.ui.log(`recorded as your ruling (${record.id}, on ${cut(about.text, 120)}): "${cut(words, 300)}". To change it, say it again here: a new ruling of yours stands over this one.`)
+    $.ui.log(`recorded as your ruling (${record.id}, on ${cut(named, 120)}): "${cut(words, 300)}". To change it, say it again here: a new ruling of yours stands over this one.`)
   } catch {}
   bg(beat($))
-  return { result: `Recorded as ${record.id}: the person's ruling on ${about.text}, in his words, in the register, closed (the judges and the brief read it as his answer).${area.note ? ` (${area.note}.)` : ''} Act on it as his decision.` }
+  return { result: `Recorded as ${record.id}: the person's ruling on ${named}, in his words, in the register, closed (the judges and the brief read it as his answer).${area.note ? ` (${area.note}.)` : ''} Act on it as his decision.` }
 }
 
 /** Withdraws this session's own open decision, unless the person answered any of it (his answer is never taken back) */
@@ -12013,6 +12018,18 @@ export const register: Register = on => {
       }
     } catch {}
     const r: any = await next(e)
+    // The same post put to the person by a verdict ask (a settings rule, a hook, a mode that asks; no organisation
+    // ceiling): it would wait at that prompt with its text frozen just the same. In auto mode a plain ask goes to the
+    // classifier, not the person: only a rule's or a hook's ask counts there
+    try {
+      if (r?.decision === 'ask' && e.ceiling !== 'ask' && e.approver === 'person') {
+        const mode = permissionMode ?? (await configuredMode($))
+        if (r.rule || r.plugin || !NO_PROMPT_MODES.has(mode ?? '')) {
+          const held = await orgAskHold($, e, 'rule')
+          if (held) return held
+        }
+      }
+    } catch {}
     try {
       // fleet's own call refused by the permission check: it never ran
       if (e.tool_use_id && ownInFlight.has(String(e.tool_use_id)) && r?.decision === 'deny') ownRefused.add(String(e.tool_use_id))
