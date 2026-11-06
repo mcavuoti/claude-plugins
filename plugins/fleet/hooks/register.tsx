@@ -484,6 +484,91 @@ async function processNow($: any): Promise<string> {
   await update($, processId, () => id)
   return id
 }
+// Live updates (0.11.0). classic.SessionStart hands the engine fleet's paths to watch (watchedPaths): events/latest,
+// inbox/latest, decisions/queue, decisions/answers, decisions/overrules and the bell folder. The engine raises
+// classic.FileChanged about 0.6 s after one changes, in background sessions too, and keeps that list across a hot reload
+// of the mod until the next SessionStart (a start, /clear, a compaction, a resume) replaces it. A reload never raises
+// SessionStart, so the set of paths has a version (FLEET_WATCH_SET), which SessionStart writes in $.state (`watching`):
+// a module that finds its own set there is watched (live); one that doesn't (a reload into a version that watches
+// more, sessions' update in place, a managed plugin that sends SessionStart on past fleet) reads on today's timers and
+// /fleet status says "live updates off". Live comes only once the engine proved it: SessionStart rings bell/probe a
+// second after it hands the list, and the first FileChanged under bell/ turns live updates on (and writes the set in
+// $.state, for a reload). Live, the timers are a safety pass (a lost event costs latency, never
+// correctness): answers every 60 s instead of 2 s, the band and the rest of the beat every 60 s instead of 10 s (10 s
+// still in the sweeping session, whose beat scans the world for outside changes).
+const FLEET_WATCH_SET = 1
+const watching = atom({ plugin: 'fleet', key: 'watching' } as const, 0)
+let live = false
+// This process's SessionStart handed the engine the set (live waits for its proof)
+let handedSet = false
+/** One file per kind of change that no watched folder carries, rewritten in place (like events/latest) by whoever
+ * made the change: who rang and when, never data. A reader that sees it ring reads again what it says moved */
+type BellKind = 'work' | 'runs' | 'restart' | 'budget' | 'probe'
+function bellDir(): string {
+  return `${root}/.claude/fleet/bell`
+}
+async function ringBell($: any, what: BellKind) {
+  if (!root) return
+  try {
+    await $.fs.write(`${bellDir()}/${what}`, json({ format: FORMAT, by: myRef ?? jobRef ?? null, at: await $.clock.now() }))
+  } catch {}
+}
+/** What changed on a watched path, run once after a short wait (a burst of events is one pass): the same code the
+ * timers run, never another copy of it */
+const RING_MS = 150
+let rungKinds = new Set<'deliver' | 'beat' | 'sweep'>()
+let ringPending = false
+function ringHere($: any, kinds: readonly ('deliver' | 'beat' | 'sweep')[]) {
+  for (const k of kinds) rungKinds.add(k)
+  if (ringPending) return
+  ringPending = true
+  $.clock.after(RING_MS, () => {
+    ringPending = false
+    const k = rungKinds
+    rungKinds = new Set()
+    bg(rung($, k))
+  })
+}
+async function rung($: any, kinds: ReadonlySet<'deliver' | 'beat' | 'sweep'>) {
+  if (!timersOn) return
+  if (kinds.has('deliver') && jobRef) await deliverChain($)
+  if (kinds.has('beat')) await beatOnce($)
+  if (kinds.has('sweep') && sweep.holding) await sweepTick($)
+}
+/** A submit that failed is tried again 30 s later (retryAt): live, the delivery pass is told then */
+function retrySoon($: any) {
+  if (live) $.clock.after(30500, () => ringHere($, ['deliver']))
+}
+/** What the delivery timer runs: answers, overrules, the person's notes that came after his answers */
+async function deliverChain($: any) {
+  await deliver($)
+  await deliverOverrules($)
+  await deliverLate($)
+}
+/** The beat, one at a time: one that comes while another runs runs once more after it */
+let beating = false
+let beatAgain = false
+async function beatOnce($: any) {
+  if (beating) {
+    beatAgain = true
+    return
+  }
+  beating = true
+  try {
+    do {
+      beatAgain = false
+      await beat($)
+    } while (beatAgain)
+  } finally {
+    beating = false
+  }
+}
+/** /fleet status's line on live updates */
+function liveLine(): string {
+  return live
+    ? 'live updates: on (questions, answers and overrules reach this session by their files, in under a second)'
+    : 'live updates off: u or /clear turns them on (here fleet reads its files on timers: answers every 2 s, the band every 10 s)'
+}
 const section = atom({ plugin: 'fleet', key: 'section' } as const, '')
 const reads = atom({ plugin: 'fleet', key: 'reads' } as const, {} as Record<string, Record<string, FleetRead>>)
 const warned = atom({ plugin: 'fleet', key: 'warned' } as const, {} as Record<string, Record<string, string>>)
@@ -907,9 +992,26 @@ function timers($: any) {
   if (timersOn || !root) return
   timersOn = true
   $.clock.after(0, () => bg((async () => (sweep.bornAt = sweep.bornAt || (await $.clock.now())))()))
+  // A module that came in by a reload: watched when the SessionStart behind it handed this set of paths
+  $.clock.after(0, () =>
+    bg(
+      (async () => {
+        if (!live && (await read($, watching)) === FLEET_WATCH_SET) {
+          live = true
+          watchingLatest = true
+        }
+      })(),
+    ),
+  )
+  // Live, the timers below are the safety pass: their ticks in between end at once, with nothing read
+  let deliverTicks = 0
+  let beatTicks = 0
   if (jobRef) {
     $.clock.after(0, () => bg(rebuild($)))
-    $.clock.every(2000, () => bg(deliver($).then(() => deliverOverrules($)).then(() => deliverLate($))))
+    $.clock.every(2000, () => {
+      if (live && ++deliverTicks % 30 !== 0) return
+      bg(deliverChain($))
+    })
     // An instance of the roster: its binding, heartbeat and spend; its seed, and its nudges
     $.clock.after(1500, () => bg(instanceTick($)))
     $.clock.every(30000, () => bg(instanceTick($)))
@@ -920,8 +1022,11 @@ function timers($: any) {
   $.clock.after(0, () => bg(startWorld($)))
   $.clock.after(0, () => bg(restoreMark($)))
   $.clock.every(2000, () => bg(worldTick($)))
-  $.clock.every(10000, () => bg(beat($)))
-  $.clock.after(1000, () => bg(beat($)))
+  $.clock.every(10000, () => {
+    if (live && !sweep.holding && !sweep.takenAt && ++beatTicks % 6 !== 0) return
+    bg(beatOnce($))
+  })
+  $.clock.after(1000, () => bg(beatOnce($)))
 }
 
 // ---- The decisions' files ----
@@ -1259,6 +1364,7 @@ async function failed($: any, ids: string[], err: unknown) {
   await update($, inflight, m => omit(m, ids))
   const now = await $.clock.now()
   await update($, retryAt, () => now + 30000)
+  retrySoon($)
   log($, `the submit of ${ids.join(', ')} failed (${String(err).slice(0, 200)}); trying again in 30 s`)
 }
 
@@ -1964,7 +2070,9 @@ async function eventsTick($: any, fromPoll = false) {
     if (unwatched && now - unwatched > 3000) {
       if (fileChangedAt < unwatched && ++watchMisses >= 2) {
         watchingLatest = false
-        log($, "events/latest: the engine's watcher didn't bring two landings; the world is looked at every 2 s")
+        // The watcher misses fleet's files here: every timer back at its own pace
+        live = false
+        log($, "events/latest: the engine's watcher didn't bring two landings; the world is looked at every 2 s, and live updates are off")
       }
       unwatched = 0
     }
@@ -3799,7 +3907,7 @@ async function worldTick($: any) {
 
 // ---- The sweeper: one session of the project, elected by a lease, every 60 s (and soon after each landing) ----
 
-const sweep = { bornAt: 0, holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0, running: false, asking: false, dirty: false, intakeDirty: false, slotsDirty: false, lastRun: {} as Record<string, number>, commitNote: '', suspectsKey: '' }
+const sweep = { bornAt: 0, holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0, running: false, asking: false, dirty: false, intakeDirty: false, slotsDirty: false, wakeDirty: false, lastRun: {} as Record<string, number>, commitNote: '', suspectsKey: '' }
 
 // The lease, <project>/.claude/fleet/state/sweeper.json: whoever holds it rewrites it every 30 s; one older than 90 s
 // (or none) is taken by writing it, and the taker sweeps once it still finds itself there 2 s later (two that took it
@@ -3888,13 +3996,14 @@ async function sweepTick($: any) {
   const now = await $.clock.now()
   const full = now - sweep.lastSweep >= 60000
   const worldUp = worldOn() && baselined
-  if (!full && !(sweep.dirty && worldUp) && !sweep.intakeDirty && !sweep.slotsDirty) return
+  if (!full && !(sweep.dirty && worldUp) && !sweep.intakeDirty && !sweep.slotsDirty && !sweep.wakeDirty) return
   sweep.running = true
   try {
     if (worldUp && (full || sweep.dirty)) await computeSuspects($)
     if (full || sweep.slotsDirty) await sweepSlotsNow($).catch(err => log($, `slots: ${String(err).slice(0, 200)}`))
     if (full) {
       sweep.lastSweep = now
+      sweep.wakeDirty = false
       // Wakes and alerts first: a check or a commit that hangs to its timeout doesn't hold them
       await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
       await alertsTick($).catch(err => log($, `alerts: ${String(err).slice(0, 200)}`))
@@ -3905,6 +4014,11 @@ async function sweepTick($: any) {
       // The code watch, whatever the world: each repository polled every everyMin (a poll that hangs to its timeout
       // holds nothing above)
       await codeTick($).catch(err => log($, `code: ${String(err).slice(0, 200)}`))
+    }
+    // An answer or an overrule landed (live updates): a retired asker is woken for it now, not at the next full sweep
+    if (!full && sweep.wakeDirty) {
+      sweep.wakeDirty = false
+      await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
     }
     if (full || sweep.intakeDirty) await intakeTick($).catch(err => log($, `intake: ${String(err).slice(0, 200)}`))
   } catch (err) {
@@ -6539,6 +6653,7 @@ async function pollRuns($: any, views: RunView[], now: number): Promise<boolean>
     const r = await publish($, `${runsDir()}/${v.run.id}.done.json`, json({ format: FORMAT, id: v.run.id, at: now, exit: doneExit(text) }))
     if (r !== 'failed') {
       any = true
+      await ringBell($, 'runs')
       log($, `run ${v.run.id} of ${v.run.owner.name} finished`)
     }
   }
@@ -6715,6 +6830,7 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
       await run($, ['mkdir', '-p', stateDir()])
       await replace($, stateDir('work.json'), json(next))
     }
+    if (!same) await ringBell($, 'work')
   }
   return { offered, later, finished }
 }
@@ -9074,6 +9190,7 @@ async function rosterTakesEffect($: any): Promise<string[]> {
     if (restart) {
       await run($, ['mkdir', '-p', instDir(inst.slug)])
       await replace($, `${instDir(inst.slug)}/restart.json`, json({ format: FORMAT, at }))
+      await ringBell($, 'restart')
       parts.push('restarts with its new settings once idle (nothing in flight)')
     }
     const said: string[] = []
@@ -9113,6 +9230,7 @@ async function setDown($: any, slugs: readonly string[], down: boolean) {
     await run($, ['mkdir', '-p', stateDir()])
     await replace($, stateDir('down.json'), json(d))
   }
+  await ringBell($, 'budget')
 }
 
 function sameProject(rowRoot: string | null): boolean {
@@ -9451,7 +9569,10 @@ async function rosterTick($: any) {
     const line = await restartLine($, st).catch(() => restart)
     if (line !== restart) {
       const w = await readWork($)
-      if (w) await replace($, stateDir('work.json'), json({ ...w, ...(line ? { restart: line } : { restart: undefined }) }))
+      if (w) {
+        await replace($, stateDir('work.json'), json({ ...w, ...(line ? { restart: line } : { restart: undefined }) }))
+        await ringBell($, 'work')
+      }
     }
   }
   await setFleetMarks($, marks, now)
@@ -9915,6 +10036,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
       const named = !rewritten.has(p.inst.slug)
       await run($, ['mkdir', '-p', instDir(p.inst.slug)])
       await replace($, `${instDir(p.inst.slug)}/restart.json`, json({ format: FORMAT, at, ...(named ? { named: true } : {}) }))
+      await ringBell($, 'restart')
       restarts.push(`  ${p.inst.name}: ${named ? 'restarts once idle, as asked' : 'restarts with its settings once idle'} (nothing in flight); /fleet status shows what it waits for`)
     }
   }
@@ -10044,6 +10166,7 @@ async function budgetCommand($: any, target: string, amount: string, origin: str
     await run($, ['mkdir', '-p', stateDir()])
     await replace($, stateDir('lifts.json'), json(lifts))
   }
+  await ringBell($, 'budget')
   budgetCache.at = 0
   log($, `budget of ${name} for ${day}: ${next}`)
   return `${name}: ${usd(next)} for today (${usd(key === null ? p.usd : (b?.usd ?? 0))} spent so far). Tomorrow it's the roster's again.`
@@ -10200,6 +10323,7 @@ async function rosterStatus($: any): Promise<string[]> {
   }
   if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
   lines.push(classicLine(await read($, classicSeen)))
+  lines.push(liveLine())
   const loose = await unstamped($)
   if (loose.length) lines.push(`changed outside fleet (not through a change you applied): ${loose.join(', ')}: /fleet accept <path> stamps your own edit as yours`)
   return lines
@@ -11037,6 +11161,7 @@ async function deliverOverrules($: any) {
         (async () => {
           await update($, overruling, m => omit(m, ids))
           await update($, retryAt, () => now + 30000)
+          retrySoon($)
           log($, `the overrule of ${ids.join(', ')} failed (${String(err).slice(0, 200)}); trying again in 30 s`)
         })(),
       ),
@@ -11087,6 +11212,7 @@ async function deliverLate($: any) {
         (async () => {
           await update($, lateNotes, unsend)
           await update($, retryAt, () => now + 30000)
+          retrySoon($)
           log($, `the late notes of ${ready.join(', ')} failed (${String(err).slice(0, 200)}); trying again in 30 s`)
         })(),
       ),
@@ -12261,12 +12387,22 @@ export const register: Register = on => {
       if (!root) return r
       // The files it watches exist before it says so: a path whose folder is missing then is never watched in this
       // session (the inbox's folder is made only once intake is set up)
-      const watched = [`${eventsDir()}/latest`, ...(intakeCfg ? [`${inboxDir()}/latest`] : [])]
-      for (const p of watched) {
+      const files = [`${eventsDir()}/latest`, ...(intakeCfg ? [`${inboxDir()}/latest`] : [])]
+      // And the folders that carry what fleet's timers looked for (0.11.0: live updates). A missing one is watched only
+      // in the simplest case (several missing under one parent: only one ever is), so each is made before the list goes
+      const folders = [dec('queue'), dec('answers'), dec('overrules'), bellDir()]
+      const missing: string[] = []
+      for (const d of folders) if (await gone($, d)) missing.push(d)
+      if (missing.length) await run($, ['mkdir', '-p', ...missing])
+      for (const p of files) {
         if (await gone($, p)) await $.fs.write(p, json({ format: FORMAT, last: '' })).catch(() => {})
       }
       watchingLatest = true
       watchMisses = 0
+      const watched = [...files, ...folders]
+      // Live once the engine brings its own ring back (the list is set once this hook returns)
+      handedSet = true
+      $.clock.after(1000, () => bg(ringBell($, 'probe')))
       const out = { ...r, watchPaths: [...(r?.watchPaths ?? []), ...watched] }
       if (!envInstance || !jobRef) return out
       await loadRoster($)
@@ -12340,6 +12476,25 @@ export const register: Register = on => {
     }
     // A poller dropped an item: the sweeper reads it at its next tick
     if (root && String(e.file_path).endsWith('/.claude/fleet/inbox/latest')) sweep.intakeDirty = true
+    // Live updates: an answer, an overrule or a note reaches its asker now; a question asked or closed reaches the band
+    // and the sweeper's marks now (and an answer to a retired asker wakes it now); a bell says what else moved
+    // The engine brought a bell: it watches fleet's paths in this session
+    if (root && !live && handedSet && String(e.file_path).includes('/.claude/fleet/bell/')) {
+      live = true
+      bg(update($, watching, () => FLEET_WATCH_SET))
+    }
+    if (root && live) {
+      const p = String(e.file_path)
+      if (p.includes('/.claude/fleet/decisions/answers/') || p.includes('/.claude/fleet/decisions/overrules/')) {
+        sweep.wakeDirty = true
+        ringHere($, ['deliver', 'beat', 'sweep'])
+      } else if (p.includes('/.claude/fleet/decisions/queue/')) ringHere($, ['beat', 'sweep'])
+      else if (p.includes('/.claude/fleet/bell/')) {
+        // A budget raised or an instance taken down: its budgets are read again, not from the minute's cache
+        if (p.endsWith('/bell/budget')) budgetCache.at = 0
+        ringHere($, ['beat'])
+      }
+    }
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -12526,6 +12681,8 @@ export const register: Register = on => {
           await update($, idleSince, () => now)
           // Its nudges are looked at once it's been idle the 30 s they wait for
           if (myInstance) kickNudge($, 30500)
+          // Answers that came while it worked go now (live: the delivery pass runs only on what moved)
+          if (live) ringHere($, ['deliver'])
         })(),
       )
     }
@@ -12538,7 +12695,13 @@ export const register: Register = on => {
   // thread's digest (prompt.submit's context is in the turn's first request; an append there would not be)
   on('prompt.submit', async ($, e, next) => {
     if ((e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') && timersOn) {
-      bg((async () => ((await read($, stopped)) ? update($, stopped, () => false) : null))())
+      bg(
+        (async () => {
+          if (!(await read($, stopped))) return
+          await update($, stopped, () => false)
+          if (live) ringHere($, ['deliver'])
+        })(),
+      )
     }
     // A background task's notification that names a Bash command of this session's: it completed (or stopped), so what
     // it wrote lands now, without waiting for the turn's stop
