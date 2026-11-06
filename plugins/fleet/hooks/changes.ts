@@ -681,7 +681,9 @@ function sedScripts(args: readonly string[]): string[] | null {
           break
         }
         if (ch === 'l') {
-          if (k + 1 < a.length) break
+          // GNU's number attached (-l80) ends the cluster; other letters after it are BSD's flags, read on (-le, -nle)
+          if (/^\d+$/.test(a.slice(k + 1))) break
+          if (k + 1 < a.length) continue
           if (/^\d+$/.test(args[i + 1] ?? '')) i++
           break
         }

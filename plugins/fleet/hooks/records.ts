@@ -275,6 +275,26 @@ export function bodyTextOf(text: string, records: Records): string {
   })
 }
 
+/** A text's lines as a copy is judged by (records.ts bodyTextOf, line by line: pins' numbers blanked, the change line
+ * out), each with the pins it cites ("R-1@4"): a copy carries a pin when every line citing it is a source's line
+ * citing it */
+export function citingLines(text: string, records: Records): { line: string; pins: string[] }[] {
+  const re = new RegExp(`${records.pin.source}(?:${RANGE_END})?`, 'g')
+  return withoutChangeLine(text, records.changeKey)
+    .split('\n')
+    .map(raw => {
+      const pins: string[] = []
+      const line = raw.trimEnd().replace(re, (...a: any[]) => {
+        const m = a as unknown as RegExpMatchArray
+        const id = m[1] as string
+        const end = rangeEnd(m)
+        pins.push(`${id}@${end ?? m[2]}`)
+        return end === null ? `${id}@${(m[0] as string).slice(`${id}@${m[2]}`.length)}` : `${id}@`
+      })
+      return { line, pins }
+    })
+}
+
 /** The end of a range of versions after a pin, its number captured: –@5 or — @5 (a dash, then @), -@5, ..5 or ..@5,
  * " to @5". A dash and a bare number after a pin is prose ("F-7@3 — 2 tests fail") */
 const RANGE_END = '(?:\\s*[\u2013\u2014]\\s*@|-@|\\.\\.@?|\\s+to\\s+@)(\\d+)(?![0-9])'
@@ -426,7 +446,13 @@ export type PinState = {
   moved?: Rev
   /** When the oldest of them landed: since when the pin has been stale */
   firstAt?: number
+  /** When the run of them the newest belongs to began (each under BURST_GAP_MS after the one before): a burst of
+   * revisions is told once, at most a while after it began */
+  burstAt?: number
 }
+
+/** The longest gap between two moves of one burst of revisions */
+export const BURST_GAP_MS = 2 * 60000
 
 export function pinState(pin: Pin, revs: readonly Rev[] | undefined): PinState {
   if (!revs || !revs.length) return { pin, state: 'unknown', now: 0 }
@@ -434,7 +460,13 @@ export function pinState(pin: Pin, revs: readonly Rev[] | undefined): PinState {
   if (pin.rev > now) return { pin, state: 'ahead', now }
   const movers = revs.filter(r => r.rev > pin.rev && STALE_KINDS.has(r.kind)).sort((a, b) => b.rev - a.rev)
   const moved = movers[0]
-  return moved ? { pin, state: 'stale', now, moved, firstAt: Math.min(...movers.map(r => r.at)) } : { pin, state: 'current', now }
+  if (!moved) return { pin, state: 'current', now }
+  let burstAt = moved.at
+  for (const r of [...movers].sort((a, b) => b.at - a.at)) {
+    if (burstAt - r.at >= BURST_GAP_MS) break
+    burstAt = Math.min(burstAt, r.at)
+  }
+  return { pin, state: 'stale', now, moved, firstAt: Math.min(...movers.map(r => r.at)), burstAt }
 }
 
 /** How the writing thread read a record: the version there now, an older one, or never in this conversation */
@@ -566,6 +598,8 @@ export type Reason = {
   moved?: Pick<Rev, 'rev' | 'kind' | 'at' | 'by' | 'hash'>
   /** stale: when the oldest move since the cited version landed (a derived document's longest wait counts from it) */
   first?: number
+  /** stale: when the burst of moves the newest belongs to began (the owners' quiet wait counts from it) */
+  burst?: number
 }
 export type Suspect = { path: string; id: string | null; owner: Who | null; reasons: Reason[]; via?: string[] }
 /** derived: the derived documents among the suspects a revised record made stale (derived.ts), for their owners */
@@ -586,7 +620,7 @@ export function suspectsOf(files: readonly Facts[], stateOf: (p: Pin) => PinStat
       const st = stateOf(pin)
       if (st.state === 'current' || keptAt(f.confirmed, s, st)) continue
       const m = st.moved
-      reasons.push({ why: st.state, pin: s, of: pin.id, ...(st.now ? { now: st.now } : {}), ...(m ? { moved: { rev: m.rev, kind: m.kind, at: m.at, by: m.by, hash: m.hash } } : {}), ...(st.firstAt !== undefined ? { first: st.firstAt } : {}) })
+      reasons.push({ why: st.state, pin: s, of: pin.id, ...(st.now ? { now: st.now } : {}), ...(m ? { moved: { rev: m.rev, kind: m.kind, at: m.at, by: m.by, hash: m.hash } } : {}), ...(st.firstAt !== undefined ? { first: st.firstAt } : {}), ...(st.burstAt !== undefined ? { burst: st.burstAt } : {}) })
     }
     for (const b of f.blind ?? []) {
       const [pin = '', detail = ''] = b.split(':')
