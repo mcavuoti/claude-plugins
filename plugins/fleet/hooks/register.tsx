@@ -407,6 +407,7 @@ import {
   copyReadText,
   copyWriteText,
   idOf,
+  isHistoryPath,
   isStrict,
   landedText,
   landingKind,
@@ -1557,6 +1558,12 @@ function isJournal(rel: string): boolean {
   if (!roster) return false
   const fold = (x: string) => (insensitive ? x.toLowerCase() : x)
   return roster.instances.some(i => fold(i.journal) === fold(rel))
+}
+
+/** A journal, or a register many write a row of (world.json's history, G31): its pins are history, so they're kept as
+ * written, never refused, never suspect, never asked for a proof */
+function isHistory(rel: string): boolean {
+  return isJournal(rel) || isHistoryPath(rel, records)
 }
 
 function isIntakePath(rel: string): boolean {
@@ -2754,12 +2761,15 @@ async function gate($: any, e: any, next: any) {
   const cur = await versionOf($, w.abs)
   const mine = (await read($, reads))[thread]?.[w.rel]
   const told = (await read($, warned))[thread] ?? {}
-  // Under strict, nothing passes on a second try: only a read clears it
+  // Under strict, nothing passes on a second try: only a read clears it. Nor does a second call of the batch whose
+  // first was refused (the same step: the model hadn't seen the refusal)
   const strict = isStrict(records, w.rel)
-  const v = verdict(mine, cur.v, strict ? undefined : told[w.rel])
+  const step = stepOf.get(thread)
+  const sameStep = step !== undefined && refusedIn.get(`${thread}|${w.rel}`) === step
+  const v = verdict(mine, cur.v, strict || sameStep ? undefined : told[w.rel])
   // The pins of what the write leaves: a stale one, or a new one of a record this thread never read, is told once
   const text = resultOf(e, cur.text)
-  const pins = text === null || isJournal(w.rel) ? null : await checkPins($, thread, text, new Set(pinsFrom(cur.text, w.rel)), strict)
+  const pins = text === null || isHistory(w.rel) ? null : await checkPins($, thread, text, new Set(pinsFrom(cur.text, w.rel)), strict)
   // An Edit is refused only for the pins it writes: one left elsewhere in the file is told after it lands (under
   // strict, every pin of the file counts, as before)
   const edited = !strict && e.tool === 'Edit' && typeof e.new_string === 'string' && records ? new Set(pinsOf(e.new_string, records).map(pinKey)) : null
@@ -2767,8 +2777,13 @@ async function gate($: any, e: any, next: any) {
   const elsewhere = pins && edited ? pins.problems.filter(p => !edited.has(pinKey(p.pin))) : []
   const refusedKeys = problemKeys(refused)
   const said = new Set((told[`pins:${w.rel}`] ?? '').split('\n').filter(Boolean))
-  const fresh = refusedKeys.filter(k => strict || !said.has(k))
+  const fresh = refusedKeys.filter(k => strict || sameStep || !said.has(k))
   if (v !== 'pass' || fresh.length) {
+    if (step !== undefined) {
+      refusedIn.set(`${thread}|${w.rel}`, step)
+      const r = refusedWrites.get(thread)
+      refusedWrites.set(thread, r && r.step === step ? { ...r, writes: [...new Set([...r.writes, `${e.tool} of ${w.rel}`])] } : { step, writes: [`${e.tool} of ${w.rel}`], held: false })
+    }
     const me = await meNow($)
     const texts: string[] = []
     if (v !== 'pass') {
@@ -2789,7 +2804,14 @@ async function gate($: any, e: any, next: any) {
   // A record fleet never saw a version of: the one there now is its first
   const id = records ? idOf(w.rel, records) : null
   if (id && cur.v !== null) await revsFor($, id, { rel: w.rel, v: cur.v, text: cur.text })
-  const r = await next(e)
+  // In flight until its event is out: a peer's command that names the file and ends meanwhile leaves it to the scan
+  await markWriting($, w.rel, thread, false)
+  let r: any
+  try {
+    r = await next(e)
+  } finally {
+    if (!r || r.deny !== undefined || r.isError) await markWriting($, w.rel, thread, true)
+  }
   if (!r || r.deny !== undefined || r.isError) return r
   const extra: string[] = []
   try {
@@ -2823,15 +2845,75 @@ async function gate($: any, e: any, next: any) {
     scheduleChecks($, [w.rel])
   } catch (err) {
     log($, `after ${e.tool} of ${w.rel}: ${String(err).slice(0, 200)}`)
+  } finally {
+    await markWriting($, w.rel, thread, true)
   }
   return withLines($, r, thread, extra)
+}
+
+// ---- A tool write in flight (B28): the gate marks it in state/writing/ before the write and says done after its event.
+// A command's post-scan that finds a file it names changed while such a mark stands (not done, under WRITING_MS old)
+// leaves the change to the scan, which finds the tool's event: the gap between a peer's write and its event is never
+// taken for the command's own write. One file per path, session and thread, rewritten (no process); the prune takes
+// the old ones ----
+
+const WRITING_MS = 30000
+
+/** How long a revised record stays quiet before the owners of what cites it are told (a burst is told once) */
+const REVISION_QUIET_MS = 2 * 60000
+
+// ---- The model's steps: each loop's step now (its turn and index), the step of each refused write, and the writes a
+// step had refused (a SendMessage of that step is held once). Module state: after a reload no step is known, and the
+// gate's once works as before ----
+
+const stepOf = new Map<string, string>()
+const refusedIn = new Map<string, string>()
+const refusedWrites = new Map<string, { step: string; writes: string[]; held: boolean }>()
+
+/** A SendMessage in the step whose write the gate refused: the text that holds it once, or null */
+function sameStepHold(thread: string): string | null {
+  const step = stepOf.get(thread)
+  const r = refusedWrites.get(thread)
+  if (step === undefined || !r || r.step !== step || r.held) return null
+  refusedWrites.set(thread, { ...r, held: true })
+  const what = r.writes.length === 1 ? `your ${r.writes[0]}` : `your ${r.writes.slice(0, -1).join(', ')} and ${r.writes.at(-1)}`
+  return `fleet: this message wasn't sent: ${what} in this same batch was refused, so it didn't land${r.writes.length === 1 ? '' : ' (none of them)'}. Send it once the write lands, or send it again as it is.`
+}
+
+function writingPath(rel: string, sid8: string, thread: string): string {
+  return stateDir(`writing/${hashText(rel).slice(1, 17)}-${sid8}-${thread.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`)
+}
+
+async function markWriting($: any, rel: string, thread: string, done: boolean) {
+  try {
+    const sessionId = String(await $.session.id())
+    const at = await $.clock.now()
+    await $.fs.write(writingPath(rel, sessionId.slice(0, 8), thread), json({ format: FORMAT, path: rel, sessionId, agentId: thread === 'main' ? null : thread, at, ...(done ? { done: true } : {}) }))
+  } catch (err) {
+    log($, `couldn't mark ${rel} in flight: ${String(err).slice(0, 120)}`)
+  }
+}
+
+/** Whether a tool write of rel is in flight in some session (its mark there, not done, fresh) */
+async function writingNow($: any, rel: string): Promise<boolean> {
+  const prefix = `${hashText(rel).slice(1, 17)}-`
+  const now = await $.clock.now()
+  for (const name of await names($, stateDir('writing'))) {
+    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue
+    let m: any = null
+    try {
+      m = JSON.parse((await readText($, stateDir(`writing/${name}`))) ?? 'null')
+    } catch {}
+    if (m && m.path === rel && m.done !== true && typeof m.at === 'number' && now - m.at < WRITING_MS) return true
+  }
+  return false
 }
 
 /** Whether a world file is one that must carry a proof when world.json's proofs say so: a record, or a file under their
  * paths; never a journal (history) or an intake record (fleet's own) */
 function mustProve(rel: string): boolean {
   const p = records?.proofs
-  if (!p || !records || isJournal(rel) || isIntakePath(rel)) return false
+  if (!p || !records || isHistory(rel) || isIntakePath(rel)) return false
   return !!idOf(rel, records) || p.res.some(r => r.test(rel))
 }
 
@@ -2966,10 +3048,16 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     // A command with no write syntax changed nothing: another session's write landed while it ran (its event says so,
     // or will, and the scan takes it then). It isn't this thread's landing: its model hears what changed under it
     if (readOnly) {
-      if ((await read($, reads))[thread]?.[rel]) during.push({ rel, v })
+      // Told now only for a file it names (it may have read it mid-change); the digest tells the rest at its next step
+      if ((await read($, reads))[thread]?.[rel] && (!names || names(rel))) during.push({ rel, v })
       continue
     }
     if (names && !names(rel)) {
+      unnamed++
+      continue
+    }
+    // Named, but a tool write of it is in flight (a peer's Edit whose event isn't out yet): the scan finds that event
+    if (await writingNow($, rel)) {
       unnamed++
       continue
     }
@@ -2982,7 +3070,14 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     }
     const mine = (await read($, reads))[thread]?.[rel]
     // The pins of what the command left, as the gate would have checked them (it isn't held: it's marked)
-    const pc = f.text === null || isJournal(rel) ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []), isStrict(records, rel))
+    let pc = f.text === null || isHistory(rel) ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []), isStrict(records, rel))
+    // A copy of a shared file the command names (cp, tail -n +N, sed -n, cat … > x): the pins it carries over were that
+    // file's already, so they need no read of their own (a stale one is still one)
+    if (pc?.problems.some(p => p.why === 'unread') && names && f.text !== null) {
+      const unread = new Set(pc.problems.filter(p => p.why === 'unread').map(p => pinKey(p.pin)))
+      const inherited = [...known].filter(([p, kk]) => p !== rel && (kk.pins ?? []).some(x => unread.has(x)) && names(p)).flatMap(([, kk]) => kk.pins ?? [])
+      if (inherited.length) pc = await checkPins($, thread, f.text, new Set([...(k?.pins ?? []), ...inherited]), isStrict(records, rel))
+    }
     const suspect = pc ? pc.problems.map(p => `${pinKey(p.pin)}:${p.why}`) : []
     const id = records ? idOf(rel, records) : null
     if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
@@ -3558,7 +3653,7 @@ async function computeSuspects($: any) {
     }
     const said = confirmedBy(rel, k.v, k.pins ?? [], confs)
     if (said.length) confirmed = [...(confirmed ?? []), ...said]
-    if ((k.pins?.length || blind?.length) && !isJournal(rel)) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}), ...(confirmed ? { confirmed } : {}) })
+    if ((k.pins?.length || blind?.length) && !isHistory(rel)) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}), ...(confirmed ? { confirmed } : {}) })
   }
   const cited = new Map<string, Rev[]>()
   for (const id of new Set(facts.flatMap(f => f.pins.map(p => parsePin(p)?.id ?? '')))) if (id) cited.set(id, await revsFor($, id))
@@ -3736,9 +3831,13 @@ async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   // person): their writer is no session
   const orphans: Suspect[] = []
   const janitor = !!myInstance && isJanitor(myInstance)
+  const at = await $.clock.now()
   for (const s of directSuspects()) {
     if (derivedKinds.length && derivedKindOf(s.path, derivedKinds)) continue
     if (told[`s|${suspectKey(s)}`]) continue
+    // A record still being revised (its last revision under REVISION_QUIET_MS old) is told once it's quiet: one line per
+    // burst, at the version it came to, not one per revision (G33)
+    if (s.reasons.some(r => r.why === 'stale' && r.moved && at - r.moved.at < REVISION_QUIET_MS)) continue
     if (ownedBy(s.owner, me)) mine.push(s)
     else if (janitor && untold(s.owner) && movesOf(s)) orphans.push(s)
   }
@@ -4981,6 +5080,7 @@ async function pruneWorld($: any, now: number) {
   }
   await old(eventsDir('claims'))
   await old(`${fleetDir()}/reads`)
+  await old(stateDir('writing'))
 }
 
 // ---- /fleet world, /fleet accept, and the world's part of /fleet status ----
@@ -11056,6 +11156,8 @@ export const register: Register = on => {
   // The model each main-loop request names, as the engine resolved it (the session's, or a fallback's): the heartbeat
   // reports it, and /fleet status and the dry run say when it isn't the roster's. Only watches: the stream passes as is
   on('turn.step', async function* ($, e, next) {
+    // The loop's step now: the calls of one batch come from one step, so the gate's "once" is spent only from a later one
+    stepOf.set(typeof e.agentId === 'string' && e.agentId ? e.agentId : 'main', `${e.turnId}#${e.index}`)
     const r = yield* next(e)
     // The model that answered (usage.model, as the API reports it), else the one the request named
     const m = (r as { usage?: { model?: string } | null } | undefined)?.usage?.model ?? e.model
@@ -11248,6 +11350,16 @@ export const register: Register = on => {
 
   // Only fleet's and sessions' code notifies the person: in a background session of the project, the model's own
   // PushNotification (origin engine) is refused; a plugin's own call (from its timer) passes (H3)
+  // A message sent in the same batch as a write the gate refused may announce what didn't land (G33): held once
+  on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
+    const held = sameStepHold(threadOf(e))
+    if (held) {
+      log($, `held once: SendMessage by ${threadOf(e)} in the step of a refused write`)
+      return { deny: held }
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', { tool: 'PushNotification' }, async ($, e, next) => {
     if (next.origin?.plugin !== 'engine') return next(e)
     await locate($)

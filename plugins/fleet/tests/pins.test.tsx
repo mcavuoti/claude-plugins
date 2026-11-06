@@ -81,10 +81,14 @@ test('C10: a record cited at a version that has been revised: its owner hears it
   await tick(w)
   await tick(w)
   expect(json(w, `${STATE}/suspects.json`).suspects).toEqual([expect.objectContaining({ path: 'board/B-1.md', id: 'B-1', owner: expect.objectContaining({ sessionId: SID }), reasons: [expect.objectContaining({ why: 'stale', pin: 'R-1@1', now: 2 })] })])
-  // The next step carries both: R-1 changed since W read it, and B-1 (W's) cites it at v1
+  // The next step carries R-1's change since W read it; that B-1 (W's) cites it at v1 waits until R-1 has been quiet two
+  // minutes (a burst of revisions is told once, G33)
   const step = (await call($, { tool: 'Bash', command: 'ls' })).context.join('\n')
   expect(step).toMatch(new RegExp(`- req/R-1\\.md: changed at ${WHEN} by TEST R \\(Edit\\), now R-1@2`))
-  expect(step).toMatch(new RegExp(`fleet: shared files you wrote last are flagged[^\\n]*\\n- board/B-1\\.md \\(B-1\\) cites R-1@1, and R-1 is at v2 \\(a revision at ${WHEN} by TEST R\\)`))
+  expect(step).not.toContain('shared files you wrote last are flagged')
+  await tick(w, 2 * 60000)
+  const quiet = (await call($, { tool: 'Bash', command: 'ls' })).context.join('\n')
+  expect(quiet).toMatch(new RegExp(`fleet: shared files you wrote last are flagged[^\\n]*\\n- board/B-1\\.md \\(B-1\\) cites R-1@1, and R-1 is at v2 \\(a revision at ${WHEN} by TEST R\\)`))
   expect((await call($, { tool: 'Bash', command: 'ls' })).context).toBe(undefined)
   // Only behind the revision: one line a move on the band and in status, apart from the real flags (B23)
   expect(await band($)).toContain('1 behind R-1@2 · /fleet status')

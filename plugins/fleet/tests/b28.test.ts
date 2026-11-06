@@ -46,8 +46,8 @@ const READS = [
   'jq .items notes/a.json | head',
   "python3 -I .claude/fleet/checks/proof-check.py notes/a.md",
   // A file name with a w in it is an operand, not a sed command
-  "sed -n '1,40p' notes/area-w2-vs-w1.md",
-  "sed -n '/x/,/y/p' notes/workload.md",
+  "sed -n '1,40p' notes/new-views.md",
+  "sed -n '/x/,/y/p' notes/known-now.md",
   "sed -e '1,5p' -n notes/w.md",
   "sed -n -e '/now/p' notes/a.md",
   'sed s/a/b/ notes/a.md',
