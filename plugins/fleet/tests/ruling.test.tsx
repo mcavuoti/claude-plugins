@@ -45,7 +45,7 @@ test('a ruling the person types unprompted in his own session is recorded as his
   const reg = json(w, `${DEC}/register/2026-11/D-1.json`)
   expect(reg).toMatchObject({ source: 'decide', ruling: true, state: 'delivered', questions: [{ question: 'which packet sizes the report shows', options: [] }], answers: [{ text: 'From now on the report shows only the two packet sizes we quote, not the others.', origin: 'composer', pre: true }] })
   expect(w.files.has(`${DEC}/queue/D-1.json`)).toBe(false)
-  expect(w.logs).toContain('fleet: recorded as your ruling (D-1, on which packet sizes the report shows): "From now on the report shows only the two packet sizes we quote, not the others.". /fleet note D-1 adds to it.')
+  expect(w.logs).toContain('recorded as your ruling (D-1, on which packet sizes the report shows): "From now on the report shows only the two packet sizes we quote, not the others.". To change it, say it again here: a new ruling of yours stands over this one.')
   expect(await fleet($, '')).toContain('Nothing is waiting for you')
   // The judges read it as his answer
   const ps = precedentsOf([reg])

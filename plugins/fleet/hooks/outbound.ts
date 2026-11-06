@@ -495,13 +495,20 @@ function sentencesIn(t: string): string[] {
     .filter(Boolean)
 }
 
-/** A hold line: a block that starts by saying its part isn't to go out ("DO NOT POST N-4 yet", "Held: waiting for the
- * person", "Not ready"). It holds the whole section it's in, not only itself; a block that only mentions it further on
- * ("Notes (internal, never post): …") marks only itself, as before */
-const HOLD_LINE = /^(?:do not post|don't post|never post(?:ed)?|not ready|not for posting|not to be posted|hold|held|unready)\b/i
+/** A hold line: a block that starts by saying its part isn't to go out, after any decoration (a bracket, an emoji, bold):
+ * the words that can only mean it ("DO NOT POST until QA signs off", "**[Not ready]**"), or hold, held or unready set
+ * off as a marker: in capitals ("[HOLD] waiting"), or followed by a separator, until, pending, for, off or nothing
+ * ("(Held) waiting", "Held until D-12", "Hold: QA"), or a status saying so ("Status: held until …"). It holds the whole
+ * section it's in, not only itself. An ordinary sentence that starts so ("Hold the date: …", "Held on Friday, …") holds
+ * nothing, and a block that only mentions it further on ("Notes (internal, never post): …") marks only itself */
+const HOLD_PHRASE = /^[^\p{L}\p{N}]*(?:do not post|don'?t post|never post(?:ed)?|not ready|not for posting|not to be posted)\b/iu
+const HOLD_WORD = /^[^\p{L}\p{N}]*(?:(?:status|state)\s*[:=]\s*)?(?:on hold|hold|held|unready)(?=\s*$|\s*[:\-–—\])}.!,;]|\s+(?:until|pending|for|off)\b)/iu
+const HOLD_CAPS = /^[^\p{L}\p{N}]*(?:ON HOLD|HOLD|HELD|UNREADY)\b/u
 
 function holdsSection(block: { text: string; heading?: number }): boolean {
-  return !block.heading && HOLD_LINE.test(plainText(block.text))
+  if (block.heading) return false
+  const t = plainText(block.text)
+  return HOLD_PHRASE.test(t) || HOLD_WORD.test(t) || HOLD_CAPS.test(t)
 }
 
 /** The sentences a ready post may be made of, in the file's order: every block's, less a block marked not to post,
@@ -1672,6 +1679,16 @@ export const SEND_DESCRIPTION =
 
 export type SendInput = { to: string; why: string; command?: string; tool?: string; input?: Record<string, unknown>; files: string[]; blocks?: string }
 
+/** The keys of a tool call that the call itself sets (which tool, its id, its loop, its consent): an MCP draft's input
+ * can't carry them, or the call fleet makes would be another than the one the person approved */
+export const RESERVED_KEYS = ['tool', 'tool_use_id', 'agentId', 'consent', 'requestMeta'] as const
+
+/** The first reserved key an input sets, if any */
+export function reservedKey(input: unknown): string | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  return RESERVED_KEYS.find(k => Object.prototype.hasOwnProperty.call(input, k)) ?? null
+}
+
 /** mcp__fleet__send's input, tidied, or what to fix. The MCP call's name is mcp_tool: a tool call's own "tool" is the
  * name of the tool called (mcp__fleet__send itself) */
 export function checkSend(input: any): { ok: true; send: SendInput } | { ok: false; reason: string } {
@@ -1686,6 +1703,8 @@ export function checkSend(input: any): { ok: true; send: SendInput } | { ok: fal
   if (tool && !mcpParts(tool)) return { ok: false, reason: 'mcp_tool: an MCP tool, mcp__<server>__<tool>' }
   if (tool && /^mcp__fleet__/.test(tool)) return { ok: false, reason: "mcp_tool: fleet's own tools send nothing outside" }
   if (tool && input?.input !== undefined && (typeof input.input !== 'object' || input.input === null || Array.isArray(input.input))) return { ok: false, reason: "input: the tool's input, as an object" }
+  const reserved = tool ? reservedKey(input?.input) : null
+  if (reserved) return { ok: false, reason: `input: ${reserved} is a key the call itself sets (with ${RESERVED_KEYS.filter(k => k !== reserved).join(', ')}), so a draft can't carry it: fleet would make another call than the one the person approves. A tool whose own argument is named so can't be sent through /fleet: say in your journal what should go out, and the person sends it himself` }
   const files = strings(input?.files).slice(0, 20)
   const blocks = typeof input?.blocks === 'string' ? cut(input.blocks.trim(), 200) : ''
   return {
@@ -1727,6 +1746,8 @@ export function parseDraft(text: string): { command: string } | { tool: string; 
   if (d && typeof d.command === 'string' && d.command.trim()) return { command: d.command }
   if (d && typeof d.tool === 'string' && mcpParts(d.tool) && !/^mcp__fleet__/.test(d.tool)) {
     if (d.input !== undefined && (typeof d.input !== 'object' || d.input === null || Array.isArray(d.input))) return { problem: "the draft's input isn't an object" }
+    const reserved = reservedKey(d.input)
+    if (reserved) return { problem: `its input sets ${reserved}, which the call itself sets` }
     return { tool: d.tool, input: d.input ?? {} }
   }
   return { problem: 'the draft holds neither a command nor an MCP tool and its input' }
