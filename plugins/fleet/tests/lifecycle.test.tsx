@@ -189,3 +189,95 @@ test("a result world.json says needs reproducing becomes a board item for its te
   }
   expect([...w.files.keys()].filter(k => k.startsWith(`${ROOT}/board/`)).sort()).toEqual([`${ROOT}/board/B-3.md`, `${ROOT}/board/B-4.md`, `${ROOT}/board/B-9.md`])
 })
+
+// ---- One call that never returns (a liaison hung on one read for 1 h 42 min, and nothing said so) ----
+
+test("an instance's heartbeat carries its main thread's tool call in flight, and drops it once the call returns", WITH_SESSIONS, async ($, on) => {
+  const w = world(on, {
+    worldPaths: ['notes/**'],
+    env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Owner A', FLEET_ROLE: 'owner' },
+    files: { [`${FLEET}/roster.json`]: roster({}), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${FLEET}/instances/owner-a.json`]: '{}\n' },
+  })
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
+  on('classic.SessionStart', () => ({}))
+  // Beneath fleet: a search that doesn't return until the test lets it
+  let release: (v: unknown) => void = () => {}
+  on('tool.call', { tool: 'Grep' }, () => new Promise(r => (release = r)) as any)
+  sessionsSay(w, { current: { ready: true, ref: 'aaaaaaaa', sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', name: 'Owner A', root: ROOT, background: true, agent: 'owner' }, rows: { aaaaaaaa: row('aaaaaaaa', 'Owner A', 'working') } })
+  await startSession($, w)
+  const t0 = w.clock.now()
+  const pending = $.tool.call({ tool: 'Grep', pattern: 'x', path: ROOT } as any)
+  await w.clock.advance(31000)
+  await w.clock.settle()
+  expect(json(w, `${HB}/state.json`).call).toEqual({ tool: 'Grep', since: t0 })
+  release({ result: 'ok', text: 'nothing found' })
+  await pending
+  await w.clock.advance(31000)
+  await w.clock.settle()
+  expect(json(w, `${HB}/state.json`).call).toBe(undefined)
+})
+
+test('one call in flight past half an hour: its row is marked, status and the brief name it, the front door hears it once, and the person gets an alert past waitingMin', WITH_SESSIONS, async ($, on) => {
+  const TEAM = { rosterFormat: 1, sections: [{ id: 'work', title: 'Work' }], roles: { chief: { agent: 'owner', model: 'haiku' }, liaison: { agent: 'owner', model: 'haiku' } }, instances: [{ name: 'Chief', role: 'chief', section: 'work' }, { name: 'Liaison', role: 'liaison', section: 'work' }], person: { addresses: ['me@example.invalid'], channel: { kind: 'command', argv: ['bash', '.claude/fleet/alert.sh'] }, perDay: 4 } }
+  const w = world(on, {
+    background: false,
+    files: {
+      [`${FLEET}/roster.json`]: JSON.stringify(TEAM),
+      [`${ROOT}/.claude/agents/owner.md`]: OWNER,
+      [`${FLEET}/alert.sh`]: '#!/bin/bash\ncat > /dev/null\n',
+      [`${FLEET}/instances/liaison/state.json`]: JSON.stringify({ format: 1, instance: 'Liaison', slug: 'liaison', ref: 'bbbbbbb1', sessionId: 'bbbbbbb1-0000-0000-0000-000000000000', at: NOW, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, call: { tool: 'mcp__x__poll', since: NOW - 40 * 60000 } }),
+    },
+  })
+  const sent: string[] = []
+  w.exec.value = (argv, _cwd, stdin) => {
+    if (argv[1] !== '.claude/fleet/alert.sh') return undefined
+    sent.push(stdin ?? '')
+    return { exitCode: 0 }
+  }
+  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Chief', 'working'), bbbbbbb1: row('bbbbbbb1', 'Liaison', 'working') } })
+  await startSession($, w)
+  expect(await fleet($, 'accept channel')).toContain('Stamped')
+  // Its heartbeat stays fresh: the call goes on
+  for (let i = 0; i < 4; i++) {
+    w.touch(`${FLEET}/instances/liaison/state.json`, JSON.stringify({ ...JSON.parse(w.files.get(`${FLEET}/instances/liaison/state.json`) as string), at: w.clock.now() }))
+    await w.clock.advance(30000)
+    await w.clock.settle()
+  }
+  const status = await fleet($, 'status')
+  expect(status).toMatch(/one call to mcp__x__poll for 4\dm: it may be hung/)
+  expect(await fleet($, 'brief')).toMatch(/Liaison: one call to mcp__x__poll for 4\dm/)
+  expect(json(w, `${FLEET}/state/work.json`).capacity.stuck).toEqual([{ inst: 'Liaison', tool: 'mcp__x__poll', since: NOW - 40 * 60000 }])
+  expect(sent.join('\n')).toMatch(/Liaison has been in one call to mcp__x__poll for 4\dm/)
+})
+
+// ---- B27: after the background service died and its sessions came back ----
+
+test('after a restart an instance hears the slots it still holds, beside its runs and commands', WITH_SESSIONS, async ($, on) => {
+  const SID = 'aaaaaaaa-0000-0000-0000-000000000000'
+  const t0 = Date.UTC(2026, 10, 2, 12, 0, 0)
+  const w = world(on, {
+    worldPaths: ['notes/**'],
+    env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Owner A', FLEET_ROLE: 'owner' },
+    files: {
+      [`${FLEET}/roster.json`]: roster({}),
+      [`${ROOT}/.claude/agents/owner.md`]: OWNER,
+      [`${FLEET}/instances/owner-a.json`]: '{}\n',
+      [`${FLEET}/slots.json`]: JSON.stringify({ slotsFormat: 1, slots: { lab: { count: 2, leaseMin: 30, what: 'the test machine' } } }),
+      [`${FLEET}/state/slots/lab/1.json`]: JSON.stringify({ format: 1, slot: 'lab', n: 0, holder: { sessionId: SID, ref: 'aaaaaaaa', name: 'Owner A' }, at: t0 - 600000, until: t0 + 20 * 60000 }),
+      [`${HB}/state.json`]: JSON.stringify({ format: 1, instance: 'Owner A', slug: 'owner-a', ref: 'aaaaaaaa', sessionId: SID, at: t0 - 60000, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: t0 - HOUR }),
+      [`${HB}/seed-aaaaaaaa.json`]: JSON.stringify({ format: 1, ref: 'aaaaaaaa', at: t0 - HOUR }),
+    },
+  })
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
+  on('classic.SessionStart', () => ({}))
+  sessionsSay(w, { current: { ready: true, ref: 'aaaaaaaa', sessionId: SID, name: 'Owner A', root: ROOT, background: true, agent: 'owner' }, rows: { aaaaaaaa: row('aaaaaaaa', 'Owner A', 'idle') } })
+  await startSession($, w)
+  for (let i = 0; i < 3; i++) {
+    await w.clock.advance(30000)
+    await w.clock.settle()
+  }
+  const told = w.submits.filter(s => s.includes('in flight'))
+  expect(told.length).toBe(1)
+  expect(told[0]).toMatch(/fleet: your conversation was restarted while these were in flight: the slots you hold: lab \(unit 1 of 2, until \d\d:\d\d\)/)
+  expect(told[0]).toContain('release a slot you no longer need (mcp__fleet__slot release)')
+})

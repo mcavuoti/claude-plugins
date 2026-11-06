@@ -4837,6 +4837,16 @@ async function alertsTick($: any) {
   const long = records.filter(r => knownKind(r) && !progress(r.id, slots(r), present).complete && now - r.at >= person.waitingMin * 60000).sort((a, b) => a.at - b.at)
   const oldest = long[0]
   if (oldest) due.push({ key: `waiting:${day}:${DAY_PARTS[Math.floor(minute / 360)]}`, kind: 'waiting', text: `${long.length} decision(s) have waited over ${ago(person.waitingMin * 60000)} (the oldest, ${oldest.id} from ${view(oldest).name}, ${ago(now - oldest.at)})` })
+  // An instance stopped at a permission prompt nobody sees, or in one call that may hang, past waitingMin (a call: past
+  // half an hour too): once per prompt or call
+  for (const inst of roster?.instances ?? []) {
+    const hb = await heartbeatOf($, inst.slug)
+    if (!hb || now - hb.at >= HEARTBEAT_STALE_MS) continue
+    const w = hb.waitingOn
+    if (w?.kind === 'permission' && now - w.at >= person.waitingMin * 60000) due.push({ key: `prompt:${inst.slug}:${w.at}`, kind: 'waiting', text: `${inst.name} has waited on a permission prompt (${w.tool}) for ${ago(now - w.at)}: Enter on its row in the panel answers it` })
+    const c = hungCall(hb, now)
+    if (c && now - c.since >= person.waitingMin * 60000) due.push({ key: `call:${inst.slug}:${c.since}`, kind: 'waiting', text: `${inst.name} has been in one call to ${c.tool} for ${ago(now - c.since)}: it may be hung` })
+  }
   // A budget used up (an instance's own, the project's, intake's)
   budgetCache.at = 0
   for (const b of await budgets($)) if (b.own === 'over') due.push({ key: `budget:${b.inst.slug}:${day}`, kind: 'budget', text: `${b.inst.name} used up its budget (${usd(b.usd)} today)` })
@@ -5333,6 +5343,8 @@ type Heartbeat = {
   budget?: { day: string; usd: number; cap: number | null; state: BudgetState } | null
   /** The main thread's Bash commands running in the background (their text, when each started): told after a restart */
   bg?: { command: string; at: number }[]
+  /** The main thread's oldest tool call in flight (one that runs past STUCK_MS may hang: a call that never returns) */
+  call?: { tool: string; since: number }
   /** The roster's model or effort the account refused in this process: its requests run the session's own */
   modelRefused?: string
   effortRefused?: string
@@ -5392,6 +5404,15 @@ function settingsCoreHash(text: string): string {
   return hashText(text)
 }
 
+/** One tool call in flight this long may hang (a subagent's is its own work, and a permission prompt has its mark) */
+const STUCK_MS = 30 * 60000
+const OWN_PACE_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task'])
+function hungCall(hb: { call?: { tool: string; since: number }; waitingOn?: unknown } | null, now: number): { tool: string; since: number } | null {
+  const c = hb?.call
+  if (!c || typeof c.tool !== 'string' || typeof c.since !== 'number' || hb?.waitingOn || OWN_PACE_TOOLS.has(c.tool)) return null
+  return now - c.since >= STUCK_MS ? c : null
+}
+
 /** A step that got no response at all: no usage, no stop reason, nothing said (the API refused the request) */
 function noResponse(r: any): boolean {
   return !!r && !r.usage && (r.stopReason === null || r.stopReason === undefined) && !r.answer && !(r.toolUses?.length > 0)
@@ -5410,6 +5431,14 @@ let turnFailed: { at: number; why: string } | null = null
 // permission prompt it waits on now (classic.PermissionRequest, until its tool ran or was refused, or the turn ended)
 let permissionMode: string | null = null
 let permissionWait: { kind: 'permission'; tool: string; at: number } | null = null
+// The main thread's tool calls in flight (parallel calls each), for the heartbeat: the oldest says which one may hang
+const callsInFlight = new Map<number, { tool: string; since: number }>()
+let callSeq = 0
+function oldestCall(): { tool: string; since: number } | null {
+  let o: { tool: string; since: number } | null = null
+  for (const c of callsInFlight.values()) if (!o || c.since < o.since) o = c
+  return o
+}
 // What this instance's heartbeat carried over from the one before it (once per process)
 const carried = { done: false, startedAt: 0, lastLanding: 0, lastWork: 0, budgetOver: '' }
 type BudgetRow = { inst: Instance; usd: number; cap: number | null; own: BudgetState; state: BudgetState }
@@ -5613,6 +5642,7 @@ async function heartbeat($: any) {
     intakeSeen: intakeSeen.at || null,
     mode: permissionMode ?? (await configuredMode($)),
     waitingOn: permissionWait,
+    ...(oldestCall() ? { call: oldestCall() as { tool: string; since: number } } : {}),
     remote: await remoteControl($),
     contextTokens,
     model: stepModel,
@@ -5747,7 +5777,7 @@ type WorkFile = {
  * oldest waits, the slots free, the runs in flight and those finished but not recorded; flags: an idle instance an
  * item that waits FLAG_AFTER_MS fits (the band's red flag, and the front's hourly note); nobody: open items nobody owns
  * that no instance can be offered (no for:, and the roster has no front door), waiting FLAG_AFTER_MS */
-type Capacity = { idle: string[]; unowned: number; oldest: number | null; slotsFree: number | null; slotsTotal: number | null; runs: number; unrecorded: number; flags: { inst: string; item: string }[]; nobody?: string[] }
+type Capacity = { idle: string[]; unowned: number; oldest: number | null; slotsFree: number | null; slotsTotal: number | null; runs: number; unrecorded: number; flags: { inst: string; item: string }[]; nobody?: string[]; stuck?: { inst: string; tool: string; since: number }[] }
 
 /** An item offered to one instance is offered to the next after this long while still nobody owns it; each instance it's
  * for once (a round), and again only when its file changed: a later round counts within the wakes' daily cap */
@@ -6083,7 +6113,17 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     if (c) flags.push({ inst: c.name, item: id })
   }
   const ages = Object.values(unowned).map(u => u.since)
-  const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}) }
+  // Running instances in one call past STUCK_MS (their own fresh heartbeat says so): the front door hears it
+  const stuck: { inst: string; tool: string; since: number }[] = []
+  for (const i of insts) {
+    const { running } = rowsOf(i, rows)
+    if (!running) continue
+    const hb = await heartbeatOf($, i.slug)
+    if (!hb || now - hb.at >= HEARTBEAT_STALE_MS) continue
+    const c = hungCall(hb, now)
+    if (c) stuck.push({ inst: i.name, tool: c.tool, since: c.since })
+  }
+  const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}), ...(stuck.length ? { stuck } : {}) }
   const next: WorkFile = { format: FORMAT, at: now, unowned, capacity, ...(Object.keys(quiet).length ? { quiet } : {}) }
   const same = !!had && JSON.stringify({ ...had, at: 0 }) === JSON.stringify({ ...next, at: 0 })
   if (!same || now - had.at > 10 * 60000) {
@@ -6184,6 +6224,15 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     const k = `capacity|${Math.floor(now / HOUR)}`
     if (told[k] === undefined) {
       lines.push(`fleet: idle while work waits: ${work.capacity.flags.map(f => `${f.inst} could take ${f.item}`).join('; ')}. Give each item an owner (or the right for:), or say in your journal why it waits.`)
+      keys.push(k)
+    }
+  }
+  // Another instance in one call past STUCK_MS: the front door hears it once per call
+  if (work?.capacity.stuck?.length && frontOf(roster?.r ?? null, roster?.instances ?? [])?.slug === inst.slug) {
+    for (const s of work.capacity.stuck) {
+      const k = `stuck|${s.inst}|${s.since}`
+      if (s.inst === inst.name || told[k] !== undefined) continue
+      lines.push(`fleet: ${s.inst} has been in one call to ${s.tool} for ${ago(now - s.since)}: it may be hung (a call that never returns, a prompt nobody sees). What waits on it (a post, a reply) isn't moving; the person can look at it in the panel.`)
       keys.push(k)
     }
   }
@@ -8244,6 +8293,7 @@ async function rosterTick($: any) {
       }
       // A permission prompt it waits on, as its own fleet saw it, while sessions sees it waiting too
       const prompt = fresh && running.state === 'waiting' && hb?.waitingOn?.kind === 'permission'
+      const hung = fresh && !prompt ? hungCall(hb, now) : null
       const old = fresh && typeof hb?.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0 ? hb.fleet : ''
       const asks = asking.get(running.ref) ?? 0
       // Auto mode's blocks piling up today (a mark, never a hold: the brief says what would allow them)
@@ -8254,6 +8304,8 @@ async function rosterTick($: any) {
         ? { badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true }
         : prompt
           ? { badge: '!', tint: 'warning', line: 'waiting on a permission prompt: Enter answers it', needsPerson: true }
+          : hung
+            ? { badge: '⧗', tint: 'warning', line: `one call to ${hung.tool} for ${ago(now - hung.since)}: it may be hung`, needsPerson: true }
           : b?.state === 'over'
             ? { badge: '$', tint: 'error', line: overBudgetLine(inst.name, inst.slug), needsPerson: true }
             : asks
@@ -9115,6 +9167,8 @@ async function rosterStatus($: any): Promise<string[]> {
         if (typeof hb.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0) parts.push(`runs fleet ${hb.fleet}, installed ${version}: u restarts it`)
         if (hb.mode) parts.push(`mode ${hb.mode}${modeWaits(hb.mode) ? ' (it asks: a mode that doesn’t lets it work unattended)' : ''}`)
         if (hb.waitingOn?.kind === 'permission' && running.state === 'waiting') parts.push(`waiting on a permission prompt (${hb.waitingOn.tool}) since ${ago(now - hb.waitingOn.at)}: Enter in the panel answers it`)
+        const hung = hungCall(hb, now)
+        if (hung) parts.push(`one call to ${hung.tool} for ${ago(now - hung.since)}: it may be hung (a call that never returns, a prompt nobody sees): look at it in the panel`)
         if (hb.remote) parts.push('Remote Control')
         if (typeof hb.model === 'string' && hb.model) parts.push(modelLine(inst, hb))
         if (hb.failed) parts.push(`last turn failed ${ago(now - hb.failed.at)} ago: ${hb.failed.why}`)
@@ -10728,6 +10782,8 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
       const retiredHere = !running && !!rows.stopped && stopReason(rows.stopped) !== 'person'
       if ((fresh || retiredHere) && inst.poll && pollOverdue(inst, hb, now)) polls.push({ name: inst.name, last: hb.lastPoll ?? null, everyMin: inst.poll.everyMin })
       if (fresh && running.state === 'waiting' && hb.waitingOn?.kind === 'permission') prompts.push({ name: inst.name, tool: hb.waitingOn.tool, at: hb.waitingOn.at })
+      const hung = fresh ? hungCall(hb, now) : null
+      if (hung) prompts.push({ name: inst.name, tool: hung.tool, at: hung.since, hung: true })
       const p = parseReads((await readText($, readsPath(hb.sessionId))) ?? '')
       if (p && 'threads' in p && p.threads.main) {
         const n = untoldStale(p.threads.main).length
@@ -11522,6 +11578,20 @@ export const register: Register = on => {
     if (!root || !jobRef) return next(e)
     log($, "refused: the model's PushNotification (only fleet and sessions notify the person)")
     return { deny: "fleet: in this project only fleet notifies the person (in the brief, the band and their channel, within their caps). Ask with mcp__fleet__decide, or write it in your journal; nothing was sent." }
+  }).catch(($, e, next) => next(e))
+
+  // The main thread's tool call in flight, for an instance's heartbeat: one that never returns (a hung read, a prompt
+  // nobody sees) shows on its row past STUCK_MS instead of looking like work (every tool: a matcher that takes any name,
+  // since one hook without a matcher is the MCP one below)
+  on('tool.call', { tool: /^/ }, async ($, e, next) => {
+    if (e.agentId !== undefined || !jobRef) return next(e)
+    const k = ++callSeq
+    callsInFlight.set(k, { tool: String((e as any).tool ?? '').slice(0, 80), since: await $.clock.now() })
+    try {
+      return await next(e)
+    } finally {
+      callsInFlight.delete(k)
+    }
   }).catch(($, e, next) => next(e))
 
   // Every MCP tool: one that would send the project's content outside is refused in a background session (the one hard
