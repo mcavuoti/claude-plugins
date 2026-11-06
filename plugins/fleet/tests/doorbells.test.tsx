@@ -63,13 +63,14 @@ test("SessionStart hands fleet's folders to watch, made before the list goes; li
   sessionsSay(w, { rows: {} })
   await startSession($, w)
   await tick(w)
-  expect(await fleet($, 'status')).toContain('live updates off: u or /clear turns them on')
+  // Before any SessionStart: it hasn't reached fleet here (a managed plugin may skip it), so neither u nor /clear is named
+  expect(await fleet($, 'status')).toContain("live updates off: SessionStart hasn't reached fleet in this session")
   const r: any = await $.classic.SessionStart({ source: 'startup' } as any)
   for (const p of [`${FLEET}/events/latest`, `${DEC}/queue`, `${DEC}/answers`, `${DEC}/overrules`, `${FLEET}/bell`]) expect(r.watchPaths).toContain(p)
   // Made before the list goes (several missing names under one folder: only one would be watched)
   for (const d of [`${DEC}/queue`, `${DEC}/answers`, `${DEC}/overrules`, `${FLEET}/bell`]) expect(w.dirs.has(d)).toBe(true)
   // Not live until the engine proves it watches: its probe bell, rung a second later
-  expect(await fleet($, 'status')).toContain('live updates off')
+  expect(await fleet($, 'status')).toContain('live updates off: u or /clear turns them on')
   await tick(w, 1500)
   expect(w.files.has(`${FLEET}/bell/probe`)).toBe(true)
   await changed($, `${FLEET}/bell/probe`)
