@@ -251,7 +251,7 @@ test('pin gate: an Edit is refused only for the stale pins it writes; one left e
   const pinned = await call($, { tool: 'Edit', file_path: PLAN, old_string: 'And on R-2@1.', new_string: 'And on R-2@1, still.' })
   expect(pinned.deny).toContain('- R-2@1: R-2 is at v2 now')
   expect(pinned.deny).not.toContain('R-1@1')
-  expect(pinned.deny).toContain('A read is the Read tool or a plain cat of the file.')
+  expect(pinned.deny).toContain('A read is the Read tool, or one file shown by cat, head, tail, nl or sed -n N,Mp alone (a grep or a pipe doesn\'t count).')
 })
 
 test('quotes: a finding whose quoted source lands is checked again with it; one whose source changed outside fleet, at the next sweep', WITH_SESSIONS, async ($, on) => {

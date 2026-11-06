@@ -25,6 +25,9 @@ change you apply, rewrite it.
 - A result (poc/results/): `kind: result`, the exact command as run from the project's folder (`run:`) and the sha256
   of its standard output (`sha:`, from `<command> | shasum -a 256`, 12 digits or more). Several runs: a `run:` and its
   `sha:` each, in turn.
+- In a `run:` command, call grep as `command grep` (an instance's shell runs Claude Code's own grep, whose output order
+  differs from the system's) and sort what lists several files (`| sort`): it then gives the same output wherever it's
+  run again.
 - A finding (findings/F-<n>.md): `kind: finding`, where it comes from (`source:`, a path in the project, a URL, or
   `ssh://<host>/<path>` for a file on another machine) and the exact text it rests on (`quote:`, copied as it is there,
   10 characters or more). Several sources: a `source:` and its `quote:` each, in turn.

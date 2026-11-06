@@ -23,6 +23,9 @@ fleet's check doesn't run it again.
   and its board item names the commit they passed at.
 - A result (a benchmark, a measure): `kind: result`, the exact command as run from the project's folder (`run:`) and
   the sha256 of its standard output (`sha:`, from `<command> | shasum -a 256`).
+- In a `run:` command, call grep as `command grep` (an instance's shell runs Claude Code's own grep, whose output order
+  differs from the system's) and sort what lists several files (`| sort`): it then gives the same output wherever it's
+  run again.
 - A finding (how a library behaves, what an issue says): `kind: finding`, where it comes from (`source:`, a path in the
   project or a URL) and the exact text it rests on (`quote:`).
 - A test that was skipped, or a run that didn't finish, proves nothing.

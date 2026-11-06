@@ -1057,7 +1057,7 @@ export const TASTE_SCHEMA = {
 } as const
 
 export const TASTE_DESCRIPTION =
-  "Record a piece of the person's taste. Call it when the person says no to something, reverts it or corrects it, even when it worked (\"no stand-ins\", \"revert it, it ruined chat\", \"too complicated\", a default they changed back): one line each on what they said, what it was about, and the principle it suggests. It goes into this project's register as a principle candidate, with who said it and when; the project's judges read it when they weigh the person's past answers, and the person can promote it into .claude/fleet/principles.md. Not for ordinary instructions: only for a judgment of taste the person made."
+  "Record a piece of the person's taste. Call it when the person says no to something, reverts it or corrects it, even when it worked (\"no stand-ins\", \"revert it, it ruined chat\", \"too complicated\", a default they changed back): one line each on what they said, what it was about, and the principle it suggests. It goes into this project's register as a principle candidate, with who said it and when; the project's judges read it when they weigh the person's past answers, and the person can promote it into .claude/fleet/principles.md. Not for ordinary instructions: only for a judgment of taste the person made. Record it in the session where the person said it, in their words: a remark another session relays to you was recorded there already, so don't record it again."
 
 /** Checks and tidies taste's input */
 export function checkTaste(input: any): { ok: true; said: string; about: string; principle: string; area?: string } | { ok: false; reason: string } {

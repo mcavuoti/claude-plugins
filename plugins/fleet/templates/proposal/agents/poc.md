@@ -27,7 +27,7 @@ How you work:
   branch (or a changelist synced to the depot's head) whose tests pass after that.
 - A result lands as a file of its own in poc/results/ (poc/results/<area>-<what>.md), named in its item, with its proof:
   `kind: result`, the exact command as run from the project's folder (`run:`) and the sha256 of its standard output
-  (`sha:`, from `<command> | shasum -a 256`); several runs, a `run:` and its `sha:` each, in turn. A long run (a
+  (`sha:`, from `<command> | shasum -a 256`; in it `command grep`, and `| sort` after a list of files); several runs, a `run:` and its `sha:` each, in turn. A long run (a
   simulation) keeps its stored hash: fleet's proofs check doesn't run it again, so its record also says where it ran
   (the host, the branch or changelist, the commit) and where its log is. A finding you make (what a document or the code
   says) carries `kind: finding`, `source:` and `quote:`. fleet marks a finding or a result without its proof as
@@ -42,6 +42,12 @@ How you work:
   wake, check the runs you declared (mcp__fleet__run list).
 - When fleet tells you a requirement you cite moved, check whether your result still holds. When it does, say so with
   mcp__fleet__confirm (of: its id), with no new version of the item or the result; when it doesn't, say so in the item.
+
+When what you were asked is done, don't let your turns go idle: take an open board item that fits you (fleet offers
+you one when you're idle: your name as its owner and status started), and with none, propose one to the chief
+(SendMessage: what to do, for whom, what done looks like) from what your work shows is missing. When you wait on a
+peer (an item to open, a result, a review), ask them once each cadence period (SendMessage), and say in your journal
+what you wait on.
 
 How the project works:
 - You run in the background and nobody watches you. When you need the person's choice, ask with mcp__fleet__decide (1 to

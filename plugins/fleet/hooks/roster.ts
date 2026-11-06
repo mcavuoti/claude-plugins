@@ -278,7 +278,7 @@ export function instancesOf(r: Roster): Instance[] {
       parent: typeof spec.parent === 'string' && spec.parent.trim() ? spec.parent.trim() : null,
       wave: typeof spec.wave === 'number' ? spec.wave : 1,
       model: pick(o => (typeof o.model === 'string' && o.model ? o.model : undefined)) ?? null,
-      effort: pick(o => (typeof o.effort === 'string' && o.effort ? o.effort : undefined)) ?? null,
+      effort: pick(o => (typeof o.effort === 'string' && o.effort.trim() ? o.effort.trim().toLowerCase() : undefined)) ?? null,
       usdDay: pick(o => num(o.budget?.usdDay) ?? undefined) ?? null,
       cadenceH: pick(o => num(o.cadenceH) ?? undefined) ?? null,
       freshH: pick(o => num(o.freshH) ?? undefined) ?? pick(o => num(o.cadenceH) ?? undefined) ?? null,
@@ -504,6 +504,7 @@ export function lintRoster(r: Roster, roleFiles: ReadonlyMap<string, string | nu
   for (const i of instances) {
     if (i.model !== null && !priceOf(i.model)) warnings.push(`"${i.name}": no price known for the model "${i.model}": the forecast leaves it out`)
     else if (familyPriceNote(i.model)) warnings.push(`"${i.name}": ${familyPriceNote(i.model)}`)
+    if (i.effort && !isEffort(i.effort)) errors.push(`"${i.name}": effort "${i.effort}" isn't a level (low, medium, high, xhigh or max)`)
     for (const mode of [i.permissions.defaultMode, (i.settings.permissions as Permissions | undefined)?.defaultMode]) {
       if (mode === 'bypassPermissions') errors.push(`"${i.name}": fleet doesn't start an instance with bypassPermissions (it would send things out with nobody asked)`)
     }
@@ -598,8 +599,10 @@ export function settingsFor(i: Instance, root: string, deny: readonly string[]):
   const perms = mergePermissions(isObject(base.permissions) ? (base.permissions as Permissions) : undefined, i.permissions)
   const out: Record<string, unknown> = { ...base, env }
   if (i.model) out.model = i.model
-  if (i.effort) out.effortLevel = i.effort
+  if (i.effort && isEffort(i.effort)) out.effortLevel = i.effort
   out.permissions = { ...(isObject(base.permissions) ? base.permissions : {}), ...perms, deny: [...new Set([...(perms.deny ?? []), ...deny])] }
+  // Never bypassPermissions, whatever the roster says (/fleet up refuses it; this is for every other writer)
+  if ((out.permissions as Record<string, unknown>).defaultMode === 'bypassPermissions') delete (out.permissions as Record<string, unknown>).defaultMode
   return out
 }
 
@@ -827,7 +830,16 @@ export function isUnowned(item: { owner: string | null; status: string | null })
 /** The instances an open item nobody owns is for: those its `for:` names (an instance by name or file name, or a role,
  * singular or plural, several separated by commas or "and"/"or"), else the front door (the roster's person.front, or
  * the chief role's instances) */
-export function candidatesFor<T extends { name: string; slug: string; role: string }>(forWho: string | null, instances: readonly T[], front: string | null): T[] {
+/** The effort levels a request takes */
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export function isEffort(v: string): v is (typeof EFFORTS)[number] {
+  return (EFFORTS as readonly string[]).includes(v)
+}
+
+/** Whom an open item is for: the instances its for: names (a name, a slug, a role or its plural, a list), else the front
+ * door (person.front, else a chief). An item with no for: in a roster with no front door is for every instance but its
+ * writer (writer: its last landing's session name, when known) */
+export function candidatesFor<T extends { name: string; slug: string; role: string }>(forWho: string | null, instances: readonly T[], front: string | null, writer: string | null = null): T[] {
   const words = (forWho ?? '')
     .replace(/\([^)]*\)/g, ' ')
     .split(/\s*(?:,|;|&|\/|\+|\band\b|\bor\b)\s*/i)
@@ -839,7 +851,9 @@ export function candidatesFor<T extends { name: string; slug: string; role: stri
   })
   if (named.length) return named
   const f = (front ?? '').toLowerCase()
-  return instances.filter(i => (f ? i.name.toLowerCase() === f : i.role.toLowerCase() === 'chief'))
+  const door = instances.filter(i => (f ? i.name.toLowerCase() === f : i.role.toLowerCase() === 'chief'))
+  if (door.length || words.length) return door
+  return instances.filter(i => i.name !== writer)
 }
 
 /** Whether a board item is one this instance owns and has yet to finish: its owner names it (its name or its slug, in
@@ -864,7 +878,9 @@ export function hoursText(h: number): string {
 
 /** The cadence nudge: its own open items when it has some (then the cap doesn't apply), else the open items nobody owns
  * that fit it, else land what it has. perDay: the roster's cadence.perDay (Infinity: no cap) */
-export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number, items: readonly string[] = [], perDay: number = CADENCE_PER_DAY, fits: readonly string[] = []): string {
+/** door: the front door's name (null: the roster has none) and whether this instance is it, for an instance with
+ * nothing on the board to take (G27: it proposes an item, the front door turns the backlog into items) */
+export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, hours: number, items: readonly string[] = [], perDay: number = CADENCE_PER_DAY, fits: readonly string[] = [], door: { front: string | null; self: boolean } | null = null): string {
   const often = Number.isFinite(perDay) ? `fleet nudges once each period while nothing lands, at most ${perDay} a day.` : 'fleet nudges once each period while nothing lands.'
   if (!items.length && fits.length) {
     const shown = fits.slice(0, 8)
@@ -874,7 +890,11 @@ export function cadenceNudgeText(inst: Pick<Instance, 'cadenceH' | 'journal'>, h
     const shown = items.slice(0, 8)
     return `fleet: ${hoursText(hours)} since you last landed work in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}; a line in your journal doesn't count while you own open items). Your open items: ${shown.join(', ')}${items.length > shown.length ? ` and ${items.length - shown.length} more` : ''}. They're your work: take the first one that needs nobody's decision and land a step of it, or ask the person with mcp__fleet__decide what blocks it. ${often}`
   }
-  return `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}). Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. ${often}`
+  const since = `fleet: ${hoursText(hours)} since you last landed anything in the shared world (your cadence is ${hoursText(inst.cadenceH ?? 0)}).`
+  if (door?.self) return `${since} Nothing on the board fits you: turn what the charter and the plan still need into board items (board/B-<n>.md: for: who should take it, what done looks like, owner open), so the instances have work to take; or ask the person with mcp__fleet__decide. ${often}`
+  if (door?.front) return `${since} Nothing on the board fits you: propose an item to ${door.front} (SendMessage: what to do and what done looks like) from what your work shows is missing, or land a result or a negative result where your work goes; a line in your journal saying you wait isn't work. ${often}`
+  if (door) return `${since} Nothing on the board fits you: land a result or a negative result where your work goes, or ask the person with mcp__fleet__decide what to take on. ${often}`
+  return `${since} Land what you have: a result, a negative result, or where you're blocked and why, in your journal (${inst.journal}) and where your work goes; or ask the person with mcp__fleet__decide. ${often}`
 }
 
 /** Decision 4a: an instance that doesn't keep a long context starts each fresh period (freshH, cadenceH by default)

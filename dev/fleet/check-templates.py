@@ -57,6 +57,12 @@ for t in templates:
             say(t / 'fleet/world.json', 'needs worldFormat and paths')
     except (OSError, ValueError) as e:
         say(t / 'fleet/world.json', e)
+    # A template whose roles write board items has the board in its world: its items' writers are known (who wrote an
+    # item is never offered it) and their edits are landings
+    agents = t / 'agents'
+    writes_board = agents.is_dir() and any('board/B-<n>.md' in f.read_text() for f in agents.glob('*.md'))
+    if writes_board and isinstance(world, dict) and 'board/**' not in world.get('paths', []):
+        say(t / 'fleet/world.json', 'its roles write board items (board/B-<n>.md) but its paths lack board/**')
     if not (t / 'fleet/verify.md').is_file():
         say(t / 'fleet/verify.md', 'missing: how the project proves something works, which every role reads before it lands')
     # The code fleet watches: each repository or depot by a name the roster's "code" uses

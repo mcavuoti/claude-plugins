@@ -27,9 +27,12 @@ async function instance($: any, on: any, model: string, role: Record<string, unk
   })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
   on('classic.SessionStart', () => ({}))
-  // Beneath fleet: the model's answer to a step (usage.model: the model that answered, when a test sets one)
+  // Beneath fleet: the model's answer to a step (usage.model: the model that answered, the one a test sets or the one
+  // the request named); a model the account refuses gets no response at all (no usage, no stop reason)
   on('turn.step', async function* (_$: any, e: any) {
-    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], usage: answeredBy.value ? { model: answeredBy.value } : null }
+    received.push({ model: e.model, effort: e.effort, agentId: e.agentId })
+    if (refused.has(e.model)) return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null }
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: { model: answeredBy.value ?? e.model } }
   } as any)
   sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
   await startSession($, w)
@@ -38,21 +41,61 @@ async function instance($: any, on: any, model: string, role: Record<string, unk
 
 // The model the API reports as having answered, when it isn't the one the request named
 const answeredBy: { value: string | null } = { value: null }
+// The models the account refuses, and what each request beneath fleet named
+const refused = new Set<string>()
+const received: { model: string; effort?: unknown; agentId?: string }[] = []
 
-async function step($: any, model: string) {
-  const s = $.turn.step({ turnId: 't-1', index: 0, model, messageCount: 1 })
+async function step($: any, model: string, extra: Record<string, unknown> = {}) {
+  const s = $.turn.step({ turnId: 't-1', index: 0, model, messageCount: 1, ...extra })
   for await (const _ of s) {
   }
   return s.result
 }
 
-test('a roster model the account lacks falls back: the heartbeat says what really runs, and status says it differs', WITH_SESSIONS, async ($, on) => {
-  const w = await instance($, on, 'fable')
-  await step($, 'claude-sonnet-5-5')
+test('a roster model the account refuses: each step goes again on the session\'s own model; three in a row and fleet stops asking for it a while, and status says so', WITH_SESSIONS, async ($, on) => {
+  refused.add('fable')
+  received.length = 0
+  try {
+    const w = await instance($, on, 'fable')
+    // Asked for the roster's, refused, then sent again as the session named it: the turn goes on (a hook that sends
+    // twice: the test kit leaves the step's result unset, the engine takes the second; a probe in a background session
+    // showed the turn answering on the session's model)
+    await step($, 'claude-sonnet-5-5')
+    expect(received.map(x => x.model)).toEqual(['fable', 'claude-sonnet-5-5'])
+    // Not yet refused after one: asked again, twice more, then left alone
+    await step($, 'claude-sonnet-5-5')
+    await step($, 'claude-sonnet-5-5')
+    await step($, 'claude-sonnet-5-5')
+    expect(received.map(x => x.model)).toEqual(['fable', 'claude-sonnet-5-5', 'fable', 'claude-sonnet-5-5', 'fable', 'claude-sonnet-5-5', 'claude-sonnet-5-5'])
+    await tick(w, 31000)
+    const hb = json(w, `${FLEET}/instances/owner-a/state.json`)
+    expect(hb.model).toBe('claude-sonnet-5-5')
+    expect(hb.modelRefused).toBe('fable')
+    expect(await fleet($, 'status')).toMatch(/runs claude-sonnet-5-5, roster says fable \(fable got no response 3 times in a row: its requests run the session's own model; fleet asks for it again at \d\d:\d\d\)/)
+  } finally {
+    refused.clear()
+  }
+})
+
+test("a roster model reaches a running instance at its next step, whatever the session was launched with (a respawn keeps the launch's --model)", WITH_SESSIONS, async ($, on) => {
+  received.length = 0
+  const w = await instance($, on, 'claude-opus-5-5')
+  await step($, 'claude-haiku-5-5')
+  expect(received.map(x => x.model)).toEqual(['claude-opus-5-5'])
   await tick(w, 31000)
-  expect(json(w, `${FLEET}/instances/owner-a/state.json`).model).toBe('claude-sonnet-5-5')
+  expect(json(w, `${FLEET}/instances/owner-a/state.json`).model).toBe('claude-opus-5-5')
   const status = await fleet($, 'status')
-  expect(status).toContain('runs claude-sonnet-5-5, roster says fable (a model the account lacks falls back)')
+  expect(status).toContain('runs claude-opus-5-5')
+  expect(status).not.toContain('roster says')
+})
+
+test("the roster's effort reaches the instance's requests too; a subagent's steps are its own", WITH_SESSIONS, async ($, on) => {
+  received.length = 0
+  await instance($, on, 'claude-opus-5-5', { effort: 'high' })
+  await step($, 'claude-opus-5-5', { effort: 'low' })
+  expect(received[0]).toMatchObject({ model: 'claude-opus-5-5', effort: 'high' })
+  await step($, 'claude-haiku-5-5', { effort: 'low', agentId: 'agent-1' })
+  expect(received[1]).toMatchObject({ model: 'claude-haiku-5-5', effort: 'low', agentId: 'agent-1' })
 })
 
 test('the model the roster names, as an alias, is the same as the id it runs: status says only what runs', WITH_SESSIONS, async ($, on) => {

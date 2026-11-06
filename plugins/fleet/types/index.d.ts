@@ -38,6 +38,9 @@ declare module 'claude-code' {
       idleSince: number
       /** The numbering of the last /fleet listing shown in this session: "D-<n>.<question>" per number */
       listing: string[]
+      /** This process's own id ('' until made): kept through a reload, new after a restart; a send's claim at the
+       * permission prompt names it, so a later process knows the prompt went with the old one */
+      processId: string
       /** The section fleet last put this session in ('fleet:asking', 'none'; '' not known yet) */
       section: string
       /** What each thread of this session read of the world: 'main' or a helper's agentId → path → the read */

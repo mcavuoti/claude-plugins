@@ -61,7 +61,7 @@ test('withdraw: the asker takes back its own open decision: off the queue, no ju
 test('supersedes: the decision it replaces is withdrawn when it’s the asker’s own and unanswered; otherwise both stay and /fleet says which replaces which; two open changes to one file are marked', async ($, on) => {
   const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/charter.md`]: '# Charter\n' } })
   await startSession($, w)
-  expect((await decide($, { questions: [Q], supersedes: 'D-x' })).deny).toBe('supersedes: your own open decision this one replaces, as D-<n>. Nothing was queued.')
+  expect((await decide($, { questions: [Q], supersedes: 'D-x' })).deny).toBe('supersedes: your own open decision this one replaces, as D-<n> (or a list of them, up to 8). Nothing was queued.')
   await decide($, { questions: [{ ...Q, question: 'Which color for the warning band?' }] })
   const b = await decide($, { questions: [{ ...Q, question: 'Which color for the warning band, amber or red?' }], supersedes: 'D-1' })
   expect(b.result).toContain('Queued as D-2')

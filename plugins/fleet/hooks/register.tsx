@@ -59,6 +59,7 @@ import {
   classifyMcp,
   sourceMiss,
   missText,
+  RESERVED_KEYS,
   callsLint,
   callsToolLint,
   mcpRuleTools,
@@ -101,6 +102,7 @@ import {
   changeLine,
   changedPaths,
   clock,
+  clockOn,
   digestItems,
   digestText,
   eventName,
@@ -321,6 +323,7 @@ import {
   perDayText,
   cadenceNudgeText,
   candidatesFor,
+  isEffort,
   isUnowned,
   cadenceOf,
   ownsOpenItem,
@@ -387,6 +390,8 @@ import {
   behindLine,
   blindText,
   bodyHashOf,
+  bodyTextOf,
+  citingLines,
   confirmedBy,
   defaultKindOf,
   elsewhereText,
@@ -407,6 +412,7 @@ import {
   copyReadText,
   copyWriteText,
   idOf,
+  isHistoryPath,
   isStrict,
   landedText,
   landingKind,
@@ -444,6 +450,7 @@ import {
   type Records,
   type Rev,
   type RevFix,
+  type Reason,
   type Suspect,
   type SuspectsFile,
   type Unproven,
@@ -466,6 +473,16 @@ const retryAt = atom({ plugin: 'fleet', key: 'retryAt' } as const, 0)
 const busy = atom({ plugin: 'fleet', key: 'busy' } as const, false)
 const idleSince = atom({ plugin: 'fleet', key: 'idleSince' } as const, 0)
 const listing = atom({ plugin: 'fleet', key: 'listing' } as const, [] as string[])
+const processId = atom({ plugin: 'fleet', key: 'processId' } as const, '')
+
+/** This process's id, made once (a reload keeps it in $.state; a restart starts a new process with a new one) */
+async function processNow($: any): Promise<string> {
+  const had = await read($, processId)
+  if (had) return had
+  const id = `${(await $.clock.now()).toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  await update($, processId, () => id)
+  return id
+}
 const section = atom({ plugin: 'fleet', key: 'section' } as const, '')
 const reads = atom({ plugin: 'fleet', key: 'reads' } as const, {} as Record<string, Record<string, FleetRead>>)
 const warned = atom({ plugin: 'fleet', key: 'warned' } as const, {} as Record<string, Record<string, string>>)
@@ -1110,6 +1127,8 @@ async function closeNow($: any, id: string, how: CloseHow) {
       // A withdrawn one counts in no judge's stats: nobody answered it
       ...(jf && how.state !== 'withdrawn' ? { judge: judgeEntryOf(jf, outcomes, drop) } : {}),
       ...(rec.supersedes ? { supersedes: rec.supersedes } : {}),
+      ...(rec.supersedesAll ? { supersedesAll: rec.supersedesAll } : {}),
+      ...(rec.ruling ? { ruling: true as const } : {}),
     }
     // What an outbound would send (or sent), as the draft held it: the project's own record of what left it
     if (rec.outbound) {
@@ -1459,11 +1478,11 @@ let insensitive = false
 // a fleet with another format
 const seen = new Map<string, number>()
 const latest = new Map<string, ChangeEvent>()
-/** When the main thread's turn began (a send checks what it read since, or in the last 30 minutes) */
+/** When the main thread's turn began (a send checks what it read since, or in the last 12 hours) */
 let mainTurnAt = 0
 /** When the person was last told whose instance he's typing to */
 let typingToldAt = 0
-const SEND_FRESH_MS = 30 * 60000
+const SEND_FRESH_MS = 12 * 3600000
 // The last landings of the window, newest last, for /fleet status
 const recent: ChangeEvent[] = []
 let otherEvents = 0
@@ -1557,6 +1576,12 @@ function isJournal(rel: string): boolean {
   if (!roster) return false
   const fold = (x: string) => (insensitive ? x.toLowerCase() : x)
   return roster.instances.some(i => fold(i.journal) === fold(rel))
+}
+
+/** A journal, or a register many write a row of (world.json's history, G31): its pins are history, so they're kept as
+ * written, never refused, never suspect, never asked for a proof */
+function isHistory(rel: string): boolean {
+  return isJournal(rel) || isHistoryPath(rel, records)
 }
 
 function isIntakePath(rel: string): boolean {
@@ -2681,8 +2706,9 @@ async function outboundGate($: any, e: any): Promise<{ held: { deny: string } | 
 }
 
 /** A send the gate let through (a calls entry, the person's recipients), from a thread that read a shared file in this
- * turn or the last 30 minutes which changed since: refused once, so what goes out is what's there now (G13). The same
- * call again passes: a hold that names its reason and lets the session decide */
+ * turn or the last 12 hours which changed since: refused once, so what goes out is what's there now (G13; a post went
+ * out from a read of an hour and more before). The same call again passes: a hold that names its reason and lets the
+ * session decide */
 async function staleSend($: any, thread: string): Promise<string | null> {
   if (!worldOn()) return null
   await eventsTick($)
@@ -2703,7 +2729,10 @@ async function staleSend($: any, thread: string): Promise<string | null> {
   await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), ...Object.fromEntries(fresh.map(s => [`send:${s.path}`, s.v])) } }))
   log($, `send refused once: ${fresh.map(s => s.path).join(', ')} changed since ${thread} read ${fresh.length === 1 ? 'it' : 'them'}`)
   const one = fresh.length === 1
-  return `fleet: this wasn't sent: ${one ? 'a shared file you read' : 'shared files you read'} changed since you read ${one ? 'it' : 'them'} (${fresh.map(s => `${s.path}: ${changeLine(s.e, me)}`).join('; ')}). Read ${one ? 'it' : 'them'} again and send what's there now. The same call again sends it as it is.`
+  return `fleet: this wasn't sent: ${one ? 'a shared file you read' : 'shared files you read'} changed since you read ${one ? 'it' : 'them'} (${fresh
+    .slice(0, 5)
+    .map(s => `${s.path}: ${changeLine(s.e, me)}`)
+    .join('; ')}${fresh.length > 5 ? `; and ${fresh.length - 5} more` : ''}). Read ${one ? 'it' : 'them'} again and send what's there now. The same call again sends it as it is.`
 }
 
 /** When a gate's hook threw before the call ran: in a background session of a fleet project, a call that may reach the
@@ -2713,6 +2742,91 @@ function heldOnError(e: any): { deny: string } | null {
   const tool = String(e?.tool ?? '')
   const risky = tool === 'Bash' ? mayReachNetwork(String(e?.command ?? '')) : tool.startsWith('mcp__') && !tool.startsWith('mcp__fleet__')
   return risky ? { deny: "fleet couldn't check whether this sends the project's content outside, so it was not run. If it should go out, draft it with mcp__fleet__send; the person approves it and fleet runs it." } : null
+}
+
+/** fleet's own tool calls ($.tool.call: an approved draft /fleet n send makes, its push notification): one token each,
+ * taken by the generic tool.call hook as that very call reaches it (never one of the engine's, the model's own). The
+ * call that took it is fleet's own: past fleet's gate (checked when the person approved it), with nobody's answers on
+ * it, past the organisation-ask check (by its tool_use_id while in flight). refused: the verdict beneath fleet was a
+ * deny (a hook above may still answer over it: the call's own result says whether it held) */
+type OwnToken = { taken: boolean; refused?: boolean }
+const ownCalls = new Map<string, OwnToken[]>()
+// The tool_use_ids of fleet's own calls in flight, and those the permission check refused
+const ownInFlight = new Set<string>()
+const ownRefused = new Set<string>()
+
+function ownKey(tool: string, input: unknown): string {
+  return `${tool}\n${callKey(input)}`
+}
+
+/** A token for a call fleet is about to make; dropOwn takes it back if the call never reached the hook */
+function expectOwn(tool: string, input: unknown): OwnToken {
+  const t: OwnToken = { taken: false }
+  const k = ownKey(tool, input)
+  ownCalls.set(k, [...(ownCalls.get(k) ?? []), t])
+  return t
+}
+
+function dropOwn(tool: string, input: unknown, t: OwnToken) {
+  const k = ownKey(tool, input)
+  const left = (ownCalls.get(k) ?? []).filter(x => x !== t)
+  if (left.length) ownCalls.set(k, left)
+  else ownCalls.delete(k)
+}
+
+/** The token of fleet's own call, taken once by the call that reaches the hook with it; null for any other */
+function takeOwn(tool: string, input: unknown, origin: { plugin?: string } | undefined): OwnToken | null {
+  if (origin?.plugin === 'engine') return null
+  const k = ownKey(tool, input)
+  const list = ownCalls.get(k)
+  const t = list?.shift()
+  if (!t) return null
+  if (!list?.length) ownCalls.delete(k)
+  t.taken = true
+  return t
+}
+
+/** A call's input as one string, its keys in order at every level */
+function callKey(v: unknown): string {
+  const norm = (x: unknown): unknown => (Array.isArray(x) ? x.map(norm) : x && typeof x === 'object' ? Object.fromEntries(Object.keys(x as object).sort().map(k => [k, norm((x as Record<string, unknown>)[k])])) : x)
+  return JSON.stringify(norm(v) ?? null)
+}
+
+/** A tool call's input: the event less the keys the call itself sets (its tool, id, loop, consent) */
+function callInput(e: any): Record<string, unknown> {
+  const input: Record<string, unknown> = { ...(e ?? {}) }
+  for (const k of RESERVED_KEYS) delete input[k]
+  return input
+}
+
+/** In an instance of the roster (nobody sits at it), a call the gate lets out (a calls entry, the person's recipients)
+ * that would be put to the person at a permission prompt: its organisation's ceiling ask (org, before the check), or a
+ * verdict ask the person answers (rule: a settings rule, a hook's ask, a mode that asks; after the check). Refused
+ * before that prompt opens: it would wait there, maybe for hours, with its text as it is now, and go out when he
+ * answers, whatever its source says by then; as a /fleet draft it's checked against its source when he sends it, and
+ * the prompt follows there. A read of the tool's server, a query, fleet's own approved call and the person's own
+ * sessions are left to the prompt */
+async function orgAskHold($: any, e: any, why: 'org' | 'rule' = 'org'): Promise<{ decision: 'deny'; reason: string } | null> {
+  if ((why === 'org' && e?.ceiling !== 'ask') || e?.approver !== 'person' || !e?.tool_use_id) return null
+  const tool = String(e.tool ?? '')
+  if (!tool.startsWith('mcp__') || tool.startsWith('mcp__fleet__')) return null
+  await locate($)
+  if (!root || !jobRef || !myInstance) return null
+  // fleet's own call of a draft the person approved (its token taken by that call): his own prompt, now
+  if (ownInFlight.has(String(e.tool_use_id))) return null
+  const input = e.input && typeof e.input === 'object' ? (e.input as Record<string, unknown>) : {}
+  const c = await outboundConfig($)
+  // Only what the gate lets out: a send it holds never gets this far
+  const o = await outboundOf($, { tool, ...input }, c)
+  if (!o.allowed) return null
+  const sources = callSources(tool, input, c, myInstance.name)
+  const where = sources.length ? sources.join(', ') : null
+  log($, `refused before ${why === 'org' ? "the organisation's" : 'a permission'} prompt: ${tool} from ${myInstance.name} (a background instance): to be drafted for the person instead`)
+  const asks = why === 'org' ? `Your organisation asks the person about every call of ${tool}` : `A permission rule puts every call of ${tool} to the person`
+  return {
+    decision: 'deny',
+    reason: `fleet: this wasn't sent. ${asks}, and in this background session the call would wait at that prompt, maybe for hours, with its text as it is now, and go out when he answers${where ? ` even if ${where} changed meanwhile` : ''}. So draft it with mcp__fleet__send (mcp_tool "${tool}", the same input): the person approves it in /fleet${where ? `, where fleet checks it against ${where} as ${sources.length === 1 ? 'it is' : 'they are'} then` : ''}, and ${why === 'org' ? "his organisation's prompt" : 'the prompt'} follows there.`,
+  }
 }
 
 // ---- Outside content (decision 2b): a conversation that read a web page or an outside service's result is marked
@@ -2733,8 +2847,8 @@ async function restoreMark($: any) {
   if (p && 'threads' in p && p.outside && typeof p.outside.at === 'number') await update($, outside, () => p.outside as OutsideMark)
 }
 
-function markText(m: OutsideMark, offsetMin: number): string {
-  return markWords(m, ms => clock(ms, offsetMin))
+function markText(m: OutsideMark, offsetMin: number, now: number): string {
+  return markWords(m, ms => clockOn(ms, offsetMin, now))
 }
 
 // ---- The gate: a Write, Edit or NotebookEdit of a world file this thread didn't read as it is now, or whose pins it
@@ -2754,12 +2868,15 @@ async function gate($: any, e: any, next: any) {
   const cur = await versionOf($, w.abs)
   const mine = (await read($, reads))[thread]?.[w.rel]
   const told = (await read($, warned))[thread] ?? {}
-  // Under strict, nothing passes on a second try: only a read clears it
+  // Under strict, nothing passes on a second try: only a read clears it. Nor does a second call of the batch whose
+  // first was refused (the same step: the model hadn't seen the refusal)
   const strict = isStrict(records, w.rel)
-  const v = verdict(mine, cur.v, strict ? undefined : told[w.rel])
+  const step = stepOf.get(thread)
+  const sameStep = step !== undefined && refusedIn.get(`${thread}|${w.rel}`) === step
+  const v = verdict(mine, cur.v, strict || sameStep ? undefined : told[w.rel])
   // The pins of what the write leaves: a stale one, or a new one of a record this thread never read, is told once
   const text = resultOf(e, cur.text)
-  const pins = text === null || isJournal(w.rel) ? null : await checkPins($, thread, text, new Set(pinsFrom(cur.text, w.rel)), strict)
+  const pins = text === null || isHistory(w.rel) ? null : await checkPins($, thread, text, new Set(pinsFrom(cur.text, w.rel)), strict)
   // An Edit is refused only for the pins it writes: one left elsewhere in the file is told after it lands (under
   // strict, every pin of the file counts, as before)
   const edited = !strict && e.tool === 'Edit' && typeof e.new_string === 'string' && records ? new Set(pinsOf(e.new_string, records).map(pinKey)) : null
@@ -2767,8 +2884,13 @@ async function gate($: any, e: any, next: any) {
   const elsewhere = pins && edited ? pins.problems.filter(p => !edited.has(pinKey(p.pin))) : []
   const refusedKeys = problemKeys(refused)
   const said = new Set((told[`pins:${w.rel}`] ?? '').split('\n').filter(Boolean))
-  const fresh = refusedKeys.filter(k => strict || !said.has(k))
+  const fresh = refusedKeys.filter(k => strict || sameStep || !said.has(k))
   if (v !== 'pass' || fresh.length) {
+    if (step !== undefined) {
+      refusedIn.set(`${thread}|${w.rel}`, step)
+      const r = refusedWrites.get(thread)
+      refusedWrites.set(thread, r && r.step === step ? { ...r, writes: [...new Set([...r.writes, `${e.tool} of ${w.rel}`])] } : { step, writes: [`${e.tool} of ${w.rel}`], held: false })
+    }
     const me = await meNow($)
     const texts: string[] = []
     if (v !== 'pass') {
@@ -2777,6 +2899,12 @@ async function gate($: any, e: any, next: any) {
       await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: cur.v as string } }))
       if (mine && cur.v) await update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } }))
       texts.push(gateText(v, w.rel, last && last.to === cur.v ? last : null, cur.mtimeMs, me))
+      // A new board item someone else just made under the id this thread meant for its own (ids race): the next free one
+      const item = /^board\/B-(\d+)\.md$/.exec(w.rel)
+      if (v === 'unread' && item && last && last.to === cur.v && last.from === null) {
+        const taken = (await names($, `${root}/board`)).map(x => /^B-(\d+)\.md$/.exec(x)).filter((m): m is RegExpExecArray => !!m).map(m => Number(m[1]))
+        texts.push(`B-${item[1]} is a new item ${last.by?.name || 'another session'} just created: if yours is another item, the next free id is B-${Math.max(Number(item[1]), ...taken) + 1}.`)
+      }
     }
     if (fresh.length) {
       await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [`pins:${w.rel}`]: [...new Set([...said, ...refusedKeys])].join('\n') } }))
@@ -2789,7 +2917,16 @@ async function gate($: any, e: any, next: any) {
   // A record fleet never saw a version of: the one there now is its first
   const id = records ? idOf(w.rel, records) : null
   if (id && cur.v !== null) await revsFor($, id, { rel: w.rel, v: cur.v, text: cur.text })
-  const r = await next(e)
+  // In flight until its event is out: a peer's command that names the file and ends meanwhile leaves it to the scan.
+  // Rewritten every WRITING_REFRESH_MS while what runs beneath waits (a permission prompt can take minutes): its age is
+  // the wait's, and a session that died stops refreshing it, so it goes stale in WRITING_MS
+  const mark = await inFlight($, w.rel, thread, text === null ? null : hashText(text))
+  let r: any
+  try {
+    r = await next(e)
+  } finally {
+    if (!r || r.deny !== undefined || r.isError) await mark.done()
+  }
   if (!r || r.deny !== undefined || r.isError) return r
   const extra: string[] = []
   try {
@@ -2823,15 +2960,173 @@ async function gate($: any, e: any, next: any) {
     scheduleChecks($, [w.rel])
   } catch (err) {
     log($, `after ${e.tool} of ${w.rel}: ${String(err).slice(0, 200)}`)
+  } finally {
+    await mark.done()
   }
   return withLines($, r, thread, extra)
+}
+
+// ---- A tool write in flight (B28): the gate marks it in state/writing/ before the write and says done after its event.
+// A command's post-scan that finds a file it names changed while such a mark stands (not done, under WRITING_MS old)
+// leaves the change to the scan, which finds the tool's event: the gap between a peer's write and its event is never
+// taken for the command's own write. One file per path, session and thread, rewritten (no process); the prune takes
+// the old ones ----
+
+const WRITING_MS = 30000
+/** How often a mark is rewritten while its write waits beneath the gate (a permission prompt) */
+const WRITING_REFRESH_MS = 10000
+/** How long a mark is kept after its last rewrite: a done one is never read again */
+const WRITING_KEEP_MS = 10 * 60000
+
+/** How long a revised record stays quiet before the owners of what cites it are told (a burst is told once), and the
+ * longest that waits from its first move (a record that never stops moving is told anyway) */
+const REVISION_QUIET_MS = 2 * 60000
+const REVISION_WAIT_MS = 10 * 60000
+
+// ---- The model's steps: each loop's step now (its turn and index), the step of each refused write, and the writes a
+// step had refused (a SendMessage of that step is held once). Module state: after a reload no step is known, and the
+// gate's once works as before ----
+
+const stepOf = new Map<string, string>()
+const refusedIn = new Map<string, string>()
+const refusedWrites = new Map<string, { step: string; writes: string[]; held: boolean }>()
+
+/** A SendMessage in the step whose write the gate refused: the text that holds it once, or null */
+function sameStepHold(thread: string): string | null {
+  const step = stepOf.get(thread)
+  const r = refusedWrites.get(thread)
+  if (step === undefined || !r || r.step !== step || r.held) return null
+  refusedWrites.set(thread, { ...r, held: true })
+  const one = r.writes.length === 1
+  const what = one ? `your ${r.writes[0]}` : `your ${r.writes.slice(0, -1).join(', ')} and ${r.writes.at(-1)}`
+  return `fleet: this message wasn't sent: ${what} in this same batch ${one ? 'was refused, so it didn\'t land' : 'were refused, so they didn\'t land'}. Send it once ${one ? 'the write lands' : 'they land'}, or send it again as it is.`
+}
+
+function writingPath(rel: string, sid8: string, thread: string): string {
+  return stateDir(`writing/${hashText(rel).slice(1, 17)}-${sid8}-${thread.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`)
+}
+
+/** One write's mark: written now, rewritten every WRITING_REFRESH_MS until done() (which waits for a rewrite under
+ * way, so done is the last word) */
+async function inFlight($: any, rel: string, thread: string, to: string | null): Promise<{ done: () => Promise<void> }> {
+  let pending = true
+  const since = await $.clock.now()
+  const mark = { since, ...(to ? { to } : {}) }
+  let chain: Promise<void> = markWriting($, rel, thread, false, mark)
+  // Written before the write goes on
+  await chain
+  const timer = $.clock.every(WRITING_REFRESH_MS, () => {
+    if (pending) chain = chain.then(() => (pending ? markWriting($, rel, thread, false, mark) : undefined))
+  })
+  return {
+    done: async () => {
+      if (!pending) return
+      pending = false
+      timer.cancel()
+      chain = chain.then(() => markWriting($, rel, thread, true, mark))
+      await chain
+    },
+  }
+}
+
+let writingDirMade = false
+
+/** A mark put in place whole (a temporary file moved over it), so a reader never meets half of one */
+async function markWriting($: any, rel: string, thread: string, done: boolean, mark: { since: number; to?: string }) {
+  try {
+    const sessionId = String(await $.session.id())
+    const at = await $.clock.now()
+    if (!writingDirMade) {
+      await run($, ['mkdir', '-p', stateDir('writing')])
+      writingDirMade = true
+    }
+    if (!(await replace($, writingPath(rel, sessionId.slice(0, 8), thread), json({ format: FORMAT, path: rel, sessionId, agentId: thread === 'main' ? null : thread, at, ...mark, ...(done ? { done: true } : {}) })))) {
+      writingDirMade = false
+      log($, `couldn't mark ${rel} in flight`)
+    }
+  } catch (err) {
+    log($, `couldn't mark ${rel} in flight: ${String(err).slice(0, 120)}`)
+  }
+}
+
+/** The tool writes in flight now for some of these files, in any session (a mark at this format, not done, rewritten
+ * under WRITING_MS ago), by path: the text each will leave (to), when it was first marked. The folder is listed once,
+ * and only the marks of these files are read */
+async function writingNow($: any, rels: readonly string[]): Promise<Map<string, { to: string | null; since: number }[]>> {
+  const out = new Map<string, { to: string | null; since: number }[]>()
+  const prefixes = new Set(rels.map(r => `${hashText(r).slice(1, 17)}-`))
+  const now = await $.clock.now()
+  for (const name of await names($, stateDir('writing'))) {
+    if (!name.endsWith('.json') || !prefixes.has(name.slice(0, name.indexOf('-') + 1))) continue
+    let m: any = null
+    try {
+      m = JSON.parse((await readText($, stateDir(`writing/${name}`))) ?? 'null')
+    } catch {}
+    if (!m || m.format !== FORMAT || typeof m.path !== 'string' || m.done === true || typeof m.at !== 'number' || now - m.at >= WRITING_MS) continue
+    out.set(m.path, [...(out.get(m.path) ?? []), { to: typeof m.to === 'string' ? m.to : null, since: typeof m.since === 'number' ? m.since : m.at }])
+  }
+  return out
+}
+
+/** Whether a line (as citingLines gives it) citing key is a line of a shared file the command names that cites key
+ * too: the line index of the files read so far first, then the next unread file citing key, each read once a
+ * post-scan, until one has it */
+async function copyLine($: any, copy: { named: Map<string, boolean>; lines: Map<string, Set<string>>; read: Set<string>; sources: Map<string, string[]> }, names: (rel: string) => boolean, rel: string, line: string, key: string): Promise<boolean> {
+  if (copy.lines.get(line)?.has(key)) return true
+  let sources = copy.sources.get(key)
+  if (!sources) {
+    sources = []
+    for (const [p, kk] of known) {
+      if (p === rel || !(kk.pins ?? []).includes(key)) continue
+      let named = copy.named.get(p)
+      if (named === undefined) copy.named.set(p, (named = names(p)))
+      if (named) sources.push(p)
+    }
+    copy.sources.set(key, sources)
+  }
+  for (const p of sources) {
+    if (copy.read.has(p)) continue
+    copy.read.add(p)
+    const text = await readText($, `${realRoot}/${p}`)
+    if (text === null || !records) continue
+    for (const l of citingLines(text, records)) {
+      if (!l.pins.length) continue
+      const had = copy.lines.get(l.line) ?? new Set<string>()
+      for (const x of l.pins) had.add(x)
+      copy.lines.set(l.line, had)
+    }
+    if (copy.lines.get(line)?.has(key)) return true
+  }
+  return false
+}
+
+/** Whether a mark stands for the version a file is at: its write will leave that text (or, with no text to compare,
+ * it was first marked under WRITING_MS ago). A write of someone else's, meanwhile, is theirs */
+function standsFor(m: { to: string | null; since: number }, v: string | null, now: number): boolean {
+  return m.to !== null && v !== null && v.startsWith('h') ? m.to === v : now - m.since < WRITING_MS
+}
+
+let writingPrunedAt = 0
+
+/** The marks no write needs any more (done, or a dead session's, past WRITING_KEEP_MS by their time), removed at most
+ * every few minutes by the sweeper */
+async function pruneWriting($: any, now: number) {
+  if (now - writingPrunedAt < 5 * 60000) return
+  writingPrunedAt = now
+  let entries: any[] = []
+  try {
+    entries = await $.fs.list(stateDir('writing'))
+  } catch {
+    return
+  }
+  await remove($, entries.filter(x => x.kind === 'file' && now - Number(x.mtimeMs) > WRITING_KEEP_MS).map(x => stateDir(`writing/${x.name}`)))
 }
 
 /** Whether a world file is one that must carry a proof when world.json's proofs say so: a record, or a file under their
  * paths; never a journal (history) or an intake record (fleet's own) */
 function mustProve(rel: string): boolean {
   const p = records?.proofs
-  if (!p || !records || isJournal(rel) || isIntakePath(rel)) return false
+  if (!p || !records || isHistory(rel) || isIntakePath(rel)) return false
   return !!idOf(rel, records) || p.res.some(r => r.test(rel))
 }
 
@@ -2947,8 +3242,11 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   }
   const todo: (Landing & { plan: RevPlan | null; skip?: boolean; takeover?: boolean })[] = []
   // The other commands running now (this session's other ones, other sessions'), asked once: one that names a file
-  // this one changed too may be its writer
+  // this one changed too may be its writer. And the tool writes in flight, read once
   let others: Running[] | null = null
+  let writing: Map<string, { to: string | null; since: number }[]> | null = null
+  // Copies: each named file a pin may come from read once, its lines indexed (copyLines), whatever the command wrote
+  const copy = { named: new Map<string, boolean>(), lines: new Map<string, Set<string>>(), read: new Set<string>(), sources: new Map<string, string[]>() }
   for (const rel of changed) {
     const s = after.get(rel)
     const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
@@ -2966,10 +3264,18 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     // A command with no write syntax changed nothing: another session's write landed while it ran (its event says so,
     // or will, and the scan takes it then). It isn't this thread's landing: its model hears what changed under it
     if (readOnly) {
-      if ((await read($, reads))[thread]?.[rel]) during.push({ rel, v })
+      // Told now only for a file it names (it may have read it mid-change); the digest tells the rest at its next step
+      if ((await read($, reads))[thread]?.[rel] && (!names || names(rel))) during.push({ rel, v })
       continue
     }
     if (names && !names(rel)) {
+      unnamed++
+      continue
+    }
+    // Named, but a tool write of it is in flight (a peer's Edit whose event isn't out yet): the scan finds that event
+    writing ??= await writingNow($, changed)
+    const scanAt = await $.clock.now()
+    if ((writing.get(rel) ?? []).some(m => standsFor(m, v, scanAt))) {
       unnamed++
       continue
     }
@@ -2982,7 +3288,22 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     }
     const mine = (await read($, reads))[thread]?.[rel]
     // The pins of what the command left, as the gate would have checked them (it isn't held: it's marked)
-    const pc = f.text === null || isJournal(rel) ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []), isStrict(records, rel))
+    let pc = f.text === null || isHistory(rel) ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []), isStrict(records, rel))
+    // A copy from shared files the command names (cp, tail -n +N, cat a b > c, … >> log): a pin is carried when every
+    // line of what it wrote that cites it is a line of such a file citing it too (pins' numbers aside), so it needs no
+    // read of its own (a stale one is still one). A line added or rewritten that cites it isn't a copy
+    if (pc?.problems.some(p => p.why === 'unread') && names && f.text !== null && records) {
+      const carried: string[] = []
+      const lines = citingLines(f.text, records)
+      for (const p of pc.problems.filter(p => p.why === 'unread')) {
+        const key = pinKey(p.pin)
+        const citing = lines.filter(l => l.pins.includes(key))
+        let all = citing.length > 0
+        for (const l of citing) if (!(await copyLine($, copy, names, rel, l.line, key))) all = false
+        if (all) carried.push(key)
+      }
+      if (carried.length) pc = await checkPins($, thread, f.text, new Set([...(k?.pins ?? []), ...carried]), isStrict(records, rel))
+    }
     const suspect = pc ? pc.problems.map(p => `${pinKey(p.pin)}:${p.why}`) : []
     const id = records ? idOf(rel, records) : null
     if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
@@ -3088,10 +3409,15 @@ async function bashResolver($: any): Promise<(target: string) => string | null |
 async function bashTargetPredicate($: any): Promise<(target: string) => boolean> {
   const resolve = await bashResolver($)
   const res = world ? world.res : null
+  // A folder that holds shared files (or may: a glob from the project's top) is written by a copy into it
+  const bases = world ? world.globs.map(globBase) : []
   return (target: string) => {
     if (!res) return true
     const rel = resolve(target)
-    return rel === undefined || (rel !== null && inWorld(rel, res))
+    if (rel === undefined) return true
+    if (rel === null) return false
+    const dir = rel.replace(/\/+$/, '')
+    return inWorld(dir, res) || bases.some(b => b === '' || b === dir || b.startsWith(`${dir}/`) || dir.startsWith(`${b}/`) || dir === '')
   }
 }
 
@@ -3290,6 +3616,7 @@ async function scanWorld($: any) {
   const snap = await snapshot($)
   if (!snap) return
   const now = await $.clock.now()
+  await pruneWriting($, now)
   if (!baselined) {
     known.clear()
     for (const [rel, s] of snap) {
@@ -3558,7 +3885,7 @@ async function computeSuspects($: any) {
     }
     const said = confirmedBy(rel, k.v, k.pins ?? [], confs)
     if (said.length) confirmed = [...(confirmed ?? []), ...said]
-    if ((k.pins?.length || blind?.length) && !isJournal(rel)) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}), ...(confirmed ? { confirmed } : {}) })
+    if ((k.pins?.length || blind?.length) && !isHistory(rel)) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}), ...(confirmed ? { confirmed } : {}) })
   }
   const cited = new Map<string, Rev[]>()
   for (const id of new Set(facts.flatMap(f => f.pins.map(p => parsePin(p)?.id ?? '')))) if (id) cited.set(id, await revsFor($, id))
@@ -3736,14 +4063,27 @@ async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   // person): their writer is no session
   const orphans: Suspect[] = []
   const janitor = !!myInstance && isJanitor(myInstance)
+  const at = await $.clock.now()
+  // The told key of each reason of a suspect told, by the suspect's key as ownSuspectLines gives it
+  const perReason = new Map<string, string[]>()
   for (const s of directSuspects()) {
     if (derivedKinds.length && derivedKindOf(s.path, derivedKinds)) continue
-    if (told[`s|${suspectKey(s)}`]) continue
-    if (ownedBy(s.owner, me)) mine.push(s)
-    else if (janitor && untold(s.owner) && movesOf(s)) orphans.push(s)
+    // A record still being revised (its last revision under REVISION_QUIET_MS old) is told once it's quiet: one line per
+    // burst, at the version it came to, not one per revision (G33). Only that reason waits, and at most REVISION_WAIT_MS
+    // from the record's first move: the file's other reasons are told now
+    // from the burst's first move: the file's other reasons are told now. Each reason is told once
+    const busy = (r: Reason) => r.why === 'stale' && !!r.moved && at - r.moved.at < REVISION_QUIET_MS && at - (r.burst ?? r.first ?? r.moved.at) < REVISION_WAIT_MS
+    const one = (r: Reason) => suspectKey({ ...s, reasons: [r] })
+    const reasons = s.reasons.filter(r => !busy(r) && !told[`s|${one(r)}`])
+    if (!reasons.length) continue
+    const ready = reasons.length === s.reasons.length ? s : { ...s, reasons }
+    perReason.set(suspectKey(ready), reasons.map(one))
+    if (ownedBy(ready.owner, me)) mine.push(ready)
+    else if (janitor && untold(ready.owner) && movesOf(ready)) orphans.push(ready)
   }
-  const items = ownSuspectLines(mine, words).map(x => ({ keys: x.keys.map(k => `s|${k}`), line: x.line }))
-  const strays = ownSuspectLines(orphans, words).map(x => ({ keys: x.keys.map(k => `s|${k}`), line: x.line }))
+  const keysOf = (keys: string[]) => keys.flatMap(k => perReason.get(k) ?? [k]).map(k => `s|${k}`)
+  const items = ownSuspectLines(mine, words).map(x => ({ keys: keysOf(x.keys), line: x.line }))
+  const strays = ownSuspectLines(orphans, words).map(x => ({ keys: keysOf(x.keys), line: x.line }))
   for (const f of failing()) {
     if (!ownedBy(f.owner, me)) continue
     const key = `c|${f.path}|${f.check}|${f.hash}`
@@ -4595,7 +4935,7 @@ async function slotCall($: any, e: any): Promise<any> {
       const l: Lease = { ...v.lease, until: r.until, ...(why ? { why } : {}) }
       await replace($, slotDir(name, `${v.lease.n}.json`), json(l))
       await update($, slotTold, m => ({ ...m, [leaseKey(l)]: now }))
-      return { result: `You hold ${name} (${v.lease.n + 1} of ${spec.count}) until ${clock(l.until, me.offsetMin)} now${r.capped ? ` (no later: ${others} wait${others === 1 ? 's' : ''} for it, and a lease lasts ${spec.leaseMin} min from when you took it)` : ''}. Release it with mcp__fleet__slot release as soon as you're done.` }
+      return { result: `You hold ${name} (unit ${v.lease.n + 1} of ${spec.count}; ${(await leasesOf($, name)).filter(x => x.lease.until > now).length} of ${spec.count} taken) until ${clock(l.until, me.offsetMin)} now${r.capped ? ` (no later: ${others} wait${others === 1 ? 's' : ''} for it, and a lease lasts ${spec.leaseMin} min from when you took it)` : ''}. Release it with mcp__fleet__slot release as soon as you're done.` }
     }
     if (v.kind === 'grant') {
       const old = leases.find(x => x.lease.n === v.n)
@@ -4612,7 +4952,7 @@ async function slotCall($: any, e: any): Promise<any> {
         await update($, slotTold, m => ({ ...m, [leaseKey(lease)]: now }))
         await update($, slotWait, l => l.filter(x => x !== name))
         log($, `slot ${name}: taken by ${slotHolderWords(holder)} (${v.n + 1} of ${spec.count})`)
-        return { result: `Yours: ${name} (${v.n + 1} of ${spec.count}) until ${clock(lease.until, me.offsetMin)} (${minutes} min). Release it with mcp__fleet__slot release as soon as you're done; take it again to extend it. Once it runs out, fleet takes it back.` }
+        return { result: `Yours: ${name} (unit ${v.n + 1} of ${spec.count}; ${(await leasesOf($, name)).filter(x => x.lease.until > now).length} of ${spec.count} taken) until ${clock(lease.until, me.offsetMin)} (${minutes} min). Release it with mcp__fleet__slot release as soon as you're done; take it again to extend it. Once it runs out, fleet takes it back.` }
       }
       leases = await leasesOf($, name)
       waiters = await waitersOf($, name)
@@ -4781,8 +5121,12 @@ async function channelStamp($: any, c: Channel): Promise<{ ok: boolean; key: str
 async function sendToPerson($: any, c: Channel, text: string): Promise<{ outcome: SendOutcome; answer: string; problem?: string }> {
   if (c.kind === 'push') {
     const who = myName || myRef || jobRef || 'this session'
+    // fleet's own call: it carries none of the session's answers
+    const input = { message: text, status: 'proactive' }
+    const token = expectOwn('PushNotification', input)
     try {
-      const r: any = await Promise.race([$.tool.call({ tool: 'PushNotification', message: text, status: 'proactive' }), $.clock.sleep(10000).then(() => null)])
+      const r: any = await Promise.race([$.tool.call({ ...input, tool: 'PushNotification' }), $.clock.sleep(10000).then(() => null)])
+      if (!token.taken) dropOwn('PushNotification', input, token)
       if (!r) return { outcome: 'unknown', answer: 'push: no answer in 10 s' }
       if (r.deny) return { outcome: 'failed', answer: `push refused: ${String(r.deny).slice(0, 100)}` }
       if (r.result?.pushSent === true) return { outcome: 'sent', answer: 'push: sent' }
@@ -4791,6 +5135,7 @@ async function sendToPerson($: any, c: Channel, text: string): Promise<{ outcome
       const why = r.result?.localSent === true ? 'shown on a background session nobody looks at' : String(r.result?.disabledReason ?? (r.isError ? r.text : 'no reason given')).slice(0, 100)
       return { outcome: 'failed', answer: `push: not sent (${why})`, problem: `alerts aren't reaching you: the sweeper (${who}) has no Remote Control` }
     } catch (err) {
+      if (!token.taken) dropOwn('PushNotification', input, token)
       return { outcome: 'failed', answer: `push: unavailable (${String(err).slice(0, 100)})` }
     }
   }
@@ -4837,6 +5182,16 @@ async function alertsTick($: any) {
   const long = records.filter(r => knownKind(r) && !progress(r.id, slots(r), present).complete && now - r.at >= person.waitingMin * 60000).sort((a, b) => a.at - b.at)
   const oldest = long[0]
   if (oldest) due.push({ key: `waiting:${day}:${DAY_PARTS[Math.floor(minute / 360)]}`, kind: 'waiting', text: `${long.length} decision(s) have waited over ${ago(person.waitingMin * 60000)} (the oldest, ${oldest.id} from ${view(oldest).name}, ${ago(now - oldest.at)})` })
+  // An instance stopped at a permission prompt nobody sees, or in one call that may hang, past waitingMin (a call: past
+  // half an hour too): once per prompt or call
+  for (const inst of roster?.instances ?? []) {
+    const hb = await heartbeatOf($, inst.slug)
+    if (!hb || now - hb.at >= HEARTBEAT_STALE_MS) continue
+    const w = hb.waitingOn
+    if (w?.kind === 'permission' && now - w.at >= person.waitingMin * 60000) due.push({ key: `prompt:${inst.slug}:${w.at}`, kind: 'waiting', text: `${inst.name} has waited on a permission prompt (${w.tool}) for ${ago(now - w.at)}: Enter on its row in the panel answers it` })
+    const c = hungCall(hb, now)
+    if (c && now - c.since >= person.waitingMin * 60000) due.push({ key: `call:${inst.slug}:${c.since}`, kind: 'waiting', text: `${inst.name} has been in one call to ${c.tool} for ${ago(now - c.since)}: it may be hung` })
+  }
   // A budget used up (an instance's own, the project's, intake's)
   budgetCache.at = 0
   for (const b of await budgets($)) if (b.own === 'over') due.push({ key: `budget:${b.inst.slug}:${day}`, kind: 'budget', text: `${b.inst.name} used up its budget (${usd(b.usd)} today)` })
@@ -5035,7 +5390,11 @@ async function acceptCommand($: any, path: string, origin: string): Promise<stri
   if (path && (await configFiles($)).includes(cfg)) {
     if (origin !== 'composer') return `Only the person stamps a change as his, typing /fleet accept at a terminal (${originWords(origin)})`
     await writeStamps($, [cfg])
-    if (cfg === '.claude/fleet/roster.json') roster = null
+    if (cfg === '.claude/fleet/roster.json') {
+      roster = null
+      const took = await rosterTakesEffect($)
+      return [`${cfg}: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).${took.length ? ' It takes effect now:' : ''}`, ...took].join('\n')
+    }
     return `${cfg}: its current version is stamped as yours (fleet no longer flags it as changed outside fleet).`
   }
   if (!worldOn()) return worldProblem || 'This project has no world (world.json): /fleet world add <glob> starts one.'
@@ -5329,9 +5688,135 @@ type Heartbeat = {
   budget?: { day: string; usd: number; cap: number | null; state: BudgetState } | null
   /** The main thread's Bash commands running in the background (their text, when each started): told after a restart */
   bg?: { command: string; at: number }[]
+  /** The job's background tasks (Claude's state.json inFlight: an MCP call it moved to the background, a subagent),
+   * and since when it has had some */
+  tasks?: { count: number; kinds: string[]; since: number }
+  /** The main thread's oldest tool call in flight (one that runs past STUCK_MS may hang: a call that never returns) */
+  call?: { tool: string; since: number }
+  /** The roster's model or effort that got no response STEP_FAILS times in a row: its requests run the session's own
+   * until refusedUntil */
+  modelRefused?: string
+  effortRefused?: string
+  /** How many no-responses in a row made it so, and when fleet asks for it again */
+  refusedTimes?: number
+  refusedUntil?: number
+  /** The model its last request named (the roster's once fleet asked for it): a different one answered, the account's */
+  asked?: string
 }
 // That model, from turn.step (B4: a roster model the account lacks ran the org default, and nothing said so)
 let stepModel: string | null = null
+// The model its last main-loop request named (the roster's, once fleet asked for it)
+let stepAsked: string | null = null
+// Whether turn.step tried to bind this process already
+let stepBound = false
+// The roster's model and effort that got no response STEP_FAILS times in a row: not asked for again until `until`
+let stepRefused: (StepWant & { until: number; times: number }) | null = null
+// Its no-responses in a row so far, for one model and effort
+let stepFails: { key: string; times: number } | null = null
+const STEP_FAILS = 3
+const STEP_BACKOFF_MS = 30 * 60000
+
+type StepWant = { model?: string; effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
+
+/** What an instance's main-loop request should name that it doesn't: the roster's model (an alias that picks for
+ * itself never differs) and its effort, unless they got no response STEP_FAILS times in a row (then not for
+ * STEP_BACKOFF_MS), or its roster entry has a lint error */
+function stepWant(inst: Instance, e: { model: string; effort?: unknown }, now: number): StepWant | null {
+  if (myLint && myLint.of === roster && myLint.errors.length) return null
+  const want: StepWant = {}
+  if (inst.model && modelDiffers(inst.model, e.model)) want.model = inst.model
+  // Effort where the request carries one, or along with a model fleet switches to (a model without effort drops it)
+  if (inst.effort && isEffort(inst.effort) && e.effort !== inst.effort && (e.effort !== undefined || want.model)) want.effort = inst.effort
+  if (!want.model && !want.effort) return null
+  if (stepRefused && now >= stepRefused.until) stepRefused = null
+  return stepRefused && refusalKey(stepRefused) === refusalKey(want) ? null : want
+}
+
+/** An instance's lint errors: its own ("<name>": …, said without its name) and the roster's that name no instance that
+ * way (a role file missing, two instances with one name, a parent: /fleet up refuses the whole roster for them) */
+function lintOf(errors: readonly string[], all: readonly Instance[], inst: Instance): string[] {
+  const head = `"${inst.name}": `
+  const loose = errors.filter(x => !all.some(i => x.startsWith(`"${i.name}": `)))
+  return [...errors.filter(x => x.startsWith(head)).map(x => x.slice(head.length)), ...loose]
+}
+
+// This instance's lint errors, for the roster it was worked out on: while it has any, its requests keep the model and
+// effort they name (the roster's new ones wait until the entry is fixed, as its settings file does)
+let myLint: { of: unknown; errors: string[] } | null = null
+async function lintMine($: any, inst: Instance) {
+  if (!roster || myLint?.of === roster) return
+  const of = roster
+  const roleFiles = new Map<string, string | null>()
+  for (const a of new Set(roster.instances.map(i => i.agent))) roleFiles.set(a, await readText($, `${root}/.claude/agents/${a}.md`))
+  myLint = { of, errors: lintOf(lintRoster((of as { r: Roster }).r, roleFiles).errors, of.instances, inst) }
+}
+
+function refusalKey(w: StepWant): string {
+  return `${w.model ?? ''}|${w.effort ?? ''}`
+}
+
+function wantWords(w: StepWant): string {
+  return [w.model, w.effort ? `effort ${w.effort}` : null].filter(Boolean).join(' at ')
+}
+
+/** What an instance runs, as its heartbeat says, beside the roster's model: the same; the roster's got no response
+ * STEP_FAILS times in a row (asked for again at refusedUntil); the account answered with its own though fleet asked for
+ * the roster's; or not asked for yet (the roster changed, or its last request fell back: its next one names it) */
+function modelLine(inst: Instance, hb: { model?: unknown; modelRefused?: unknown; asked?: unknown; refusedTimes?: unknown; refusedUntil?: unknown }, offsetMin = -new Date().getTimezoneOffset()): string {
+  const runs = String(hb.model)
+  if (!inst.model || !modelDiffers(inst.model, runs)) return `runs ${runs}`
+  if (typeof hb.modelRefused === 'string' && !modelDiffers(hb.modelRefused, inst.model) && !modelDiffers(inst.model, hb.modelRefused))
+    return `runs ${runs}, roster says ${inst.model} (${inst.model} got no response ${typeof hb.refusedTimes === 'number' ? hb.refusedTimes : STEP_FAILS} times in a row: its requests run the session's own model; fleet asks for it again ${typeof hb.refusedUntil === 'number' ? `at ${clock(hb.refusedUntil, offsetMin)}` : 'after a restart'})`
+  if (typeof hb.asked === 'string' && (hb.asked === inst.model || !modelDiffers(inst.model, hb.asked))) return `runs ${runs}, roster says ${inst.model} (a model the account lacks falls back)`
+  return `runs ${runs}, roster says ${inst.model} (its next request asks for ${inst.model})`
+}
+
+/** An instance's settings file as a restart matters for it: without its model and effort, which reach a running
+ * instance at its next request (turn.step), so a change of those alone needs no restart */
+function settingsCoreHash(text: string): string {
+  try {
+    const s = JSON.parse(text)
+    if (s && typeof s === 'object' && !Array.isArray(s)) {
+      // fleet's own deny rules (Edit(//<project>/…) on the command-level files): its gate refuses those writes live, so
+      // a change of them alone (a command channel's script) is no reason to restart
+      const deny = Array.isArray(s.permissions?.deny) ? s.permissions.deny : null
+      const own = deny ? deny.filter((d: unknown) => typeof d === 'string' && d.startsWith('Edit(//')) : []
+      if ('model' in s || 'effortLevel' in s || own.length) {
+        const { model: _m, effortLevel: _e, ...rest } = s
+        if (own.length) rest.permissions = { ...rest.permissions, deny: deny.filter((d: unknown) => !own.includes(d)) }
+        return hashText(settingsText(rest))
+      }
+    }
+  } catch {}
+  return hashText(text)
+}
+
+/** One tool call in flight this long may hang (a subagent's is its own work, and a permission prompt has its mark) */
+const STUCK_MS = 20 * 60000
+const OWN_PACE_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task'])
+function hungCall(hb: { call?: { tool: string; since: number }; waitingOn?: unknown; tasks?: { kinds?: unknown; since?: unknown } } | null, now: number): { tool: string; since: number } | null {
+  // An MCP call the engine moved to the background (it aborts one silent for 30 min): seen there that long
+  const t = hb?.tasks
+  if (t && Array.isArray(t.kinds) && t.kinds.includes('mcp_task') && typeof t.since === 'number' && now - t.since >= STUCK_MS) return { tool: 'a background MCP task', since: t.since }
+  const c = hb?.call
+  if (!c || typeof c.tool !== 'string' || typeof c.since !== 'number' || hb?.waitingOn || OWN_PACE_TOOLS.has(c.tool)) return null
+  return now - c.since >= STUCK_MS ? c : null
+}
+
+/** "2026-11-02 09:00 here, UTC-03:00": the date and time where the session runs, for what it writes */
+async function clockStamp($: any): Promise<string> {
+  const now = await $.clock.now()
+  const off = (await meNow($)).offsetMin
+  const d = new Date(now + off * 60000)
+  const two = (n: number) => String(n).padStart(2, '0')
+  const a = Math.abs(off)
+  return `${d.getUTCFullYear()}-${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())} here, UTC${off < 0 ? '-' : '+'}${two(Math.floor(a / 60))}:${two(a % 60)}`
+}
+
+/** A step that got no response at all: no usage, no stop reason, nothing said (the API refused the request) */
+function noResponse(r: any): boolean {
+  return !!r && !r.usage && (r.stopReason === null || r.stopReason === undefined) && !r.answer && !(r.toolUses?.length > 0)
+}
 // The tokens its context held at the last heartbeat (the idle compaction reads it)
 let lastContextTokens: number | null = null
 // Why a pending restart (/fleet up --restart-when-idle) hasn't happened yet, for its heartbeat; null: none pending
@@ -5346,6 +5831,14 @@ let turnFailed: { at: number; why: string } | null = null
 // permission prompt it waits on now (classic.PermissionRequest, until its tool ran or was refused, or the turn ended)
 let permissionMode: string | null = null
 let permissionWait: { kind: 'permission'; tool: string; at: number } | null = null
+// The main thread's tool calls in flight (parallel calls each), for the heartbeat: the oldest says which one may hang
+const callsInFlight = new Map<number, { tool: string; since: number }>()
+let callSeq = 0
+function oldestCall(): { tool: string; since: number } | null {
+  let o: { tool: string; since: number } | null = null
+  for (const c of callsInFlight.values()) if (!o || c.since < o.since) o = c
+  return o
+}
 // What this instance's heartbeat carried over from the one before it (once per process)
 const carried = { done: false, startedAt: 0, lastLanding: 0, lastWork: 0, budgetOver: '' }
 type BudgetRow = { inst: Instance; usd: number; cap: number | null; own: BudgetState; state: BudgetState }
@@ -5437,11 +5930,14 @@ async function bind($: any) {
   const type = agentType ?? current?.agent ?? null
   const was = myInstance?.name
   myInstance = inst
+  try {
+    await lintMine($, inst)
+  } catch {}
   bound = !type || type === inst.agent
   bindWhy = bound ? '' : `it runs as ${type}, and the roster gives ${inst.name} the role file ${inst.agent}`
   if (settingsHash === null) {
     const t = await readText($, settingsPath(inst.slug))
-    settingsHash = t === null ? '' : hashText(t)
+    settingsHash = t === null ? '' : settingsCoreHash(t)
   }
   if (was !== inst.name) log($, `instance ${inst.name} (${inst.role})${bound ? '' : `, unbound: ${bindWhy}`}`)
 }
@@ -5549,9 +6045,15 @@ async function heartbeat($: any) {
     intakeSeen: intakeSeen.at || null,
     mode: permissionMode ?? (await configuredMode($)),
     waitingOn: permissionWait,
+    ...(oldestCall() ? { call: oldestCall() as { tool: string; since: number } } : {}),
     remote: await remoteControl($),
+    ...(await jobTasks($)),
     contextTokens,
     model: stepModel,
+    ...(stepAsked ? { asked: stepAsked } : {}),
+    ...(stepRefused?.model ? { modelRefused: stepRefused.model } : {}),
+    ...(stepRefused?.effort ? { effortRefused: stepRefused.effort } : {}),
+    ...(stepRefused ? { refusedTimes: stepRefused.times, refusedUntil: stepRefused.until } : {}),
     failed: turnFailed,
     classicStart: !!(await read($, classicSeen)).SessionStart,
     ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
@@ -5617,6 +6119,42 @@ async function blocksOf($: any, slug: string, now: number): Promise<BlocksFile |
   return blocksToday(await readWire<BlocksFile>($, `${instDir(slug)}/blocks.json`), today(now))
 }
 
+/** The job's background tasks, from Claude's state.json (inFlight: { tasks, kinds }), and since when there have been
+ * some: { tasks } for the heartbeat, or nothing */
+let tasksSince = 0
+async function jobTasks($: any): Promise<{ tasks?: { count: number; kinds: string[]; since: number } }> {
+  if (!jobRef || !jobDir) return {}
+  let f: any = null
+  try {
+    f = JSON.parse((await readText($, `${jobDir}/state.json`)) ?? 'null')?.inFlight
+  } catch {}
+  const count = typeof f?.tasks === 'number' ? f.tasks : 0
+  if (!count) {
+    tasksSince = 0
+    return {}
+  }
+  if (!tasksSince) tasksSince = await $.clock.now()
+  const kinds = Array.isArray(f.kinds) ? f.kinds.filter((k: unknown): k is string => typeof k === 'string').slice(0, 10) : []
+  return { tasks: { count, kinds, since: tasksSince } }
+}
+
+/** A background task that keeps an instance at work though its row says idle: an MCP call moved to the background, a
+ * subagent */
+const BUSY_TASKS: ReadonlySet<string> = new Set(['mcp_task', 'agent'])
+function busyTasks(hb: { tasks?: { kinds?: unknown } } | null): boolean {
+  const k = hb?.tasks?.kinds
+  return Array.isArray(k) && k.some(x => BUSY_TASKS.has(x))
+}
+
+/** The background tasks busyTasks counts, in words: "a background MCP task", "2 background tasks (a subagent, an MCP task)" */
+function backgroundTasksText(hb: { tasks?: { count?: unknown; kinds?: unknown } } | null): string {
+  const kinds = (Array.isArray(hb?.tasks?.kinds) ? hb!.tasks!.kinds : []).filter((x): x is string => typeof x === 'string' && BUSY_TASKS.has(x))
+  const word = (k: string) => (k === 'mcp_task' ? 'an MCP task' : 'a subagent')
+  const n = typeof hb?.tasks?.count === 'number' && hb.tasks.count > 0 ? hb.tasks.count : kinds.length
+  if (n <= 1) return kinds[0] === 'agent' ? 'a background subagent' : 'a background MCP task'
+  return `${n} background tasks (${[...new Set(kinds)].map(word).join(', ')})`
+}
+
 /** Whether this background session has Remote Control on: Claude's background service keeps its connection in the
  * job's state.json (bridgeSessionId) while it's on. null: not a background session, or it can't be read */
 async function remoteControl($: any): Promise<boolean | null> {
@@ -5672,7 +6210,7 @@ type WorkOffer = { slug: string; at: number }
 type WorkFile = {
   format: number
   at: number
-  unowned: Record<string, { for: string | null; since: number; offers: WorkOffer[]; mtime?: number; round?: number; allOffered?: number | null }>
+  unowned: Record<string, { for: string | null; since: number; offers: WorkOffer[]; mtime?: number; round?: number; allOffered?: number | null; writer?: string }>
   capacity: Capacity
   quiet?: Record<string, number>
 }
@@ -5680,7 +6218,7 @@ type WorkFile = {
  * oldest waits, the slots free, the runs in flight and those finished but not recorded; flags: an idle instance an
  * item that waits FLAG_AFTER_MS fits (the band's red flag, and the front's hourly note); nobody: open items nobody owns
  * that no instance can be offered (no for:, and the roster has no front door), waiting FLAG_AFTER_MS */
-type Capacity = { idle: string[]; unowned: number; oldest: number | null; slotsFree: number | null; slotsTotal: number | null; runs: number; unrecorded: number; flags: { inst: string; item: string }[]; nobody?: string[] }
+type Capacity = { idle: string[]; unowned: number; oldest: number | null; slotsFree: number | null; slotsTotal: number | null; runs: number; unrecorded: number; flags: { inst: string; item: string }[]; nobody?: string[]; stuck?: { inst: string; tool: string; since: number }[] }
 
 /** An item offered to one instance is offered to the next after this long while still nobody owns it; each instance it's
  * for once (a round), and again only when its file changed: a later round counts within the wakes' daily cap */
@@ -5717,6 +6255,125 @@ async function boardItems($: any): Promise<({ id: string; mtime: number } & Retu
 
 async function readWork($: any): Promise<WorkFile | null> {
   return readWire<WorkFile>($, stateDir('work.json'))
+}
+
+// ---- Results to reproduce (G30): world.json's reproduce rules; the one board item fleet writes itself ----
+
+/** <project>/.claude/fleet/state/reproduce.json (the sweeper's, replaced with mv): since when it watches (results landed
+ * before it started open nothing), and the item it opened for each result, by path */
+type ReproduceFile = { format: number; since: number; made: Record<string, { item: string; at: number; writer: string; v: string; opened?: true }> }
+
+/** world.json's "reproduce": [{ "glob": "poc/results/**", "for": "tester" }]: a result (front matter kind: result) an
+ * instance of another role lands under the glob becomes a board item for that role, once per file */
+let reproduceCache: { mtime: number; rules: { re: RegExp; glob: string; for: string }[] } | null = null
+async function reproduceRules($: any): Promise<{ re: RegExp; glob: string; for: string }[]> {
+  // Kept while world.json stays the version the world was loaded from (a tick asks every 5 s)
+  const mtime = world?.mtimeMs ?? -1
+  if (reproduceCache && reproduceCache.mtime === mtime && mtime !== -1) return reproduceCache.rules
+  const rules = await readReproduceRules($)
+  reproduceCache = { mtime, rules }
+  return rules
+}
+
+async function readReproduceRules($: any): Promise<{ re: RegExp; glob: string; for: string }[]> {
+  const raw = parseJson(await readText($, `${fleetDir()}/world.json`))
+  const list = Array.isArray(raw?.reproduce) ? raw.reproduce : []
+  return list
+    .filter((r: any) => r && typeof r.glob === 'string' && r.glob.trim() && typeof r.for === 'string' && r.for.trim())
+    .map((r: any) => ({ glob: r.glob.trim(), re: globRegex(r.glob.trim(), insensitive), for: r.for.trim() }))
+}
+
+/** The sweeper: each result a rule names that landed since it started watching, by an instance whose role isn't the
+ * rule's, with no item for it on the board (one naming its path or id) and none fleet opened, gets board/B-<n>.md: owner
+ * open, for: the rule's role, landed as fleet's own (via fleet). B14's offers take it from there; its writer hears it */
+async function reproduceTick($: any, now: number) {
+  if (!root || !roster || !worldOn()) return
+  const rules = await reproduceRules($)
+  if (!rules.length) return
+  const had = await readWire<ReproduceFile>($, stateDir('reproduce.json'))
+  const file: ReproduceFile = had ?? { format: FORMAT, since: now, made: {} }
+  let changed = !had
+  await pullEvents($)
+  const board = await boardItems($)
+  for (const e of [...latest.values()].sort((a, b) => a.at - b.at)) {
+    if (e.at < file.since || e.to === null || file.made[e.path] || (e.via !== 'tool' && e.via !== 'bash') || !e.by || e.probably) continue
+    const rule = rules.find(r => r.re.test(e.path))
+    if (!rule) continue
+    const writer = roster.instances.find(i => i.name === e.by?.name)
+    // Its writer is one the rule is for (a role, its plural, a list): its own result is the reproduction
+    const forRule = candidatesFor(rule.for, roster.instances, null)
+    if (!writer || forRule.some(i => i.slug === writer.slug || i.role === writer.role)) continue
+    // A file under the glob that isn't a result: read once per version
+    if (notResult.get(e.path) === e.to) continue
+    const text = await readText($, `${root}/${e.path}`)
+    if (text === null || !/^\s*kind\s*:\s*result\b/im.test(text.slice(0, 4096).split('\n').slice(0, 40).join('\n'))) {
+      notResult.set(e.path, e.to)
+      continue
+    }
+    const id = records ? idOf(e.path, records) : null
+    const cite = id && e.rev ? `${id}@${e.rev}` : null
+    // The board has its reproduction already: an item naming it, for the rule's role, that its writer doesn't own (the
+    // item that asked for the result names it too, and is no reproduction)
+    const named = await (async () => {
+      for (const b of board) {
+        if (b.owner && b.owner.toLowerCase() === writer.name.toLowerCase()) continue
+        if (!candidatesFor(b.for, roster.instances, null).some(i => forRule.some(r => r.slug === i.slug))) continue
+        const t = await readText($, `${root}/board/${b.id}.md`)
+        if (t && (t.includes(e.path) || (id && new RegExp(`\\b${id}\\b`).test(t)))) return b.id
+      }
+      return null
+    })()
+    if (named) {
+      file.made[e.path] = { item: named, at: now, writer: writer.slug, v: e.to }
+      changed = true
+      continue
+    }
+    const item = await openReproduceItem($, e, writer, rule, cite, now)
+    if (!item) continue
+    file.made[e.path] = { item, at: now, writer: writer.slug, v: e.to, opened: true }
+    changed = true
+    log($, `reproduce: ${item} opened for ${e.path} (${writer.name}'s result), for ${rule.for}`)
+  }
+  if (changed && !(await replace($, stateDir('reproduce.json'), json(file)))) {
+    await run($, ['mkdir', '-p', stateDir()])
+    await replace($, stateDir('reproduce.json'), json(file))
+  }
+}
+
+/** A file under a reproduce glob that isn't a result, by path: the version read (not read again till it changes) */
+const notResult = new Map<string, string>()
+
+async function openReproduceItem($: any, e: ChangeEvent, writer: Instance, rule: { glob: string; for: string }, cite: string | null, now: number): Promise<string | null> {
+  const dir = `${root}/board`
+  await run($, ['mkdir', '-p', dir])
+  const me = await meNow($)
+  const body = [
+    '---',
+    'owner: open',
+    'status: open',
+    `for: ${rule.for}`,
+    '---',
+    `# Reproduce ${e.path}`,
+    '',
+    `fleet opened this item (world.json's reproduce: ${rule.glob}, for: ${rule.for}): ${writer.name} landed ${e.path}${cite ? ` (${cite})` : ''} at ${clock(e.at, me.offsetMin)}, a result, and nothing on the board reproduces it yet.`,
+    '',
+    `Reproduce it on your own: rerun its \`run:\` (or the same experiment) where it says, and land a result of yours with its proof, citing ${cite ?? e.path}; then set this item done with where your result is, pass or fail. If you find it needs no reproduction, set it done saying why: that call is yours (the one who takes it), not ${writer.name}'s.`,
+    '',
+  ].join('\n')
+  let n = Math.max(0, ...(await names($, dir)).map(x => /^B-(\d+)\.md$/.exec(x)).filter((m): m is RegExpExecArray => !!m).map(m => Number(m[1]))) + 1
+  for (let tries = 0; tries < 20; tries++, n++) {
+    const rel = `board/B-${n}.md`
+    const w = await publish($, `${root}/${rel}`, body)
+    if (w === 'exists') continue
+    if (w === 'failed') return null
+    const after = await versionOf($, `${root}/${rel}`)
+    const fields = await landRecord($, rel, after, 'fleet', null)
+    await writeEvent($, { path: rel, from: null, to: after.v, via: 'fleet', blind: false, by: null, ...fields, made: `a reproduction item for ${e.path}` })
+    setKnown(rel, { mtimeMs: after.mtimeMs, size: after.size, v: after.v, pins: fields.pins ?? [] })
+    unexplained.delete(rel)
+    return `B-${n}`
+  }
+  return null
 }
 
 /** The runs declared in this project, with whether each finished and whether its owner recorded it; recorded ones only
@@ -5827,6 +6484,8 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
   const later = new Map<string, string[]>()
   const finished = new Map<string, string[]>()
   if (!root || !roster) return { offered, later, finished }
+  // The board items' writers come from their landings (read only when events/latest moved)
+  await eventsTick($)
   const insts = roster.instances
   const items = await boardItems($)
   const had = await readWork($)
@@ -5835,7 +6494,8 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
   const states = new Map<string, 'idle' | 'busy' | 'retired' | 'off'>()
   for (const i of insts) {
     const { running, stopped } = rowsOf(i, rows)
-    if (running) states.set(i.slug, running.state === 'idle' ? 'idle' : 'busy')
+    // Idle by its row, but at work on a background task (an MCP call the engine moved there, a subagent): busy
+    if (running) states.set(i.slug, running.state === 'idle' && !busyTasks(await heartbeatOf($, i.slug)) ? 'idle' : 'busy')
     else if (stopped && !['person', 'memory'].includes(stopReason(stopped) ?? '') && (await heartbeatOf($, i.slug))?.ref === stopped.ref) states.set(i.slug, 'retired')
     else states.set(i.slug, 'off')
   }
@@ -5852,11 +6512,13 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     // A round per version of the item's file: each instance it's for is offered it once; its file changed (the person
     // unblocked it, someone reworded it), a new round
     const changed = !!prev && prev.mtime !== undefined && prev.mtime !== it.mtime
-    const rec = { for: it.for, since: prev?.since ?? now, offers: changed ? [] : [...(prev?.offers ?? [])], mtime: it.mtime, round: changed ? (prev?.round ?? 1) + 1 : (prev?.round ?? 1), allOffered: changed ? null : (prev?.allOffered ?? null) }
+    // Its writer (its last landing's session), never offered its own item when it's for anyone
+    const writer = prev?.writer ?? latest.get(`board/${it.id}.md`)?.by?.name ?? null
+    const rec = { for: it.for, since: prev?.since ?? now, offers: changed ? [] : [...(prev?.offers ?? [])], mtime: it.mtime, round: changed ? (prev?.round ?? 1) + 1 : (prev?.round ?? 1), allOffered: changed ? null : (prev?.allOffered ?? null), ...(writer ? { writer } : {}) }
     unowned[it.id] = rec
     const last = rec.offers[rec.offers.length - 1]
     if (last && now - last.at < OFFER_AGAIN_MS) continue
-    const fits = candidatesFor(it.for, insts, front)
+    const fits = candidatesFor(it.for, insts, front, rec.writer ?? null)
     const tried = new Set(rec.offers.map(o => o.slug))
     // Every instance it's for was offered it, and the last had its time: offered no more until its file changes
     if (fits.length && fits.every(i => tried.has(i.slug))) {
@@ -5874,7 +6536,7 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     pending.set(pick.slug, (pending.get(pick.slug) ?? 0) + 1)
     const into = rec.round > 1 ? later : offered
     into.set(pick.slug, [...(into.get(pick.slug) ?? []), it.id])
-    log($, `${it.id} (open, nobody owns it, for ${it.for ?? 'the front door'}) offered to ${pick.name}${rec.round > 1 ? ` (round ${rec.round}: its file changed)` : ''}`)
+    log($, `${it.id} (open, nobody owns it, for ${it.for ?? (front ? 'the front door' : 'anyone but its writer')}) offered to ${pick.name}${rec.round > 1 ? ` (round ${rec.round}: its file changed)` : ''}`)
   }
   // The runs: their done-files, then which finished and aren't recorded, by owner
   let views = await runViews($)
@@ -5908,7 +6570,7 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
   const nobody: string[] = []
   for (const [id, u] of Object.entries(unowned)) {
     if (now - u.since < FLAG_AFTER_MS) continue
-    const fits = candidatesFor(u.for, insts, front)
+    const fits = candidatesFor(u.for, insts, front, u.writer ?? null)
     // No instance can be offered it: no for: that names one, and no front door
     if (!fits.length) {
       nobody.push(id)
@@ -5920,7 +6582,17 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     if (c) flags.push({ inst: c.name, item: id })
   }
   const ages = Object.values(unowned).map(u => u.since)
-  const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}) }
+  // Running instances in one call past STUCK_MS (their own fresh heartbeat says so): the front door hears it
+  const stuck: { inst: string; tool: string; since: number }[] = []
+  for (const i of insts) {
+    const { running } = rowsOf(i, rows)
+    if (!running) continue
+    const hb = await heartbeatOf($, i.slug)
+    if (!hb || now - hb.at >= HEARTBEAT_STALE_MS) continue
+    const c = hungCall(hb, now)
+    if (c) stuck.push({ inst: i.name, tool: c.tool, since: c.since })
+  }
+  const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}), ...(stuck.length ? { stuck } : {}) }
   const next: WorkFile = { format: FORMAT, at: now, unowned, capacity, ...(Object.keys(quiet).length ? { quiet } : {}) }
   const same = !!had && JSON.stringify({ ...had, at: 0 }) === JSON.stringify({ ...next, at: 0 })
   if (!same || now - had.at > 10 * 60000) {
@@ -5995,6 +6667,15 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     // A first round is urgent, like an answer; a later one (its file changed) waits within the wakes' caps
     if (offers.some(x => x.round <= 1)) urgent = true
   }
+  // Its results fleet opened a reproduction item for (G30): once each
+  const repro = worldOn() && (await reproduceRules($)).length ? await readWire<ReproduceFile>($, stateDir('reproduce.json')) : null
+  for (const [path, m] of Object.entries(repro?.made ?? {})) {
+    if (m.writer !== inst.slug || told[`repro|${path}`] !== undefined || now - m.at > 24 * HOUR) continue
+    if (!m.opened) continue
+    const by = (await reproduceRules($)).find(r => r.re.test(path))?.for ?? 'the ones it is for'
+    lines.push(`fleet: ${path} is a result world.json says needs reproducing, so fleet opened ${m.item} for its reproduction by ${by}. Whether it needs one is theirs to judge: go on with your own work.`)
+    keys.push(`repro|${path}`)
+  }
   for (const v of await runViews($)) {
     if (v.run.owner.slug !== inst.slug) continue
     // Its log quiet RUN_QUIET_MS with no done-file: once per log time
@@ -6013,6 +6694,33 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     const k = `capacity|${Math.floor(now / HOUR)}`
     if (told[k] === undefined) {
       lines.push(`fleet: idle while work waits: ${work.capacity.flags.map(f => `${f.inst} could take ${f.item}`).join('; ')}. Give each item an owner (or the right for:), or say in your journal why it waits.`)
+      keys.push(k)
+    }
+  }
+  // Another instance in one call past STUCK_MS: the front door hears it once per call
+  if (work?.capacity.stuck?.length && frontOf(roster?.r ?? null, roster?.instances ?? [])?.slug === inst.slug) {
+    for (const s of work.capacity.stuck) {
+      const k = `stuck|${s.inst}|${s.since}`
+      if (s.inst === inst.name || told[k] !== undefined) continue
+      lines.push(`fleet: ${s.inst} has been in one call to ${s.tool} for ${ago(now - s.since)}: it may be hung (a call that never returns, a prompt nobody sees). What waits on it (a post, a reply) isn't moving; the person can look at it in the panel.`)
+      keys.push(k)
+    }
+  }
+  // The others idle with nothing on the board for them (G27): the front door turns the backlog into items, once an hour
+  if (work && frontOf(roster?.r ?? null, roster?.instances ?? [])?.slug === inst.slug) {
+    const waiting = new Set(work.capacity.flags.map(f => f.inst))
+    // Every instance an open item nobody owns fits, offered it yet or not
+    const front = frontOf(roster?.r ?? null, roster?.instances ?? [])?.name ?? null
+    for (const u of Object.values(work.unowned)) if (!u.allOffered) for (const i of candidatesFor(u.for, roster?.instances ?? [], front, u.writer ?? null)) waiting.add(i.name)
+    let bare = work.capacity.idle.filter(n => n !== inst.name && !waiting.has(n))
+    const k = `nothing|${Math.floor(now / HOUR)}`
+    // An item opened since the sweep that wrote work.json (fleet's own, a peer's): the ones it fits aren't bare
+    if (bare.length && told[k] === undefined) {
+      for (const b of await boardItems($)) if (b.mtime >= work.at - 1000 && isUnowned(b)) for (const i of candidatesFor(b.for, roster?.instances ?? [], front)) waiting.add(i.name)
+      bare = bare.filter(n => !waiting.has(n))
+    }
+    if (bare.length && told[k] === undefined) {
+      lines.push(`fleet: idle with no item to take: ${bare.slice(0, 8).join(', ')}${bare.length > 8 ? ` and ${bare.length - 8} more` : ''}. Turn what the charter and the plan still need into board items (for:, what done looks like), or say in your journal why they wait.`)
       keys.push(k)
     }
   }
@@ -6049,8 +6757,8 @@ async function workStatus($: any, now: number): Promise<string[]> {
   const front = roster ? (frontOf(roster.r, roster.instances)?.name ?? null) : null
   for (const [id, u] of Object.entries(work?.unowned ?? {}).slice(0, 8)) {
     const last = u.offers[u.offers.length - 1]
-    const fits = roster ? candidatesFor(u.for, roster.instances, front) : []
-    const forWho = u.for ?? (fits.length ? 'the front door' : 'nobody')
+    const fits = roster ? candidatesFor(u.for, roster.instances, front, u.writer ?? null) : []
+    const forWho = u.for ?? (front ? 'the front door' : fits.length ? 'anyone but its writer' : 'nobody')
     const state = !fits.length
       ? `: ${forNobodyWhy(u.for)}`
       : u.allOffered
@@ -6101,7 +6809,7 @@ async function fitsMe($: any, inst: Instance): Promise<string[]> {
   if (!work || !roster) return []
   const front = frontOf(roster.r, roster.instances)?.name ?? null
   return Object.entries(work.unowned)
-    .filter(([, u]) => candidatesFor(u.for, roster?.instances ?? [], front).some(i => i.slug === inst.slug))
+    .filter(([, u]) => candidatesFor(u.for, roster?.instances ?? [], front, u.writer ?? null).some(i => i.slug === inst.slug))
     .map(([id]) => id)
 }
 
@@ -6113,13 +6821,22 @@ async function setInFlight($: any, how: 'restarted' | 'compacted', commands: rea
   const inst = myInstance
   if (!inst) return
   const runs = (await runViews($)).filter(v => v.run.owner.slug === inst.slug && !v.done)
-  if (!commands.length && !runs.length) return
+  // The slots it still holds (a restart doesn't give them back: the new process may not know)
+  const now = await $.clock.now()
+  const me = await meNow($)
+  const holder = await holderNow($)
+  const held: string[] = []
+  for (const spec of await loadSlots($)) for (const x of await leasesOf($, spec.name)) if (sameHolder(x.lease.holder, holder) && x.lease.until > now) held.push(`${spec.name} (unit ${x.lease.n + 1} of ${spec.count}, until ${clock(x.lease.until, me.offsetMin)})`)
+  if (!commands.length && !runs.length && !held.length) return
   const parts: string[] = []
+  if (held.length && how === 'restarted') parts.push(`the slots you hold: ${held.join(', ')}`)
   if (commands.length) parts.push(`background commands: ${commands.slice(0, 6).map(c => `\`${c}\``).join('; ')}${commands.length > 6 ? ` and ${commands.length - 6} more` : ''}`)
   if (runs.length) parts.push(`your declared runs: ${runs.map(v => `${v.run.id} (${v.run.what}${v.run.host ? `, on ${v.run.host}` : ''})`).join(', ')}`)
   // A restart ends the old process's background commands, never a detached run; a compaction ends neither
   const survived = how === 'restarted' ? ": a background command of the old process didn't survive a restart, a detached run did" : ''
-  await update($, inFlightNote, () => `fleet: your conversation was ${how} while these were in flight: ${parts.join('; ')}. Check their outputs (their logs, their done-files) before going on${survived}. Record what finished (mcp__fleet__run record).`)
+  if (!parts.length) return
+  const release = held.length && how === 'restarted' ? '; release a slot you no longer need (mcp__fleet__slot release)' : ''
+  await update($, inFlightNote, () => `fleet: your conversation was ${how} while these were in flight: ${parts.join('; ')}. Check their outputs (their logs, their done-files) before going on${survived}. Record what finished (mcp__fleet__run record)${release}.`)
   await update($, inFlightQuiet, () => quiet)
   log($, `in flight after ${how === 'restarted' ? 'a restart' : 'a compaction'} for ${inst.name}: ${commands.length} command(s), ${runs.length} run(s)${quiet ? ' (said at its next step)' : ''}`)
 }
@@ -6198,12 +6915,18 @@ async function heartbeatOf($: any, slug: string): Promise<Heartbeat | null> {
 async function contextSizes($: any, instances: readonly Instance[]): Promise<Record<string, number>> {
   const now = await $.clock.now()
   const out: Record<string, number> = {}
+  stoppedSizes.clear()
   for (const i of instances) {
     const hb = await heartbeatOf($, i.slug)
-    if (hb && now - hb.at < HEARTBEAT_STALE_MS && typeof hb.contextTokens === 'number' && hb.contextTokens > 0) out[i.slug] = hb.contextTokens
+    if (!hb || typeof hb.contextTokens !== 'number' || hb.contextTokens <= 0) continue
+    out[i.slug] = hb.contextTokens
+    // Its heartbeat is old: it isn't running, and a wake or a restart reloads the conversation it had (B26)
+    if (now - hb.at >= HEARTBEAT_STALE_MS) stoppedSizes.add(i.slug)
   }
   return out
 }
+/** The instances contextSizes priced at their last heartbeat's context (not running now) */
+const stoppedSizes = new Set<string>()
 
 // Today's spend and cap of every instance (instances/<slug>/spend.json, state/lifts.json) and of the project; an
 // instance is over when its own budget or the project's is. A few seconds' cache: the band reads it every 10 s
@@ -6451,7 +7174,7 @@ async function nudgeTick($: any) {
   const journal = await readText($, `${root}/${inst.journal}`)
   const journalAt = await mtimeOf($, `${root}/${inst.journal}`)
   const conv = await read($, conversationAt)
-  if (FRESH_PERIODS && journal !== null && (await read($, freshAt)) <= conv && freshDue({ context: inst.context, freshH: inst.freshH, conversationAt: conv, journalAt, now, idleMs: now - (await read($, idleSince)), pending: false })) {
+  if (FRESH_PERIODS && journal !== null && (await read($, freshAt)) <= conv && freshDue({ context: inst.context, freshH: inst.freshH, conversationAt: conv, journalAt, now, idleMs: now - (await read($, idleSince)), pending: !!(await pendingRestart($, inst)) })) {
     await update($, freshAt, () => now)
     await update($, nudgeAt, () => now)
     await counted()
@@ -6487,7 +7210,9 @@ async function nudgeTick($: any) {
     // One that owns nothing hears the open items nobody owns that fit it (B14)
     const fits = owns.length ? [] : await fitsMe($, inst)
     log($, `cadence nudge to ${inst.name} (${hoursText(c.hours)} since its last landing${owns.length ? `, owns ${owns.length} open item(s)` : fits.length ? `, ${fits.length} open item(s) fit it` : ''})`)
-    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns, cadenceCap, fits), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: ownCadence + 1 }), now)
+    // With nothing on the board to take: it proposes an item to the front door, and the front door makes the items (G27)
+    const front = frontOf(roster?.r ?? null, roster?.instances ?? [])
+    nudgeSubmit($, 'the cadence nudge', cadenceNudgeText(inst, c.hours, owns, cadenceCap, fits, { front: front?.name ?? null, self: front?.slug === inst.slug }), () => counted({ cadenceFor: c.anchor, cadenceKey: c.key, cadenceDay: day, cadenceCount: ownCadence + 1 }), now)
     return
   }
   // Its budget's line too: past 80% it's nothing, used up it's never here (no nudge then), raised again it's to resume
@@ -6657,6 +7382,7 @@ async function instanceContext($: any, inst: Instance): Promise<string> {
     ...(await derivedFor(inst)),
     (await loadSlots($)).length ? `The project's scarce resources (${(await loadSlots($)).map(x => `${x.name} ×${x.count}`).join(', ')}) are taken with mcp__fleet__slot take and given back with release; with none free you wait in line, and fleet tells you when one is yours.` : '',
     dateLine(await $.clock.now(), (await meNow($)).offsetMin, false),
+    "A time you write (in your journal, a record) comes from `date` or from fleet's clock, never a guess: most mcp__fleet__ results carry it (a refusal doesn't).",
   ]
     .filter(Boolean)
     .join(' ')
@@ -6860,7 +7586,7 @@ async function answeredHere($: any, e: any) {
   log($, `${id} question ${q} answered in its asker's session: the person typed it this turn`)
   // What was recorded, said to the person (a line the model doesn't read): their words just became an answer
   try {
-    $.ui.log(`fleet: recorded as your answer to ${id}${rec.questions.length > 1 ? ` question ${q}` : ''} ("${cut(rec.questions[q - 1]?.question ?? '', 120)}"): "${cut(words, 300)}". /fleet note ${id} adds to it.`)
+    $.ui.log(`recorded as your answer to ${id}${rec.questions.length > 1 ? ` question ${q}` : ''} ("${cut(rec.questions[q - 1]?.question ?? '', 120)}"): "${cut(words, 300)}". /fleet note ${id} adds to it.`)
   } catch {}
   bg(beat($))
   if (left.length) return { result: `${id} question ${q}: what they typed this turn is its answer, in the register when ${id} closes. Question${left.length === 1 ? '' : 's'} ${left.join(' and ')} still wait${left.length === 1 ? 's' : ''} in their queue. Go on with what depended on question ${q}.` }
@@ -6883,6 +7609,48 @@ async function withdrawHere($: any, e: any) {
   return w.deny ? { deny: w.text } : { result: w.text }
 }
 
+// The ruling recorded from the person's words of a turn: the same words again aren't recorded twice
+let lastRuling: { key: string; id: string } | null = null
+
+/** decide kind ruling (G29): what the person ruled, unasked, by typing in his own session (his console, never an
+ * instance's window; not words relayed from another session): recorded as a decision he answered, his words as fleet
+ * saw them typed this turn (never the model's account; about only names it), closed at once. The judges read it as his
+ * answer, and the brief lists it with the other answers */
+async function rulingHere($: any, e: any) {
+  const turn = await read($, personTurn)
+  if (!turn) return { deny: "kind ruling records the person's ruling only in a turn the person typed in this session: their words are the ruling. Nothing was recorded." }
+  if (myInstance) return { deny: `${myInstance.name} is an instance of the roster, not the person's own session: a ruling typed in its window isn't recorded (they can say it in their own session, or write it in the charter). Nothing was recorded.` }
+  const about = field(e.about, 300, 'about')
+  if ('reason' in about) return { deny: `${about.reason}. Nothing was recorded.` }
+  if (!about.text) return { deny: "about: one line on what the person ruled (fleet records their words as the ruling; this line only names it). Nothing was recorded." }
+  // What it names, without a stop of its own: it goes inside a sentence and a parenthesis
+  const named = about.text.replace(/[\s.!?;:,]+$/, '')
+  const words = (turn.text ?? turn.quoted).trim()
+  if (!words) return { deny: "the person's words this turn are empty: nothing to record as a ruling. Nothing was recorded." }
+  if (words.length > TYPED_MAX) return { deny: `the person's words this turn are over ${TYPED_MAX} characters, more than a ruling keeps whole: ask them to say it shorter, or write it in the charter. Nothing was recorded.` }
+  const key = `${turn.at ?? ''}\n${words}`
+  if (lastRuling?.key === key) return { result: `${lastRuling.id} has this ruling already (the person's words this turn): nothing new was recorded.` }
+  await ensureWorld($)
+  const area = areaOf(typeof e.area === 'string' ? e.area : undefined, worldTags)
+  const asker = await askerNow($)
+  const now = await $.clock.now()
+  const here = await sessionName($)
+  const record = await allocate($, id => ({ format: FORMAT, fleet: version, id, at: now, asker, questions: [{ question: named, options: [], recommended: '', why: '' }], ruling: true as const, ...(area.area ? { area: area.area } : {}) }))
+  const file: AnswerFile = { format: FORMAT, id: record.id, q: 1, text: words, origin: turn.origin === 'bridge' ? 'bridge' : 'composer', session: here, at: now, pre: true, quoted: turn.quoted }
+  if ((await publish($, dec(`answers/${answerName(record.id, 1)}`), json(file))) !== 'ok') {
+    await remove($, [dec(`queue/${queueName(record.id)}`)])
+    return { result: "fleet couldn't record this ruling: say it in your journal, and the person can write it in the charter" }
+  }
+  await close($, record.id, { state: 'delivered', how: 'result' })
+  lastRuling = { key, id: record.id }
+  log($, `${record.id}: the person's ruling, typed here (${named.slice(0, 80)})`)
+  try {
+    $.ui.log(`recorded as your ruling (${record.id}, on ${cut(named, 120)}): "${cut(words, 300)}". To change it, say it again here: a new ruling of yours stands over this one.`)
+  } catch {}
+  bg(beat($))
+  return { result: `Recorded as ${record.id}: the person's ruling on ${named}, in his words, in the register, closed (the judges and the brief read it as his answer).${area.note ? ` (${area.note}.)` : ''} Act on it as his decision.` }
+}
+
 /** Withdraws this session's own open decision, unless the person answered any of it (his answer is never taken back) */
 async function withdraw($: any, id: string, why: string): Promise<{ done: boolean; deny?: true; text: string }> {
   const rec = await readQueue($, id)
@@ -6899,27 +7667,43 @@ async function withdraw($: any, id: string, why: string): Promise<{ done: boolea
   return { done: true, text: `${id} is withdrawn: it left the person's queue, and the register keeps it as withdrawn ("${why}"). No answer comes for it.` }
 }
 
-/** decide's supersedes, as the record keeps it */
-function supOf(e: any): { supersedes?: string } {
-  const s = String(e?.supersedes ?? '').trim().toUpperCase()
-  return isDecisionId(s) ? { supersedes: s } : {}
+/** decide's supersedes (one D-<n>, or a list), as the record keeps it: the first, and every one when there are several */
+function supOf(e: any): { supersedes?: string; supersedesAll?: string[] } {
+  const raw = Array.isArray(e?.supersedes) ? e.supersedes : [e?.supersedes]
+  const ids = [...new Set(raw.map((s: unknown) => String(s ?? '').trim().toUpperCase()).filter(isDecisionId))] as string[]
+  if (!ids.length) return {}
+  return ids.length === 1 ? { supersedes: ids[0] as string } : { supersedes: ids[0] as string, supersedesAll: ids }
 }
 
-/** After a decision filed with supersedes: the one it replaces is withdrawn when it's this session's own and the
- * person answered none of it; otherwise both stay, and /fleet shows which replaces which */
+/** The decisions a record replaces */
+function supersededBy(r: Pick<QueueRecord, 'supersedes' | 'supersedesAll'>): string[] {
+  return r.supersedesAll?.length ? r.supersedesAll : r.supersedes ? [r.supersedes] : []
+}
+
+/** After a decision filed with supersedes: each one it replaces is withdrawn when it's this session's own and the
+ * person answered none of it; otherwise it stays, and /fleet shows on both which replaces which */
 async function superseding<R extends { result: string } | { deny: string }>($: any, e: any, r: R): Promise<R> {
-  const old = supOf(e).supersedes
+  const olds = supersededBy(supOf(e))
   const id = 'result' in r ? /^(?:Queued|Filed) as (D-\d+)/.exec(r.result)?.[1] : undefined
-  if (!old || !id || !('result' in r)) return r
-  const w = await withdraw($, old, `replaced by ${id}`)
-  const said = w.done ? ` ${old}, which it replaces, is withdrawn.` : ` ${old} stays as it is (${w.text.replace(/ Nothing was changed\.$/, '').replace(/\.$/, '')}); the person sees that ${id} replaces it.`
+  if (!olds.length || !id || !('result' in r)) return r
+  let said = ''
+  for (const old of olds) {
+    const w = await withdraw($, old, `replaced by ${id}`)
+    said += w.done ? ` ${old}, which it replaces, is withdrawn.` : ` ${old} stays as it is (${w.text.replace(/ Nothing was changed\.$/, '').replace(/\.$/, '')}); the person sees that ${id} replaces it.`
+  }
   return { ...r, result: `${r.result}${said}` }
 }
 
-/** What /fleet adds under an item: the decision it replaces, and the other open changes to the same file */
-function alsoLines(r: QueueRecord, records: readonly QueueRecord[]): string {
+/** What /fleet adds under an item: the decisions it replaces, the open ones that replace it (another session's, or one
+ * the person answered in part, which stay), and the other open changes to the same file */
+function alsoLines(r: QueueRecord, records: readonly QueueRecord[], present: ReadonlySet<string>): string {
   const out: string[] = []
-  if (r.supersedes) out.push(`   replaces ${r.supersedes}${records.some(x => x.id === r.supersedes) ? ' (still open)' : ''}`)
+  for (const old of supersededBy(r)) out.push(`   replaces ${old}${records.some(x => x.id === old) ? ' (still open)' : ''}`)
+  // Withdrawn only by its asker, and never once any of it is answered: then it's the person's to finish or drop
+  const inPart = r.kind === undefined && progress(r.id, slots(r), present).answered.some(Boolean)
+  for (const x of records.filter(x => x.id !== r.id && supersededBy(x).includes(r.id))) {
+    out.push(inPart ? `   replaced by ${x.id}: it stays, answered in part (answer the rest or /fleet drop ${r.id})` : `   replaced by ${x.id} (${r.asker.name || r.asker.ref || 'its asker'} can withdraw it)`)
+  }
   const path = r.change?.path
   const same = path ? records.filter(x => x.id !== r.id && x.change?.path === path).map(x => x.id) : []
   if (same.length) out.push(`   ⚠ also open for ${path}: ${same.join(', ')}: applying one leaves the other${same.length > 1 ? 's' : ''} stale`)
@@ -6957,7 +7741,7 @@ async function confirmChange($: any, record: QueueRecord, quoted: string, outsid
     if (lines.length <= DIFF_IN_QUESTION && diff.length <= 1500) a = await ask(`${diff}\n\n${question}`, [APPLY, DONT_APPLY])
     else {
       try {
-        $.ui.log(`fleet: ${record.id}, the change to ${spec.path}:`)
+        $.ui.log(`${record.id}, the change to ${spec.path}:`)
         for (const l of lines.slice(0, DIFF_SHOWN)) $.ui.log(`  ${l.slice(0, 300)}`)
         if (lines.length > DIFF_SHOWN) $.ui.log(`  … ${lines.length - DIFF_SHOWN} more lines: ${fleetDir()}/${spec.diff}`)
       } catch {}
@@ -7233,7 +8017,7 @@ async function fileChange($: any, e: any) {
     // His own turn: no queue, but fleet asks him here before it writes (its own dialog, from a timer: the tool's answer
     // never waits for him). Apply writes it as filed; Don't apply closes it; Esc leaves it in his queue
     const quoted = turn.quoted
-    const label = marked && mark ? markText(mark, (await meNow($)).offsetMin) : null
+    const label = marked && mark ? markText(mark, (await meNow($)).offsetMin, await $.clock.now()) : null
     $.clock.after(0, () => bg(confirmChange($, record, quoted, label)))
     log($, `${record.id} filed in the person's turn: asking them here before applying`)
     bg(beat($))
@@ -7270,10 +8054,14 @@ async function fileOutbound($: any, e: any) {
   const cwd = await folderOf($, null)
   const s = c.send
   let found: Send[] = []
+  // A ready post's source (a calls entry's): read for what it is now, and kept with its version, to check the post
+  // against when the person sends it (G28)
+  const sources: { path: string; v: string | null }[] = []
   if (s.command !== undefined) found = classifyBash(s.command, cfg).sends
   else {
-    const m = classifyMcp(s.tool as string, s.input ?? {}, cfg, myInstance?.name ?? null).send
+    const m = classifyMcp(s.tool as string, s.input ?? {}, cfg, myInstance?.name ?? null, await callSourceTexts($, s.tool as string, s.input ?? {}, cfg)).send
     found = m ? [m] : []
+    for (const p of callSources(s.tool as string, s.input ?? {}, cfg, myInstance?.name ?? null)) sources.push({ path: p, v: (await sourceOf($, `${root}/${p}`)).v })
   }
   const parts = s.tool ? mcpParts(s.tool) : null
   const pushes = s.command !== undefined ? classifyBash(s.command, cfg).pushes.length : 0
@@ -7292,7 +8080,7 @@ async function fileOutbound($: any, e: any) {
   const now = await $.clock.now()
   const mark = await read($, outside)
   const record = await allocate($, id => {
-    const spec: OutboundSpec = { to: s.to, why: s.why, what, how: s.command !== undefined ? 'command' : 'tool', draft: `decisions/drafts/${id}.json`, files, cwd, hash: outboundHash(draft, files, hashText) }
+    const spec: OutboundSpec = { to: s.to, why: s.why, what, how: s.command !== undefined ? 'command' : 'tool', draft: `decisions/drafts/${id}.json`, files, cwd, hash: outboundHash(draft, files, hashText), ...(sources.length ? { sources } : {}) }
     return { format: FORMAT, fleet: version, id, at: now, asker, questions: [], ...(s.blocks ? { blocks: s.blocks } : {}), kind: 'outbound', outbound: spec, ...(mark ? { outside: mark } : {}) }
   })
   const spec = record.outbound as OutboundSpec
@@ -7332,6 +8120,11 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
   for (const f of o.files) sources.push(await sourceOf($, shownPath(f.path)))
   const hashNow = draft === null ? null : outboundHash(draft, o.files.map((f, k) => ({ path: f.path, v: sources[k]?.v ?? null })), hashText)
   const lines = [`${n}. Send outside: ${o.what} to ${o.to}`, `   why: ${o.why}`]
+  // Being sent: still at the permission prompt (and the way out), or one that may have gone out: refused or withheld
+  // after it may have run, or left at a prompt nobody will settle
+  const claim = await readClaim($, r.id)
+  const unsettled = !!claim && (claim.unclear !== undefined || (await stalePending($, claim)))
+  if (claim?.pending && !unsettled) lines.push(`   ⏳ waiting at the permission prompt in ${claim.session} since ${clockOn(claim.at, (await meNow($)).offsetMin, now)}, not sent yet: answer it there: yes sends it, No and then /fleet ${n} reject (or /fleet ${n} done if you sent it yourself)`)
   const call = draft === null ? null : parseDraft(draft)
   let cut = false
   if (!call || 'problem' in call) lines.push(`   the draft can't be run (${call ? call.problem : 'it is gone'}): /fleet ${n} edit, or /fleet ${n} reject`)
@@ -7340,10 +8133,20 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
     if ('command' in call) lines.push('```sh', ...shown.lines, '```')
     else {
       lines.push(`   ${call.tool}, with:`, '```json', ...shown.lines, '```')
-      // A ready post whose text isn't its file's as it is now: where it departs
+      // A ready post whose text isn't its file's as it is now: where it departs, and the version that sends it anyway
+      // (its source's version in it, so one seen before the source changed doesn't)
       const cfg = await outboundConfig($)
       const miss = sourceMiss(call.tool, call.input ?? {}, cfg, r.asker.name, await callSourceTexts($, call.tool, call.input ?? {}, cfg, r.asker.name))
-      if (miss) lines.push(`   ⚠ ${missText(miss)}`)
+      if (miss && draft !== null) {
+        const v = await sourcedVersion($, draft, o.files.map((f, k) => ({ path: f.path, v: sources[k]?.v ?? null })), call, r.asker.name)
+        lines.push(`   ⚠ ${missText(miss)}: /fleet ${n} send ${shortHash(v)} sends it as drafted anyway`)
+      }
+      if (claim && unsettled) lines.push(`   ⚠ ${maybeSentText(r.id, n, claimCause(claim), hashNow ?? '')}`)
+      // Its source edited since it was drafted: what it says may be stale even where the words still match
+      for (const s of o.sources ?? []) {
+        const now = (await sourceOf($, shownPath(s.path))).v
+        if (now !== s.v) lines.push(`   ⚠ ${s.path} changed since it was drafted (${now === null ? 'it is gone' : shortHash(now)}): /fleet ${n} send checks the text against it as it is then`)
+      }
     }
     if (shown.more) {
       cut = true
@@ -7382,7 +8185,7 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
   const allow = call && 'command' in call ? ' (with --allow it also allows where it goes)' : ''
   lines.push(`   draft ${draftAbs} (${shortHash(hashNow)}) · ${send}${allow}, /fleet ${n} reject, /fleet ${n} edit to change it first, or /fleet ${n} done if you sent it yourself`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
-  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin)})` : ''}`)
+  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin, now)})` : ''}`)
   return lines.join('\n')
 }
 
@@ -7566,6 +8369,9 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   const say = (label: string, extra: Record<string, unknown> = {}) => publish($, answerPath, json({ format: FORMAT, id: rec.id, q: 1, label, origin, session: here, at: now, ...extra }))
   if (verb === 'edit') return draft === null ? `${n}: the draft of ${rec.id} is gone (${draftAbs}): /fleet ${n} reject` : `${n}: edit the call in your editor: ${draftAbs}. Then /fleet shows it as it would go out, and /fleet ${n} send <its version> sends it.`
   if (verb === 'reject' || verb === 'done') {
+    // Its call waits at the permission prompt: a yes there would still send it, whatever is recorded here
+    const waiting = await waitingClaim($, rec.id)
+    if (waiting) return `${n}: ${rec.id} waits at the permission prompt in ${waiting.session}: answer No there first, then /fleet ${n} ${verb} (a yes there sends it)`
     await saveNote($, rec.id, it.note, origin)
     const r = await say(verb === 'reject' ? 'rejected' : 'done')
     if (r !== 'ok') return `${n}: ${r === 'exists' ? `${rec.id} was answered meanwhile` : "couldn't save the answer"}`
@@ -7574,16 +8380,27 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   if (draft === null) return `${n}: the draft of ${rec.id} is gone (${draftAbs}): /fleet ${n} reject`
   const files = await filesNow($, o)
   const hashNow = outboundHash(draft, files, hashText)
-  if (hashNow !== o.hash && !sameHash(it.hash, hashNow)) {
+  const call = parseDraft(draft)
+  // A draft that can't be run (edited into one that sets the call's own keys, say) says so first, whatever its version
+  if ('problem' in call) return `${n}: ${call.problem}: /fleet ${n} edit, or /fleet ${n} reject`
+  // A ready post's version with its source as it is now: past a miss it goes only with this one typed, so a version
+  // seen before the source changed doesn't send it
+  const srcVersion = !('command' in call) ? await sourcedVersion($, draft, files, call, rec.asker.name) : null
+  const typed = (h: string | null) => !!h && sameHash(it.hash, h)
+  if (hashNow !== o.hash && !typed(hashNow) && !typed(srcVersion)) {
     const moved = files.filter((f, k) => f.v !== o.files[k]?.v).map(f => f.path)
     const why = moved.length ? `${moved.join(', ')} changed since it was drafted` : 'its draft was edited'
     return `${n}: ${rec.id} isn't as it was drafted (${why}). /fleet shows it as it would go out now; /fleet ${n} send ${shortHash(hashNow)} sends that.`
   }
-  const call = parseDraft(draft)
-  if ('problem' in call) return `${n}: ${call.problem}: /fleet ${n} edit, or /fleet ${n} reject`
+  // A ready post is checked against its source as it is now (G28): edited since, it goes only with its version typed
+  if (!('command' in call)) {
+    const cfg = await outboundConfig($)
+    const miss = sourceMiss(call.tool, call.input ?? {}, cfg, rec.asker.name, await callSourceTexts($, call.tool, call.input ?? {}, cfg, rec.asker.name))
+    if (miss && !typed(srcVersion)) return `${n}: ${rec.id} wasn't sent: ${missText(miss)}. /fleet ${n} reject, and ${who} drafts it again from the file as it is now; or /fleet ${n} send ${shortHash(srcVersion)} sends it as drafted.`
+  }
   // A call /fleet showed cut goes only with its version typed: the person read the rest in the draft
   const shown = callShown(call)
-  if (shown.more && !sameHash(it.hash, hashNow)) {
+  if (shown.more && !typed(hashNow) && !typed(srcVersion)) {
     return `${n}: /fleet showed ${rec.id}'s ${'command' in call ? 'command' : 'input'} cut (${shown.more} more line${shown.more === 1 ? '' : 's'} in ${draftAbs}), so a plain send doesn't send it: read it whole there, then /fleet ${n} send ${shortHash(hashNow)} sends it.`
   }
   // send --allow: what it adds to outbound.json, checked before anything goes out
@@ -7605,12 +8422,37 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
     }
     allow = { ...a, before }
   }
-  // Once: the first claim wins
+  // Once: the first claim wins. A claim left by a call still at its permission prompt, or one that may have gone out
+  // (refused or its result withheld after the tool ran), holds it: sent again only with its version typed
   const claimPath = dec(`applied/${rec.id}.json`)
-  const claim = await publish($, claimPath, json({ format: FORMAT, id: rec.id, at: now, session: here, origin, hash: hashNow }))
+  const held = await readClaim($, rec.id)
+  // A claim at the prompt nobody will settle (its process is gone, or it waited past 12 hours) reads as one that may
+  // have gone out: sent again only with its version typed
+  const stale = !!held && (await stalePending($, held))
+  if (held?.pending && !stale) return `${n}: ${rec.id} is waiting at the permission prompt in ${held.session === here ? 'this session' : held.session} since ${clockOn(held.at, (await meNow($)).offsetMin, now)}: it isn't recorded as sent, and fleet records what happens once the prompt is answered.`
+  if (held && (stale || held.unclear !== undefined)) {
+    if (!typed(hashNow) && !typed(srcVersion)) return `${n}: ${maybeSentText(rec.id, n, claimCause(held), srcVersion ?? hashNow)}`
+    await remove($, [claimPath])
+  }
+  const claimBody: SendClaim = { format: FORMAT, id: rec.id, at: now, session: here, origin, hash: hashNow, sid: String(await $.session.id()), proc: await processNow($) }
+  const claim = await publish($, claimPath, json(claimBody))
   if (claim === 'exists') return `${n}: ${rec.id} was sent already`
   if (claim === 'failed') return `${n}: couldn't claim ${rec.id} (${claimPath})`
-  let result = ''
+  // It went out: the note, what --allow adds (as the person's), the answer its asker hears. Closed meanwhile another
+  // way (its answer there already): it went out all the same, and that's what fleet says
+  const sent = async (result: string, at: number): Promise<string> => {
+    await saveNote($, rec.id, it.note, origin)
+    const allowed = allow ? await allowNow($, allow) : null
+    const r = await say('sent', { text: result, hash: hashNow, at, ...(allowed?.added.length ? { allowed: allowed.added } : {}) })
+    if (r === 'exists') {
+      const before = parseWire<AnswerFile>((await readText($, answerPath)) ?? '')
+      const label = before && 'value' in before ? (before.value.label ?? 'answered') : 'answered'
+      log($, `${rec.id} went out after it was closed as ${label}: ${result.slice(0, 80)}`)
+      return `${n}: ${rec.id} went out (${result}) after it was closed as ${label}: the register and ${who} have ${label}, so tell them it went.${allowed ? `\n${allowed.line}` : ''}`
+    }
+    log($, `${rec.id} sent: ${o.what.slice(0, 80)} (${result.slice(0, 80)})`)
+    return `${n}: sent ${rec.id} (${o.what} to ${o.to}), exactly as shown: ${result}. ${who} hears it.${allowed ? `\n${allowed.line}` : ''}`
+  }
   if ('command' in call) {
     const cwd = (await exists($, o.cwd)) ? o.cwd : (root as string)
     const r = await run($, ['/bin/sh', '-c', call.command], { cwd, timeoutMs: 120000 })
@@ -7618,26 +8460,119 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
     const rows = (s: string) => s.split(/[\r\n]+/).map(x => x.trim()).filter(Boolean)
     const ok = r.exitCode === 0
     const out = ((ok ? rows(r.stdout)[0] : rows(r.stderr).pop()) ?? (ok ? rows(r.stderr).pop() : rows(r.stdout).pop()) ?? '').slice(0, 200)
-    result = `${ok ? 'it ran' : `it failed (exit ${r.exitCode})`}${out ? `: ${out}` : ''}`
-  } else {
-    const parts = mcpParts(call.tool) as { server: string; name: string }
-    let res: any
-    try {
-      res = await Promise.race([$.mcp.call(parts.server, parts.name, call.input), $.clock.sleep(60000).then(() => ({ timeout: true }))])
-    } catch (err) {
-      // Nothing went out: the claim goes, so it can be sent from a session that has that server
-      await remove($, [claimPath])
-      return `${n}: couldn't call ${call.tool} from this session (${String(err).slice(0, 160)}): nothing was sent. Answer from a session that has ${parts.server}, or /fleet ${n} done once you sent it yourself.`
-    }
-    const text = res?.timeout ? '' : (Array.isArray(res?.content) ? res.content : []).map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join(' ').trim().slice(0, 200)
-    result = res?.timeout ? "it didn't answer within a minute" : res?.isError ? `it answered an error${text ? `: ${text}` : ''}` : `it answered${text ? `: ${text}` : ' with no text'}`
+    return sent(`${ok ? 'it ran' : `it failed (exit ${r.exitCode})`}${out ? `: ${out}` : ''}`, now)
   }
-  await saveNote($, rec.id, it.note, origin)
-  // It went out; then what --allow adds, as the person's
-  const allowed = allow ? await allowNow($, allow) : null
-  await say('sent', { text: result, hash: hashNow, ...(allowed?.added.length ? { allowed: allowed.added } : {}) })
-  log($, `${rec.id} sent: ${o.what.slice(0, 80)} (${result.slice(0, 80)})`)
-  return `${n}: sent ${rec.id} (${o.what} to ${o.to}), exactly as shown: ${result}. ${who} hears it.${allowed ? `\n${allowed.line}` : ''}`
+  const parts = mcpParts(call.tool) as { server: string; name: string }
+  const input = call.input ?? {}
+  // Through this session's own tool call: its permission check and dialog (the organisation's prompt for a tool it
+  // always asks about shows here, to the person who just approved it), then the tool. The tool's name goes last, so
+  // nothing in the input names another; fleet's own token lets this one call past its gate
+  const token = expectOwn(call.tool, input)
+  // How it settled: refused by the permission check (the verdict beneath fleet a deny, and the call came back refused:
+  // a hook above may have answered over that verdict, and then it ran), or by a plugin before it reached fleet: it never
+  // ran, so the claim goes. A result: it ran, sent. Any other refusal (the prompt said no, or a plugin withheld its result
+  // after it ran) or an error (a refusal comes back as one too): it may have gone out, neither sent nor free to send again
+  const settle = async (res: any): Promise<string> => {
+    if (!token.taken) dropOwn(call.tool, input, token)
+    const raw = typeof res?.deny === 'string' ? res.deny : typeof res?.text === 'string' ? res.text : typeof res?.result === 'string' ? res.result : (Array.isArray(res?.content) ? res.content : []).map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join(' ')
+    const text = cut(String(raw ?? '').trim(), 200).replace(/\.+$/, '')
+    const denied = !!res && typeof res.deny === 'string'
+    if ((token.refused && (denied || res?.isError)) || (denied && !token.taken)) {
+      await remove($, [claimPath])
+      return `${n}: ${rec.id} wasn't sent: ${text || 'refused'}. /fleet ${n} send asks again, /fleet ${n} reject, or /fleet ${n} done once you sent it yourself.`
+    }
+    if (denied || res?.isError) {
+      const why = denied ? text : `it answered an error${text ? `: ${text}` : ''}`
+      await replace($, claimPath, json({ ...claimBody, unclear: why }))
+      log($, `${rec.id}: refused, failed or its result withheld (${why.slice(0, 80)}): it may have gone out`)
+      return `${n}: ${maybeSentText(rec.id, n, claimCause({ ...claimBody, unclear: why }), srcVersion ?? hashNow)}`
+    }
+    return sent(`it answered${text ? `: ${text}` : ' with no text'}`, await $.clock.now())
+  }
+  const failed = async (err: unknown): Promise<string> => {
+    if (!token.taken) dropOwn(call.tool, input, token)
+    // Nothing went out: the claim goes, so it can be sent from a session that has that server
+    await remove($, [claimPath])
+    return `${n}: couldn't call ${call.tool} from this session (${String(err).slice(0, 160)}): nothing was sent. Answer from a session that has ${parts.server}, or /fleet ${n} done once you sent it yourself.`
+  }
+  const going: Promise<any> = $.tool.call({ ...input, tool: call.tool })
+  let res: any
+  try {
+    res = await Promise.race([going, $.clock.sleep(5 * 60000).then(() => WAITING)])
+  } catch (err) {
+    return failed(err)
+  }
+  if (res !== WAITING) return settle(res)
+  // Still at the permission prompt: not sent, not refused. The claim says so, and the outcome is recorded when it comes
+  await replace($, claimPath, json({ ...claimBody, pending: true }))
+  log($, `${rec.id}: waiting at the permission prompt after 5 minutes`)
+  bg(
+    (async () => {
+      let line: string
+      try {
+        line = await settle(await going)
+      } catch (err) {
+        line = await failed(err)
+      }
+      log($, `${rec.id} settled: ${line.slice(0, 160)}`)
+      try {
+        $.ui.log(line)
+      } catch {}
+    })(),
+  )
+  return `${n}: ${rec.id} is waiting at the permission prompt in this session (5 minutes so far): it isn't recorded as sent, and fleet records what happens once the prompt is answered.`
+}
+
+/** A claim of an outbound being sent (decisions/applied/D-n.json): pending, its call still at the permission prompt;
+ * unclear, refused or its result withheld after the tool may have run (why) */
+type SendClaim = { format: number; id: string; at: number; session: string; origin: string; hash: string; pending?: true; unclear?: string; sid?: string; proc?: string }
+
+// A pending claim older than this reads as one nobody will settle
+const STALE_PENDING_MS = 12 * HOUR
+
+async function readClaim($: any, id: string): Promise<SendClaim | null> {
+  const p = parseWire<SendClaim>((await readText($, dec(`applied/${id}.json`))) ?? '')
+  return p && 'value' in p ? p.value : null
+}
+
+/** A pending claim nobody will settle: its session's process isn't this one any more (it ended or restarted, and the
+ * prompt went with it), or it waited past 12 hours. A claim of another session counts only by its age: fleet can't see
+ * that session's process from here */
+async function stalePending($: any, c: SendClaim): Promise<boolean> {
+  if (!c.pending) return false
+  if ((await $.clock.now()) - c.at > STALE_PENDING_MS) return true
+  if (c.sid && c.sid === String(await $.session.id())) return c.proc !== (await processNow($))
+  return false
+}
+
+/** The claim of an outbound whose call still waits at the permission prompt (one that will be settled), or null */
+async function waitingClaim($: any, id: string): Promise<SendClaim | null> {
+  const c = await readClaim($, id)
+  return c?.pending && !(await stalePending($, c)) ? c : null
+}
+
+/** Why a claim may have gone out: refused, failed or withheld after the tool may have run; or left at a prompt nobody
+ * settled */
+function claimCause(c: SendClaim): string {
+  if (c.pending) return `it waited at the permission prompt in ${c.session}, and nothing settled it (that session's process ended, or it waited past 12 hours)`
+  return `its call was refused, failed or had its result withheld (${c.unclear ?? 'no reason given'})`
+}
+
+// What a race against a call's wait gives when the wait came first
+const WAITING = Symbol('waiting')
+
+function maybeSentText(id: string, n: number | string, cause: string, version: string): string {
+  return `${id} may have gone out: ${cause}. Check where it goes before sending again: /fleet ${n} done if it went, /fleet ${n} send ${shortHash(version)} sends it again, or /fleet ${n} reject.`
+}
+
+
+/** A ready post's version with its source as it is now: its draft, the files it sends, and the files its calls entry
+ * checks it against */
+async function sourcedVersion($: any, draft: string, files: { path: string; v: string | null }[], call: { tool: string; input?: Record<string, unknown> }, who: string | null): Promise<string> {
+  const cfg = await outboundConfig($)
+  const sources: { path: string; v: string | null }[] = []
+  for (const p of callSources(call.tool, call.input ?? {}, cfg, who)) sources.push({ path: `source:${p}`, v: (await sourceOf($, `${root}/${p}`)).v })
+  return sources.length ? outboundHash(draft, [...files, ...sources], hashText) : outboundHash(draft, files, hashText)
 }
 
 const OUTBOUND_JSON = '.claude/fleet/outbound.json'
@@ -7720,12 +8655,13 @@ async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, n
   else lines.push(`   draft ${fleetDir()}/${spec.draft} (${shortHash(spec.result)}) · /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit to change the draft first`)
   if (spec.circular?.length) lines.push(`   ⚠ ${circularWords(spec.circular)}.`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
-  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin)}): read the diff before you apply it` : ''}`)
+  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin, now)}): read the diff before you apply it` : ''}`)
   return lines.join('\n')
 }
 
 function effectOf(path: string): string {
-  if (path === '.claude/fleet/roster.json') return '. It takes effect at the next /fleet up (a running instance takes new settings when restarted, u)'
+  // roster.json: rosterTakesEffect says, instance by instance, what happens now
+  if (path === '.claude/fleet/roster.json') return ''
   if (path === '.claude/fleet/world.json') return '. Every session of the project follows it within 2 s'
   if (path.startsWith('.claude/agents/')) return '. Running instances of that role take it when restarted (u)'
   return ''
@@ -7810,7 +8746,11 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   const present = await answerNames($)
   const rivals = records.filter(r => r.id !== rec.id && r.kind === 'change' && r.change?.path === spec.path && !progress(r.id, slots(r), present).complete).map(r => r.id)
   const stale = rivals.length ? ` ${rivals.join(', ')} ${rivals.length === 1 ? 'changes' : 'change'} ${spec.path} too, drafted on the version it just left, so ${rivals.length === 1 ? "it can't" : "they can't"} apply: /fleet ${rivals.map(id => `${id} reject`).join(' ')} closes ${rivals.length === 1 ? 'it' : 'them'} as stale (${rivals.length === 1 ? 'its asker hears' : 'their askers hear'} the file moved, and can draft again)` : ''
-  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effectOf(spec.path)}. ${who} hears it.${stale}`, done: true, applied: true }
+  // roster.json takes effect now: instance by instance, what changes (P26)
+  const took = spec.path === '.claude/fleet/roster.json' ? await rosterTakesEffect($) : []
+  const effect = spec.path === '.claude/fleet/roster.json' ? (took.length ? '' : ". No instance's settings changed") : effectOf(spec.path)
+  const list = took.length ? `\nIt takes effect now:\n${took.join('\n')}` : ''
+  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effect}. ${who} hears it.${stale}${list}`, done: true, applied: true }
 }
 
 // What follows fleet's write of a command-level file the person answered for (an applied change, the outbound.json of
@@ -7841,6 +8781,72 @@ async function landApplied($: any, path: string, before: string | null, drafter?
   if (spec.path === '.claude/fleet/roster.json') roster = null
   if (spec.path === '.claude/fleet/slots.json') slotsCfg = null
   if (spec.path === '.claude/fleet/outbound.json') outboundCfg = null
+}
+
+/** A roster change the person accepted or applied takes effect by itself (P26): each instance's settings file is
+ * written anew; a running one whose settings a restart carries changed restarts once idle (instances/<slug>/restart.json,
+ * as /fleet up --restart-when-idle asks); a model or an effort alone reaches it at its next request (turn.step), no
+ * restart. Instances down, or never started, only get their file. One line per instance it changed something for */
+async function rosterTakesEffect($: any): Promise<string[]> {
+  if (await freshRoster($)) return []
+  const all = (roster as { instances: Instance[] }).instances
+  const down = await downSet($)
+  const level = await commandLevelNow($)
+  const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
+  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
+  const at = await $.clock.now()
+  const out: string[] = []
+  let wrote = false
+  // The same lint as /fleet up's: an instance it finds an error for keeps its settings and isn't restarted
+  const roleFiles = new Map<string, string | null>()
+  for (const a of new Set(all.map(i => i.agent))) roleFiles.set(a, await readText($, `${root}/.claude/agents/${a}.md`))
+  const errors = lintRoster((roster as { r: Roster }).r, roleFiles).errors
+  for (const inst of all) {
+    const bad = lintOf(errors, all, inst)
+    if (bad.length) {
+      out.push(`  not applied to ${inst.name}: ${bad.join('; ')}; its settings file stays as it was, and its model and effort stay as they were too; /fleet up --dry-run lists what to fix`)
+      continue
+    }
+    const next = settingsText(settingsFor(inst, root as string, deny))
+    const before = await readText($, settingsPath(inst.slug))
+    if (before === next) continue
+    const { running, stopped } = st?.ready ? rowsOf(inst, st.rows) : { running: null, stopped: null }
+    // Never started and no file yet: /fleet up writes it when it starts the instance
+    if (before === null && !running && !stopped) continue
+    if (!wrote) await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
+    wrote = true
+    await $.fs.write(settingsPath(inst.slug), next)
+    if (!running || down.has(inst.slug)) {
+      out.push(`  ${inst.name}: settings rewritten (it takes them when it ${running ? 'restarts' : 'starts or wakes'})`)
+      continue
+    }
+    const hb = await heartbeatOf($, inst.slug)
+    const core = settingsCoreHash(next)
+    const restart = hb?.settingsHash ? hb.settingsHash !== core : before !== null && settingsCoreHash(before) !== core
+    const old = parseJson(before)
+    const parts: string[] = []
+    if (restart) {
+      await run($, ['mkdir', '-p', instDir(inst.slug)])
+      await replace($, `${instDir(inst.slug)}/restart.json`, json({ format: FORMAT, at }))
+      parts.push('restarts with its new settings once idle (nothing in flight)')
+    }
+    const said: string[] = []
+    if (inst.model && old?.model !== inst.model) said.push(`model ${inst.model}`)
+    if (inst.effort && old?.effortLevel !== inst.effort) said.push(`effort ${inst.effort}`)
+    if (said.length) parts.push(`${said.join(', ')} at its next request${restart ? '' : ' (no restart)'}`)
+    if (parts.length) out.push(`  ${inst.name}: ${parts.join('; ')}`)
+  }
+  if (out.length) log($, `roster.json took effect: ${out.map(l => l.trim()).join('; ')}`)
+  return out
+}
+
+function parseJson(text: string | null): any {
+  if (text === null) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
 }
 
 // ---- The sweeper's part: marks on the instances' rows, and wakes of retired ones (coalesced) ----
@@ -7964,6 +8970,8 @@ async function rosterTick($: any) {
   const swept: WakesFile = had && had.day === day ? had : { format: FORMAT, day, instances: {} }
   let woke = false
   // The open items nobody owns, offered; the runs' done-files; the capacity line (B14, B16, P19)
+  // A result that needs reproducing becomes a board item first, so this pass offers it (G30)
+  await reproduceTick($, now).catch(err => log($, `reproduce: ${String(err).slice(0, 200)}`))
   const work = await workTick($, st.rows, list, down, now).catch(err => {
     log($, `work: ${String(err).slice(0, 200)}`)
     return { offered: new Map<string, string[]>(), later: new Map<string, string[]>(), finished: new Map<string, string[]>() }
@@ -7998,6 +9006,7 @@ async function rosterTick($: any) {
       }
       // A permission prompt it waits on, as its own fleet saw it, while sessions sees it waiting too
       const prompt = fresh && running.state === 'waiting' && hb?.waitingOn?.kind === 'permission'
+      const hung = fresh && !prompt ? hungCall(hb, now) : null
       const old = fresh && typeof hb?.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0 ? hb.fleet : ''
       const asks = asking.get(running.ref) ?? 0
       // Auto mode's blocks piling up today (a mark, never a hold: the brief says what would allow them)
@@ -8008,6 +9017,8 @@ async function rosterTick($: any) {
         ? { badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true }
         : prompt
           ? { badge: '!', tint: 'warning', line: 'waiting on a permission prompt: Enter answers it', needsPerson: true }
+          : hung
+            ? { badge: '⧗', tint: 'warning', line: `one call to ${hung.tool} for ${ago(now - hung.since)}: it may be hung`, needsPerson: true }
           : b?.state === 'over'
             ? { badge: '$', tint: 'error', line: overBudgetLine(inst.name, inst.slug), needsPerson: true }
             : asks
@@ -8442,7 +9453,7 @@ async function waveRecord($: any, earlier: readonly Instance[], n: number): Prom
     const mine = (w: { ref?: string | null; name?: string | null } | null | undefined) => !!w && ((!!hb?.ref && w.ref === hb.ref) || (!!w.name && w.name === inst.name))
     const landed = events.filter(e => e.by && !e.by.person && mine(e.by) && e.path !== inst.journal && e.to !== null)
     const files = [...new Set(landed.map(e => e.path))]
-    const asked = register.filter(r => r.source === 'decide' && mine(r.asker))
+    const asked = register.filter(r => r.source === 'decide' && !r.ruling && mine(r.asker))
     const rejected = asked.filter(r => (r.kind === 'change' || r.kind === 'outbound') ? r.answers[0]?.label === 'rejected' : r.kind === 'resource' && r.answers[0]?.label === 'no').map(r => r.id)
     const askedIds = new Set(asked.map(r => r.id))
     const overruled = [...new Set(overrules.filter(o => askedIds.has(o.overrules) || mine(o.asker)).map(o => o.overrules))]
@@ -8517,13 +9528,14 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
   // A running instance whose settings this writes anew takes them only when restarted
   const rewritten = new Set<string>()
-  // A running instance whose requests name another model than the roster's (one the account lacks falls back)
-  const fallback = new Map<string, string>()
+  // A running instance that runs another model than the roster's (the account refused it, or answers with its own, or
+  // its next request asks for the roster's new one)
+  const fallback = new Map<string, Heartbeat>()
   for (const p of plan) {
     if (p.action !== 'running') continue
     const hb = await heartbeatOf($, p.inst.slug)
-    if (hb?.settingsHash && hb.settingsHash !== hashText(settingsText(settingsFor(p.inst, root as string, deny)))) rewritten.add(p.inst.slug)
-    if (typeof hb?.model === 'string' && modelDiffers(p.inst.model, hb.model)) fallback.set(p.inst.slug, hb.model)
+    if (hb?.settingsHash && hb.settingsHash !== settingsCoreHash(settingsText(settingsFor(p.inst, root as string, deny)))) rewritten.add(p.inst.slug)
+    if (hb && typeof hb.model === 'string' && modelDiffers(p.inst.model, hb.model)) fallback.set(p.inst.slug, hb)
     // A big context with nothing to shrink it (G22): every wake reloads it
     const huge = hugeContext(p.inst, hb)
     if (huge) lint.warnings.push(`${p.inst.name}: ${huge}`)
@@ -8581,16 +9593,16 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     const i = p.inst
     const where = `${i.section ? i.section.title : 'no section'}${i.parent ? `, under ${i.parent}` : ''}`
     const actual = fallback.get(i.slug)
-    const runs = `${i.model ?? 'the default model'}${i.effort ? ` (${i.effort})` : ''}${actual ? ` (runs ${actual}, roster says ${i.model}: a model the account lacks falls back)` : ''}`
+    const runs = `${i.model ?? 'the default model'}${i.effort ? ` (${i.effort})` : ''}${actual ? ` (${modelLine(i, actual)})` : ''}`
     const size = sizes[i.slug]
     const w = wakeUsd(i.model, effectivePerDay(wakes), size)
     const pw = i.poll ? wakeUsd(i.model, pollsPerDay(i.poll), size) : null
-    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day${pw !== null ? `, polls ~${usd(pw)}/day (${pollsPerDay(i.poll as { everyMin: number })} a day)` : ''}${size !== undefined ? ` (its context: ${tokensText(size)})` : ''}` : ''}`
+    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day${pw !== null ? `, polls ~${usd(pw)}/day (${pollsPerDay(i.poll as { everyMin: number })} a day)` : ''}${size !== undefined ? ` (its context${stoppedSizes.has(i.slug) ? ' when it stopped' : ''}: ${tokensText(size)})` : ''}` : ''}`
     const now =
       p.action === 'start'
         ? 'to start'
         : p.action === 'running'
-          ? `running (${p.state}): placed, not started again${rewritten.has(i.slug) ? `; ${c.dryRun ? 'its settings would be rewritten' : 'settings rewritten'}: ${c.restartWhenIdle ? 'it restarts with them once idle' : 'u restarts it with them, or /fleet up --restart-when-idle restarts it once idle'}` : ''}`
+          ? `running (${p.state}): placed, not started again (fleet doesn't restart a running session: a model or effort change reaches it at its next request)${rewritten.has(i.slug) ? `; ${c.dryRun ? 'its settings would be rewritten' : 'settings rewritten'}: ${c.restartWhenIdle ? 'it restarts with them once idle' : 'u restarts it with them, or /fleet up --restart-when-idle restarts it once idle'}` : ''}`
           : p.action === 'wake'
             ? p.why === 'person'
               ? 'stopped by you: not woken (Enter or u in the panel restarts it)'
@@ -8682,7 +9694,7 @@ async function downCommand($: any, names: string[], origin: string): Promise<str
   const running = st?.ready ? p.picked.filter(i => rowsOf(i, st.rows).running) : []
   return [
     `Down: ${p.picked.map(i => i.name).join(', ')}. fleet won't wake or nudge them, and /fleet up skips them (/fleet up <name> brings one back).`,
-    running.length ? `Still running: ${running.map(i => i.name).join(', ')}: s in the panel stops one (fleet never stops a session).` : 'None of them is running.',
+    running.length ? `Still running: ${running.map(i => i.name).join(', ')}: ${running.length === 1 ? 'it keeps' : 'they keep'} working; fleet only stops waking and nudging ${running.length === 1 ? 'it' : 'them'} until /fleet up names ${running.length === 1 ? 'it' : 'them'} (s in the panel stops the session).` : 'None of them is running.',
   ].join('\n')
 }
 
@@ -8854,7 +9866,9 @@ async function rosterStatus($: any): Promise<string[]> {
                   ? 'closed for lack of memory (fleet wakes it once memory is back)'
                   : (retired as any)?.stopped === 'unknown'
                     ? 'stopped, and nothing says why (Enter or u in the panel restarts it)'
-                    : String(row.state),
+                    : row.state === 'idle' && running && busyTasks(hb)
+                      ? `idle, with ${backgroundTasksText(hb)} running (busy for offers and capacity)`
+                      : String(row.state),
     )
     const restartWake = swept && swept.day === day ? swept.instances[inst.slug] : undefined
     if (running && restartWake?.restartAt !== undefined && now - restartWake.restartAt < RESTART_SHOWN_MS) parts.push(`woken after a restart ${ago(now - restartWake.restartAt)} ago`)
@@ -8868,8 +9882,10 @@ async function rosterStatus($: any): Promise<string[]> {
         if (typeof hb.fleet === 'string' && hb.fleet && version && compareVersions(hb.fleet, version) < 0) parts.push(`runs fleet ${hb.fleet}, installed ${version}: u restarts it`)
         if (hb.mode) parts.push(`mode ${hb.mode}${modeWaits(hb.mode) ? ' (it asks: a mode that doesn’t lets it work unattended)' : ''}`)
         if (hb.waitingOn?.kind === 'permission' && running.state === 'waiting') parts.push(`waiting on a permission prompt (${hb.waitingOn.tool}) since ${ago(now - hb.waitingOn.at)}: Enter in the panel answers it`)
+        const hung = hungCall(hb, now)
+        if (hung) parts.push(`one call to ${hung.tool} for ${ago(now - hung.since)}: it may be hung (a call that never returns, a prompt nobody sees): look at it in the panel`)
         if (hb.remote) parts.push('Remote Control')
-        if (typeof hb.model === 'string' && hb.model) parts.push(modelDiffers(inst.model, hb.model) ? `runs ${hb.model}, roster says ${inst.model} (a model the account lacks falls back)` : `runs ${hb.model}`)
+        if (typeof hb.model === 'string' && hb.model) parts.push(modelLine(inst, hb))
         if (hb.failed) parts.push(`last turn failed ${ago(now - hb.failed.at)} ago: ${hb.failed.why}`)
         if (hb.classicStart === false) parts.push('its classic hooks are sent on past fleet (a managed plugin): fleet tells it who it is in its prompts')
         if (hb.orgAsk?.length) parts.push(`asks you on every call to ${hb.orgAsk.join(', ')} (an organisation's setting: allow rules don't lift it)`)
@@ -8882,7 +9898,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (inst.pin) parts.push(pinnedRefs.has(running.ref) ? 'pinned' : (await has($, 'pin')) ? 'to pin' : "pin: the sessions here can't pin (an older sessions): it may be retired when idle")
         else if (pinnedRefs.has(running.ref)) parts.push('pinned by fleet before: to unpin (roster.json no longer pins it)')
         const t = await readText($, settingsPath(inst.slug))
-        if (hb.settingsHash !== null && t !== null && hb.settingsHash !== hashText(t)) parts.push('its settings changed since it started: u restarts it with them')
+        if (hb.settingsHash !== null && t !== null && hb.settingsHash !== settingsCoreHash(t)) parts.push('its settings changed since it started: u restarts it with them')
         if (hb.ref && (await exists($, `${instDir(inst.slug)}/seed-${hb.ref}.json`))) parts.push('seeded')
       }
     } else if (retired && why !== 'person' && inst.poll && hb) {
@@ -9410,8 +10426,9 @@ async function tasteCall($: any, e: any) {
   const asker = await askerNow($)
   const all: string[] = []
   for (const m of await registerMonths($)) all.push(...(await names($, dec(`register/${m}`))))
-  // The same words recorded in the last hour (two sessions heard one "no", or one called twice): kept once
-  const since = now - HOUR
+  // The same words recorded in the last day, whatever their case, punctuation or spacing (two sessions heard one "no",
+  // a relay quoted it again, or one called twice): kept once
+  const since = now - 24 * HOUR
   for (const m of [monthOf(now), monthOf(since)].filter((x, i, a) => a.indexOf(x) === i)) {
     for (const name of (await names($, dec(`register/${m}`))).filter(x => /^T-\d+\.json$/.test(x))) {
       let t: RegisterRecord | null = null
@@ -9419,7 +10436,7 @@ async function tasteCall($: any, e: any) {
         t = JSON.parse((await readText($, dec(`register/${m}/${name}`))) ?? 'null') as RegisterRecord | null
       } catch {}
       // (kept again when this one is the person's own words and that one wasn't)
-      if (t?.taste && t.at >= since && loose(t.taste.said) === loose(spec.said) && (t.taste.person || !spec.person)) return { result: `${t.id} has these words already (recorded at ${clock(t.at, (await meNow($)).offsetMin)}): nothing new was recorded.` }
+      if (t?.taste && t.at >= since && sameWords(t.taste.said, spec.said) && (t.taste.person || !spec.person)) return { result: `${t.id} has these words already (recorded at ${clockOn(t.at, (await meNow($)).offsetMin, now)}): nothing new was recorded.` }
     }
   }
   let n = nextTasteNumber(all)
@@ -9904,8 +10921,8 @@ async function listCommand($: any): Promise<string> {
       if (r.kind === 'change') {
         const moved = await changeMoved($, r.change as ChangeSpec)
         if (moved) stale.push(`${n} reject`)
-        shown.push((await changeHeld($, n, r, view(r), now, moved)) + alsoLines(r, records))
-      } else shown.push((r.kind === 'resource' ? resourceHeld(n, r, view(r), now) : await outboundHeld($, n, r, view(r), now)) + alsoLines(r, records))
+        shown.push((await changeHeld($, n, r, view(r), now, moved)) + alsoLines(r, records, present))
+      } else shown.push((r.kind === 'resource' ? resourceHeld(n, r, view(r), now) : await outboundHeld($, n, r, view(r), now)) + alsoLines(r, records, present))
       count[r.kind]++
       continue
     }
@@ -9916,7 +10933,7 @@ async function listCommand($: any): Promise<string> {
       const o = byId.get(m.id) as QueueRecord
       return { name: view(o).name, id: o.id, q: m.q, of: o.questions.length }
     })
-    shown.push(heldText(n, r, first.q, view(r), now, proposalLine(jf, r.questions[first.q - 1], first.q), also) + alsoLines(r, records))
+    shown.push(heldText(n, r, first.q, view(r), now, proposalLine(jf, r.questions[first.q - 1], first.q), also) + alsoLines(r, records, present))
   }
   // The person's overrules of a judge, on their way to their askers
   for (const n of (await names($, dec('overrules'))).filter(x => /^D-\d+\.json$/.test(x)).sort()) {
@@ -10267,6 +11284,9 @@ async function dropOne($: any, id: string, why: string, origin: string): Promise
   if (knownKind(rec) && progress(id, slots(rec), await answerNames($)).answered.every(Boolean)) {
     return `${id} is answered already: it goes to ${(await askerViews($, [rec]))(rec).name} as answered, not dropped (/fleet note <n> "…" adds a note to it)`
   }
+  // An outbound whose call waits at the permission prompt: a yes there would still send it
+  const waiting = await waitingClaim($, id)
+  if (waiting) return `${id} waits at the permission prompt in ${waiting.session}: answer No there first, then /fleet drop ${id} (a yes there sends it)`
   const file: DropFile = { format: FORMAT, id, ...(why ? { why } : {}), origin, session: await sessionName($), at: await $.clock.now() }
   const r = await publish($, dec(`answers/${dropName(id)}`), json(file))
   if (r === 'exists') return `${id} was dropped already`
@@ -10367,6 +11387,12 @@ function loose(s: string): string {
   return s.toLowerCase().replace(/\s+/g, ' ').trim()
 }
 
+/** The same words, whatever their case, punctuation or spacing */
+function sameWords(a: string, b: string): boolean {
+  const w = (s: string) => s.toLowerCase().replace(/[\p{P}\p{S}]+/gu, ' ').replace(/\s+/g, ' ').trim()
+  return w(a) === w(b)
+}
+
 async function briefCommand($: any, chief: boolean, origin: string): Promise<string> {
   if (chief && origin !== 'composer') return onlyPerson("asks for the chief's lines (they cost a model call)", origin)
   const now = await $.clock.now()
@@ -10400,7 +11426,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     const jf = r.kind === undefined ? await readJudge($, r.id) : null
     const firstOpen = p.answered.findIndex(a => !a) + 1
     const judge = jf ? proposalLine(jf, r.questions[firstOpen - 1], firstOpen) : null
-    needs.push({ id: r.id, kind: r.kind ?? 'choice', what, who, at: r.at, ...(r.blocks ? { blocks: r.blocks } : {}), ...(r.outside ? { outside: markText(r.outside, me.offsetMin) } : {}), ...(judge ? { judge } : {}) })
+    needs.push({ id: r.id, kind: r.kind ?? 'choice', what, who, at: r.at, ...(r.blocks ? { blocks: r.blocks } : {}), ...(r.outside ? { outside: markText(r.outside, me.offsetMin, await $.clock.now()) } : {}), ...(judge ? { judge } : {}) })
     if (r.blocks && now - r.at >= HOUR) blocks.push({ id: r.id, who, at: r.at, blocks: r.blocks })
   }
   // 2 and 5. The landings, by level (world.json); and the decisions carried out (a change applied, an outbound sent),
@@ -10481,6 +11507,8 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
       const retiredHere = !running && !!rows.stopped && stopReason(rows.stopped) !== 'person'
       if ((fresh || retiredHere) && inst.poll && pollOverdue(inst, hb, now)) polls.push({ name: inst.name, last: hb.lastPoll ?? null, everyMin: inst.poll.everyMin })
       if (fresh && running.state === 'waiting' && hb.waitingOn?.kind === 'permission') prompts.push({ name: inst.name, tool: hb.waitingOn.tool, at: hb.waitingOn.at })
+      const hung = fresh ? hungCall(hb, now) : null
+      if (hung) prompts.push({ name: inst.name, tool: hung.tool, at: hung.since, hung: true })
       const p = parseReads((await readText($, readsPath(hb.sessionId))) ?? '')
       if (p && 'threads' in p && p.threads.main) {
         const n = untoldStale(p.threads.main).length
@@ -10640,7 +11668,7 @@ async function statusCommand($: any, all = false): Promise<string> {
     for (const l of callsLint(oc)) lines.push(`  ⚠ ${l}`)
     const mark = await read($, outside)
     if (mark) {
-      lines.push(`this conversation read outside content (${markText(mark, (await meNow($)).offsetMin)}): a change it files waits for /fleet <n> apply (one filed in your own turn: fleet's dialog asks you, with its diff), until /clear`)
+      lines.push(`this conversation read outside content (${markText(mark, (await meNow($)).offsetMin, await $.clock.now())}): a change it files waits for /fleet <n> apply (one filed in your own turn: fleet's dialog asks you, with its diff), until /clear`)
       // A connector of his own organisation (his mail, his directory, his chat) needn't mark: the exact line that says so
       const offer = insideOffer(mark)
       if (offer) lines.push(`  if what ${offer.tool} reads is your own organisation's (its directory, its files, its own people's messages), add ${offer.line} to outbound.json's "inside" (then /fleet accept outbound.json): reading it then marks nothing${offer.messages ? ". It reads messages, and one from an outside sender is outside content: leave it out if outside senders reach it" : ''}`)
@@ -10784,11 +11812,53 @@ function worldCommitWords(w: WorldConfig): string {
   return every ? ` World commits are on: every ${every} min the sweeper commits the shared files that changed, only them, and never pushes (world.json's "commit"; take it out to turn them off).` : ''
 }
 
+// A bare verb (/fleet apply): the kinds of item it answers, and what they're called
+const VERB_KINDS: Record<string, { kinds: string[]; one: string; many: string }> = {
+  apply: { kinds: ['change'], one: 'change', many: 'changes' },
+  send: { kinds: ['outbound'], one: 'outbound', many: 'outbounds' },
+  edit: { kinds: ['outbound'], one: 'outbound', many: 'outbounds' },
+  reject: { kinds: ['change', 'outbound'], one: 'change or outbound', many: 'changes or outbounds' },
+  no: { kinds: ['change', 'resource', 'outbound'], one: 'change, resource or outbound', many: 'items' },
+  done: { kinds: ['resource', 'outbound'], one: 'resource or outbound', many: 'items' },
+}
+
+/** /fleet apply (or send, reject, done, no, edit) with no number: the one item of its kind that waits, as if its number
+ * were typed; with none or several, one line on which to name. In a session that showed no list yet, the list it reads
+ * isn't one the person saw: an outbound to send is shown instead (it goes only as /fleet shows it), and the list, read
+ * only to find the item, doesn't count as shown afterwards; with none or several, the list is shown with the line */
+async function bareVerb($: any, e: any, verb: string, rest: string): Promise<string> {
+  const v = VERB_KINDS[verb] as { kinds: string[]; one: string; many: string }
+  const before = await read($, listing)
+  let keys = before
+  let list = ''
+  if (!keys.length) {
+    list = await listCommand($)
+    keys = await read($, listing)
+  }
+  const fits: { n: number; kind: string }[] = []
+  for (const [i, k] of keys.entries()) {
+    const m = listedMembers(k)[0]
+    const r = m ? await readQueue($, m.id) : null
+    if (r && !('otherFormat' in r) && v.kinds.includes(r.kind ?? 'choice')) fits.push({ n: i + 1, kind: r.kind ?? 'choice' })
+  }
+  const one = fits.length === 1 ? (fits[0] as { n: number; kind: string }) : null
+  if (one && !before.length && one.kind === 'outbound' && verb === 'send') return `Nothing was sent: an outbound goes only as /fleet shows it. Here it is; /fleet ${one.n} send sends it.\n\n${list}`
+  if (one) {
+    const out = await fleetCommand($, { ...e, args: `${one.n} ${verb}${rest}` })
+    if (!before.length) await update($, listing, () => before)
+    return out
+  }
+  const line = !fits.length ? `${verb} what? No ${v.one} waits for you (/fleet lists what does)` : `${verb} what? ${fits.length} ${v.many} wait: ${fits.map(f => `/fleet ${f.n} ${verb}`).join(' or ')} (/fleet lists them)`
+  return before.length || !list ? line : `${line}\n\n${list}`
+}
+
 async function fleetCommand($: any, e: any): Promise<string> {
   const c = parseCommand(String(e.args ?? ''))
   await locate($)
   const origin = String(e.origin?.kind ?? '')
   if (c.kind === 'help') return HELP
+  const bare = /^\s*(apply|send|reject|done|no|edit)\b(.*)$/is.exec(String(e.args ?? ''))
+  if (c.kind === 'bad' && bare && root) return bareVerb($, e, (bare[1] as string).toLowerCase(), bare[2] ?? '')
   if (c.kind === 'bad') return `${c.reason}\n\n${HELP}`
   if (c.kind === 'status') return statusCommand($, c.all === true)
   if (c.kind === 'brief') return root ? briefCommand($, c.chief, origin) : `Not set up in this project: /fleet init sets it up in ${await $.session.root()}`
@@ -10998,8 +12068,30 @@ export const register: Register = on => {
   // What stands in for the classic hooks when a managed plugin sends them on past fleet (B3), by events it can't skip:
   // a permission prompt put to the person (an organisation's ceiling `ask` above all: allow rules don't lift it)...
   on('tool.check', async ($, e, next) => {
-    const r: any = await next(e)
+    // A ready post from an instance that would wait at the organisation's prompt with its text frozen: a draft instead
     try {
+      const held = await orgAskHold($, e)
+      if (held) {
+        if (e.tool) orgAsk.add(String(e.tool))
+        return held
+      }
+    } catch {}
+    const r: any = await next(e)
+    // The same post put to the person by a verdict ask (a settings rule, a hook, a mode that asks; no organisation
+    // ceiling): it would wait at that prompt with its text frozen just the same. In auto mode a plain ask goes to the
+    // classifier, not the person: only a rule's or a hook's ask counts there
+    try {
+      if (r?.decision === 'ask' && e.ceiling !== 'ask' && e.approver === 'person') {
+        const mode = permissionMode ?? (await configuredMode($))
+        if (r.rule || r.plugin || !NO_PROMPT_MODES.has(mode ?? '')) {
+          const held = await orgAskHold($, e, 'rule')
+          if (held) return held
+        }
+      }
+    } catch {}
+    try {
+      // fleet's own call refused by the permission check: it never ran
+      if (e.tool_use_id && ownInFlight.has(String(e.tool_use_id)) && r?.decision === 'deny') ownRefused.add(String(e.tool_use_id))
       if (e.ceiling === 'ask' && e.tool) orgAsk.add(String(e.tool))
       if (r?.decision === 'ask' && e.tool_use_id && e.agentId === undefined && e.approver === 'person' && jobRef && myInstance && !permissionWait) {
         const mode = permissionMode ?? (await configuredMode($))
@@ -11053,12 +12145,54 @@ export const register: Register = on => {
   // the network (in a background session); after it, or for any other command, it fails open as the rest of fleet
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => bashHook($, e, next)).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
-  // The model each main-loop request names, as the engine resolved it (the session's, or a fallback's): the heartbeat
-  // reports it, and /fleet status and the dry run say when it isn't the roster's. Only watches: the stream passes as is
+  // An instance's main-loop requests run the roster's model and effort (B24/G32): a respawn replays the launch's
+  // --model whatever the settings file says now, and /model in a background session waits on a dialog nobody answers,
+  // so each request names them itself. A request of the roster's model that gets no response at all is sent again as the
+  // session named it; STEP_FAILS in a row and it isn't asked for again for STEP_BACKOFF_MS. The model that answered
+  // goes to the heartbeat
   on('turn.step', async function* ($, e, next) {
-    const r = yield* next(e)
+    // The loop's step now: the calls of one batch come from one step, so the gate's "once" is spent only from a later one
+    stepOf.set(typeof e.agentId === 'string' && e.agentId ? e.agentId : 'main', `${e.turnId}#${e.index}`)
+    // A request before the instance's first binding (a respawn's first turn): bound now, once per process (a session
+    // that's no instance leaves the rest to the 30 s timer)
+    if (e.agentId === undefined && !myInstance && jobRef && root && !stepBound) {
+      stepBound = true
+      try {
+        await bind($)
+      } catch {}
+    }
+    const now = await $.clock.now()
+    const want = e.agentId === undefined && myInstance ? stepWant(myInstance, e, now) : null
+    let r: any = yield* next(want ? { ...e, ...want } : e)
+    // Its own request answered after fleet's got nothing: nothing fleet asked for answered this step
+    let fell = false
+    if (want && noResponse(r)) {
+      fell = true
+      const again: any = yield* next(e)
+      // No response to what fleet asked, and one to the session's own request: counted; STEP_FAILS in a row and it's
+      // not asked for again for STEP_BACKOFF_MS (an overload or a rate limit passes; a model the account lacks doesn't)
+      if (!noResponse(again)) {
+        const key = refusalKey(want)
+        stepFails = { key, times: stepFails?.key === key ? stepFails.times + 1 : 1 }
+        if (stepFails.times >= STEP_FAILS) {
+          stepRefused = { ...want, until: now + STEP_BACKOFF_MS, times: stepFails.times }
+          stepFails = null
+          log($, `${wantWords(want)} got no response ${STEP_FAILS} times in a row for ${myInstance?.name}: its requests run ${e.model}${e.effort !== undefined ? ` (${e.effort})` : ''} for ${STEP_BACKOFF_MS / 60000} min`)
+        }
+      }
+      r = again
+    } else if (want) stepFails = null
     // The model that answered (usage.model, as the API reports it), else the one the request named
-    const m = (r as { usage?: { model?: string } | null } | undefined)?.usage?.model ?? e.model
+    const m = r?.usage?.model ?? (want && !fell && !noResponse(r) ? (want.model ?? e.model) : e.model)
+    if (e.agentId === undefined && typeof m === 'string' && m) {
+      stepModel = m
+      stepAsked = want?.model && !fell && !noResponse(r) ? want.model : e.model
+    }
+    return r
+  }).catch(async function* ($: any, e: any, next: any) {
+    // The hook failed (an argument the engine refused): the request goes as it came, and its model is still recorded
+    const r: any = yield* next(e)
+    const m = r?.usage?.model ?? e.model
     if (e.agentId === undefined && typeof m === 'string' && m) stepModel = m
     return r
   })
@@ -11080,7 +12214,7 @@ export const register: Register = on => {
       if (his && myInstance && now - typingToldAt > 30 * 60000) {
         typingToldAt = now
         try {
-          $.ui.log(`fleet: you're typing to the ${myInstance.name} instance (role ${myInstance.role}): what you say here steers its work`)
+          $.ui.log(`you're typing to the ${myInstance.name} instance (role ${myInstance.role}): what you say here steers its work`)
         } catch {}
       }
       // Busy whatever the timers are: a hot reload mid-turn resets them (module state) while busy lives on in $.state,
@@ -11162,19 +12296,29 @@ export const register: Register = on => {
     return r
   }).catch(($, e, next) => next(e))
 
+  // fleet's own tools end each result with its clock: a role with no Bash has no other to stamp what it writes (an
+  // outer hook, so it sees what each tool's own hook below answered)
+  on('tool.call', { tool: /^mcp__fleet__/ }, async ($, e, next) => {
+    const r: any = await next(e)
+    // Beside its answer, as a line of context (the answer's own text stays as the tool wrote it)
+    return r && typeof r.result === 'string' ? { ...r, context: [...(Array.isArray(r.context) ? r.context : []), `fleet's clock: ${await clockStamp($)}`] } : r
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', { tool: 'mcp__fleet__decide' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT_REFUSAL }
     await locate($)
     if (!root) return { deny: "fleet isn't set up in this project any more: ask the person in plain text" }
     const kind = (e as any).kind
     const sup = (e as any).supersedes
-    if (sup !== undefined && sup !== null && sup !== '' && !isDecisionId(String(sup).trim().toUpperCase())) return { deny: 'supersedes: your own open decision this one replaces, as D-<n>. Nothing was queued.' }
+    const sups = Array.isArray(sup) ? sup : sup === undefined || sup === null || sup === '' ? [] : [sup]
+    if (sups.length > 8 || sups.some(s => !isDecisionId(String(s).trim().toUpperCase()))) return { deny: 'supersedes: your own open decision this one replaces, as D-<n> (or a list of them, up to 8). Nothing was queued.' }
     if (kind === 'change') return superseding($, e, await fileChange($, e))
     if (kind === 'resource') return superseding($, e, await fileResource($, e))
     if (kind === 'answered') return answeredHere($, e)
     if (kind === 'wait') return waitFor($, e)
     if (kind === 'withdraw') return withdrawHere($, e)
-    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions), "change" (a change to a command-level file), "resource" (something only the person can get), "answered" (one of your own questions the person just answered here, with its id), "wait" (another session\'s decision your work waits on, with its id) or "withdraw" (one of your own open decisions you take back, with its id and why). Nothing was queued.' }
+    if (kind === 'ruling') return rulingHere($, e)
+    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions), "change" (a change to a command-level file), "resource" (something only the person can get), "answered" (one of your own questions the person just answered here, with its id), "wait" (another session\'s decision your work waits on, with its id), "withdraw" (one of your own open decisions you take back, with its id and why) or "ruling" (what the person just ruled, unasked, by typing in their own session, with about). Nothing was queued.' }
     const checked = checkDecide(e)
     if (!checked.ok) return { deny: `${checked.reason}. Nothing was queued: call mcp__fleet__decide again with that fixed.` }
     const asker = await askerNow($)
@@ -11248,6 +12392,16 @@ export const register: Register = on => {
 
   // Only fleet's and sessions' code notifies the person: in a background session of the project, the model's own
   // PushNotification (origin engine) is refused; a plugin's own call (from its timer) passes (H3)
+  // A message sent in the same batch as a write the gate refused may announce what didn't land (G33): held once
+  on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
+    const held = sameStepHold(threadOf(e))
+    if (held) {
+      log($, `held once: SendMessage by ${threadOf(e)} in the step of a refused write`)
+      return { deny: held }
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', { tool: 'PushNotification' }, async ($, e, next) => {
     if (next.origin?.plugin !== 'engine') return next(e)
     await locate($)
@@ -11256,15 +12410,47 @@ export const register: Register = on => {
     return { deny: "fleet: in this project only fleet notifies the person (in the brief, the band and their channel, within their caps). Ask with mcp__fleet__decide, or write it in your journal; nothing was sent." }
   }).catch(($, e, next) => next(e))
 
+  // The main thread's tool call in flight, for an instance's heartbeat: one that never returns (a hung read, a prompt
+  // nobody sees) shows on its row past STUCK_MS instead of looking like work (every tool: a matcher that takes any name,
+  // since one hook without a matcher is the MCP one below)
+  on('tool.call', { tool: /^/ }, async ($, e, next) => {
+    if (e.agentId !== undefined || !jobRef) return next(e)
+    const k = ++callSeq
+    callsInFlight.set(k, { tool: String((e as any).tool ?? '').slice(0, 80), since: await $.clock.now() })
+    try {
+      return await next(e)
+    } finally {
+      callsInFlight.delete(k)
+    }
+  }).catch(($, e, next) => next(e))
+
   // Every MCP tool: one that would send the project's content outside is refused in a background session (the one hard
   // line); one whose result is outside content marks the conversation. fleet's own pass untouched
   // And every tool's call settles a permission prompt this instance waited on (it ran or was refused): what
   // classic.PostToolUse says, by an event a managed plugin can't send on past fleet
   on('tool.call', async ($, e, next) => {
     const tool = String((e as any).tool ?? '')
+    // fleet's own call (an approved draft, its push notification): past the gate, as the person approved it, with
+    // nobody's answers on it (they'd go where no model reads them); what came back from beneath is kept on its token
+    const own = takeOwn(tool, callInput(e), next.origin)
+    if (own) {
+      const id = typeof (e as any).tool_use_id === 'string' ? ((e as any).tool_use_id as string) : null
+      if (id) ownInFlight.add(id)
+      try {
+        const r: any = await next(e)
+        // The verdict fleet saw beneath it; whether that refusal held, the call's own result says (settle)
+        own.refused = !!id && ownRefused.has(id)
+        return r
+      } finally {
+        if (id) {
+          ownInFlight.delete(id)
+          ownRefused.delete(id)
+        }
+      }
+    }
     // An answer for a busy main thread rides on whatever tool it calls next (Read, Write, Edit and Bash carry it with
-    // the world's digest)
-    const answered = (r: any) => (e.agentId === undefined && !['Read', 'Write', 'Edit', 'NotebookEdit', 'Bash'].includes(tool) ? withAnswers($, r) : r)
+    // the world's digest); never on a plugin's own call of fleet's
+    const answered = (r: any) => (e.agentId === undefined && next.origin?.plugin !== 'fleet' && !['Read', 'Write', 'Edit', 'NotebookEdit', 'Bash'].includes(tool) ? withAnswers($, r) : r)
     if (!tool.startsWith('mcp__') || tool.startsWith('mcp__fleet__')) {
       const r = await next(e)
       if (permissionWait && e.agentId === undefined) bg(promptAnswered($))

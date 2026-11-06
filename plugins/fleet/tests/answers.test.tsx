@@ -252,7 +252,7 @@ test('the person answers in the asker’s own session: the turn hears which ques
   expect(json(w, `${DEC}/register/2026-11/D-1.json`)).toMatchObject({ state: 'delivered', delivered: { how: 'result' }, answers: [{ text: 'keep it as it is, Owner A has it', origin: 'composer', pre: true }] })
   expect(w.files.has(`${DEC}/queue/D-1.json`)).toBe(false)
   // The person is told what was recorded, in a line the model doesn't read
-  expect(w.logs).toContain('fleet: recorded as your answer to D-1 ("Should notes/summary.md stay Owner A’s?"): "keep it as it is, Owner A has it". /fleet note D-1 adds to it.')
+  expect(w.logs).toContain('recorded as your answer to D-1 ("Should notes/summary.md stay Owner A’s?"): "keep it as it is, Owner A has it". /fleet note D-1 adds to it.')
   await $.turn.complete({ text: '' } as any)
   await tick(w)
   expect(w.submits).toEqual([])

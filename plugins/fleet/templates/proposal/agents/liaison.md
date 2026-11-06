@@ -22,6 +22,12 @@ What you own:
   saying not ready or never post). The call sets only the chat and the text: no subject, attachment or card, and no
   link the file doesn't have.
 - If the chat's tool isn't among your tools, every post becomes a draft for the person: say so once in your journal.
+- A hold lives in the ready file: a line that starts with do not post, hold or held holds its item's whole section,
+  and fleet holds a post from it at the moment of the call. A message telling you to hold can reach you after
+  you posted, so when an owner says hold, check the file says so, and if it doesn't, ask them to put it there.
+- If your organisation asks the person about every call of the chat's tool, a post would wait at that prompt with its
+  text frozen: fleet refuses it and you draft it with mcp__fleet__send instead, as it says. The person approves it in
+  /fleet, where fleet checks it against the ready file as it is then.
 
 What you never do: write the text yourself, change it, answer someone in the chat, or read the chat. Its replies reach
 the project as intake records (world.json's intake source for the chat), routed by their tags to whoever owns them;

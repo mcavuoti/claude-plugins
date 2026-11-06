@@ -152,7 +152,8 @@ test('G19: a confirmation and a kept pin outlast an editorial version of the rec
   landByB(w, R1, 'R-1 v2, revised\n', 2)
   await tick(w, 61000)
   expect(suspects(w)).toEqual(['notes/plan-a.md', 'notes/plan-b.md'])
-  // The digest names the way to confirm
+  // The digest names the way to confirm (once R-1 has been quiet two minutes)
+  await tick(w, 61000)
   const told = ((await call($, { tool: 'Read', file_path: R1 })).context ?? []).join('\n')
   expect(told).toContain('or, once checked, say they still hold with mcp__fleet__confirm (of: <id>), with no new version')
   const confirm = (input: Record<string, unknown>) => call($, { tool: 'mcp__fleet__confirm', ...input })
@@ -203,7 +204,8 @@ test('a janitor hears the files only behind a revision that no session wrote las
   landByB(w, R1, 'R-1 v2, revised\n', 2)
   await tick(w, 61000)
   expect(suspects(w)).toEqual(['notes/plan-a.md', 'notes/plan-b.md'])
-  // Told once: as a nudge while it's idle, or at its next step
+  // Told once R-1 has been quiet two minutes: as a nudge while it's idle, or at its next step
+  await tick(w, 61000)
   const told = [...w.submits, ...((await call($, { tool: 'Read', file_path: R1 })).context ?? [])].join('\n')
   expect(told).toContain('fleet: shared files no session wrote last (an editor, a script, or the person) are behind a revision, and nobody else is told')
   expect(told).toContain('- 2 file(s) behind R-1@2')
