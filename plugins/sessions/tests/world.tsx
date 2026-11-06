@@ -31,6 +31,8 @@ export type World = {
   storeKeys: Set<string>
   namespace: string
   runs: string[][]
+  // When each command ran, by the mocked clock
+  runAt: number[]
   // The folder each command ran in, and the variables it set over the session's
   cwds: (string | undefined)[]
   envs: (Record<string, string> | undefined)[]
@@ -201,11 +203,13 @@ export function world(on: On, options: WorldOptions = {}): World {
     written.set(path, clock.now())
   }
   const runs: string[][] = []
+  const runAt: number[] = []
   const cwds: (string | undefined)[] = []
   const envs: (Record<string, string> | undefined)[] = []
   on('process.run', (_, e) => {
     const argv = e.argv
     runs.push([...argv])
+    runAt.push(clock.now())
     cwds.push(e.init?.cwd)
     envs.push(e.init?.env ? { ...e.init.env } : undefined)
     // As on a real computer: a command can't start in a folder that's gone (its own, or else the session's)
@@ -309,7 +313,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

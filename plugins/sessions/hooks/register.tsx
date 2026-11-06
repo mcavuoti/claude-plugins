@@ -3,6 +3,7 @@ import type { Register } from 'claude-code'
 
 import type {
   Color,
+  EndedNote,
   PaneNote,
   PanelSummary,
   RateLimit,
@@ -69,6 +70,13 @@ import {
   sparkline,
   stoppedKind,
   stopLog,
+  diedWithService,
+  endedShown,
+  endedText,
+  bringBackOptions,
+  bringBackQuestion,
+  bringBackResult,
+  type EndedSession,
   stopReasons,
   storeNamespace,
   wakeStagger,
@@ -208,6 +216,8 @@ const tellInFlight = atom({ plugin: 'sessions', key: 'tellInFlight' } as const, 
 // What this session's classic.SessionStart had the engine watch (watch.ts): in $.state, which a reload keeps as the
 // engine keeps the watched paths; null when no SessionStart of this mod came in this session
 const watching = atom({ plugin: 'sessions', key: 'watching' } as const, null as Watching)
+// The line about the sessions that ended with the background service (endedText), or null: in every session's panel
+const ended = atom({ plugin: 'sessions', key: 'ended' } as const, null as EndedNote)
 
 // Every write of a value the panel or the band reads draws them again, equal or not (the engine compares nothing): so
 // each one is written only when its data changed (sameData), and a refresh that finds nothing new draws nothing. The
@@ -452,7 +462,10 @@ function debugLine($: any, text: string) {
 // windowsList until, when a slow ps pushed the next one back),
 // answer:<id> (the answer to a Stop or Restart question that session asked, when the asked session couldn't send it as
 // a notice: format, sessionId, action, cameBack, at; that session's panel takes it and deletes it), personStop:<id>
-// (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again).
+// (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again),
+// endedDismissed (the time of the background service's death the person dismissed the panel's line for: Leave them
+// stopped), broughtBack (the sessions a panel is bringing back after such a death, by sessionId: since when, for two
+// minutes, so two panels never respawn the same one).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
@@ -1027,6 +1040,9 @@ async function flush($: any) {
           for (const id of news.changed) forgetStored(k => k.endsWith(`:${id}`))
           redraw ||= [...news.changed].some(inThisProject)
           if (!redraw && sessionFiles && !slowList && sessionFiles.usable(myId, myPid)) lastList = sessionFiles.list()
+          // A session came or went in another folder: the line about the sessions that ended with the background
+          // service counts every folder's (a refresh does it otherwise)
+          if (!redraw && news.membership) bg(solo('ended', () => readEnded($)))
         }
         // Who leads changes only when a session comes or goes; what the leader does, when a turn ends or Remote Control
         // moves (the rest waits for the pass)
@@ -1882,11 +1898,16 @@ async function reopenPass($: any) {
 
 // Why stopped sessions stopped, from the background service's log (stopLog), read right then. A log that can't be read
 // says nothing: no session reads as ended by itself (stoppedKind fails closed)
+let parsedLog: { text: string; log: StopLog } | null = null
 async function stopLogNow($: any): Promise<StopLog> {
   const none: StopLog = { reasons: {}, started: {}, deaths: [] }
   if (!daemonLog) return none
   const text = await daemonLogTail($)
-  return text === null ? none : stopLog(text)
+  if (text === null) return none
+  // The same tail as last time (the log didn't move): parsed once
+  if (parsedLog?.text === text) return parsedLog.log
+  parsedLog = { text, log: stopLog(text) }
+  return parsedLog.log
 }
 
 // The end of the background service's log (its last 4000 lines), read with tail only when the log changed (its time
@@ -1921,6 +1942,148 @@ async function stoppedOf($: any, s: any, log: StopLog): Promise<'person' | 'idle
   const beatAt = (await readHeartbeats($, [s.sessionId]))[s.sessionId]?.at
   const runs = [typeof s.id === 'string' ? log.started[s.id] : undefined, beatAt].filter((t): t is number => typeof t === 'number' && t > 0)
   return stoppedKind(reason, personAt, runs.length ? Math.max(...runs) : undefined, log.deaths)
+}
+
+// ---- The sessions that ended with the background service ----
+
+// The background sessions of every folder that ended with Claude's background service and are still stopped
+// (diedWithService: the service's log found workers dead after they last ran, with nothing of their own since and no
+// stop of the person's). From a list as it is (no command), the service's log (read again only when it changed), each
+// one's last heartbeat and the person's stops from a panel (personStop, read only for the sessions the store has one
+// for: keys, one read of the store's keys). No stopped background session, or a log with no death, reads nothing more
+async function endedSessions($: any, list: readonly any[], keys: ReadonlySet<string>): Promise<EndedSession[]> {
+  const stopped = list.filter(s => s.kind === 'background' && !s.pid && typeof s.id === 'string' && typeof s.sessionId === 'string' && s.sessionId !== myId)
+  if (stopped.length === 0 || !daemonLog) return []
+  const log = await stopLogNow($)
+  if (log.deaths.length === 0) return []
+  const beats = await readHeartbeats($, stopped.map(s => s.sessionId))
+  const out: EndedSession[] = []
+  for (const s of stopped) {
+    const personAt = keys.has(`personStop:${s.sessionId}`) ? await storeGet($, `personStop:${s.sessionId}`) : undefined
+    const runs = [log.started[s.id], beats[s.sessionId]?.at].filter((t): t is number => typeof t === 'number' && t > 0)
+    const at = diedWithService(log.reasons[s.id], personAt, runs.length ? Math.max(...runs) : undefined, log.deaths)
+    if (at === undefined) continue
+    out.push({ sessionId: s.sessionId, id: s.id, name: s.name && s.name !== s.id ? String(s.name) : s.id, cwd: typeof s.cwd === 'string' ? s.cwd : '', at })
+  }
+  return out
+}
+
+// The panel's line about them (endedText), the same in every session's panel: worked out again at each refresh, and
+// when a session came or went in any folder (the line counts every folder's). Those of the death the person dismissed
+// the line for, and of the ones before it, are left out (endedDismissed)
+async function readEnded($: any, keys?: ReadonlySet<string>) {
+  const k = keys ?? new Set(await storeKeys($))
+  const all = await endedSessions($, lastList, k)
+  const shown = all.length ? endedShown(all, k.has('endedDismissed') ? await storeGet($, 'endedDismissed') : undefined) : []
+  const line = endedText(shown, await $.clock.now())
+  const next: EndedNote = line ? { ...line, count: shown.length } : null
+  if (!sameData(await read($, ended), next)) await update($, ended, () => next)
+}
+
+// The b key, on that line: a question (how many, from which folders), then they're brought back one at a time,
+// BRING_BACK_STAGGER_MS apart, through the restart path (claude respawn; a window with a launcher that showed one is
+// told to reopen it). Each one is looked at again just before (stillEnded): one the person stopped since, one that runs
+// again, one gone from the list or that another panel is bringing back is skipped, and never one that didn't end with
+// the service. Leave them stopped dismisses the line for that death (endedDismissed): the next death shows it again
+const BRING_BACK_STAGGER_MS = 3000
+const BROUGHT_BACK_MS = 120000
+let bringingBack = false
+async function bringBack($: any) {
+  if (bringingBack) return
+  bringingBack = true
+  try {
+    const list = await officialList($, 2000)
+    if (typeof list === 'string') {
+      $.ui.toast(list)
+      return
+    }
+    const keys = new Set(await storeKeys($))
+    const found = endedShown(await endedSessions($, list, keys), keys.has('endedDismissed') ? await storeGet($, 'endedDismissed') : undefined)
+    if (found.length === 0) {
+      $.ui.toast('Nothing to bring back: those sessions run again, or were stopped or removed')
+      await readEnded($)
+      return
+    }
+    const { bring, leave, options } = bringBackOptions(found.length)
+    let answer = ''
+    try {
+      answer = await $.ui.ask(bringBackQuestion(found, await $.clock.now(), home), { options, header: 'Sessions' })
+    } catch (err) {
+      if (askRejection(err) === 'unshown') {
+        $.ui.toast(`Couldn't show the question in this session (its agent may have no AskUserQuestion): nothing was changed`)
+        return
+      }
+    }
+    // The keyboard back to the panel, on the row that was selected (as after s and u), whatever the answer
+    await focusRow($, selectedRow?.startsWith('s:') ? selectedRow.slice(2) : '', undefined)
+    if (answer === leave) {
+      await storeSet($, 'endedDismissed', Math.max(...found.map(s => s.at)))
+      await readEnded($)
+      return
+    }
+    if (answer !== bring) return
+    if (found.length > 1) $.ui.toast(`Bringing back ${found.length} sessions, one at a time…`)
+    let done = 0
+    let skipped = 0
+    let failed = 0
+    for (const s of found) {
+      if (done + failed > 0) await $.clock.sleep(BRING_BACK_STAGGER_MS)
+      const skip = await stillEnded($, s)
+      if (skip) {
+        skipped++
+        debugLine($, `bring back “${s.name}”: skipped, ${skip}`)
+        continue
+      }
+      const ok = await respawnWithWindows($, s.id, s.name)
+      debugLine($, `bring back “${s.name}”: ${ok ? 'restarted' : 'failed'}`)
+      if (ok) done++
+      else failed++
+      await invalidateList($)
+    }
+    $.ui.toast(bringBackResult(done, skipped, failed))
+    await requestRefresh($, false)
+  } finally {
+    bringingBack = false
+  }
+}
+
+// Whether a session to bring back still ended with the service, right before its respawn: '' if so, and then it's
+// claimed (broughtBack, under the <data>/bringback.lock folder, so another panel bringing it back too skips it); else
+// why not
+async function stillEnded($: any, s: EndedSession): Promise<string> {
+  if (!dataDir) return 'no data folder'
+  let why = 'another panel holds the lock'
+  await withLock($, `${dataDir}/bringback`, async () => {
+    const list = await officialList($, 2000)
+    if (typeof list === 'string') {
+      why = "the session list can't be read"
+      return
+    }
+    const now = list.find(x => x.sessionId === s.sessionId)
+    if (!now || now.id !== s.id) {
+      why = 'gone from the list'
+      return
+    }
+    if (now.pid) {
+      why = 'it runs again'
+      return
+    }
+    const at = await $.clock.now()
+    const claims = await storeGet($, 'broughtBack')
+    const held: Record<string, number> = {}
+    for (const [k, v] of Object.entries(claims && typeof claims === 'object' ? claims : {})) if (typeof v === 'number' && at - v < BROUGHT_BACK_MS) held[k] = v
+    if (held[s.sessionId] !== undefined) {
+      why = 'another panel is bringing it back'
+      return
+    }
+    if ((await endedSessions($, [now], new Set(await storeKeys($)))).length === 0) {
+      why = 'it no longer reads as ended with the service (stopped by you, or it ran since)'
+      return
+    }
+    await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at })
+    why = ''
+  })
+  return why
 }
 
 // Whether a session can be woken (another plugin's wake, ccc tell): running already, or stopped and wakeable. A
@@ -2347,6 +2510,8 @@ async function refresh($: any) {
     collapsed = keys.has('collapsed') ? await readCollapsed($) : new Set()
   }
   await layout($, focused)
+  // Every folder's sessions that ended with the background service, for the panel's line
+  await readEnded($, keys)
   {
     const next = noticeText()
     if (!sameData(await read($, notice), next)) await update($, notice, () => next)
@@ -4662,12 +4827,17 @@ export const register: Register = (on, options) => {
     // above them, as Text too
     const plan = drawPlan(list)
     const shownRows = list.filter(f => !f.folded)
+    // The line about the sessions of every folder that ended with the background service, under the legend: one line,
+    // more where the panel is narrower than it (it wraps between words)
+    const endedNote = await read($, ended)
+    const endedLine = endedNote ? `${endedNote.text}${inTerminal ? ` · b: ${endedNote.action}` : ''}` : ''
+    const endedRows = endedLine ? Math.ceil((displayWidth(endedLine) + 4) / Math.max(20, (e.props.bodyColumns ?? 48) - 1)) : 0
     // While the list doesn't fit, the status lines of rows that don't need you are left out (their badges stay), so more
     // sessions fit; a row that waits for you, or that a plugin marked as needing you, keeps its line
-    const crowded = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0) + 6 + (note !== '' ? 1 : 0) > height
+    const crowded = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0) + 6 + (note !== '' ? 1 : 0) + endedRows > height
     const keepsLine = (f: Row) => !!f.line && (!crowded || f.color === 'red' || f.needsPerson === true)
     const lines = plan.length + shownRows.filter(keepsLine).length + (about.waitingOnly ? 1 : 0)
-    const overflows = lines + 6 + (note !== '' ? 1 : 0) > height
+    const overflows = lines + 6 + (note !== '' ? 1 : 0) + endedRows > height
     // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
     // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
     // and a flexible spacer pushes the block down
@@ -4677,7 +4847,7 @@ export const register: Register = (on, options) => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      lines + 6 + (note !== '' ? 1 : 0) + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
+      lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
     // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
     const usageData = showUsage ? await read($, usage) : null
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
@@ -4826,6 +4996,17 @@ export const register: Register = (on, options) => {
         <Text dimColor>
           <Text color={TINT.red}>●</Text> Attention  <Text color={TINT.blue}>●</Text> Working  <Text color={TINT.yellow}>●</Text> Done  <Text color={TINT.green}>●</Text> Idle  <Text color={TINT.gray}>●</Text> Stopped
         </Text>
+        {/* Sessions of any folder that ended with the background service: b asks, then brings them back. Under the
+            legend, after every row and field: a line that comes and goes there moves nothing the arrows go through.
+            A word each, so a panel narrower than the line wraps it between words with the key flowing after them */}
+        {endedNote && (
+          <Box flexDirection="row" flexWrap="wrap">
+            {(inTerminal ? `${endedNote.text} ·` : endedNote.text).split(' ').map((word, i) => (
+              <Text key={`ended:${i}`} color="warning">{`${word} `}</Text>
+            ))}
+            {inTerminal && <Button key="bring-back" plain hotkey="b" label={endedNote.action} onPress={() => { bg(bringBack($)) }} />}
+          </Box>
+        )}
         {list.some(f => f.outdated) && (
           <Text dimColor>
             <Text color="claude">↑</Text>

@@ -667,6 +667,86 @@ export function stoppedKind(reason: StopReason | undefined, personAt: unknown, l
   return 'unknown'
 }
 
+// When the background service goes down with its sessions (a machine that restarted, a service killed or crashed),
+// each session it ran stops with it, and nothing starts them again until the person opens each one. A stopped
+// background session ended with the service when it reads as ended by itself (stoppedKind) on the service's death
+// alone: no line of its own after it last ran (a crash's `settled <id> (done)` is a stop of its own), the person didn't
+// stop it, and the service's log found workers dead at or after it last ran. When: the first such death (the service's
+// next start, which is when the log says so). undefined: not one of those
+export function diedWithService(reason: StopReason | undefined, personAt: unknown, lastRun: number | undefined, deaths: readonly number[]): number | undefined {
+  if (reason || typeof lastRun !== 'number' || stoppedKind(reason, personAt, lastRun, deaths) !== 'ended') return undefined
+  const after = deaths.filter(t => t >= lastRun)
+  return after.length ? Math.min(...after) : undefined
+}
+
+// A session that ended with the background service, for the panel's line and its question (at: diedWithService)
+export type EndedSession = { sessionId: string; id: string; name: string; cwd: string; at: number }
+
+// The ones the panel's line counts: those that ended after the death the person dismissed the line for (dismissed: that
+// death's time, the store's endedDismissed), so a dismissal holds for that death only and the next one shows again
+export function endedShown(ended: readonly EndedSession[], dismissed: unknown): EndedSession[] {
+  const before = typeof dismissed === 'number' && Number.isFinite(dismissed) ? dismissed : 0
+  return ended.filter(s => s.at > before)
+}
+
+// A time of day, local: "14:05", with its day when it isn't today's ("14:05 on Oct 30")
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+export function clockText(at: Date, now: Date): string {
+  const two = (x: number) => String(x).padStart(2, '0')
+  const time = `${two(at.getHours())}:${two(at.getMinutes())}`
+  return dayOf(at) === dayOf(now) ? time : `${time} on ${MONTHS[at.getMonth()]} ${at.getDate()}`
+}
+
+// The panel's line about them: "3 sessions ended with the background service at 14:05", at the latest death's time
+// (several deaths are rare: the latest is the one the person would remember); action: what the key does, said after it
+export function endedText(ended: readonly EndedSession[], now: number): { text: string; action: string; at: number } | null {
+  if (ended.length === 0) return null
+  const at = Math.max(...ended.map(s => s.at))
+  const count = ended.length === 1 ? '1 session' : `${ended.length} sessions`
+  return { text: `${count} ended with the background service at ${clockText(new Date(at), new Date(now))}`, action: ended.length === 1 ? 'brings it back' : 'brings them back', at }
+}
+
+// A folder as the person writes it, with the home folder as ~
+export function tildePath(path: string, home: string): string {
+  if (home && home !== '/' && (path === home || path.startsWith(`${home}/`))) return `~${path.slice(home.length)}`
+  return path
+}
+
+// Where they were, for the question: "2 in ~/x/app, 1 in ~/x/site", the folder with the most first, three folders at
+// most and then how many in how many others
+export function endedFolders(ended: readonly EndedSession[], home: string): string {
+  const by = new Map<string, number>()
+  for (const s of ended) by.set(s.cwd, (by.get(s.cwd) ?? 0) + 1)
+  const folders = [...by].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+  const shown = folders.slice(0, folders.length > 4 ? 3 : 4).map(([cwd, n]) => `${n} in ${tildePath(cwd, home)}`)
+  const rest = folders.slice(shown.length)
+  if (rest.length) shown.push(`${rest.reduce((sum, [, n]) => sum + n, 0)} in ${rest.length} other folders`)
+  return shown.join(', ')
+}
+
+// The question the key asks, and its answers: bring them back, leave them stopped (the line goes until the service ends
+// sessions again: the dismissal), or nothing (Cancel, Esc or typed text)
+export function bringBackOptions(count: number): { bring: string; leave: string; options: string[] } {
+  const them = count === 1 ? 'it' : 'them'
+  const bring = `Bring ${them} back`
+  const leave = `Leave ${them} stopped`
+  return { bring, leave, options: [bring, leave, 'Cancel'] }
+}
+export function bringBackQuestion(ended: readonly EndedSession[], now: number, home: string): string {
+  if (ended.length === 0) return ''
+  const when = clockText(new Date(Math.max(...ended.map(s => s.at))), new Date(now))
+  const { leave } = bringBackOptions(ended.length)
+  if (ended.length === 1) {
+    return `Bring back the session that ended with the background service at ${when} (in ${tildePath(ended[0]?.cwd ?? '', home)})? It restarts with its conversation. ${leave} hides this line until the service ends sessions again.`
+  }
+  return `Bring back the ${ended.length} sessions that ended with the background service at ${when} (${endedFolders(ended, home)})? Each one restarts with its conversation, one at a time. ${leave} hides this line until the service ends sessions again.`
+}
+
+// What the key did, as its toast says
+export function bringBackResult(done: number, skipped: number, failed: number): string {
+  return `Brought back ${done === 1 ? '1 session' : `${done} sessions`}, skipped ${skipped}, failed ${failed}`
+}
+
 // The times the mod reopened a session in the last 2 h (so it doesn't insist if memory fills up again)
 export function recentReopens(previous: unknown, now: number): number[] {
   return Array.isArray(previous) ? previous.filter((t): t is number => typeof t === 'number' && now - t < 7200000) : []

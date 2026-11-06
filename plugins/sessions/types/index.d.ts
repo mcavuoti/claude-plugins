@@ -49,6 +49,10 @@ export type RateLimit = { kind: string; percent: number }
 // you), how many sessions the project has, how many others wait for you (red) or have something unseen (yellow), and
 // what they spent at list price (null: none is on an API account)
 export type PanelSummary = { waitingOnly: boolean; sessions: number; waiting: number; unseen: number; spent: number | null }
+// The panel's line about the background sessions of every folder that ended with Claude's background service and are
+// still stopped: what it says ("3 sessions ended with the background service at 14:05"), what its key does ("brings
+// them back"), the latest death's time and how many; null: none, or the person dismissed it for that death
+export type EndedNote = { text: string; action: string; at: number; count: number } | null
 
 // The usage block. usage.py builds the summary: totals per day and per hour, split by the session's folder; each total
 // is [input, output, cache read, cache written, thinking] (thinking is part of the output)
@@ -220,6 +224,7 @@ declare module 'claude-code' {
       summary: PanelSummary
       tellInFlight: TellInFlight
       watching: Watching
+      ended: EndedNote
     }
   }
 }
