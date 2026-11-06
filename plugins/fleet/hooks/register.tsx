@@ -12381,6 +12381,8 @@ export const register: Register = on => {
   // And an instance of the roster learns there, every time its conversation starts again (after /clear, compaction,
   // resume), who it is, what it can't write and its budget; fleet learns the role it runs as (agent_type)
   on('classic.SessionStart', async ($, e, next) => {
+    // A /clear starts the conversation's state afresh: the classic hooks it sees are noted again
+    classicNoted.clear()
     sawClassic($, 'SessionStart')
     if (typeof e.agent_type === 'string' && e.agent_type) agentType = e.agent_type
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
