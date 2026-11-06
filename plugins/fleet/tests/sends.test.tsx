@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
 import { postableSentences } from '../hooks/outbound'
+import { FORMAT } from '../hooks/decisions'
 import { DEC, FAKE_SESSIONS, FLEET, REF, ROOT, SID, decide, fleet, json, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 
 // What /fleet n send does with an approved MCP draft, beyond its version: the call is the one shown (its input can't
@@ -37,8 +38,10 @@ function landByB(w: World, path: string, text: string) {
 const calls: { tool: string; input: any }[] = []
 let mode: 'ok' | 'prompt' | 'ran-then-withheld' = 'ok'
 let answerPrompt: (how: 'run' | 'deny') => void = () => {}
+let checkVerdict: 'allow' | 'deny' = 'allow'
 
 function serve(on: any) {
+  checkVerdict = 'allow'
   calls.length = 0
   mode = 'ok'
   for (const tool of [POST, DRAFT, 'mcp__claude_ai_Gmail__send_message']) {
@@ -61,7 +64,7 @@ const ROSTER = JSON.stringify({ rosterFormat: 1, sections: [{ id: 'team', title:
 async function liaison($: any, on: any, ready = '# Ready\n\n## Q-1\n\nWe can run both sizes this week.\n'): Promise<World> {
   const w = world(on, { worldPaths: ['notes/**'], env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Liaison', FLEET_ROLE: 'liaison' }, files: { [READY]: ready, [`${FLEET}/outbound.json`]: SOURCED, [`${FLEET}/roster.json`]: ROSTER, [`${ROOT}/.claude/agents/liaison.md`]: LIAISON, [`${FLEET}/instances/liaison.json`]: '{}\n' } })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
-  on('tool.check', () => ({ decision: 'allow' }))
+  on('tool.check', () => (checkVerdict === 'deny' ? { decision: 'deny', reason: 'a deny rule refuses it' } : { decision: 'allow' }))
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Liaison', root: ROOT, background: true, agent: 'liaison' }, rows: { [REF]: row(REF, 'Liaison', 'idle') } })
   serve(on)
   on('classic.SessionStart', () => ({}))
@@ -235,4 +238,88 @@ test('“replaced by” says the asker can withdraw it only when it could: one a
   const list = await fleet($, '')
   expect(list).toContain('   replaced by D-2: it stays, answered in part (answer the rest or /fleet drop D-1)')
   expect(list).not.toContain('can withdraw it')
+})
+
+// A plugin above fleet whose check answers over a deny beneath it (an organisation's policy that lets its own chat
+// through whatever the local rules say): the last word up the chain is the decision
+const OVERRIDE = {
+  name: 'policy',
+  tier: 'prepend' as const,
+  register(on: any) {
+    on('tool.check', { tool: 'mcp__claude_ai_Office__send_chat_message' }, async ($: any, e: any, next: any) => {
+      const r = await next(e)
+      return r?.decision === 'deny' ? { decision: 'allow', reason: 'the organisation allows its own chat' } : r
+    })
+  },
+}
+
+test('a deny fleet saw beneath it that a hook above answered over (the tool ran) is sent, once: the claim isn’t freed for a second post', { plugins: [FAKE_SESSIONS, OVERRIDE], timeoutMs: 30000 }, async ($, on) => {
+  await liaison($, on)
+  await draft($, READY_POST)
+  await fleet($, '')
+  checkVerdict = 'deny'
+  expect(await fleet($, '1 send')).toContain('1: sent D-1')
+  expect(await fleet($, '1 send')).toContain('D-1 was answered already')
+  expect(calls.length).toBe(1)
+})
+
+test('a pending claim its process didn’t settle (that session restarted, or it waited past 12 hours) reads as may have gone out: sent again by its version', { plugins: [FAKE_SESSIONS], timeoutMs: 30000 }, async ($, on) => {
+  const w = await liaison($, on)
+  await draft($, READY_POST)
+  // As answerOutbound writes it after its wait, by a process gone since, three days ago
+  w.touch(`${DEC}/applied/D-1.json`, JSON.stringify({ format: FORMAT, id: 'D-1', at: w.clock.now() - 3 * 24 * 3600000, session: 'Liaison', origin: 'composer', hash: 'x', pending: true }))
+  await tick(w)
+  const list = await fleet($, '')
+  expect(list).not.toContain('⏳')
+  expect(list).toContain('⚠ D-1 may have gone out')
+  const plain = await fleet($, '1 send')
+  expect(plain).toContain('1: D-1 may have gone out: it waited at the permission prompt in Liaison')
+  const v = /\/fleet 1 send (h[0-9a-f]{8}) sends it again/.exec(plain)?.[1] as string
+  expect(await fleet($, `1 send ${v}`)).toContain('1: sent D-1')
+  expect(calls.length).toBe(1)
+})
+
+test('a pending claim of this session made by another process (it restarted an hour ago) reads as may have gone out; one of another session that recent still waits', { plugins: [FAKE_SESSIONS], timeoutMs: 30000 }, async ($, on) => {
+  const w = await liaison($, on)
+  await draft($, READY_POST)
+  await draft($, { ...READY_POST, why: 'the second post' })
+  const hour = w.clock.now() - 3600000
+  w.touch(`${DEC}/applied/D-1.json`, JSON.stringify({ format: FORMAT, id: 'D-1', at: hour, session: 'Liaison', origin: 'composer', hash: 'x', pending: true, sid: SID, proc: 'an-earlier-process' }))
+  w.touch(`${DEC}/applied/D-2.json`, JSON.stringify({ format: FORMAT, id: 'D-2', at: hour, session: 'Console', origin: 'composer', hash: 'x', pending: true, sid: 'cccccccc-0000-0000-0000-000000000000', proc: 'its-process' }))
+  await tick(w)
+  await fleet($, '')
+  expect(await fleet($, '1 send')).toContain('1: D-1 may have gone out: it waited at the permission prompt in Liaison')
+  expect(await fleet($, '2 send')).toContain('2: D-2 is waiting at the permission prompt in Console')
+  expect(calls).toEqual([])
+})
+
+test('one this session’s own process still waits on says the way out; reject, done and drop wait for the prompt; a yes there after a close says so', { plugins: [FAKE_SESSIONS], timeoutMs: 60000 }, async ($, on) => {
+  const w = await liaison($, on)
+  await draft($, READY_POST)
+  await fleet($, '')
+  mode = 'prompt'
+  const p = fleet($, '1 send')
+  for (let i = 0; i < 6; i++) await tick(w, 60000)
+  expect(await p).toContain('1: D-1 is waiting at the permission prompt')
+  expect(await fleet($, '')).toContain('answer it there: yes sends it, No and then /fleet 1 reject')
+  for (const verb of ['reject', 'done']) expect(await fleet($, `1 ${verb}`)).toContain(`1: D-1 waits at the permission prompt in Liaison: answer No there first, then /fleet 1 ${verb}`)
+  expect(await fleet($, 'drop 1')).toContain('D-1 waits at the permission prompt in Liaison: answer No there first')
+  expect(w.files.has(`${DEC}/answers/D-1.1.json`)).toBe(false)
+  // Closed meanwhile another way (another fleet's answer): the yes still sends it, and fleet says what really happened
+  w.touch(`${DEC}/answers/D-1.1.json`, JSON.stringify({ format: FORMAT, id: 'D-1', q: 1, label: 'rejected', origin: 'composer', session: 'Console', at: w.clock.now() }))
+  answerPrompt('run')
+  await tick(w)
+  expect(calls.length).toBe(1)
+  expect(w.logs.some(l => l.includes('D-1 settled: 1: D-1 went out (it answered: posted) after it was closed as rejected'))).toBe(true)
+})
+
+test('a hold line with a short label before it holds its section; a hyphenated term doesn’t', () => {
+  const post = 'We can run both sizes this week.'
+  const holds = (line: string) => !postableSentences(`# Ready\n\n## Q-1\n\n${line}\n\n${post}\n\n## Q-2\n\nThe report is attached.\n`).includes(post)
+  for (const line of ['Status: not ready', 'Status: do not post', 'Status: DO NOT POST until QA signs off.', 'Note: do not post until QA signs off.', 'NB: hold until QA signs off.', 'Holding until QA signs off.', 'Pending QA: do not post.', 'Don’t post until QA signs off.', '~~Hold until QA signs off.~~', 'On hold until QA signs off.', 'Do NOT post yet.', 'Held - waiting for QA.']) {
+    expect([line, holds(line)]).toEqual([line, true])
+  }
+  for (const line of ['Held-out accuracy is 92% on both sizes.', 'Hold-out set: both sizes pass.', 'Holding costs fall with the larger size.', 'Holding: the larger size.', 'Hold the date: the launch is on 12 Dec.']) {
+    expect([line, holds(line)]).toEqual([line, false])
+  }
 })
