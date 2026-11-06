@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { hashText } from '../hooks/changes'
+import { hashText, hourFolder } from '../hooks/changes'
 import { cadenceNudgeText, settingsText } from '../hooks/roster'
 import { FLEET, ROOT, decide, fleet, json, row, sessionsSay, startSession, world, WITH_SESSIONS } from './world'
 
@@ -115,4 +115,77 @@ test('the front door hears, once an hour, the instances idle with no item to tak
   expect(told).toContain('fleet: idle with no item to take: Tester 1, Tester 2. Turn what the charter and the plan still need into board items (for:, what done looks like), or say in your journal why they wait.')
   const again = ((await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/plan.md` } as any)).context ?? []).join('\n')
   expect(again).not.toContain('idle with no item to take')
+})
+
+// ---- G30: a result that needs reproducing becomes a board item ----
+
+const POC_TEAM = {
+  rosterFormat: 1,
+  sections: [{ id: 'work', title: 'Work' }],
+  roles: { chief: { agent: 'owner', model: 'haiku' }, poc: { agent: 'owner', model: 'haiku' }, tester: { agent: 'owner', model: 'haiku' } },
+  instances: [
+    { name: 'Chief', role: 'chief', section: 'work' },
+    { name: 'PoC A', role: 'poc', section: 'work' },
+    { name: 'Tester 1', role: 'tester', section: 'work' },
+  ],
+}
+const RESULT = '---\nkind: result\nrun: echo 42\nsha: 084c799cd551\n---\n# Latency at 64 B\n\n42 ns.\n'
+
+// A landing as fleet records it: the file, its event (events/<hour>/<at>-<id>.json), then events/latest rewritten
+function landed(w: any, path: string, text: string, by: { name: string; ref: string }, n: number) {
+  const at = w.clock.now()
+  w.touch(`${ROOT}/${path}`, text)
+  w.touch(`${FLEET}/events/${hourFolder(at)}/${at}-bbbbbbbb-${n}.json`, JSON.stringify({ format: 1, at, path, from: null, to: hashText(text), via: 'tool', tool: 'Write', blind: false, by: { sessionId: `${by.ref}-0000-0000-0000-000000000000`, ref: by.ref, name: by.name, agentId: null } }))
+  w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: `${at}-bbbbbbbb-${n}.json` }))
+}
+
+test("a result world.json says needs reproducing becomes a board item for its testers, once, unless the board has one; a tester's own result doesn't", WITH_SESSIONS, async ($, on) => {
+  const w = world(on, {
+    background: false,
+    files: {
+      [`${FLEET}/roster.json`]: JSON.stringify(POC_TEAM),
+      [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['board/**', 'poc/**', 'notes/**'], reproduce: [{ glob: 'poc/results/**', for: 'tester' }] }),
+      [`${ROOT}/.claude/agents/owner.md`]: OWNER,
+      [`${ROOT}/board/B-3.md`]: '---\nowner: Chief\nstatus: done\n---\n# the plan\n',
+    },
+  })
+  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Chief', 'working'), bbbbbbb1: row('bbbbbbb1', 'PoC A', 'idle'), ccccccc1: row('ccccccc1', 'Tester 1', 'idle') } })
+  await startSession($, w)
+  for (let i = 0; i < 2; i++) {
+    await w.clock.advance(30000)
+    await w.clock.settle()
+  }
+  landed(w, 'poc/results/area-a-latency.md', RESULT, { name: 'PoC A', ref: 'bbbbbbb1' }, 1)
+  for (let i = 0; i < 3; i++) {
+    await w.clock.advance(30000)
+    await w.clock.settle()
+  }
+  const item = w.files.get(`${ROOT}/board/B-4.md`) as string
+  expect(item).toContain('owner: open\nstatus: open\nfor: tester\n')
+  expect(item).toContain('# Reproduce poc/results/area-a-latency.md')
+  expect(item).toContain('PoC A landed poc/results/area-a-latency.md')
+  expect(json(w, `${FLEET}/state/reproduce.json`).made['poc/results/area-a-latency.md']).toMatchObject({ item: 'B-4', writer: 'poc-a' })
+  // Landed as fleet's own: its event says so, nobody's write is blamed for it
+  const events = [...w.files.keys()].filter(k => k.startsWith(`${FLEET}/events/`) && k.endsWith('.json')).map(k => JSON.parse(w.files.get(k) as string))
+  expect(events.find(e => e.path === 'board/B-4.md')).toMatchObject({ via: 'fleet', by: null })
+  // Offered to the idle tester like any open item
+  await w.clock.advance(60000)
+  await w.clock.settle()
+  expect(json(w, `${FLEET}/state/work.json`).unowned['B-4']).toMatchObject({ for: 'tester', offers: [{ slug: 'tester-1' }] })
+  // Once: a later version of the same result opens nothing more
+  landed(w, 'poc/results/area-a-latency.md', `${RESULT}\nRun again: 42 ns.\n`, { name: 'PoC A', ref: 'bbbbbbb1' }, 2)
+  for (let i = 0; i < 3; i++) {
+    await w.clock.advance(30000)
+    await w.clock.settle()
+  }
+  expect(w.files.has(`${ROOT}/board/B-5.md`)).toBe(false)
+  // A tester's own result (a reproduction) opens nothing; nor does one the board already names
+  landed(w, 'poc/results/area-a-latency-repro.md', RESULT, { name: 'Tester 1', ref: 'ccccccc1' }, 3)
+  w.touch(`${ROOT}/board/B-9.md`, '---\nowner: open\nstatus: open\nfor: tester\n---\n# Reproduce poc/results/area-b-rate.md\n')
+  landed(w, 'poc/results/area-b-rate.md', RESULT, { name: 'PoC A', ref: 'bbbbbbb1' }, 4)
+  for (let i = 0; i < 3; i++) {
+    await w.clock.advance(30000)
+    await w.clock.settle()
+  }
+  expect([...w.files.keys()].filter(k => k.startsWith(`${ROOT}/board/`)).sort()).toEqual([`${ROOT}/board/B-3.md`, `${ROOT}/board/B-4.md`, `${ROOT}/board/B-9.md`])
 })

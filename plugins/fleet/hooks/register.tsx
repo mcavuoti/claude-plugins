@@ -5786,6 +5786,102 @@ async function readWork($: any): Promise<WorkFile | null> {
   return readWire<WorkFile>($, stateDir('work.json'))
 }
 
+// ---- Results to reproduce (G30): world.json's reproduce rules; the one board item fleet writes itself ----
+
+/** <project>/.claude/fleet/state/reproduce.json (the sweeper's, replaced with mv): since when it watches (results landed
+ * before it started open nothing), and the item it opened for each result, by path */
+type ReproduceFile = { format: number; since: number; made: Record<string, { item: string; at: number; writer: string; v: string; opened?: true }> }
+
+/** world.json's "reproduce": [{ "glob": "poc/results/**", "for": "tester" }]: a result (front matter kind: result) an
+ * instance of another role lands under the glob becomes a board item for that role, once per file */
+async function reproduceRules($: any): Promise<{ re: RegExp; glob: string; for: string }[]> {
+  const raw = parseJson(await readText($, `${fleetDir()}/world.json`))
+  const list = Array.isArray(raw?.reproduce) ? raw.reproduce : []
+  return list
+    .filter((r: any) => r && typeof r.glob === 'string' && r.glob.trim() && typeof r.for === 'string' && r.for.trim())
+    .map((r: any) => ({ glob: r.glob.trim(), re: globRegex(r.glob.trim(), insensitive), for: r.for.trim() }))
+}
+
+/** The sweeper: each result a rule names that landed since it started watching, by an instance whose role isn't the
+ * rule's, with no item for it on the board (one naming its path or id) and none fleet opened, gets board/B-<n>.md: owner
+ * open, for: the rule's role, landed as fleet's own (via fleet). B14's offers take it from there; its writer hears it */
+async function reproduceTick($: any, now: number) {
+  if (!root || !roster || !worldOn()) return
+  const rules = await reproduceRules($)
+  if (!rules.length) return
+  const had = await readWire<ReproduceFile>($, stateDir('reproduce.json'))
+  const file: ReproduceFile = had ?? { format: FORMAT, since: now, made: {} }
+  let changed = !had
+  await pullEvents($)
+  const board = await boardItems($)
+  for (const e of [...latest.values()].sort((a, b) => a.at - b.at)) {
+    if (e.at < file.since || e.to === null || file.made[e.path] || (e.via !== 'tool' && e.via !== 'bash') || !e.by || e.probably) continue
+    const rule = rules.find(r => r.re.test(e.path))
+    if (!rule) continue
+    const writer = roster.instances.find(i => i.name === e.by?.name)
+    if (!writer || writer.role.toLowerCase() === rule.for.toLowerCase() || writer.name.toLowerCase() === rule.for.toLowerCase()) continue
+    const text = await readText($, `${root}/${e.path}`)
+    if (text === null || !/^\s*kind\s*:\s*result\b/im.test(text.split('\n').slice(0, 40).join('\n'))) continue
+    const id = records ? idOf(e.path, records) : null
+    const cite = id && e.rev ? `${id}@${e.rev}` : null
+    // The board names it already (an item a lead wrote for it, open or closed)
+    const named = await (async () => {
+      for (const b of board) {
+        const t = await readText($, `${root}/board/${b.id}.md`)
+        if (t && (t.includes(e.path) || (id && new RegExp(`\\b${id}\\b`).test(t)))) return b.id
+      }
+      return null
+    })()
+    if (named) {
+      file.made[e.path] = { item: named, at: now, writer: writer.slug, v: e.to }
+      changed = true
+      continue
+    }
+    const item = await openReproduceItem($, e, writer, rule, cite, now)
+    if (!item) continue
+    file.made[e.path] = { item, at: now, writer: writer.slug, v: e.to, opened: true }
+    changed = true
+    log($, `reproduce: ${item} opened for ${e.path} (${writer.name}'s result), for ${rule.for}`)
+  }
+  if (changed && !(await replace($, stateDir('reproduce.json'), json(file)))) {
+    await run($, ['mkdir', '-p', stateDir()])
+    await replace($, stateDir('reproduce.json'), json(file))
+  }
+}
+
+async function openReproduceItem($: any, e: ChangeEvent, writer: Instance, rule: { glob: string; for: string }, cite: string | null, now: number): Promise<string | null> {
+  const dir = `${root}/board`
+  await run($, ['mkdir', '-p', dir])
+  const me = await meNow($)
+  const body = [
+    '---',
+    'owner: open',
+    'status: open',
+    `for: ${rule.for}`,
+    '---',
+    `# Reproduce ${e.path}`,
+    '',
+    `fleet opened this item (world.json's reproduce: ${rule.glob}, for: ${rule.for}): ${writer.name} landed ${e.path}${cite ? ` (${cite})` : ''} at ${clock(e.at, me.offsetMin)}, a result, and nothing on the board reproduces it yet.`,
+    '',
+    `Reproduce it on your own: rerun its \`run:\` (or the same experiment) where it says, and land a result of yours with its proof, citing ${cite ?? e.path}; then set this item done with where your result is, pass or fail. If it needs no reproduction, ${writer.name} or the front door sets it done saying why.`,
+    '',
+  ].join('\n')
+  let n = Math.max(0, ...(await names($, dir)).map(x => /^B-(\d+)\.md$/.exec(x)).filter((m): m is RegExpExecArray => !!m).map(m => Number(m[1]))) + 1
+  for (let tries = 0; tries < 20; tries++, n++) {
+    const rel = `board/B-${n}.md`
+    const w = await publish($, `${root}/${rel}`, body)
+    if (w === 'exists') continue
+    if (w === 'failed') return null
+    const after = await versionOf($, `${root}/${rel}`)
+    const fields = await landRecord($, rel, after, 'fleet', null)
+    await writeEvent($, { path: rel, from: null, to: after.v, via: 'fleet', blind: false, by: null, ...fields, made: `a reproduction item for ${e.path}` })
+    setKnown(rel, { mtimeMs: after.mtimeMs, size: after.size, v: after.v, pins: fields.pins ?? [] })
+    unexplained.delete(rel)
+    return `B-${n}`
+  }
+  return null
+}
+
 /** The runs declared in this project, with whether each finished and whether its owner recorded it; recorded ones only
  * when asked (withRecorded) */
 async function runViews($: any, withRecorded = false): Promise<RunView[]> {
@@ -6061,6 +6157,14 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     keys.push(...offers.map(x => `offer|${x.id}|${x.last?.at}`))
     // A first round is urgent, like an answer; a later one (its file changed) waits within the wakes' caps
     if (offers.some(x => x.round <= 1)) urgent = true
+  }
+  // Its results fleet opened a reproduction item for (G30): once each
+  const repro = await readWire<ReproduceFile>($, stateDir('reproduce.json'))
+  for (const [path, m] of Object.entries(repro?.made ?? {})) {
+    if (m.writer !== inst.slug || told[`repro|${path}`] !== undefined || now - m.at > 24 * HOUR) continue
+    if (!m.opened) continue
+    lines.push(`fleet: ${path} is a result world.json says needs reproducing, so fleet opened ${m.item} for its reproduction (offered to the ones it's for). If it needs none, set ${m.item} done saying why.`)
+    keys.push(`repro|${path}`)
   }
   for (const v of await runViews($)) {
     if (v.run.owner.slug !== inst.slug) continue
@@ -8104,6 +8208,8 @@ async function rosterTick($: any) {
   const swept: WakesFile = had && had.day === day ? had : { format: FORMAT, day, instances: {} }
   let woke = false
   // The open items nobody owns, offered; the runs' done-files; the capacity line (B14, B16, P19)
+  // A result that needs reproducing becomes a board item first, so this pass offers it (G30)
+  await reproduceTick($, now).catch(err => log($, `reproduce: ${String(err).slice(0, 200)}`))
   const work = await workTick($, st.rows, list, down, now).catch(err => {
     log($, `work: ${String(err).slice(0, 200)}`)
     return { offered: new Map<string, string[]>(), later: new Map<string, string[]>(), finished: new Map<string, string[]>() }
