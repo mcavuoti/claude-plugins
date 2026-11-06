@@ -504,7 +504,8 @@ test('after a sleep the holder finds its own lease 90 s old: it holds nothing, t
   const lapsed = async () => {
     const before = w.logs.filter(l => l.includes('its own lease ran out')).length
     stale()
-    for (let i = 0; i < 12 && w.logs.filter(l => l.includes('its own lease ran out')).length === before; i++) await tick(w)
+    // (the holder renews, and so looks at, its lease every 30 s)
+    for (let i = 0; i < 20 && w.logs.filter(l => l.includes('its own lease ran out')).length === before; i++) await tick(w)
   }
   await lapsed()
   expect(w.logs.join('\n')).toContain('sweeper: its own lease ran out (a sleep or a stall): taking it again')

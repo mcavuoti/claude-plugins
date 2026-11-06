@@ -38,6 +38,7 @@ import {
   parseUpstream,
   parseWorktrees,
   parseZtag,
+  codeEveryMs,
   sshHost,
   viaHost,
   takesPart,
@@ -697,6 +698,7 @@ async function tmpFile($: any, text: string): Promise<string> {
 // No-clobber: the file appears whole, or not at all when it's there already (ln refuses to replace it). So the first
 // answer wins, and a register record is written once
 async function publish($: any, path: string, text: string): Promise<'ok' | 'exists' | 'failed'> {
+  wrote(path)
   const tmp = await tmpFile($, text)
   let r = await run($, ['ln', tmp, path])
   if (r.exitCode !== 0 && !(await exists($, path))) {
@@ -722,7 +724,10 @@ async function publishAll($: any, items: readonly { path: string; text: string }
     return out
   }
   const pairs: string[] = []
-  for (const x of items) pairs.push(await tmpFile($, x.text), x.path)
+  for (const x of items) {
+    wrote(x.path)
+    pairs.push(await tmpFile($, x.text), x.path)
+  }
   const r = await run($, ['sh', '-c', LN_ALL, 'sh', ...pairs], { timeoutMs: 30000 })
   for (const line of r.stdout.split('\n')) {
     const m = /^(ok|exists|failed) (.+)$/.exec(line)
@@ -738,6 +743,7 @@ async function publishAll($: any, items: readonly { path: string; text: string }
 
 // The file appears whole, over any older one
 async function replace($: any, path: string, text: string): Promise<boolean> {
+  wrote(path)
   const tmp = await tmpFile($, text)
   const r = await run($, ['mv', '-f', tmp, path])
   if (r.exitCode !== 0) await run($, ['rm', '-f', tmp])
@@ -907,7 +913,9 @@ function timers($: any) {
     // An instance of the roster: its binding, heartbeat and spend; its seed, and its nudges
     $.clock.after(1500, () => bg(instanceTick($)))
     $.clock.every(30000, () => bg(instanceTick($)))
-    $.clock.every(5000, () => bg(nudgeTick($)))
+    // Its nudges: a pass every minute, and soon after what they act on moved (kickNudge)
+    $.clock.every(NUDGE_PASS_MS, () => bg(runNudge($)))
+    kickNudge($, 5000)
   }
   $.clock.after(0, () => bg(startWorld($)))
   $.clock.after(0, () => bg(restoreMark($)))
@@ -1363,7 +1371,8 @@ async function beat($: any) {
   }
   if ((await read($, overBudget)) !== o) await update($, overBudget, () => o)
   if (jobRef) await keepSection($, records, present)
-  await refreshName($)
+  if (!myName || (await $.clock.now()) - nameAt >= 60000) await refreshName($)
+  if (myInstance) await watchForNudge($, records, present)
   // The commands it runs, said again every minute while they run (a mark not renewed for 3 min is taken as gone); a
   // background one a day old is taken as done
   if (worldOn()) {
@@ -1376,10 +1385,11 @@ async function beat($: any) {
   // What the band says besides the counts: nobody sweeps, the world too big to scan
   // In the person's sessions: instances a restart stopped (the machine, or the background service), which the sweeper
   // wakes by itself (once per stop, RESTART_WAKES_PER_DAY a day), and the ones it woke a moment ago
-  const restarted = !myInstance && roster ? await restartLine($) : ''
+  // (the sweeper's line in work.json while a sweeper runs; without one, this session's own, once a minute)
+  const work = !myInstance && roster ? await readWork($) : null
+  const restarted = !myInstance && roster ? await bandRestart($, work) : ''
   // ... and, in the person's sessions, instances idle beside open items that fit them (G18, P19; a mark, never a hold),
   // and the instances past 80% of their budget (B15: the band and status say it, the instance doesn't hear it)
-  const work = !myInstance && roster ? await readWork($) : null
   const idleFlag = work ? idleFlagText(work.capacity) : ''
   const near = roster ? (await budgets($)).filter(b => b.state === 'warn').length : 0
   const notes = [...((await sweeperState($)).nobody ? ['nobody sweeps'] : []), ...(restarted ? [restarted] : []), ...(idleFlag ? [idleFlag] : []), ...(near ? [`${near} past 80% of budget`] : []), ...(tooBig && worldOn() ? ['world too big: no scan'] : [])].join(' · ')
@@ -1553,7 +1563,9 @@ const revCache = new Map<string, { revs: Map<number, Rev>; mtime: number; at: nu
 const idIndex = new Map<string, string>()
 const twins = new Map<string, string[]>()
 // The linked git worktrees of the project's repository (their real folders), and where the project sits in it
-const trees = { at: 0, linked: [] as string[], sub: '', git: true, forced: 0 }
+// The repository's own facts (rev-parse) are kept for the process; the worktree list is read again only when the
+// repository's worktrees folder (<common>/worktrees) moved, or a path names a worktree fleet doesn't know (forced)
+const trees = { at: 0, linked: [] as string[], sub: '', git: true, forced: 0, repo: null as { top: string; gitDir: string; common: string } | null, listMark: -2 }
 
 function eventsDir(sub = ''): string {
   return `${root}/.claude/fleet/events${sub ? `/${sub}` : ''}`
@@ -1811,15 +1823,23 @@ async function refreshTrees($: any, force = false) {
   if (force ? now - trees.forced < 5000 : now - trees.at < (trees.git ? 60000 : 600000)) return
   trees.at = now
   if (force) trees.forced = now
-  const g = await gitOf($, realRoot)
+  const g = trees.repo ?? (await gitOf($, realRoot))
   if (!g) {
     trees.git = false
     trees.linked = []
     return
   }
+  trees.repo = g
   trees.git = true
   const main = g.common.endsWith('/.git') ? g.common.slice(0, -'/.git'.length) : g.top
   trees.sub = realRoot.startsWith(`${main}/`) ? realRoot.slice(main.length + 1) : ''
+  // The worktrees folder's time (-1: none, no linked worktree): the list is read again only once it moved
+  let mark = -1
+  try {
+    mark = Number((await $.fs.stat(`${g.common}/worktrees`)).mtimeMs)
+  } catch {}
+  if (!force && mark === trees.listMark) return
+  trees.listMark = mark
   const l = await run($, ['git', '-C', realRoot, 'worktree', 'list', '--porcelain'])
   const linked: string[] = []
   for (const f of l.exitCode === 0 ? worktreeFolders(l.stdout).slice(1) : []) {
@@ -1845,8 +1865,12 @@ function threadOf(e: any): string {
   return typeof e.agentId === 'string' && e.agentId ? e.agentId : 'main'
 }
 
+/** This session's name and ref as sessions has them: once a minute from the beat (a rename shows within it), at once
+ * while it isn't known */
+let nameAt = 0
 async function refreshName($: any) {
   if (!(await has($, 'current'))) return
+  nameAt = await $.clock.now()
   const c = await race<Current>($, () => $.sessions.current())
   if (c?.ready) {
     myName = c.name || null
@@ -1925,7 +1949,7 @@ function remember(e: ChangeEvent) {
 
 // events/latest moved (another session landed something): read the new events. Every 2 s, at each tool step, and on
 // the engine's FileChanged for it
-async function eventsTick($: any) {
+async function eventsTick($: any, fromPoll = false) {
   if (!worldOn()) return
   let m = 0
   try {
@@ -1933,9 +1957,24 @@ async function eventsTick($: any) {
   } catch {
     return
   }
+  // The world tick found a landing (not this session's own) the engine's watcher hadn't brought: one it still hasn't 3 s
+  // after it was made is a miss, and two misses take the watch as off here, so the world is looked at every 2 s again
+  if (fromPoll && watchingLatest) {
+    const now = await $.clock.now()
+    if (unwatched && now - unwatched > 3000) {
+      if (fileChangedAt < unwatched && ++watchMisses >= 2) {
+        watchingLatest = false
+        log($, "events/latest: the engine's watcher didn't bring two landings; the world is looked at every 2 s")
+      }
+      unwatched = 0
+    }
+    if (m !== latestMark && latestMark !== 0 && Math.abs(m - ownTriggerAt) > 15000 && fileChangedAt < m) unwatched = m
+  }
   if (m === latestMark) return
   latestMark = m
   await pullEvents($)
+  // Something landed: an instance's nudges are looked at (within the old 5 s pace)
+  if (myInstance) kickNudge($)
 }
 
 // One landing: published once under a name of its own in the current hour's folder, then events/latest rewritten so
@@ -1983,6 +2022,7 @@ function eventLanded($: any, x: { e: ChangeEvent; name: string; now: number }) {
 
 /** events/latest rewritten: every session's watcher fires */
 async function trigger($: any, name: string) {
+  ownTriggerAt = await $.clock.now()
   try {
     await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: name }))
   } catch {}
@@ -3721,8 +3761,24 @@ async function startWorld($: any) {
   await lease($)
 }
 
+// Every 2 s; every WORLD_SLOW_MS instead in a session that doesn't sweep (and isn't taking the lease) while the engine
+// watches events/latest for it (classic.SessionStart returned it): the watcher brings landings at once, so the tick
+// is only the fallback. A reload of the module (no SessionStart of its own) starts at 2 s again
+const WORLD_SLOW_MS = 10000
+let watchingLatest = false
+let watchMisses = 0
+let ownTriggerAt = 0
+// When the watcher last brought events/latest, and a landing the tick found that it hadn't (its time, 0: none)
+let fileChangedAt = 0
+let unwatched = 0
+let worldTickAt = 0
 async function worldTick($: any) {
   if (!root) return
+  if (watchingLatest && !sweep.holding && !sweep.takenAt) {
+    const now = await $.clock.now()
+    if (now - worldTickAt < WORLD_SLOW_MS - 500) return
+    worldTickAt = now
+  }
   if (!realRoot) {
     // Set up after this session started (/fleet init here or in another session)
     worldReady = null
@@ -3731,7 +3787,7 @@ async function worldTick($: any) {
   }
   await loadWorld($)
   if (world && !worldStarted) await startWorld($)
-  await eventsTick($)
+  await eventsTick($, true)
   // The sweeper runs whenever the project has fleet: answers to retired instances, alerts, intake and slots don't wait
   // on the world (an empty, broken, newer or too big world.json turns off only the world's own parts)
   await lease($)
@@ -3745,12 +3801,12 @@ async function worldTick($: any) {
 
 const sweep = { bornAt: 0, holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0, running: false, asking: false, dirty: false, intakeDirty: false, slotsDirty: false, lastRun: {} as Record<string, number>, commitNote: '', suspectsKey: '' }
 
-// The lease, <project>/.claude/fleet/state/sweeper.json: whoever holds it rewrites it every 20 s; one older than 90 s
+// The lease, <project>/.claude/fleet/state/sweeper.json: whoever holds it rewrites it every 30 s; one older than 90 s
 // (or none) is taken by writing it, and the taker sweeps once it still finds itself there 2 s later (two that took it
 // at once: the last write wins, and the other backs off). Replaced with mv, no lock: a minute of two sweepers is harmless
 async function lease($: any) {
   const now = await $.clock.now()
-  const due = sweep.holding ? 20000 : sweep.takenAt ? 2000 : 10000
+  const due = sweep.holding ? 30000 : sweep.takenAt ? 2000 : 10000
   if (now - sweep.leaseAt < due) return
   sweep.leaseAt = now
   const sessionId = String(await $.session.id())
@@ -4632,8 +4688,12 @@ async function codeTick($: any) {
   for (const repo of codeCfg.repos) {
     const rs = st.repos[repo.name]
     const prev = rs && rs.kind === repo.kind ? rs : null
-    if (prev && now - prev.polledAt < repo.everyMin * 60000) continue
+    // One whose last polls failed (a host down, a command failing) waits longer each time (codeEveryMs); a poll that
+    // works brings it back to everyMin
+    if (prev && now - prev.polledAt < codeEveryMs(repo.everyMin, prev)) continue
     const p = await pollRepo($, repo, prev, now)
+    // Stamped when it came back: a slow one's next poll counts from its end
+    p.state = { ...p.state, polledAt: await $.clock.now() }
     st = { ...st, repos: { ...st.repos, [repo.name]: p.state }, overlaps: p.overlaps ? mergeOverlaps(st.overlaps, repo.name, p.overlaps, p.unseen, names, now) : st.overlaps }
     dirty = true
     const mine = st.overlaps.filter(o => o.repo === repo.name)
@@ -5875,10 +5935,36 @@ function today(now: number): string {
 }
 
 async function readWire<T>($: any, path: string): Promise<T | null> {
+  const rare = RARE_FILE.test(path)
+  if (rare && (absentUntil.get(path) ?? 0) > (await $.clock.now())) return null
   const t = await readText($, path)
-  if (t === null) return null
+  if (t === null) {
+    if (rare && (await gone($, path))) absentUntil.set(path, (await $.clock.now()) + ABSENT_MS)
+    return null
+  }
   const p = parseWire<T>(t)
   return p && 'value' in p ? p.value : null
+}
+
+/** fleet's small files that are usually not there (nobody down, no budget raised, no poll yet), and the
+ * folders that are usually empty or missing (overrules, runs): one found missing isn't looked for again for ABSENT_MS,
+ * unless this session writes it (replace, publish), so an idle session doesn't fail the same reads every few seconds.
+ * Another session's write of one is seen within ABSENT_MS */
+const ABSENT_MS = 30000
+const RARE_FILE = /\/\.claude\/fleet\/(?:state\/(?:down|lifts|wakes)\.json|instances\/[^/]+\/(?:nudges|poll)\.json)$/
+const absentUntil = new Map<string, number>()
+function wrote(path: string) {
+  absentUntil.delete(path)
+  absentUntil.delete(path.slice(0, path.lastIndexOf('/')))
+}
+/** names(), for a folder that's usually empty or missing: one found so isn't listed again for ABSENT_MS (unless this
+ * session writes in it) */
+async function rareNames($: any, dir: string): Promise<string[]> {
+  const now = await $.clock.now()
+  if ((absentUntil.get(dir) ?? 0) > now) return []
+  const got = await names($, dir)
+  if (!got.length) absentUntil.set(dir, now + ABSENT_MS)
+  return got
 }
 
 async function loadRoster($: any) {
@@ -5945,13 +6031,17 @@ async function bind($: any) {
 async function instanceTick($: any) {
   await bind($)
   if (!myInstance) return
-  await heartbeat($)
+  await heartbeat($, false)
   await maybeSeed($)
 }
 
-// <project>/.claude/fleet/instances/<slug>/state.json every 30 s (the sweeper reads "no fleet" from its absence), and the
-// session's cost turned into today's spend (spend.json)
-async function heartbeat($: any) {
+// <project>/.claude/fleet/instances/<slug>/state.json every HEARTBEAT_EVERY_MS (the sweeper reads "no fleet" from its
+// absence: stale after HEARTBEAT_STALE_MS, three beats), and at once when something in it changes that others act on (a
+// permission prompt and its answer, a wait settled, a seed, a restart); the session's cost turned into today's spend
+// (spend.json). Each beat is one mv: $.fs.write isn't atomic for a reader in another process (a probe saw torn reads)
+const HEARTBEAT_EVERY_MS = 60000
+let lastBeatAt = 0
+async function heartbeat($: any, force = true) {
   const inst = myInstance
   if (!inst || !root) return
   const now = await $.clock.now()
@@ -5970,13 +6060,22 @@ async function heartbeat($: any) {
     contextTokens = typeof u?.context?.tokens === 'number' ? u.context.tokens : null
   } catch {}
   lastContextTokens = contextTokens
+  // Its spend at every tick (30 s), as before: written only when it moved, and the budgets read again then, so a budget
+  // used up is seen within a tick; the beat itself once a minute
+  let spent = false
   if (cost !== null) {
     const spend = await readWire<SpendFile>($, `${dir}/spend.json`)
     const next = addSpend(spend, { format: FORMAT, slug: inst.slug, day, sessionId, cost, at: now })
-    if (!spend || next.usd !== spend.usd || next.day !== spend.day || next.last !== spend.last || next.sessionId !== spend.sessionId) await replace($, `${dir}/spend.json`, json(next))
+    if (!spend || next.usd !== spend.usd || next.day !== spend.day || next.last !== spend.last || next.sessionId !== spend.sessionId) {
+      await replace($, `${dir}/spend.json`, json(next))
+      spent = true
+    }
   }
-  budgetCache.at = 0
+  if (spent || force || now - lastBeatAt >= HEARTBEAT_EVERY_MS - 5000) budgetCache.at = 0
   const b = (await budgets($)).find(x => x.inst.slug === inst.slug)
+  // (with the 30 s tick: at its first tick past the minute)
+  if (!force && now - lastBeatAt < HEARTBEAT_EVERY_MS - 5000) return
+  lastBeatAt = now
   // Carried over from the heartbeat before this process's first: when this short id started, its last landing, and
   // the conversation's start when it's the same conversation (a restart)
   if (!carried.done) {
@@ -6213,6 +6312,8 @@ type WorkFile = {
   unowned: Record<string, { for: string | null; since: number; offers: WorkOffer[]; mtime?: number; round?: number; allOffered?: number | null; writer?: string }>
   capacity: Capacity
   quiet?: Record<string, number>
+  /** The band's line on the instances a restart stopped (restartLine), from the sweeper's status call */
+  restart?: string
 }
 /** Idle instances (idle or retired, owning no open item, no run in flight), the open items nobody owns and since when the
  * oldest waits, the slots free, the runs in flight and those finished but not recorded; flags: an idle instance an
@@ -6380,7 +6481,7 @@ async function openReproduceItem($: any, e: ChangeEvent, writer: Instance, rule:
  * when asked (withRecorded) */
 async function runViews($: any, withRecorded = false): Promise<RunView[]> {
   if (!root) return []
-  const all = await names($, runsDir())
+  const all = await rareNames($, runsDir())
   const out: RunView[] = []
   for (const n of all) {
     const m = /^(run-\d+)\.json$/.exec(n)
@@ -6403,7 +6504,18 @@ async function runViews($: any, withRecorded = false): Promise<RunView[]> {
 async function doneText($: any, r: RunFile): Promise<string | null> {
   if (r.host) {
     if (!hostAllowed(sshHost(r.host), await outboundConfig($))) return null
+    // A host that can't be reached (ssh's own 255, or a timeout) is asked again only after its back-off: 2 min doubled
+    // at each failure up to HOST_BACKOFF_MAX_MS, stamped when the try came back; any answer (the file there or not) ends it
+    const host = sshHost(r.host)
+    const down = hostDown.get(host)
+    if (down && (await $.clock.now()) < down.until) return null
     const res = await run($, viaHost(r.host, ['cat', '--', r.done.replace(/^~\//, '')]), { timeoutMs: 30000 })
+    const back = await $.clock.now()
+    if (res.exitCode === 255 || res.exitCode === 124) {
+      const failures = (down?.failures ?? 0) + 1
+      hostDown.set(host, { failures, until: back + Math.min(HOST_BACKOFF_MAX_MS, RUN_POLL_MS * 2 ** (failures - 1)) })
+      if (failures === 1 || failures % 5 === 0) log($, `runs: ${host} can't be reached (${failures} time(s)); asked again in ${Math.round(Math.min(HOST_BACKOFF_MAX_MS, RUN_POLL_MS * 2 ** (failures - 1)) / 60000)} min`)
+    } else hostDown.delete(host)
     return res.exitCode === 0 ? res.stdout : null
   }
   const p = r.done.startsWith('/') ? r.done : r.done.startsWith('~/') ? `${home}/${r.done.slice(2)}` : `${root}/${r.done}`
@@ -6413,6 +6525,9 @@ async function doneText($: any, r: RunFile): Promise<string | null> {
 /** The sweeper: each declared run not finished yet, its done-file looked at every RUN_POLL_MS; once there, published as
  * done (no-clobber), with the exit code it holds */
 const runPolledAt = new Map<string, number>()
+/** Hosts a done-file poll couldn't reach, and until when they're left alone */
+const hostDown = new Map<string, { failures: number; until: number }>()
+const HOST_BACKOFF_MAX_MS = 30 * 60000
 async function pollRuns($: any, views: RunView[], now: number): Promise<boolean> {
   let any = false
   for (const v of views) {
@@ -6479,7 +6594,7 @@ async function runCall($: any, e: any): Promise<any> {
  * role it's for (by the instance's own fleet when it runs: work.json; by a wake when it's retired), the runs' done-files,
  * and the capacity line. Returns what wakes a retired instance: the items just offered to it (offered: a first round,
  * urgent; later: a round after the item's file changed, within the wakes' caps), its runs that finished */
-async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[], down: ReadonlySet<string>, now: number): Promise<{ offered: Map<string, string[]>; later: Map<string, string[]>; finished: Map<string, string[]> }> {
+async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[], down: ReadonlySet<string>, now: number, restart = ''): Promise<{ offered: Map<string, string[]>; later: Map<string, string[]>; finished: Map<string, string[]> }> {
   const offered = new Map<string, string[]>()
   const later = new Map<string, string[]>()
   const finished = new Map<string, string[]>()
@@ -6593,7 +6708,7 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     if (c) stuck.push({ inst: i.name, tool: c.tool, since: c.since })
   }
   const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}), ...(stuck.length ? { stuck } : {}) }
-  const next: WorkFile = { format: FORMAT, at: now, unowned, capacity, ...(Object.keys(quiet).length ? { quiet } : {}) }
+  const next: WorkFile = { format: FORMAT, at: now, unowned, capacity, ...(Object.keys(quiet).length ? { quiet } : {}), ...(restart ? { restart } : {}) }
   const same = !!had && JSON.stringify({ ...had, at: 0 }) === JSON.stringify({ ...next, at: 0 })
   if (!same || now - had.at > 10 * 60000) {
     if (!(await replace($, stateDir('work.json'), json(next)))) {
@@ -6865,10 +6980,10 @@ function stopEpisode(hb: Heartbeat): string {
 /** After a restart, as the band, /fleet status and the brief say it: the instances (not down) a restart stopped and
  * fleet hasn't just woken (stopped: /fleet up --stopped wakes them, starting none never started), those of them woken
  * RESTART_WAKES_PER_DAY times today (capped: a crash loop), and the ones fleet woke in the last RESTART_SHOWN_MS */
-async function restartView($: any): Promise<{ stopped: Instance[]; capped: Instance[]; woke: Instance[] }> {
+async function restartView($: any, given?: Status): Promise<{ stopped: Instance[]; capped: Instance[]; woke: Instance[] }> {
   const none = { stopped: [], capped: [], woke: [] }
-  if (!roster?.instances.length || !(await has($, 'status'))) return none
-  const st = await race<Status>($, () => $.sessions.status({ names: (roster as { instances: Instance[] }).instances.map(i => i.name) }))
+  if (!roster?.instances.length || (!given && !(await has($, 'status')))) return none
+  const st = given ?? (await race<Status>($, () => $.sessions.status({ names: (roster as { instances: Instance[] }).instances.map(i => i.name) })))
   if (!st?.ready) return none
   const down = await downSet($)
   const now = await $.clock.now()
@@ -6893,8 +7008,21 @@ function restartedNow(swept: WakesFile | null, inst: Instance, now: number, day:
   const had = swept && swept.day === day ? swept.instances[inst.slug] : undefined
   return had?.restartAt !== undefined && now - had.restartAt < RESTART_GRACE_MS
 }
-async function restartLine($: any): Promise<string> {
-  const v = await restartView($)
+/** The band's restart line in a person's session: the sweeper's (work.json, rewritten at each full sweep where it
+ * changed) while a sweeper holds a fresh lease; otherwise worked out here, at most once a minute */
+const ownRestart = { at: 0, line: '' }
+async function bandRestart($: any, work: WorkFile | null): Promise<string> {
+  const now = await $.clock.now()
+  const l = sweep.holding ? null : parseLease(await readText($, stateDir('sweeper.json')))
+  if (work && (sweep.holding || (l && now - l.at <= LEASE_MS))) return work.restart ?? ''
+  if (now - ownRestart.at >= 60000) {
+    ownRestart.at = now
+    ownRestart.line = await restartLine($)
+  }
+  return ownRestart.line
+}
+async function restartLine($: any, given?: Status): Promise<string> {
+  const v = await restartView($, given)
   const parts: string[] = []
   if (v.woke.length) parts.push(`woke ${v.woke.length} after a restart`)
   if (v.stopped.length) parts.push(`${v.stopped.length} stopped since a restart${v.capped.length ? ` (${v.capped.length} woken ${RESTART_WAKES_PER_DAY}× today: a crash loop?)` : ''}: /fleet up --stopped`)
@@ -6929,11 +7057,14 @@ async function contextSizes($: any, instances: readonly Instance[]): Promise<Rec
 const stoppedSizes = new Set<string>()
 
 // Today's spend and cap of every instance (instances/<slug>/spend.json, state/lifts.json) and of the project; an
-// instance is over when its own budget or the project's is. A few seconds' cache: the band reads it every 10 s
+// instance is over when its own budget or the project's is. A minute's cache (BUDGET_CACHE_MS): spends move once per
+// turn, and the band, the nudges and the heartbeat read it many times a minute in every session; read fresh at each
+// heartbeat, after a lift, by the sweeper's alerts, and before a helper is refused
+const BUDGET_CACHE_MS = 60000
 async function budgets($: any): Promise<BudgetRow[]> {
   if (!roster) return []
   const now = await $.clock.now()
-  if (now - budgetCache.at < 5000) return budgetCache.list
+  if (now - budgetCache.at < BUDGET_CACHE_MS) return budgetCache.list
   const day = today(now)
   const lifts = await readWire<LiftsFile>($, stateDir('lifts.json'))
   const rows: Omit<BudgetRow, 'state'>[] = []
@@ -6990,6 +7121,8 @@ async function budgetLine($: any): Promise<{ line: string; key: string; urgent?:
 async function spawnRefusal($: any): Promise<string | null> {
   const inst = myInstance
   if (!inst) return null
+  // Read as it is now (within the old 5 s), not as the minute's cache last saw it: a refusal is the one thing it holds
+  if ((await $.clock.now()) - budgetCache.at >= 5000) budgetCache.at = 0
   const b = (await budgets($)).find(x => x.inst.slug === inst.slug)
   if (b?.state !== 'over') return null
   return `fleet: ${budgetWords(b)} is used up, so no new helper starts until the person lifts it (/fleet budget "${inst.name}" +<dollars>). Your other tools still work: finish what you can yourself, write down where you stopped, and end your turn.`
@@ -7066,6 +7199,7 @@ function nudgeSubmit($: any, what: string, text: string, started: () => Promise<
       const now = await $.clock.now()
       await update($, retryAt, r => Math.max(r, now + 30000))
       log($, `${what}: ${why}; kept for the next one`)
+      if (!stop) kickNudge($, 30500)
     }
     await update($, nudgeAt, () => 0)
   }
@@ -7078,6 +7212,84 @@ function nudgeSubmit($: any, what: string, text: string, started: () => Promise<
   )
 }
 
+// When an instance's nudges are looked at: a pass every NUDGE_PASS_MS, and a kick soon after what they act on moved (a
+// landing anywhere, its own turn ending once it's been idle the 30 s a nudge waits for, a failed submit's retry, its poll
+// coming due, an answer to a decision its work waits on, the work the sweeper offers or a run of its finishing, its
+// budget's state). Runs one at a time and never closer than NUDGE_MIN_GAP_MS (the old 5 s tick), so nothing it does comes
+// later than before, and an idle instance reads its files once a minute instead of every 5 s
+const NUDGE_PASS_MS = 60000
+const NUDGE_MIN_GAP_MS = 5000
+let nudgeRunning = false
+let nudgeAgain = false
+let nudgeLastRun = 0
+let nudgeKickAt = 0
+let nudgeFrom = 0
+function kickNudge($: any, delayMs = 0) {
+  if (!jobRef || !root) return
+  bg(
+    (async () => {
+      const now = await $.clock.now()
+      // Never before its first look (5 s after its timers started, as the old tick), nor closer than the old pace
+      if (!nudgeFrom) nudgeFrom = now + NUDGE_MIN_GAP_MS
+      const at = Math.max(now + Math.max(0, delayMs), nudgeLastRun + NUDGE_MIN_GAP_MS, nudgeFrom)
+      // One on its way sooner, or at the same time, covers this one
+      if (nudgeKickAt && nudgeKickAt > now && nudgeKickAt <= at) return
+      nudgeKickAt = at
+      $.clock.after(at - now, () => {
+        if (nudgeKickAt === at) nudgeKickAt = 0
+        bg(runNudge($))
+      })
+    })(),
+  )
+}
+/** From the beat (every 10 s) in an instance: what its nudges act on that another session moved. An answer or a close
+ * of a decision its work waits on, the sweeper's work.json (an item offered to it, its capacity), the runs (one of its
+ * finished), a restart asked of it, its budget's state (raised again): each kicks a look at its nudges */
+const nudgeSeen = { decisions: '', work: -1, runs: -1, budget: '', restart: -1 }
+async function watchForNudge($: any, records: readonly QueueRecord[], present: ReadonlySet<string>) {
+  const inst = myInstance
+  if (!inst) return
+  let moved = false
+  const see = <K extends keyof typeof nudgeSeen>(k: K, v: (typeof nudgeSeen)[K]) => {
+    const before = nudgeSeen[k]
+    nudgeSeen[k] = v
+    if (before !== (typeof v === 'number' ? -1 : '') && before !== v) moved = true
+  }
+  if (Object.keys(await read($, waitsOn)).length) see('decisions', `${records.map(r => r.id).sort().join(',')}|${[...present].sort().join(',')}`)
+  see('work', (await mtimeOf($, stateDir('work.json'))) ?? 0)
+  see('runs', await folderTime($, runsDir()))
+  // A restart the person asked for (/fleet up --restart-when-idle, an applied roster change)
+  see('restart', (await mtimeOf($, `${instDir(inst.slug)}/restart.json`)) ?? 0)
+  see('budget', (await budgets($)).find(x => x.inst.slug === inst.slug)?.state ?? 'none')
+  if (moved) kickNudge($)
+}
+/** A folder's time (a file added or removed in it moves it): 0 when it isn't there */
+async function folderTime($: any, dir: string): Promise<number> {
+  try {
+    const st = await $.fs.stat(dir)
+    return st.kind === 'dir' ? Number(st.mtimeMs) : 0
+  } catch {
+    return 0
+  }
+}
+
+async function runNudge($: any) {
+  if (nudgeRunning) {
+    nudgeAgain = true
+    return
+  }
+  nudgeRunning = true
+  try {
+    do {
+      nudgeAgain = false
+      nudgeLastRun = await $.clock.now()
+      await nudgeTick($)
+    } while (nudgeAgain)
+  } finally {
+    nudgeRunning = false
+  }
+}
+
 // A nudge: an idle instance whose shared files changed (or that owns flagged files) is prompted by its own fleet, at
 // most once per wakes.everyMin and wakes.perDay a day with the sweeper's wakes; never while it's down or over budget
 async function nudgeTick($: any) {
@@ -7086,7 +7298,14 @@ async function nudgeTick($: any) {
   await maybeSeed($)
   if (!(await read($, seedSent))) return
   const now = await $.clock.now()
-  if ((await read($, busy)) || (await read($, stopped)) || now - (await read($, idleSince)) < 30000 || now < (await read($, retryAt))) return
+  if ((await read($, busy)) || (await read($, stopped))) return
+  // Idle less than the 30 s a nudge waits for, or a failed submit's retry not due: looked at again then
+  const idleFor = now - (await read($, idleSince))
+  const retry = await read($, retryAt)
+  if (idleFor < 30000 || now < retry) {
+    kickNudge($, Math.max(30000 - idleFor, retry - now) + 500)
+    return
+  }
   const pending = await read($, nudgeAt)
   if (pending && now - pending < 10 * 60000) return
   if (Object.keys(await read($, inflight)).length) return
@@ -7107,12 +7326,20 @@ async function nudgeTick($: any) {
   const restartFor = toRestart?.at ?? 0
   const askedAt = await read($, restartAskedAt)
   const again = restartFor === (await read($, restartAsked)) && now - askedAt.at >= (askedAt.queued ? RESTART_QUEUED_MS : RESTART_RETRY_MS)
+  // Why it waits goes to the heartbeat at once (/fleet status says it), and the restart is looked at again when it may go
+  const waitWas = restartWait
+  const waitTold = () => {
+    if (restartWait !== waitWas) bg(heartbeat($))
+  }
   if (!restartFor) restartWait = null
   else if (restartFor !== (await read($, restartAsked)) || again) {
     const bgs = Object.keys(await read($, bgCommands)).length
+    const idleMs = now - (await read($, idleSince))
     if (bgs) restartWait = `busy: ${bgs} background command(s) running`
-    else if (now - (await read($, idleSince)) < 60000) restartWait = 'waits for it to be idle a minute'
-    else if (!(await has($, 'restart'))) restartWait = "this session's sessions can't restart it: u in the panel restarts it"
+    else if (idleMs < 60000) {
+      restartWait = 'waits for it to be idle a minute'
+      kickNudge($, 60000 - idleMs + 500)
+    } else if (!(await has($, 'restart'))) restartWait = "this session's sessions can't restart it: u in the panel restarts it"
     else {
       await update($, restartAsked, () => restartFor)
       const reason = toRestart?.named ? 'fleet: restart asked (/fleet up --restart-when-idle)' : 'fleet: its settings changed (restart when idle)'
@@ -7122,16 +7349,20 @@ async function nudgeTick($: any) {
       const said = r && !r.ok ? String(r.detail ?? r.reason).replace(/[\s;:,.]*u in the panel restarts it\.?$/i, '') : 'no answer'
       restartWait = r?.ok ? null : `sessions: ${said}; fleet asks again in ${Math.round(RESTART_RETRY_MS / 60000)} min (u in the panel restarts it now)`
       log($, `restart when idle for ${inst.name}${again ? ' (again)' : ''}: ${r?.ok ? 'asked' : (restartWait ?? '')}`)
+      kickNudge($, (r?.ok ? RESTART_QUEUED_MS : RESTART_RETRY_MS) + 500)
+      waitTold()
       return
     }
   }
+  waitTold()
   if ((await downSet($)).has(inst.slug)) return
   if ((await budgets($)).find(x => x.inst.slug === inst.slug)?.state === 'over') return
   // The idle compaction (G22): once per idle episode, idle a while with a large context, before the prompt cache runs
   // out, so the next wake reloads a summary instead of the whole conversation
   // (idle since its last turn ended, or since its fleet started when no turn has ended here yet)
   const idleFrom = (await read($, idleSince)) || (await read($, startedHere))
-  if (inst.compact && (lastContextTokens ?? 0) >= inst.compact.minTokens && now - idleFrom >= inst.compact.idleMin * 60000 && (await read($, compactedFor)) !== idleFrom) {
+  const compactDue = inst.compact && (lastContextTokens ?? 0) >= inst.compact.minTokens && (await read($, compactedFor)) !== idleFrom ? idleFrom + inst.compact.idleMin * 60000 - now : null
+  if (compactDue !== null && compactDue <= 0) {
     await update($, compactedFor, () => idleFrom)
     log($, `idle compaction for ${inst.name} (${tokensText(lastContextTokens ?? 0)} in context, idle ${Math.round((now - idleFrom) / 60000)} min)`)
     // Its own compaction of an idle conversation: what it leaves in flight waits for the next step (session.compact)
@@ -7139,11 +7370,14 @@ async function nudgeTick($: any) {
     try {
       await $.command.run({ command: 'compact', args: '' })
       compactedAt = now
+      bg(heartbeat($))
     } catch (err) {
       log($, `idle compaction for ${inst.name} failed: ${String(err).slice(0, 200)}`)
     }
     return
   }
+  // Due before the next pass: looked at then
+  if (compactDue !== null && compactDue < NUDGE_PASS_MS) kickNudge($, compactDue + 500)
   // Its routine poll (roster.json's poll), on its own count: not a wake, not the cadence's, kept across restarts
   if (inst.poll) {
     // Its first one a period after its fleet started
@@ -7154,6 +7388,8 @@ async function nudgeTick($: any) {
       nudgeSubmit($, 'the poll', pollText(inst.poll), () => replace($, `${instDir(inst.slug)}/poll.json`, json({ format: FORMAT, at: now })), now)
       return
     }
+    // Looked at again when it comes due, not only at the next pass
+    if (last + inst.poll.everyMin * 60000 - now < NUDGE_PASS_MS) kickNudge($, last + inst.poll.everyMin * 60000 - now + 500)
   }
   const day = today(now)
   const wakes = wakesOf(roster?.r ?? null)
@@ -7170,11 +7406,13 @@ async function nudgeTick($: any) {
     await run($, ['mkdir', '-p', instDir(inst.slug)])
     await replace($, `${instDir(inst.slug)}/nudges.json`, json({ format: FORMAT, ...kept, ...countWake(mine, now, day), ...extra }))
   }
-  // A fresh period (decision 4a): a period-old conversation, idle, its journal written since it started
-  const journal = await readText($, `${root}/${inst.journal}`)
+  // A fresh period (decision 4a): a period-old conversation, idle, its journal written since it started. The journal is
+  // read (whole: its tail is the hand-off) only once one is due, by its time; journals only grow
   const journalAt = await mtimeOf($, `${root}/${inst.journal}`)
   const conv = await read($, conversationAt)
-  if (FRESH_PERIODS && journal !== null && (await read($, freshAt)) <= conv && freshDue({ context: inst.context, freshH: inst.freshH, conversationAt: conv, journalAt, now, idleMs: now - (await read($, idleSince)), pending: !!(await pendingRestart($, inst)) })) {
+  const freshNow = FRESH_PERIODS && journalAt !== null && (await read($, freshAt)) <= conv && freshDue({ context: inst.context, freshH: inst.freshH, conversationAt: conv, journalAt, now, idleMs: now - (await read($, idleSince)), pending: !!(await pendingRestart($, inst)) })
+  const journal = freshNow ? await readText($, `${root}/${inst.journal}`) : null
+  if (freshNow && journal !== null) {
     await update($, freshAt, () => now)
     await update($, nudgeAt, () => now)
     await counted()
@@ -7197,6 +7435,8 @@ async function nudgeTick($: any) {
   // journal, counts; not while it owns open board items: then only work landed elsewhere does, and the nudge names them)
   const owns = await ownedOpen($, inst)
   const c = cadenceOf({ cadenceH: inst.cadenceH, lastLanding: Math.max(carried.lastLanding, await read($, landedAt), journalAt ?? 0) || null, lastWork: Math.max(carried.lastWork, await read($, workLandedAt)) || null, ownsOpen: owns.length, startedAt: carried.startedAt || now, now })
+  // Its next period starts before the next pass: looked at then, not up to a minute later
+  if (c.nextMs !== null && c.nextMs < NUDGE_PASS_MS) kickNudge($, c.nextMs + 500)
   // One count with the sweeper's cadence wakes, one period key; and no cadence nudge while its way forward is its own
   // question to the person (it asked, nothing else came: a nudge would only make it ask again or say it waits)
   const sweptHere = swept && swept.day === day ? swept.instances[inst.slug] : undefined
@@ -7324,9 +7564,15 @@ export function classicLine(seen: Record<string, number>): string {
 
 /** A classic hook reached fleet: when, by event. A managed plugin can send one on past the plugins a person installed
  * (next.to beneath their tier): then fleet's own events stand in for it, and /fleet status says what it saw */
+// Kept the first time each one comes (only which ones came is used): FileChanged alone comes for every path any plugin
+// watches (sessions' bells, Claude's registry), and a write each time was one per event
+const classicNoted = new Set<string>()
 function sawClassic($: any, event: string) {
+  if (classicNoted.has(event)) return
+  classicNoted.add(event)
   bg(
     (async () => {
+      if ((await read($, classicSeen))[event]) return
       const now = await $.clock.now()
       await update($, classicSeen, m => ({ ...m, [event]: now }))
     })(),
@@ -8972,7 +9218,10 @@ async function rosterTick($: any) {
   // The open items nobody owns, offered; the runs' done-files; the capacity line (B14, B16, P19)
   // A result that needs reproducing becomes a board item first, so this pass offers it (G30)
   await reproduceTick($, now).catch(err => log($, `reproduce: ${String(err).slice(0, 200)}`))
-  const work = await workTick($, st.rows, list, down, now).catch(err => {
+  // The band's line on instances a restart stopped, for every person's session (work.json's restart): from this one
+  // status call, not one every 10 s in each of them
+  const restart = await restartLine($, st).catch(() => '')
+  const work = await workTick($, st.rows, list, down, now, restart).catch(err => {
     log($, `work: ${String(err).slice(0, 200)}`)
     return { offered: new Map<string, string[]>(), later: new Map<string, string[]>(), finished: new Map<string, string[]>() }
   })
@@ -9196,7 +9445,15 @@ async function rosterTick($: any) {
     }
   }
   for (const name of [...noFleetNames.keys()]) if (!named.has(name)) noFleetNames.delete(name)
-  if (woke) await replace($, stateDir('wakes.json'), json(swept))
+  if (woke) {
+    await replace($, stateDir('wakes.json'), json(swept))
+    // The band's restart line says what this sweep woke at once, not at the next one
+    const line = await restartLine($, st).catch(() => restart)
+    if (line !== restart) {
+      const w = await readWork($)
+      if (w) await replace($, stateDir('work.json'), json({ ...w, ...(line ? { restart: line } : { restart: undefined }) }))
+    }
+  }
   await setFleetMarks($, marks, now)
 }
 
@@ -9246,15 +9503,20 @@ async function asksTick($: any, now: number) {
 // The marks this session (the sweeper) keeps on the rows, set again every minute (they last 150 s, so a sweeper that
 // stops leaves none behind for long). Each one within sessions' limits (markRow): it refuses the whole call over one.
 // full: a full sweep's (rosterTick), kept for asksTick to lay the ask marks over
+const MARKS_TTL_MS = 300000
+const MARKS_RENEW_MS = 150000
 async function setFleetMarks($: any, given: Record<string, RowMark>, now: number, full = true) {
   if (full) fullMarks = given
   const rows = Object.fromEntries(Object.entries(given).map(([ref, m]) => [ref, markRow(m)]))
   const key = JSON.stringify(rows)
   const empty = key === '{}'
   if (empty && !marksSet.key) return
-  if (key === marksSet.key && now - marksSet.at < 60000) return
+  // The same marks again only near their end (MARKS_TTL_MS, renewed once MARKS_RENEW_MS old): each set rewrites sessions'
+  // store and rings every panel on the machine, so identical ones aren't sent every sweep. A sweeper that stops leaves
+  // them at most MARKS_TTL_MS
+  if (key === marksSet.key && now - marksSet.at < MARKS_RENEW_MS) return
   if (!(await has($, 'setMarks'))) return
-  const r = await race<Result>($, () => $.sessions.setMarks!({ source: 'fleet', rows, ttlMs: 150000 }))
+  const r = await race<Result>($, () => $.sessions.setMarks!({ source: 'fleet', rows, ttlMs: MARKS_TTL_MS }))
   if (r?.ok) {
     if (key !== marksSet.key) log($, `marks: ${empty ? 'none' : Object.keys(rows).join(', ')}`)
     marksSet.key = empty ? '' : key
@@ -10731,7 +10993,8 @@ async function overruleOpen($: any, c: Extract<Command, { kind: 'overrule' }>, r
  * fleet's own (decisions/overrules/D-<n>.json, removed at the turn that carries it) */
 async function deliverOverrules($: any) {
   if (!jobRef || delivering) return
-  const list = (await names($, dec('overrules'))).filter(n => /^D-\d+\.json$/.test(n))
+  // Usually empty or missing: then listed again only ABSENT_MS later, not every 2 s
+  const list = (await rareNames($, dec('overrules'))).filter(n => /^D-\d+\.json$/.test(n))
   if (!list.length) return
   const now = await $.clock.now()
   const pending = await read($, overruling)
@@ -11996,7 +12259,15 @@ export const register: Register = on => {
     try {
       await ensureWorld($)
       if (!root) return r
-      const out = { ...r, watchPaths: [...(r?.watchPaths ?? []), `${eventsDir()}/latest`, ...(intakeCfg ? [`${inboxDir()}/latest`] : [])] }
+      // The files it watches exist before it says so: a path whose folder is missing then is never watched in this
+      // session (the inbox's folder is made only once intake is set up)
+      const watched = [`${eventsDir()}/latest`, ...(intakeCfg ? [`${inboxDir()}/latest`] : [])]
+      for (const p of watched) {
+        if (await gone($, p)) await $.fs.write(p, json({ format: FORMAT, last: '' })).catch(() => {})
+      }
+      watchingLatest = true
+      watchMisses = 0
+      const out = { ...r, watchPaths: [...(r?.watchPaths ?? []), ...watched] }
       if (!envInstance || !jobRef) return out
       await loadRoster($)
       const inst = instanceNamed(envInstance)
@@ -12059,7 +12330,14 @@ export const register: Register = on => {
 
   on('classic.FileChanged', async ($, e, next) => {
     sawClassic($, 'FileChanged')
-    if (root && String(e.file_path).endsWith('/.claude/fleet/events/latest')) bg(eventsTick($))
+    if (root && String(e.file_path).endsWith('/.claude/fleet/events/latest')) {
+      bg(
+        (async () => {
+          fileChangedAt = await $.clock.now()
+          await eventsTick($)
+        })(),
+      )
+    }
     // A poller dropped an item: the sweeper reads it at its next tick
     if (root && String(e.file_path).endsWith('/.claude/fleet/inbox/latest')) sweep.intakeDirty = true
     return next(e)
@@ -12246,6 +12524,8 @@ export const register: Register = on => {
           await update($, busy, () => false)
           const now = await $.clock.now()
           await update($, idleSince, () => now)
+          // Its nudges are looked at once it's been idle the 30 s they wait for
+          if (myInstance) kickNudge($, 30500)
         })(),
       )
     }

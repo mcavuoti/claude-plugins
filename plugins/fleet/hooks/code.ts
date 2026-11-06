@@ -566,6 +566,15 @@ export function codeBriefLines(overlaps: readonly Overlap[], me: Me): string[] {
   return out
 }
 
+/** How long after its last poll a repository is polled again: everyMin, doubled for each failure in a row after the
+ * first, up to 30 minutes (a host down, a command failing aren't asked every few minutes) */
+export const CODE_BACKOFF_MAX_MS = 30 * 60000
+export function codeEveryMs(everyMin: number, s: Pick<RepoState, 'ok' | 'failures'> | null): number {
+  const base = everyMin * 60000
+  if (!s || s.ok) return base
+  return Math.max(base, Math.min(CODE_BACKOFF_MAX_MS, base * 2 ** Math.min(6, Math.max(0, (s.failures ?? 1) - 1))))
+}
+
 /** /fleet status's lines: each repository, its last poll and what it watches; the overlaps standing */
 export function codeStatusLines(c: CodeConfig, st: CodeState | null, me: Me, now: number, names: (slug: string) => string): string[] {
   const out: string[] = []
@@ -575,7 +584,7 @@ export function codeStatusLines(c: CodeConfig, st: CodeState | null, me: Me, now
     const seats = Object.entries(s?.seats ?? {})
     const when = s ? `polled at ${clock(s.polledAt, me.offsetMin)}, ${marker}` : 'not polled yet (the sweeper polls it)'
     out.push(`code: ${r.name} (${repoWords(r)}), every ${r.everyMin} min: ${when}${seats.length ? `; watching ${seats.slice(0, 8).map(([slug, where]) => `${names(slug)} (${where})`).join(', ')}${seats.length > 8 ? ` and ${seats.length - 8} more` : ''}` : s ? '; watching nobody' : ''}`)
-    if (s && !s.ok && s.problem) out.push(`  its last poll failed${s.failures && s.failures > 1 ? ` (${s.failures} in a row)` : ''}: ${s.problem}; tried again at ${clock(s.polledAt + r.everyMin * 60000, me.offsetMin)}`)
+    if (s && !s.ok && s.problem) out.push(`  its last poll failed${s.failures && s.failures > 1 ? ` (${s.failures} in a row)` : ''}: ${s.problem}; tried again at ${clock(s.polledAt + codeEveryMs(r.everyMin, s), me.offsetMin)}${s.failures && s.failures > 1 ? ' (fleet waits longer after each failure, up to 30 min)' : ''}`)
     else if (s?.problem) out.push(`  ${s.problem}`)
   }
   if (c.off.length) out.push(`code: off in world.json ("off": true): ${c.off.join(', ')}`)

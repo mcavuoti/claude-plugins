@@ -260,7 +260,7 @@ test('the sweeper marks an instance that runs with no fleet, and one over its bu
   const marks = calls(w, 'setMarks')
   const last = marks[marks.length - 1]
   expect(last.source).toBe('fleet')
-  expect(last.ttlMs).toBe(150000)
+  expect(last.ttlMs).toBe(300000)
   expect(last.rows.aaaaaaa1).toEqual({ badge: '✗', tint: 'error', line: 'no fleet in this session: u in the panel restarts it', needsPerson: true })
   // Owner B, over its budget, is marked so until its missing fleet outranks it
   expect(marks[0].rows.bbbbbbb1).toMatchObject({ badge: '$', tint: 'error', line: 'over budget: /fleet budget "Owner B" +n', needsPerson: true })
