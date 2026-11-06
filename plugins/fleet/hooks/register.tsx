@@ -5617,7 +5617,8 @@ type Heartbeat = {
   bg?: { command: string; at: number }[]
   /** The main thread's oldest tool call in flight (one that runs past STUCK_MS may hang: a call that never returns) */
   call?: { tool: string; since: number }
-  /** The roster's model or effort the account refused in this process: its requests run the session's own */
+  /** The roster's model or effort that got no response STEP_FAILS times in a row: its requests run the session's own
+   * until refusedUntil */
   modelRefused?: string
   effortRefused?: string
   /** How many no-responses in a row made it so, and when fleet asks for it again */
@@ -5642,8 +5643,10 @@ const STEP_BACKOFF_MS = 30 * 60000
 type StepWant = { model?: string; effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
 
 /** What an instance's main-loop request should name that it doesn't: the roster's model (an alias that picks for
- * itself never differs) and its effort, unless the account refused them in this process */
+ * itself never differs) and its effort, unless they got no response STEP_FAILS times in a row (then not for
+ * STEP_BACKOFF_MS), or its roster entry has a lint error */
 function stepWant(inst: Instance, e: { model: string; effort?: unknown }, now: number): StepWant | null {
+  if (myLint && myLint.of === roster && myLint.errors.length) return null
   const want: StepWant = {}
   if (inst.model && modelDiffers(inst.model, e.model)) want.model = inst.model
   // Effort where the request carries one, or along with a model fleet switches to (a model without effort drops it)
@@ -5651,6 +5654,25 @@ function stepWant(inst: Instance, e: { model: string; effort?: unknown }, now: n
   if (!want.model && !want.effort) return null
   if (stepRefused && now >= stepRefused.until) stepRefused = null
   return stepRefused && refusalKey(stepRefused) === refusalKey(want) ? null : want
+}
+
+/** An instance's lint errors: its own ("<name>": …, said without its name) and the roster's that name no instance that
+ * way (a role file missing, two instances with one name, a parent: /fleet up refuses the whole roster for them) */
+function lintOf(errors: readonly string[], all: readonly Instance[], inst: Instance): string[] {
+  const head = `"${inst.name}": `
+  const loose = errors.filter(x => !all.some(i => x.startsWith(`"${i.name}": `)))
+  return [...errors.filter(x => x.startsWith(head)).map(x => x.slice(head.length)), ...loose]
+}
+
+// This instance's lint errors, for the roster it was worked out on: while it has any, its requests keep the model and
+// effort they name (the roster's new ones wait until the entry is fixed, as its settings file does)
+let myLint: { of: unknown; errors: string[] } | null = null
+async function lintMine($: any, inst: Instance) {
+  if (!roster || myLint?.of === roster) return
+  const of = roster
+  const roleFiles = new Map<string, string | null>()
+  for (const a of new Set(roster.instances.map(i => i.agent))) roleFiles.set(a, await readText($, `${root}/.claude/agents/${a}.md`))
+  myLint = { of, errors: lintOf(lintRoster((of as { r: Roster }).r, roleFiles).errors, of.instances, inst) }
 }
 
 function refusalKey(w: StepWant): string {
@@ -5661,9 +5683,9 @@ function wantWords(w: StepWant): string {
   return [w.model, w.effort ? `effort ${w.effort}` : null].filter(Boolean).join(' at ')
 }
 
-/** What an instance runs, as its heartbeat says, beside the roster's model: the same; the account refused the
- * roster's; the account answered with its own though fleet asked for the roster's; or not asked for yet (the roster
- * changed since its last request: its next one names it) */
+/** What an instance runs, as its heartbeat says, beside the roster's model: the same; the roster's got no response
+ * STEP_FAILS times in a row (asked for again at refusedUntil); the account answered with its own though fleet asked for
+ * the roster's; or not asked for yet (the roster changed, or its last request fell back: its next one names it) */
 function modelLine(inst: Instance, hb: { model?: unknown; modelRefused?: unknown; asked?: unknown; refusedTimes?: unknown; refusedUntil?: unknown }, offsetMin = -new Date().getTimezoneOffset()): string {
   const runs = String(hb.model)
   if (!inst.model || !modelDiffers(inst.model, runs)) return `runs ${runs}`
@@ -5822,6 +5844,9 @@ async function bind($: any) {
   const type = agentType ?? current?.agent ?? null
   const was = myInstance?.name
   myInstance = inst
+  try {
+    await lintMine($, inst)
+  } catch {}
   bound = !type || type === inst.agent
   bindWhy = bound ? '' : `it runs as ${type}, and the roster gives ${inst.name} the role file ${inst.agent}`
   if (settingsHash === null) {
@@ -6336,8 +6361,8 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
   const later = new Map<string, string[]>()
   const finished = new Map<string, string[]>()
   if (!root || !roster) return { offered, later, finished }
-  // The board items' writers come from their landings
-  if (worldOn()) await pullEvents($)
+  // The board items' writers come from their landings (read only when events/latest moved)
+  await eventsTick($)
   const insts = roster.instances
   const items = await boardItems($)
   const had = await readWork($)
@@ -6364,7 +6389,7 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     // unblocked it, someone reworded it), a new round
     const changed = !!prev && prev.mtime !== undefined && prev.mtime !== it.mtime
     // Its writer (its last landing's session), never offered its own item when it's for anyone
-    const writer = latest.get(`board/${it.id}.md`)?.by?.name ?? prev?.writer ?? null
+    const writer = prev?.writer ?? latest.get(`board/${it.id}.md`)?.by?.name ?? null
     const rec = { for: it.for, since: prev?.since ?? now, offers: changed ? [] : [...(prev?.offers ?? [])], mtime: it.mtime, round: changed ? (prev?.round ?? 1) + 1 : (prev?.round ?? 1), allOffered: changed ? null : (prev?.allOffered ?? null), ...(writer ? { writer } : {}) }
     unowned[it.id] = rec
     const last = rec.offers[rec.offers.length - 1]
@@ -6387,7 +6412,7 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     pending.set(pick.slug, (pending.get(pick.slug) ?? 0) + 1)
     const into = rec.round > 1 ? later : offered
     into.set(pick.slug, [...(into.get(pick.slug) ?? []), it.id])
-    log($, `${it.id} (open, nobody owns it, for ${it.for ?? 'the front door'}) offered to ${pick.name}${rec.round > 1 ? ` (round ${rec.round}: its file changed)` : ''}`)
+    log($, `${it.id} (open, nobody owns it, for ${it.for ?? (front ? 'the front door' : 'anyone but its writer')}) offered to ${pick.name}${rec.round > 1 ? ` (round ${rec.round}: its file changed)` : ''}`)
   }
   // The runs: their done-files, then which finished and aren't recorded, by owner
   let views = await runViews($)
@@ -6561,7 +6586,7 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     const waiting = new Set(work.capacity.flags.map(f => f.inst))
     // Every instance an open item nobody owns fits, offered it yet or not
     const front = frontOf(roster?.r ?? null, roster?.instances ?? [])?.name ?? null
-    for (const u of Object.values(work.unowned)) for (const i of candidatesFor(u.for, roster?.instances ?? [], front, u.writer ?? null)) waiting.add(i.name)
+    for (const u of Object.values(work.unowned)) if (!u.allOffered) for (const i of candidatesFor(u.for, roster?.instances ?? [], front, u.writer ?? null)) waiting.add(i.name)
     const bare = work.capacity.idle.filter(n => n !== inst.name && !waiting.has(n))
     const k = `nothing|${Math.floor(now / HOUR)}`
     if (bare.length && told[k] === undefined) {
@@ -6603,7 +6628,7 @@ async function workStatus($: any, now: number): Promise<string[]> {
   for (const [id, u] of Object.entries(work?.unowned ?? {}).slice(0, 8)) {
     const last = u.offers[u.offers.length - 1]
     const fits = roster ? candidatesFor(u.for, roster.instances, front, u.writer ?? null) : []
-    const forWho = u.for ?? (fits.length ? 'the front door' : 'nobody')
+    const forWho = u.for ?? (front ? 'the front door' : fits.length ? 'anyone but its writer' : 'nobody')
     const state = !fits.length
       ? `: ${forNobodyWhy(u.for)}`
       : u.allOffered
@@ -8600,9 +8625,9 @@ async function rosterTakesEffect($: any): Promise<string[]> {
   for (const a of new Set(all.map(i => i.agent))) roleFiles.set(a, await readText($, `${root}/.claude/agents/${a}.md`))
   const errors = lintRoster((roster as { r: Roster }).r, roleFiles).errors
   for (const inst of all) {
-    const bad = errors.filter(x => x.startsWith(`"${inst.name}"`))
+    const bad = lintOf(errors, all, inst)
     if (bad.length) {
-      out.push(`  not applied to ${inst.name}: ${bad.map(x => x.slice(inst.name.length + 4)).join('; ')}; /fleet up --dry-run lists what to fix`)
+      out.push(`  not applied to ${inst.name}: ${bad.join('; ')}; its settings file stays as it was, and its model and effort stay as they were too; /fleet up --dry-run lists what to fix`)
       continue
     }
     const next = settingsText(settingsFor(inst, root as string, deny))
@@ -11928,8 +11953,9 @@ export const register: Register = on => {
 
   // An instance's main-loop requests run the roster's model and effort (B24/G32): a respawn replays the launch's
   // --model whatever the settings file says now, and /model in a background session waits on a dialog nobody answers,
-  // so each request names them itself. A model the account refuses (no response at all) is sent again as the session
-  // named it, and not asked for again in this process. The model that answered goes to the heartbeat
+  // so each request names them itself. A request of the roster's model that gets no response at all is sent again as the
+  // session named it; STEP_FAILS in a row and it isn't asked for again for STEP_BACKOFF_MS. The model that answered
+  // goes to the heartbeat
   on('turn.step', async function* ($, e, next) {
     // The loop's step now: the calls of one batch come from one step, so the gate's "once" is spent only from a later one
     stepOf.set(typeof e.agentId === 'string' && e.agentId ? e.agentId : 'main', `${e.turnId}#${e.index}`)
@@ -11944,7 +11970,10 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const want = e.agentId === undefined && myInstance ? stepWant(myInstance, e, now) : null
     let r: any = yield* next(want ? { ...e, ...want } : e)
+    // Its own request answered after fleet's got nothing: nothing fleet asked for answered this step
+    let fell = false
     if (want && noResponse(r)) {
+      fell = true
       const again: any = yield* next(e)
       // No response to what fleet asked, and one to the session's own request: counted; STEP_FAILS in a row and it's
       // not asked for again for STEP_BACKOFF_MS (an overload or a rate limit passes; a model the account lacks doesn't)
@@ -11960,10 +11989,10 @@ export const register: Register = on => {
       r = again
     } else if (want) stepFails = null
     // The model that answered (usage.model, as the API reports it), else the one the request named
-    const m = r?.usage?.model ?? (want && !noResponse(r) && stepRefused !== want ? (want.model ?? e.model) : e.model)
+    const m = r?.usage?.model ?? (want && !fell && !noResponse(r) ? (want.model ?? e.model) : e.model)
     if (e.agentId === undefined && typeof m === 'string' && m) {
       stepModel = m
-      stepAsked = want?.model && !noResponse(r) && stepRefused !== want ? want.model : e.model
+      stepAsked = want?.model && !fell && !noResponse(r) ? want.model : e.model
     }
     return r
   }).catch(async function* ($: any, e: any, next: any) {

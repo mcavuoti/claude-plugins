@@ -79,7 +79,7 @@ test('settingsFor never writes bypassPermissions, whatever the roster says', () 
 
 // ---- 2. an effort outside the levels ----
 
-test('an effort outside low..max is a lint error; its requests still get the roster model, and the effort only when it is a level', WITH_SESSIONS, async ($, on) => {
+test('an effort outside low..max is a lint error; while it stands, its requests keep the model and effort they name (as its settings file does)', WITH_SESSIONS, async ($, on) => {
   const lint = lintRoster(JSON.parse(roster({ model: 'claude-opus-5-5', effort: 'hihg' })) as Roster, new Map([['owner', OWNER]]))
   expect(lint.errors).toContain('"Owner A": effort "hihg" isn\'t a level (low, medium, high, xhigh or max)')
   expect(lintRoster(JSON.parse(roster({ effort: 'High' })) as Roster, new Map([['owner', OWNER]])).errors.filter(e => e.includes('effort'))).toEqual([])
@@ -98,9 +98,9 @@ test('an effort outside low..max is a lint error; its requests still get the ros
   sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
   await startSession($, w)
   await step($, 'claude-haiku-5-5', { effort: 'medium' })
-  expect(received).toEqual([{ model: 'claude-opus-5-5', effort: 'medium' }])
+  expect(received).toEqual([{ model: 'claude-haiku-5-5', effort: 'medium' }])
   await tick(w, 31000)
-  expect(json(w, `${HB}/state.json`).model).toBe('claude-opus-5-5')
+  expect(json(w, `${HB}/state.json`).model).toBe('claude-haiku-5-5')
 })
 
 // ---- 3. a model that doesn't answer: refused only after 3 in a row, asked again after a while ----
