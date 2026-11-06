@@ -2777,6 +2777,12 @@ async function gate($: any, e: any, next: any) {
       await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: cur.v as string } }))
       if (mine && cur.v) await update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } }))
       texts.push(gateText(v, w.rel, last && last.to === cur.v ? last : null, cur.mtimeMs, me))
+      // A new board item someone else just made under the id this thread meant for its own (ids race): the next free one
+      const item = /^board\/B-(\d+)\.md$/.exec(w.rel)
+      if (v === 'unread' && item && last && last.to === cur.v && last.from === null) {
+        const taken = (await names($, `${root}/board`)).map(x => /^B-(\d+)\.md$/.exec(x)).filter((m): m is RegExpExecArray => !!m).map(m => Number(m[1]))
+        texts.push(`B-${item[1]} is a new item ${last.by?.name || 'another session'} just created: if yours is another item, the next free id is B-${Math.max(Number(item[1]), ...taken) + 1}.`)
+      }
     }
     if (fresh.length) {
       await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [`pins:${w.rel}`]: [...new Set([...said, ...refusedKeys])].join('\n') } }))
@@ -4595,7 +4601,7 @@ async function slotCall($: any, e: any): Promise<any> {
       const l: Lease = { ...v.lease, until: r.until, ...(why ? { why } : {}) }
       await replace($, slotDir(name, `${v.lease.n}.json`), json(l))
       await update($, slotTold, m => ({ ...m, [leaseKey(l)]: now }))
-      return { result: `You hold ${name} (${v.lease.n + 1} of ${spec.count}) until ${clock(l.until, me.offsetMin)} now${r.capped ? ` (no later: ${others} wait${others === 1 ? 's' : ''} for it, and a lease lasts ${spec.leaseMin} min from when you took it)` : ''}. Release it with mcp__fleet__slot release as soon as you're done.` }
+      return { result: `You hold ${name} (unit ${v.lease.n + 1} of ${spec.count}; ${(await leasesOf($, name)).filter(x => x.lease.until > now).length} of ${spec.count} taken) until ${clock(l.until, me.offsetMin)} now${r.capped ? ` (no later: ${others} wait${others === 1 ? 's' : ''} for it, and a lease lasts ${spec.leaseMin} min from when you took it)` : ''}. Release it with mcp__fleet__slot release as soon as you're done.` }
     }
     if (v.kind === 'grant') {
       const old = leases.find(x => x.lease.n === v.n)
@@ -4612,7 +4618,7 @@ async function slotCall($: any, e: any): Promise<any> {
         await update($, slotTold, m => ({ ...m, [leaseKey(lease)]: now }))
         await update($, slotWait, l => l.filter(x => x !== name))
         log($, `slot ${name}: taken by ${slotHolderWords(holder)} (${v.n + 1} of ${spec.count})`)
-        return { result: `Yours: ${name} (${v.n + 1} of ${spec.count}) until ${clock(lease.until, me.offsetMin)} (${minutes} min). Release it with mcp__fleet__slot release as soon as you're done; take it again to extend it. Once it runs out, fleet takes it back.` }
+        return { result: `Yours: ${name} (unit ${v.n + 1} of ${spec.count}; ${(await leasesOf($, name)).filter(x => x.lease.until > now).length} of ${spec.count} taken) until ${clock(lease.until, me.offsetMin)} (${minutes} min). Release it with mcp__fleet__slot release as soon as you're done; take it again to extend it. Once it runs out, fleet takes it back.` }
       }
       leases = await leasesOf($, name)
       waiters = await waitersOf($, name)
@@ -5411,6 +5417,16 @@ function hungCall(hb: { call?: { tool: string; since: number }; waitingOn?: unkn
   const c = hb?.call
   if (!c || typeof c.tool !== 'string' || typeof c.since !== 'number' || hb?.waitingOn || OWN_PACE_TOOLS.has(c.tool)) return null
   return now - c.since >= STUCK_MS ? c : null
+}
+
+/** "2026-11-02 09:00 here, UTC-03:00": the date and time where the session runs, for what it writes */
+async function clockStamp($: any): Promise<string> {
+  const now = await $.clock.now()
+  const off = (await meNow($)).offsetMin
+  const d = new Date(now + off * 60000)
+  const two = (n: number) => String(n).padStart(2, '0')
+  const a = Math.abs(off)
+  return `${d.getUTCFullYear()}-${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())} here, UTC${off < 0 ? '-' : '+'}${two(Math.floor(a / 60))}:${two(a % 60)}`
 }
 
 /** A step that got no response at all: no usage, no stop reason, nothing said (the API refused the request) */
@@ -6343,13 +6359,22 @@ async function setInFlight($: any, how: 'restarted' | 'compacted', commands: rea
   const inst = myInstance
   if (!inst) return
   const runs = (await runViews($)).filter(v => v.run.owner.slug === inst.slug && !v.done)
-  if (!commands.length && !runs.length) return
+  // The slots it still holds (a restart doesn't give them back: the new process may not know)
+  const now = await $.clock.now()
+  const me = await meNow($)
+  const holder = await holderNow($)
+  const held: string[] = []
+  for (const spec of await loadSlots($)) for (const x of await leasesOf($, spec.name)) if (sameHolder(x.lease.holder, holder) && x.lease.until > now) held.push(`${spec.name} (unit ${x.lease.n + 1} of ${spec.count}, until ${clock(x.lease.until, me.offsetMin)})`)
+  if (!commands.length && !runs.length && !held.length) return
   const parts: string[] = []
+  if (held.length && how === 'restarted') parts.push(`the slots you hold: ${held.join(', ')}`)
   if (commands.length) parts.push(`background commands: ${commands.slice(0, 6).map(c => `\`${c}\``).join('; ')}${commands.length > 6 ? ` and ${commands.length - 6} more` : ''}`)
   if (runs.length) parts.push(`your declared runs: ${runs.map(v => `${v.run.id} (${v.run.what}${v.run.host ? `, on ${v.run.host}` : ''})`).join(', ')}`)
   // A restart ends the old process's background commands, never a detached run; a compaction ends neither
   const survived = how === 'restarted' ? ": a background command of the old process didn't survive a restart, a detached run did" : ''
-  await update($, inFlightNote, () => `fleet: your conversation was ${how} while these were in flight: ${parts.join('; ')}. Check their outputs (their logs, their done-files) before going on${survived}. Record what finished (mcp__fleet__run record).`)
+  if (!parts.length) return
+  const release = held.length && how === 'restarted' ? '; release a slot you no longer need (mcp__fleet__slot release)' : ''
+  await update($, inFlightNote, () => `fleet: your conversation was ${how} while these were in flight: ${parts.join('; ')}. Check their outputs (their logs, their done-files) before going on${survived}. Record what finished (mcp__fleet__run record)${release}.`)
   await update($, inFlightQuiet, () => quiet)
   log($, `in flight after ${how === 'restarted' ? 'a restart' : 'a compaction'} for ${inst.name}: ${commands.length} command(s), ${runs.length} run(s)${quiet ? ' (said at its next step)' : ''}`)
 }
@@ -6428,12 +6453,18 @@ async function heartbeatOf($: any, slug: string): Promise<Heartbeat | null> {
 async function contextSizes($: any, instances: readonly Instance[]): Promise<Record<string, number>> {
   const now = await $.clock.now()
   const out: Record<string, number> = {}
+  stoppedSizes.clear()
   for (const i of instances) {
     const hb = await heartbeatOf($, i.slug)
-    if (hb && now - hb.at < HEARTBEAT_STALE_MS && typeof hb.contextTokens === 'number' && hb.contextTokens > 0) out[i.slug] = hb.contextTokens
+    if (!hb || typeof hb.contextTokens !== 'number' || hb.contextTokens <= 0) continue
+    out[i.slug] = hb.contextTokens
+    // Its heartbeat is old: it isn't running, and a wake or a restart reloads the conversation it had (B26)
+    if (now - hb.at >= HEARTBEAT_STALE_MS) stoppedSizes.add(i.slug)
   }
   return out
 }
+/** The instances contextSizes priced at their last heartbeat's context (not running now) */
+const stoppedSizes = new Set<string>()
 
 // Today's spend and cap of every instance (instances/<slug>/spend.json, state/lifts.json) and of the project; an
 // instance is over when its own budget or the project's is. A few seconds' cache: the band reads it every 10 s
@@ -6889,6 +6920,7 @@ async function instanceContext($: any, inst: Instance): Promise<string> {
     ...(await derivedFor(inst)),
     (await loadSlots($)).length ? `The project's scarce resources (${(await loadSlots($)).map(x => `${x.name} ×${x.count}`).join(', ')}) are taken with mcp__fleet__slot take and given back with release; with none free you wait in line, and fleet tells you when one is yours.` : '',
     dateLine(await $.clock.now(), (await meNow($)).offsetMin, false),
+    "A time you write (in your journal, a record) comes from `date` or from fleet's clock, never a guess: every mcp__fleet__ result ends with it.",
   ]
     .filter(Boolean)
     .join(' ')
@@ -8884,12 +8916,12 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     const size = sizes[i.slug]
     const w = wakeUsd(i.model, effectivePerDay(wakes), size)
     const pw = i.poll ? wakeUsd(i.model, pollsPerDay(i.poll), size) : null
-    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day${pw !== null ? `, polls ~${usd(pw)}/day (${pollsPerDay(i.poll as { everyMin: number })} a day)` : ''}${size !== undefined ? ` (its context: ${tokensText(size)})` : ''}` : ''}`
+    const cost = `${i.usdDay !== null ? `${usd(i.usdDay)}/day` : 'no budget'}${w !== null ? `, wakes ~${usd(w)}/day${pw !== null ? `, polls ~${usd(pw)}/day (${pollsPerDay(i.poll as { everyMin: number })} a day)` : ''}${size !== undefined ? ` (its context${stoppedSizes.has(i.slug) ? ' when it stopped' : ''}: ${tokensText(size)})` : ''}` : ''}`
     const now =
       p.action === 'start'
         ? 'to start'
         : p.action === 'running'
-          ? `running (${p.state}): placed, not started again${rewritten.has(i.slug) ? `; ${c.dryRun ? 'its settings would be rewritten' : 'settings rewritten'}: ${c.restartWhenIdle ? 'it restarts with them once idle' : 'u restarts it with them, or /fleet up --restart-when-idle restarts it once idle'}` : ''}`
+          ? `running (${p.state}): placed, not started again (fleet doesn't restart a running session: a model or effort change reaches it at its next request)${rewritten.has(i.slug) ? `; ${c.dryRun ? 'its settings would be rewritten' : 'settings rewritten'}: ${c.restartWhenIdle ? 'it restarts with them once idle' : 'u restarts it with them, or /fleet up --restart-when-idle restarts it once idle'}` : ''}`
           : p.action === 'wake'
             ? p.why === 'person'
               ? 'stopped by you: not woken (Enter or u in the panel restarts it)'
@@ -8981,7 +9013,7 @@ async function downCommand($: any, names: string[], origin: string): Promise<str
   const running = st?.ready ? p.picked.filter(i => rowsOf(i, st.rows).running) : []
   return [
     `Down: ${p.picked.map(i => i.name).join(', ')}. fleet won't wake or nudge them, and /fleet up skips them (/fleet up <name> brings one back).`,
-    running.length ? `Still running: ${running.map(i => i.name).join(', ')}: s in the panel stops one (fleet never stops a session).` : 'None of them is running.',
+    running.length ? `Still running: ${running.map(i => i.name).join(', ')}: ${running.length === 1 ? 'it keeps' : 'they keep'} working; fleet only stops waking and nudging ${running.length === 1 ? 'it' : 'them'} until /fleet up names ${running.length === 1 ? 'it' : 'them'} (s in the panel stops the session).` : 'None of them is running.',
   ].join('\n')
 }
 
@@ -11484,6 +11516,14 @@ export const register: Register = on => {
     if (r && r.drop === undefined && d.lines.length) bg(d.told())
     if (r && r.drop === undefined && ids.length) bg(update($, identityTold, () => true))
     return r
+  }).catch(($, e, next) => next(e))
+
+  // fleet's own tools end each result with its clock: a role with no Bash has no other to stamp what it writes (an
+  // outer hook, so it sees what each tool's own hook below answered)
+  on('tool.call', { tool: /^mcp__fleet__/ }, async ($, e, next) => {
+    const r: any = await next(e)
+    // Beside its answer, as a line of context (the answer's own text stays as the tool wrote it)
+    return r && typeof r.result === 'string' ? { ...r, context: [...(Array.isArray(r.context) ? r.context : []), `fleet's clock: ${await clockStamp($)}`] } : r
   }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'mcp__fleet__decide' }, async ($, e) => {

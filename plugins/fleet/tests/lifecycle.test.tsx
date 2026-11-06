@@ -202,7 +202,7 @@ test("an instance's heartbeat carries its main thread's tool call in flight, and
   on('classic.SessionStart', () => ({}))
   // Beneath fleet: a search that doesn't return until the test lets it
   let release: (v: unknown) => void = () => {}
-  on('tool.call', { tool: 'Grep' }, () => new Promise(r => (release = r)) as any)
+  on('tool.call', { tool: 'Grep' as any }, () => new Promise(r => (release = r)) as any)
   sessionsSay(w, { current: { ready: true, ref: 'aaaaaaaa', sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', name: 'Owner A', root: ROOT, background: true, agent: 'owner' }, rows: { aaaaaaaa: row('aaaaaaaa', 'Owner A', 'working') } })
   await startSession($, w)
   const t0 = w.clock.now()
@@ -280,4 +280,62 @@ test('after a restart an instance hears the slots it still holds, beside its run
   expect(told.length).toBe(1)
   expect(told[0]).toMatch(/fleet: your conversation was restarted while these were in flight: the slots you hold: lab \(unit 1 of 2, until \d\d:\d\d\)/)
   expect(told[0]).toContain('release a slot you no longer need (mcp__fleet__slot release)')
+})
+
+// ---- B25, B26: /fleet down and up say what they do; a stopped instance is priced at the context it will reload ----
+
+test('/fleet down says the session keeps running; /fleet up on a running one says it restarts nothing, and what reaches it without a restart', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { background: false, files: { [`${FLEET}/roster.json`]: roster({}), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${HB}/state.json`]: beat() } })
+  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'idle') } })
+  await startSession($, w)
+  const down = await fleet($, 'down "Owner A"')
+  expect(down).toContain('Still running: Owner A: it keeps working; fleet only stops waking and nudging it until /fleet up names it (s in the panel stops the session).')
+  const up = await fleet($, 'up "Owner A"')
+  expect(up).toContain("placed, not started again (fleet doesn't restart a running session: a model or effort change reaches it at its next request)")
+})
+
+test('a stopped instance is priced at the context it had when it stopped (a wake reloads all of it), and said so', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { background: false, files: { [`${FLEET}/roster.json`]: roster({}), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${HB}/state.json`]: beat({ at: NOW - 5 * HOUR, contextTokens: 300000 }) } })
+  sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'idle' } } })
+  await startSession($, w)
+  expect(await fleet($, 'up --dry-run')).toContain('(its context when it stopped: 300k)')
+})
+
+// ---- The board's ids, the clock of a role with no Bash, a slot's count ----
+
+test('a write to a board item a peer just created, unread: the refusal names the next free id', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['board/**'], files: { [`${FLEET}/roster.json`]: JSON.stringify(POC_TEAM), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${ROOT}/board/B-6.md`]: '# six\n' } })
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  await w.clock.advance(3000)
+  await w.clock.settle()
+  landed(w, 'board/B-7.md', '---\nowner: open\nstatus: open\n---\n# seven\n', { name: 'PoC A', ref: 'bbbbbbb1' }, 1)
+  await w.clock.advance(3000)
+  await w.clock.settle()
+  const r: any = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/board/B-7.md`, content: '# my new item\n' } as any)
+  expect(String(r.deny ?? '')).toContain('B-7 is a new item PoC A just created: if yours is another item, the next free id is B-8')
+})
+
+test("every mcp__fleet__ result ends with fleet's clock (a role with no Bash has no other)", WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Owner A', FLEET_ROLE: 'owner' }, files: { [`${FLEET}/roster.json`]: roster({}), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${FLEET}/instances/owner-a.json`]: '{}\n' } })
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
+  on('classic.SessionStart', () => ({}))
+  sessionsSay(w, { current: { ready: true, ref: 'aaaaaaaa', sessionId: 'aaaaaaaa-0000-0000-0000-000000000000', name: 'Owner A', root: ROOT, background: true, agent: 'owner' }, rows: { aaaaaaaa: row('aaaaaaaa', 'Owner A', 'working') } })
+  await startSession($, w)
+  await w.clock.advance(2100)
+  await w.clock.settle()
+  const r: any = await $.tool.call({ tool: 'mcp__fleet__run', action: 'list' } as any)
+  expect((r.context ?? []).join('\n')).toMatch(/fleet's clock: \d{4}-\d{2}-\d{2} \d{2}:\d{2} here, UTC[+-]\d{2}:\d{2}/)
+  const ctx: any = await $.classic.SessionStart({ source: 'startup', agent_type: 'owner' } as any)
+  expect(ctx.additionalContext.join('\n')).toContain('A time you write (in your journal, a record) comes from `date` or from fleet\'s clock, never a guess')
+})
+
+test('a slot taken says which unit and how many are taken', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [`${FLEET}/slots.json`]: JSON.stringify({ slotsFormat: 1, slots: { lab: { count: 4, leaseMin: 30, what: 'the test machine' } } }), [`${FLEET}/state/slots/lab/0.json`]: JSON.stringify({ format: 1, slot: 'lab', n: 0, holder: { sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', ref: 'bbbbbbbb', name: 'Tester 2' }, at: NOW, until: NOW + 20 * 60000 }) } })
+  sessionsSay(w, { rows: {} })
+  await startSession($, w)
+  const r: any = await $.tool.call({ tool: 'mcp__fleet__slot', action: 'take', slot: 'lab' } as any)
+  expect(String(r.result)).toContain('Yours: lab (unit 2 of 4; 2 of 4 taken) until')
+  const again: any = await $.tool.call({ tool: 'mcp__fleet__slot', action: 'take', slot: 'lab' } as any)
+  expect(String(again.result)).toContain('You hold lab (unit 2 of 4; 2 of 4 taken) until')
 })
