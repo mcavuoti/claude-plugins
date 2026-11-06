@@ -33,7 +33,7 @@ How you work:
   branch (or a changelist synced to the depot's head).
 - Land the result as a file of its own in poc/results/ (poc/results/<area>-<what>.md), named in the item, with its
   proof: `kind: result`, the exact command as run from the project's folder (`run:`) and the sha256 of its standard
-  output (`sha:`, from `<command> | shasum -a 256`). A long run (a simulation) keeps its stored hash: fleet's proofs
+  output (`sha:`, from `<command> | shasum -a 256`; in it `command grep`, and `| sort` after a list of files). A long run (a simulation) keeps its stored hash: fleet's proofs
   check doesn't run it again, so its record also says where it ran (the host, the branch or changelist, the commit) and
   where its log is. fleet marks a finding or a result without its proof as unproven, and the gap matrix and the proposal
   don't count it.

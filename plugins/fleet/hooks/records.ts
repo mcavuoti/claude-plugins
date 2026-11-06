@@ -50,6 +50,9 @@ export type Records = {
   /** world.json's defaultKind: what a landing with no change line counts as under a glob (board items: editorial, so
    * a status or an owner moving flags nobody who cites them); first match wins, revision elsewhere */
   defaultKinds: { glob: string; re: RegExp; kind: ChangeKind }[]
+  /** world.json's history: shared registers many write a row of (a list of runs, a log), read like journals: their pins
+   * are what a row cited when, never stale, never refused, never a proof's business */
+  history: { glob: string; re: RegExp }[]
 }
 /** Which records must carry a proof: those under these globs, and those whose kind: line names one of these kinds */
 export type Proofs = { globs: string[]; res: RegExp[]; kinds: string[] }
@@ -153,7 +156,22 @@ export function recordsOf(w: WorldConfig, insensitive: boolean): { records: Reco
       defaultKinds.push({ glob, re: globRegex(glob, insensitive), kind })
     }
   }
-  return { records: { id, pin, changeKey, strict, checks, commitEveryMin, proofs: p.proofs, defaultKinds } }
+  const history: Records['history'] = []
+  if (w.history !== undefined && w.history !== null) {
+    if (!Array.isArray(w.history)) return { problem: 'world.json: history is a list of globs: ["notes/runs.md"]' }
+    for (const glob of w.history) {
+      if (typeof glob !== 'string') return { problem: 'world.json: history is a list of globs: ["notes/runs.md"]' }
+      const bad = checkGlob(glob)
+      if (bad) return { problem: `world.json: history "${glob}" ${bad}` }
+      history.push({ glob, re: globRegex(glob, insensitive) })
+    }
+  }
+  return { records: { id, pin, changeKey, strict, checks, commitEveryMin, proofs: p.proofs, defaultKinds, history } }
+}
+
+/** Whether a path is one of world.json's history registers */
+export function isHistoryPath(rel: string, records: Records | null): boolean {
+  return !!records && (records.history ?? []).some(h => h.re.test(rel))
 }
 
 /** What a landing with no change line counts as at this path (world.json's defaultKind), or null: a revision */
@@ -230,8 +248,9 @@ export function parsePin(s: string): Pin | null {
  * too: "was R-1@2, now R-1@4"). In order of id */
 export function pinsOf(text: string, records: Records): Pin[] {
   const best = new Map<string, Pin>()
-  for (const m of withoutChangeLine(text, records.changeKey).matchAll(new RegExp(records.pin.source, 'g'))) {
-    const p = { id: m[1] as string, rev: Number(m[2]) }
+  for (const m of withoutChangeLine(text, records.changeKey).matchAll(new RegExp(`${records.pin.source}(?:${RANGE_END})?`, 'g'))) {
+    // A range in prose (F-7@3–@5, F-7@3..5, F-7@3 to @5) cites where it ends
+    const p = { id: m[1] as string, rev: Number(m[3] ?? m[2]) }
     const had = best.get(p.id)
     if (p.rev > 0 && (!had || p.rev > had.rev)) best.set(p.id, p)
   }
@@ -242,8 +261,12 @@ export function pinsOf(text: string, records: Records): Pin[] {
  * versions with the same body hash differ only in which versions they cite and in their change line, so the second is
  * editorial (a re-pin after a revision elsewhere doesn't cascade to whoever cites this one) */
 export function bodyHashOf(text: string, records: Records): string {
-  return hashText(withoutChangeLine(text, records.changeKey).replace(new RegExp(records.pin.source, 'g'), (_m, id: string) => `${id}@`))
+  return hashText(withoutChangeLine(text, records.changeKey).replace(new RegExp(`${records.pin.source}(?:${RANGE_END})?`, 'g'), (_m, id: string) => `${id}@`))
 }
+
+/** The end of a range of versions after a pin, its number captured: –@5 or — @5 (a dash and an optional @), -@5,
+ * ..5 or ..@5, " to @5" */
+const RANGE_END = '(?:\\s*[\u2013\u2014]\\s*@?|-@|\\.\\.@?|\\s+to\\s+@)(\\d+)(?![0-9])'
 
 /** Where a text's change line is: the index of its line among the text's lines (the front matter when there is one,
  * else the first 30 lines), or -1 */
@@ -464,7 +487,7 @@ export function pinsText(problems: readonly PinProblem[], me: Me, canDecide: boo
   const shown = problems.slice(0, MAX_LINES)
   const lines = [`fleet: this write cites records you need to read first (this write was not made):`, ...shown.map(p => problemLine(p, me))]
   if (problems.length > shown.length) lines.push(`- and ${problems.length - shown.length} more: ${problems.slice(MAX_LINES).map(p => pinKey(p.pin)).join(', ')}`)
-  lines.push(`A read is the Read tool or a plain cat of the file. Then write again.${canDecide ? ' If what changed contradicts your task, ask the person with mcp__fleet__decide.' : ''}`)
+  lines.push(`A read is the Read tool, or one file shown by cat, head, tail, nl or sed -n N,Mp alone (a grep or a pipe doesn't count). Then write again.${canDecide ? ' If what changed contradicts your task, ask the person with mcp__fleet__decide.' : ''}`)
   return lines.join('\n')
 }
 

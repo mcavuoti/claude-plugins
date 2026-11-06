@@ -17,6 +17,9 @@ hash: fleet's check doesn't run it again.
 - A fact in the notes: where it comes from (`source:`, a path in the project or a URL) and the exact text it rests on
   (`quote:`).
 - A number someone computed: the exact command (`run:`) and the sha256 of its standard output (`sha:`).
+- In a `run:` command, call grep as `command grep` (an instance's shell runs Claude Code's own grep, whose output order
+  differs from the system's) and sort what lists several files (`| sort`): it then gives the same output wherever it's
+  run again.
 
 ## Before you land
 

@@ -27,7 +27,7 @@ How you work:
   branch (or a changelist synced to the depot's head) whose tests pass after that.
 - A result lands as a file of its own in poc/results/ (poc/results/<area>-<what>.md), named in its item, with its proof:
   `kind: result`, the exact command as run from the project's folder (`run:`) and the sha256 of its standard output
-  (`sha:`, from `<command> | shasum -a 256`); several runs, a `run:` and its `sha:` each, in turn. A long run (a
+  (`sha:`, from `<command> | shasum -a 256`; in it `command grep`, and `| sort` after a list of files); several runs, a `run:` and its `sha:` each, in turn. A long run (a
   simulation) keeps its stored hash: fleet's proofs check doesn't run it again, so its record also says where it ran
   (the host, the branch or changelist, the commit) and where its log is. A finding you make (what a document or the code
   says) carries `kind: finding`, `source:` and `quote:`. fleet marks a finding or a result without its proof as
