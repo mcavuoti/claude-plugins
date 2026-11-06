@@ -497,13 +497,17 @@ function sentencesIn(t: string): string[] {
 
 /** A hold line: a block that starts by saying its part isn't to go out, after any decoration (a bracket, an emoji, bold):
  * the words that can only mean it ("DO NOT POST until QA signs off", "**[Not ready]**"), or hold, held or unready set
- * off as a marker: in capitals ("[HOLD] waiting"), or followed by a separator, until, pending, for, off or nothing
- * ("(Held) waiting", "Held until D-12", "Hold: QA"), or a status saying so ("Status: held until …"). It holds the whole
- * section it's in, not only itself. An ordinary sentence that starts so ("Hold the date: …", "Held on Friday, …") holds
- * nothing, and a block that only mentions it further on ("Notes (internal, never post): …") marks only itself */
-const HOLD_PHRASE = /^[^\p{L}\p{N}]*(?:do not post|don'?t post|never post(?:ed)?|not ready|not for posting|not to be posted)\b/iu
-const HOLD_WORD = /^[^\p{L}\p{N}]*(?:(?:status|state)\s*[:=]\s*)?(?:on hold|hold|held|unready)(?=\s*$|\s*[:\-–—\])}.!,;]|\s+(?:until|pending|for|off)\b)/iu
-const HOLD_CAPS = /^[^\p{L}\p{N}]*(?:ON HOLD|HOLD|HELD|UNREADY)\b/u
+ * off as a marker: in capitals ("[HOLD] waiting"), or followed by a separator (a hyphen or a dash only with a space
+ * before it: "Held-out accuracy" is a term), until, pending, for, off or nothing ("(Held) waiting", "Held until D-12",
+ * "Hold: QA", "Held - QA"); holding only before until, pending, for or off ("Holding until QA signs off"). Either may
+ * follow a short label of one to three words ("Status: not ready", "Note: do not post until …", "Pending QA: hold").
+ * It holds the whole section it's in, not only itself. An ordinary sentence that starts so ("Hold the date: …", "Held
+ * on Friday, …", "Holding costs fall") holds nothing, and a block that only mentions it further on ("Notes (internal,
+ * never post): …") marks only itself */
+const HOLD_LABEL = String.raw`(?:\p{L}+(?:\s+\p{L}+){0,2}\s*[:=][^\p{L}\p{N}]*)?`
+const HOLD_PHRASE = new RegExp(String.raw`^[^\p{L}\p{N}]*${HOLD_LABEL}(?:do not post|don'?t post|never post(?:ed)?|not ready|not for posting|not to be posted)\b`, 'iu')
+const HOLD_WORD = new RegExp(String.raw`^[^\p{L}\p{N}]*${HOLD_LABEL}(?:(?:on hold|hold|held|unready)(?=\s*$|\s*[:–—\])}.!,;]|\s+[-–—]\s|\s+(?:until|pending|for|off)\b)|holding(?=\s+(?:until|pending|for|off)\b))`, 'iu')
+const HOLD_CAPS = /^[^\p{L}\p{N}]*(?:ON HOLD|HOLD|HELD|UNREADY)\b(?!-)/u
 
 function holdsSection(block: { text: string; heading?: number }): boolean {
   if (block.heading) return false
