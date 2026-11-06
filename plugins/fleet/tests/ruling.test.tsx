@@ -40,7 +40,7 @@ test('a ruling the person types unprompted in his own session is recorded as his
   await $.turn.complete({ text: '' } as any)
   await typed($, w, 'From now on the report shows only the two packet sizes we quote, not the others.', 't-1')
   expect((await decide($, { kind: 'ruling' })).deny).toContain('about: one line on what the person ruled')
-  const r = await decide($, { kind: 'ruling', about: 'which packet sizes the report shows' })
+  const r = await decide($, { kind: 'ruling', about: 'which packet sizes the report shows.' })
   expect(r.result).toContain('Recorded as D-1: the person\'s ruling on which packet sizes the report shows, in his words')
   const reg = json(w, `${DEC}/register/2026-11/D-1.json`)
   expect(reg).toMatchObject({ source: 'decide', ruling: true, state: 'delivered', questions: [{ question: 'which packet sizes the report shows', options: [] }], answers: [{ text: 'From now on the report shows only the two packet sizes we quote, not the others.', origin: 'composer', pre: true }] })

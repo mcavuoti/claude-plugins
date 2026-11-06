@@ -19,6 +19,12 @@ if grep -n "sessions-data" "$hooks"/*; then
   status=1
 fi
 
+# A line fleet writes to the transcript doesn't start with its name: Claude puts the plugin's name before it already
+if grep -n "ui\.log(\`fleet:" "$hooks"/* | grep -v "to: 'debug'"; then
+  echo "fleet starts a transcript line with \"fleet:\": Claude adds the plugin's name itself" >&2
+  status=1
+fi
+
 # Every command goes through run(), which gives it a folder that exists and a timeout
 count=$(cat "$hooks"/* | grep -c '\$\.process\.run' || true)
 if [ "$count" -ne 1 ]; then

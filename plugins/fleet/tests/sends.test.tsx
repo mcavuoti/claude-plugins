@@ -38,7 +38,7 @@ function landByB(w: World, path: string, text: string) {
 const calls: { tool: string; input: any }[] = []
 let mode: 'ok' | 'prompt' | 'ran-then-withheld' = 'ok'
 let answerPrompt: (how: 'run' | 'deny') => void = () => {}
-let checkVerdict: 'allow' | 'deny' = 'allow'
+let checkVerdict: 'allow' | 'deny' | 'ask-rule' = 'allow'
 
 function serve(on: any) {
   checkVerdict = 'allow'
@@ -64,7 +64,7 @@ const ROSTER = JSON.stringify({ rosterFormat: 1, sections: [{ id: 'team', title:
 async function liaison($: any, on: any, ready = '# Ready\n\n## Q-1\n\nWe can run both sizes this week.\n'): Promise<World> {
   const w = world(on, { worldPaths: ['notes/**'], env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Liaison', FLEET_ROLE: 'liaison' }, files: { [READY]: ready, [`${FLEET}/outbound.json`]: SOURCED, [`${FLEET}/roster.json`]: ROSTER, [`${ROOT}/.claude/agents/liaison.md`]: LIAISON, [`${FLEET}/instances/liaison.json`]: '{}\n' } })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
-  on('tool.check', () => (checkVerdict === 'deny' ? { decision: 'deny', reason: 'a deny rule refuses it' } : { decision: 'allow' }))
+  on('tool.check', (_: any, e: any) => (checkVerdict === 'deny' ? { decision: 'deny', reason: 'a deny rule refuses it' } : checkVerdict === 'ask-rule' ? { decision: 'ask', rule: String(e.tool), reason: 'a rule asks the person' } : { decision: 'allow' }))
   sessionsSay(w, { current: { ready: true, ref: REF, sessionId: SID, name: 'Liaison', root: ROOT, background: true, agent: 'liaison' }, rows: { [REF]: row(REF, 'Liaison', 'idle') } })
   serve(on)
   on('classic.SessionStart', () => ({}))
@@ -322,4 +322,25 @@ test('a hold line with a short label before it holds its section; a hyphenated t
   for (const line of ['Held-out accuracy is 92% on both sizes.', 'Hold-out set: both sizes pass.', 'Holding costs fall with the larger size.', 'Holding: the larger size.', 'Hold the date: the launch is on 12 Dec.']) {
     expect([line, holds(line)]).toEqual([line, false])
   }
+})
+
+test('in an instance, a send the gate lets out that a settings rule puts to the person (an ask with no organisation ceiling) is refused before that prompt too; a read isn’t', { plugins: [FAKE_SESSIONS], timeoutMs: 30000 }, async ($, on) => {
+  await liaison($, on)
+  checkVerdict = 'ask-rule'
+  const v: any = await $.tool.check({ tool: POST, input: READY_POST.input, tool_use_id: 'u-rule', approver: 'person' } as any)
+  expect(v.decision).toBe('deny')
+  expect(v.reason).toContain("fleet: this wasn't sent. A permission rule puts every call of mcp__claude_ai_Office__send_chat_message to the person")
+  expect(v.reason).toContain('draft it with mcp__fleet__send')
+  // A read of the same server: left to its prompt
+  expect(((await $.tool.check({ tool: 'mcp__claude_ai_Office__read_resource', input: { uri: 'x' }, tool_use_id: 'u-read', approver: 'person' } as any)) as any).decision).toBe('ask')
+  // Nobody to put it to (no approver): not fleet's to refuse
+  expect(((await $.tool.check({ tool: POST, input: READY_POST.input, tool_use_id: 'u-host' } as any)) as any).decision).toBe('ask')
+})
+
+test('the person’s own background session keeps a rule’s prompt for a send', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**'], files: { [READY]: '# Ready\n\n## Q-1\n\nWe can run both sizes this week.\n', [`${FLEET}/outbound.json`]: SOURCED } })
+  on('tool.check', (_: any, e: any) => ({ decision: 'ask', rule: String(e.tool) }))
+  await startSession($, w)
+  await tick(w, 1100)
+  expect(((await $.tool.check({ tool: POST, input: READY_POST.input, tool_use_id: 'u-mine', approver: 'person' } as any)) as any).decision).toBe('ask')
 })
