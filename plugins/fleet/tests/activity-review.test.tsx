@@ -130,14 +130,15 @@ test('one request of the roster model with no response is no refusal; three in a
   await step($, 'claude-haiku-5-5')
   // Once: sent again on the session's model, then asked for at the next step
   expect(received).toEqual(['claude-opus-5-5', 'claude-haiku-5-5', 'claude-opus-5-5'])
-  await tick(w, 31000)
+  // (its next heartbeat: one a minute)
+  await tick(w, 61000)
   expect(json(w, `${HB}/state.json`).modelRefused).toBe(undefined)
   // Three in a row: not asked for again for 30 min
   failing = 3
   received.length = 0
   for (let k = 0; k < 4; k++) await step($, 'claude-haiku-5-5')
   expect(received).toEqual(['claude-opus-5-5', 'claude-haiku-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-haiku-5-5'])
-  await tick(w, 31000)
+  await tick(w, 61000)
   expect(json(w, `${HB}/state.json`).modelRefused).toBe('claude-opus-5-5')
   expect(await fleet($, 'status')).toMatch(/runs claude-haiku-5-5, roster says claude-opus-5-5 \(claude-opus-5-5 got no response 3 times in a row: its requests run the session's own model; fleet asks for it again at \d\d:\d\d\)/)
   await tick(w, 30 * 60000)
