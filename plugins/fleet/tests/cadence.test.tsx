@@ -78,7 +78,8 @@ test('nothing landed in its cadence period: a nudge from its own fleet each peri
   // It lands its journal (a negative result counts): the next period counts from there
   const r: any = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/journals/owner-a.md`, content: 'result: nothing found in the first source\n' } as any)
   expect(r.deny).toBe(undefined)
-  await tick(w, 30100)
+  // (its next heartbeat: one a minute)
+  await tick(w, 60100)
   expect(json(w, `${HB}/state.json`)).toMatchObject({ cadenceH: 0.25, context: 'long', journal: 'journals/owner-a.md' })
   expect(json(w, `${HB}/state.json`).lastLanding).toBeGreaterThan(Date.UTC(2026, 10, 2, 12, 30, 0))
   await tick(w, 16 * 60000)

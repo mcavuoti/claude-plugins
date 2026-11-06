@@ -173,6 +173,7 @@ test("an instance whose turns end on an API error isn't shown as idle: status sa
   expect(await fleet($, 'status')).toContain('last turn failed')
   await $.turn.start({ text: 'again', turnId: 't-10' } as any)
   await $.turn.complete({ answer: 'done', durationMs: 10, isAborted: false, turnId: 't-10', reason: 'answer' } as any)
-  await tick(w, 31000)
+  // (its next heartbeat: one a minute)
+  await tick(w, 61000)
   expect(json(w, `${FLEET}/instances/owner-a/state.json`).failed).toBe(null)
 })

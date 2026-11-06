@@ -213,7 +213,8 @@ test("an instance's heartbeat carries its main thread's tool call in flight, and
   expect(json(w, `${HB}/state.json`).call).toEqual({ tool: 'Grep', since: t0 })
   release({ result: 'ok', text: 'nothing found' })
   await pending
-  await w.clock.advance(31000)
+  // (its next heartbeat: one a minute)
+  await w.clock.advance(61000)
   await w.clock.settle()
   expect(json(w, `${HB}/state.json`).call).toBe(undefined)
 })

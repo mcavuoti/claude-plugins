@@ -58,6 +58,8 @@ export const FAKE_SESSIONS = {
         contract: async () => ({ api: 1, version: '0.13.0', format: 2, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', ...((await world()).extra ?? [])] }),
         current: async () => (await world()).current ?? { ready: false, ref: null, sessionId: '', name: '', root: '', background: false, agent: null },
         status: async input => {
+          // Logged too, so a test can count a session's status calls
+          await note({ status: input })
           const w = await world()
           if (!w.rows) return { ready: false, rows: [] }
           const refs = input.refs ?? []
@@ -148,6 +150,8 @@ export type World = {
   exec: { value: (argv: string[], cwd: string, stdin?: string) => { exitCode: number; stdout?: string; stderr?: string } | undefined }
   // How many times each path was read (fs.read), for a test that counts a timer's reads
   readCount: Map<string, number>
+  // ... and looked at (fs.stat, fs.exists)
+  statCount: Map<string, number>
 }
 
 export type WorldOptions = {
@@ -254,6 +258,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('turn.complete', () => ({ text: '' }))
   const unreadable = new Set<string>()
   const readCount = new Map<string, number>()
+  const statCount = new Map<string, number>()
   on('fs.read', (_, e) => {
     readCount.set(e.path, (readCount.get(e.path) ?? 0) + 1)
     if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: '{"version": "0.1.0"}' }
@@ -266,7 +271,10 @@ export function world(on: On, options: WorldOptions = {}): World {
     addFile(e.path, e.text)
     return { value: undefined }
   })
-  on('fs.exists', (_, e) => ({ value: files.has(e.path) || dirs.has(e.path) }))
+  on('fs.exists', (_, e) => {
+    statCount.set(e.path, (statCount.get(e.path) ?? 0) + 1)
+    return { value: files.has(e.path) || dirs.has(e.path) }
+  })
   on('fs.list', (_, e) => {
     lists.push(e.path)
     if (!dirs.has(e.path)) throw new Error(`ENOENT: ${e.path}`)
@@ -279,6 +287,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: entries }
   })
   on('fs.stat', (_, e) => {
+    statCount.set(e.path, (statCount.get(e.path) ?? 0) + 1)
     const p = real(e.path)
     if (p === undefined) throw new Error(`ENOENT: ${e.path}`)
     const file = files.get(p)
@@ -418,7 +427,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec, readCount }
+  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec, readCount, statCount }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

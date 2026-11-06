@@ -274,7 +274,7 @@ test('the words: what the instance hears (never a commit message), its row\'s ma
   expect(status).toEqual([
     'code: repo (git, main in .), every 5 min: polled at 14:02, at 436d16c; watching Area A (.claude/worktrees/area-a-1)',
     'code: depot (Perforce, //depot/... on dev), every 5 min: polled at 14:02, no marker yet; watching nobody',
-    '  its last poll failed (2 in a row): ssh: no route; tried again at 14:07',
+    '  its last poll failed (2 in a row): ssh: no route; tried again at 14:12 (fleet waits longer after each failure, up to 30 min)',
     'code: off in world.json ("off": true): x',
     'code overlaps (nothing is held; each instance hears its own once, and its row is marked ↻ until it rebases or syncs):',
     `  Area A: main moved under src/x.c (436d16c by TEST Integrator at 14:02), in .claude/worktrees/area-a-1, since 14:02`,
