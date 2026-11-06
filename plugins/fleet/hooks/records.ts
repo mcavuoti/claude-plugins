@@ -249,8 +249,8 @@ export function parsePin(s: string): Pin | null {
 export function pinsOf(text: string, records: Records): Pin[] {
   const best = new Map<string, Pin>()
   for (const m of withoutChangeLine(text, records.changeKey).matchAll(new RegExp(`${records.pin.source}(?:${RANGE_END})?`, 'g'))) {
-    // A range in prose (F-7@3–@5, F-7@3..5, F-7@3 to @5) cites where it ends
-    const p = { id: m[1] as string, rev: Number(m[3] ?? m[2]) }
+    // A range in prose (F-7@3–@5, F-7@3..5, F-7@3 to @5) cites where it ends, when that is past where it starts
+    const p = { id: m[1] as string, rev: rangeEnd(m) ?? Number(m[2]) }
     const had = best.get(p.id)
     if (p.rev > 0 && (!had || p.rev > had.rev)) best.set(p.id, p)
   }
@@ -261,12 +261,30 @@ export function pinsOf(text: string, records: Records): Pin[] {
  * versions with the same body hash differ only in which versions they cite and in their change line, so the second is
  * editorial (a re-pin after a revision elsewhere doesn't cascade to whoever cites this one) */
 export function bodyHashOf(text: string, records: Records): string {
-  return hashText(withoutChangeLine(text, records.changeKey).replace(new RegExp(`${records.pin.source}(?:${RANGE_END})?`, 'g'), (_m, id: string) => `${id}@`))
+  return hashText(bodyTextOf(text, records))
 }
 
-/** The end of a range of versions after a pin, its number captured: –@5 or — @5 (a dash and an optional @), -@5,
- * ..5 or ..@5, " to @5" */
-const RANGE_END = '(?:\\s*[\u2013\u2014]\\s*@?|-@|\\.\\.@?|\\s+to\\s+@)(\\d+)(?![0-9])'
+/** A text as its body hash sees it: its change line taken out, every pin's version number blanked (a range's end too,
+ * when it is one); what a copy is compared by (a copy whose pins moved is still a copy) */
+export function bodyTextOf(text: string, records: Records): string {
+  return withoutChangeLine(text, records.changeKey).replace(new RegExp(`${records.pin.source}(?:${RANGE_END})?`, 'g'), (...a: any[]) => {
+    const m = a as unknown as RegExpMatchArray
+    const id = m[1] as string
+    // Not a range (no end, or one not past the start): the text after the pin's number stays in the body
+    return rangeEnd(m) === null ? `${id}@${(m[0] as string).slice(`${id}@${m[2]}`.length)}` : `${id}@`
+  })
+}
+
+/** The end of a range of versions after a pin, its number captured: –@5 or — @5 (a dash, then @), -@5, ..5 or ..@5,
+ * " to @5". A dash and a bare number after a pin is prose ("F-7@3 — 2 tests fail") */
+const RANGE_END = '(?:\\s*[\u2013\u2014]\\s*@|-@|\\.\\.@?|\\s+to\\s+@)(\\d+)(?![0-9])'
+
+/** A pin match's range end, when it has one past its start (F-7@5..2 is F-7@5 and some prose) */
+function rangeEnd(m: RegExpMatchArray): number | null {
+  if (m[3] === undefined) return null
+  const end = Number(m[3])
+  return end > Number(m[2]) ? end : null
+}
 
 /** Where a text's change line is: the index of its line among the text's lines (the front matter when there is one,
  * else the first 30 lines), or -1 */

@@ -122,6 +122,8 @@ export type World = {
   tools: any[]
   commands: string[]
   runs: string[][]
+  /** The folders fleet listed, in order */
+  lists: string[]
   // Every prompt fleet submitted, and how the next one is answered (by default its turn starts at once)
   submits: string[]
   answerSubmit: { value: (text: string) => unknown }
@@ -232,6 +234,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const tools: any[] = []
   const commands: string[] = []
   const runs: string[][] = []
+  const lists: string[] = []
   const submits: string[] = []
   const answerSubmit = { value: (text: string): unknown => ({ text }) }
   const logs: string[] = []
@@ -261,6 +264,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   })
   on('fs.exists', (_, e) => ({ value: files.has(e.path) || dirs.has(e.path) }))
   on('fs.list', (_, e) => {
+    lists.push(e.path)
     if (!dirs.has(e.path)) throw new Error(`ENOENT: ${e.path}`)
     const prefix = e.path === '/' ? '/' : `${e.path}/`
     const below = (p: string) => p.startsWith(prefix) && p.length > prefix.length && !p.slice(prefix.length).includes('/')
@@ -410,7 +414,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec }
+  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {
