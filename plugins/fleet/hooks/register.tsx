@@ -323,6 +323,7 @@ import {
   perDayText,
   cadenceNudgeText,
   candidatesFor,
+  isEffort,
   isUnowned,
   cadenceOf,
   ownsOpenItem,
@@ -5619,6 +5620,9 @@ type Heartbeat = {
   /** The roster's model or effort the account refused in this process: its requests run the session's own */
   modelRefused?: string
   effortRefused?: string
+  /** How many no-responses in a row made it so, and when fleet asks for it again */
+  refusedTimes?: number
+  refusedUntil?: number
   /** The model its last request named (the roster's once fleet asked for it): a different one answered, the account's */
   asked?: string
 }
@@ -5626,19 +5630,26 @@ type Heartbeat = {
 let stepModel: string | null = null
 // The model its last main-loop request named (the roster's, once fleet asked for it)
 let stepAsked: string | null = null
-// The roster's model and effort the account refused in this process, not asked for again till a restart
-let stepRefused: StepWant | null = null
+// Whether turn.step tried to bind this process already
+let stepBound = false
+// The roster's model and effort that got no response STEP_FAILS times in a row: not asked for again until `until`
+let stepRefused: (StepWant & { until: number; times: number }) | null = null
+// Its no-responses in a row so far, for one model and effort
+let stepFails: { key: string; times: number } | null = null
+const STEP_FAILS = 3
+const STEP_BACKOFF_MS = 30 * 60000
 
 type StepWant = { model?: string; effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
 
 /** What an instance's main-loop request should name that it doesn't: the roster's model (an alias that picks for
  * itself never differs) and its effort, unless the account refused them in this process */
-function stepWant(inst: Instance, e: { model: string; effort?: unknown }): StepWant | null {
+function stepWant(inst: Instance, e: { model: string; effort?: unknown }, now: number): StepWant | null {
   const want: StepWant = {}
   if (inst.model && modelDiffers(inst.model, e.model)) want.model = inst.model
   // Effort where the request carries one, or along with a model fleet switches to (a model without effort drops it)
-  if (inst.effort && e.effort !== inst.effort && (e.effort !== undefined || want.model)) want.effort = inst.effort as StepWant['effort']
+  if (inst.effort && isEffort(inst.effort) && e.effort !== inst.effort && (e.effort !== undefined || want.model)) want.effort = inst.effort
   if (!want.model && !want.effort) return null
+  if (stepRefused && now >= stepRefused.until) stepRefused = null
   return stepRefused && refusalKey(stepRefused) === refusalKey(want) ? null : want
 }
 
@@ -5653,11 +5664,11 @@ function wantWords(w: StepWant): string {
 /** What an instance runs, as its heartbeat says, beside the roster's model: the same; the account refused the
  * roster's; the account answered with its own though fleet asked for the roster's; or not asked for yet (the roster
  * changed since its last request: its next one names it) */
-function modelLine(inst: Instance, hb: { model?: unknown; modelRefused?: unknown; asked?: unknown }): string {
+function modelLine(inst: Instance, hb: { model?: unknown; modelRefused?: unknown; asked?: unknown; refusedTimes?: unknown; refusedUntil?: unknown }, offsetMin = -new Date().getTimezoneOffset()): string {
   const runs = String(hb.model)
   if (!inst.model || !modelDiffers(inst.model, runs)) return `runs ${runs}`
   if (typeof hb.modelRefused === 'string' && !modelDiffers(hb.modelRefused, inst.model) && !modelDiffers(inst.model, hb.modelRefused))
-    return `runs ${runs}, roster says ${inst.model} (the account refused ${inst.model}: its requests run the session's own model; fleet asks for ${inst.model} again after a restart)`
+    return `runs ${runs}, roster says ${inst.model} (${inst.model} got no response ${typeof hb.refusedTimes === 'number' ? hb.refusedTimes : STEP_FAILS} times in a row: its requests run the session's own model; fleet asks for it again ${typeof hb.refusedUntil === 'number' ? `at ${clock(hb.refusedUntil, offsetMin)}` : 'after a restart'})`
   if (typeof hb.asked === 'string' && (hb.asked === inst.model || !modelDiffers(inst.model, hb.asked))) return `runs ${runs}, roster says ${inst.model} (a model the account lacks falls back)`
   return `runs ${runs}, roster says ${inst.model} (its next request asks for ${inst.model})`
 }
@@ -5930,6 +5941,7 @@ async function heartbeat($: any) {
     ...(stepAsked ? { asked: stepAsked } : {}),
     ...(stepRefused?.model ? { modelRefused: stepRefused.model } : {}),
     ...(stepRefused?.effort ? { effortRefused: stepRefused.effort } : {}),
+    ...(stepRefused ? { refusedTimes: stepRefused.times, refusedUntil: stepRefused.until } : {}),
     failed: turnFailed,
     classicStart: !!(await read($, classicSeen)).SessionStart,
     ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
@@ -6050,7 +6062,7 @@ type WorkOffer = { slug: string; at: number }
 type WorkFile = {
   format: number
   at: number
-  unowned: Record<string, { for: string | null; since: number; offers: WorkOffer[]; mtime?: number; round?: number; allOffered?: number | null }>
+  unowned: Record<string, { for: string | null; since: number; offers: WorkOffer[]; mtime?: number; round?: number; allOffered?: number | null; writer?: string }>
   capacity: Capacity
   quiet?: Record<string, number>
 }
@@ -6105,7 +6117,17 @@ type ReproduceFile = { format: number; since: number; made: Record<string, { ite
 
 /** world.json's "reproduce": [{ "glob": "poc/results/**", "for": "tester" }]: a result (front matter kind: result) an
  * instance of another role lands under the glob becomes a board item for that role, once per file */
+let reproduceCache: { mtime: number; rules: { re: RegExp; glob: string; for: string }[] } | null = null
 async function reproduceRules($: any): Promise<{ re: RegExp; glob: string; for: string }[]> {
+  // Kept while world.json stays the version the world was loaded from (a tick asks every 5 s)
+  const mtime = world?.mtimeMs ?? -1
+  if (reproduceCache && reproduceCache.mtime === mtime && mtime !== -1) return reproduceCache.rules
+  const rules = await readReproduceRules($)
+  reproduceCache = { mtime, rules }
+  return rules
+}
+
+async function readReproduceRules($: any): Promise<{ re: RegExp; glob: string; for: string }[]> {
   const raw = parseJson(await readText($, `${fleetDir()}/world.json`))
   const list = Array.isArray(raw?.reproduce) ? raw.reproduce : []
   return list
@@ -6130,14 +6152,24 @@ async function reproduceTick($: any, now: number) {
     const rule = rules.find(r => r.re.test(e.path))
     if (!rule) continue
     const writer = roster.instances.find(i => i.name === e.by?.name)
-    if (!writer || writer.role.toLowerCase() === rule.for.toLowerCase() || writer.name.toLowerCase() === rule.for.toLowerCase()) continue
+    // Its writer is one the rule is for (a role, its plural, a list): its own result is the reproduction
+    const forRule = candidatesFor(rule.for, roster.instances, null)
+    if (!writer || forRule.some(i => i.slug === writer.slug || i.role === writer.role)) continue
+    // A file under the glob that isn't a result: read once per version
+    if (notResult.get(e.path) === e.to) continue
     const text = await readText($, `${root}/${e.path}`)
-    if (text === null || !/^\s*kind\s*:\s*result\b/im.test(text.split('\n').slice(0, 40).join('\n'))) continue
+    if (text === null || !/^\s*kind\s*:\s*result\b/im.test(text.slice(0, 4096).split('\n').slice(0, 40).join('\n'))) {
+      notResult.set(e.path, e.to)
+      continue
+    }
     const id = records ? idOf(e.path, records) : null
     const cite = id && e.rev ? `${id}@${e.rev}` : null
-    // The board names it already (an item a lead wrote for it, open or closed)
+    // The board has its reproduction already: an item naming it, for the rule's role, that its writer doesn't own (the
+    // item that asked for the result names it too, and is no reproduction)
     const named = await (async () => {
       for (const b of board) {
+        if (b.owner && b.owner.toLowerCase() === writer.name.toLowerCase()) continue
+        if (!candidatesFor(b.for, roster.instances, null).some(i => forRule.some(r => r.slug === i.slug))) continue
         const t = await readText($, `${root}/board/${b.id}.md`)
         if (t && (t.includes(e.path) || (id && new RegExp(`\\b${id}\\b`).test(t)))) return b.id
       }
@@ -6159,6 +6191,9 @@ async function reproduceTick($: any, now: number) {
     await replace($, stateDir('reproduce.json'), json(file))
   }
 }
+
+/** A file under a reproduce glob that isn't a result, by path: the version read (not read again till it changes) */
+const notResult = new Map<string, string>()
 
 async function openReproduceItem($: any, e: ChangeEvent, writer: Instance, rule: { glob: string; for: string }, cite: string | null, now: number): Promise<string | null> {
   const dir = `${root}/board`
@@ -6301,6 +6336,8 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
   const later = new Map<string, string[]>()
   const finished = new Map<string, string[]>()
   if (!root || !roster) return { offered, later, finished }
+  // The board items' writers come from their landings
+  if (worldOn()) await pullEvents($)
   const insts = roster.instances
   const items = await boardItems($)
   const had = await readWork($)
@@ -6326,11 +6363,13 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     // A round per version of the item's file: each instance it's for is offered it once; its file changed (the person
     // unblocked it, someone reworded it), a new round
     const changed = !!prev && prev.mtime !== undefined && prev.mtime !== it.mtime
-    const rec = { for: it.for, since: prev?.since ?? now, offers: changed ? [] : [...(prev?.offers ?? [])], mtime: it.mtime, round: changed ? (prev?.round ?? 1) + 1 : (prev?.round ?? 1), allOffered: changed ? null : (prev?.allOffered ?? null) }
+    // Its writer (its last landing's session), never offered its own item when it's for anyone
+    const writer = latest.get(`board/${it.id}.md`)?.by?.name ?? prev?.writer ?? null
+    const rec = { for: it.for, since: prev?.since ?? now, offers: changed ? [] : [...(prev?.offers ?? [])], mtime: it.mtime, round: changed ? (prev?.round ?? 1) + 1 : (prev?.round ?? 1), allOffered: changed ? null : (prev?.allOffered ?? null), ...(writer ? { writer } : {}) }
     unowned[it.id] = rec
     const last = rec.offers[rec.offers.length - 1]
     if (last && now - last.at < OFFER_AGAIN_MS) continue
-    const fits = candidatesFor(it.for, insts, front)
+    const fits = candidatesFor(it.for, insts, front, rec.writer ?? null)
     const tried = new Set(rec.offers.map(o => o.slug))
     // Every instance it's for was offered it, and the last had its time: offered no more until its file changes
     if (fits.length && fits.every(i => tried.has(i.slug))) {
@@ -6382,7 +6421,7 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
   const nobody: string[] = []
   for (const [id, u] of Object.entries(unowned)) {
     if (now - u.since < FLAG_AFTER_MS) continue
-    const fits = candidatesFor(u.for, insts, front)
+    const fits = candidatesFor(u.for, insts, front, u.writer ?? null)
     // No instance can be offered it: no for: that names one, and no front door
     if (!fits.length) {
       nobody.push(id)
@@ -6480,7 +6519,7 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     if (offers.some(x => x.round <= 1)) urgent = true
   }
   // Its results fleet opened a reproduction item for (G30): once each
-  const repro = await readWire<ReproduceFile>($, stateDir('reproduce.json'))
+  const repro = worldOn() && (await reproduceRules($)).length ? await readWire<ReproduceFile>($, stateDir('reproduce.json')) : null
   for (const [path, m] of Object.entries(repro?.made ?? {})) {
     if (m.writer !== inst.slug || told[`repro|${path}`] !== undefined || now - m.at > 24 * HOUR) continue
     if (!m.opened) continue
@@ -6520,6 +6559,9 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
   // The others idle with nothing on the board for them (G27): the front door turns the backlog into items, once an hour
   if (work && frontOf(roster?.r ?? null, roster?.instances ?? [])?.slug === inst.slug) {
     const waiting = new Set(work.capacity.flags.map(f => f.inst))
+    // Every instance an open item nobody owns fits, offered it yet or not
+    const front = frontOf(roster?.r ?? null, roster?.instances ?? [])?.name ?? null
+    for (const u of Object.values(work.unowned)) for (const i of candidatesFor(u.for, roster?.instances ?? [], front, u.writer ?? null)) waiting.add(i.name)
     const bare = work.capacity.idle.filter(n => n !== inst.name && !waiting.has(n))
     const k = `nothing|${Math.floor(now / HOUR)}`
     if (bare.length && told[k] === undefined) {
@@ -6560,7 +6602,7 @@ async function workStatus($: any, now: number): Promise<string[]> {
   const front = roster ? (frontOf(roster.r, roster.instances)?.name ?? null) : null
   for (const [id, u] of Object.entries(work?.unowned ?? {}).slice(0, 8)) {
     const last = u.offers[u.offers.length - 1]
-    const fits = roster ? candidatesFor(u.for, roster.instances, front) : []
+    const fits = roster ? candidatesFor(u.for, roster.instances, front, u.writer ?? null) : []
     const forWho = u.for ?? (fits.length ? 'the front door' : 'nobody')
     const state = !fits.length
       ? `: ${forNobodyWhy(u.for)}`
@@ -6612,7 +6654,7 @@ async function fitsMe($: any, inst: Instance): Promise<string[]> {
   if (!work || !roster) return []
   const front = frontOf(roster.r, roster.instances)?.name ?? null
   return Object.entries(work.unowned)
-    .filter(([, u]) => candidatesFor(u.for, roster?.instances ?? [], front).some(i => i.slug === inst.slug))
+    .filter(([, u]) => candidatesFor(u.for, roster?.instances ?? [], front, u.writer ?? null).some(i => i.slug === inst.slug))
     .map(([id]) => id)
 }
 
@@ -7185,7 +7227,7 @@ async function instanceContext($: any, inst: Instance): Promise<string> {
     ...(await derivedFor(inst)),
     (await loadSlots($)).length ? `The project's scarce resources (${(await loadSlots($)).map(x => `${x.name} ×${x.count}`).join(', ')}) are taken with mcp__fleet__slot take and given back with release; with none free you wait in line, and fleet tells you when one is yours.` : '',
     dateLine(await $.clock.now(), (await meNow($)).offsetMin, false),
-    "A time you write (in your journal, a record) comes from `date` or from fleet's clock, never a guess: every mcp__fleet__ result ends with it.",
+    "A time you write (in your journal, a record) comes from `date` or from fleet's clock, never a guess: most mcp__fleet__ results carry it (a refusal doesn't).",
   ]
     .filter(Boolean)
     .join(' ')
@@ -8504,8 +8546,9 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   const stale = rivals.length ? ` ${rivals.join(', ')} ${rivals.length === 1 ? 'changes' : 'change'} ${spec.path} too, drafted on the version it just left, so ${rivals.length === 1 ? "it can't" : "they can't"} apply: /fleet ${rivals.map(id => `${id} reject`).join(' ')} closes ${rivals.length === 1 ? 'it' : 'them'} as stale (${rivals.length === 1 ? 'its asker hears' : 'their askers hear'} the file moved, and can draft again)` : ''
   // roster.json takes effect now: instance by instance, what changes (P26)
   const took = spec.path === '.claude/fleet/roster.json' ? await rosterTakesEffect($) : []
-  const effect = spec.path === '.claude/fleet/roster.json' ? (took.length ? '. It takes effect now:\n' + took.join('\n') + '\n' : '. No instance\'s settings changed') : effectOf(spec.path)
-  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effect}. ${who} hears it.${stale}`, done: true, applied: true }
+  const effect = spec.path === '.claude/fleet/roster.json' ? (took.length ? '' : ". No instance's settings changed") : effectOf(spec.path)
+  const list = took.length ? `\nIt takes effect now:\n${took.join('\n')}` : ''
+  return { line: `${n}: applied ${rec.id}: fleet wrote ${spec.path}${v.edited ? ' with your edits to the draft' : ' as drafted'} (${shortHash(v.hash)})${effect}. ${who} hears it.${stale}${list}`, done: true, applied: true }
 }
 
 // What follows fleet's write of a command-level file the person answered for (an applied change, the outbound.json of
@@ -8552,7 +8595,16 @@ async function rosterTakesEffect($: any): Promise<string[]> {
   const at = await $.clock.now()
   const out: string[] = []
   let wrote = false
+  // The same lint as /fleet up's: an instance it finds an error for keeps its settings and isn't restarted
+  const roleFiles = new Map<string, string | null>()
+  for (const a of new Set(all.map(i => i.agent))) roleFiles.set(a, await readText($, `${root}/.claude/agents/${a}.md`))
+  const errors = lintRoster((roster as { r: Roster }).r, roleFiles).errors
   for (const inst of all) {
+    const bad = errors.filter(x => x.startsWith(`"${inst.name}"`))
+    if (bad.length) {
+      out.push(`  not applied to ${inst.name}: ${bad.map(x => x.slice(inst.name.length + 4)).join('; ')}; /fleet up --dry-run lists what to fix`)
+      continue
+    }
     const next = settingsText(settingsFor(inst, root as string, deny))
     const before = await readText($, settingsPath(inst.slug))
     if (before === next) continue
@@ -11881,29 +11933,44 @@ export const register: Register = on => {
   on('turn.step', async function* ($, e, next) {
     // The loop's step now: the calls of one batch come from one step, so the gate's "once" is spent only from a later one
     stepOf.set(typeof e.agentId === 'string' && e.agentId ? e.agentId : 'main', `${e.turnId}#${e.index}`)
-    // A request before the instance's first binding (a respawn's first turn): bound now, the roster read once
-    if (e.agentId === undefined && !myInstance && jobRef && root) {
+    // A request before the instance's first binding (a respawn's first turn): bound now, once per process (a session
+    // that's no instance leaves the rest to the 30 s timer)
+    if (e.agentId === undefined && !myInstance && jobRef && root && !stepBound) {
+      stepBound = true
       try {
         await bind($)
       } catch {}
     }
-    const want = e.agentId === undefined && myInstance ? stepWant(myInstance, e) : null
+    const now = await $.clock.now()
+    const want = e.agentId === undefined && myInstance ? stepWant(myInstance, e, now) : null
     let r: any = yield* next(want ? { ...e, ...want } : e)
     if (want && noResponse(r)) {
       const again: any = yield* next(e)
-      // Refused for what fleet asked, not for some other reason: the session's own request went through
+      // No response to what fleet asked, and one to the session's own request: counted; STEP_FAILS in a row and it's
+      // not asked for again for STEP_BACKOFF_MS (an overload or a rate limit passes; a model the account lacks doesn't)
       if (!noResponse(again)) {
-        stepRefused = want
-        log($, `the account refused ${wantWords(want)} for ${myInstance?.name}: its requests run ${e.model}${e.effort !== undefined ? ` (${e.effort})` : ''}`)
+        const key = refusalKey(want)
+        stepFails = { key, times: stepFails?.key === key ? stepFails.times + 1 : 1 }
+        if (stepFails.times >= STEP_FAILS) {
+          stepRefused = { ...want, until: now + STEP_BACKOFF_MS, times: stepFails.times }
+          stepFails = null
+          log($, `${wantWords(want)} got no response ${STEP_FAILS} times in a row for ${myInstance?.name}: its requests run ${e.model}${e.effort !== undefined ? ` (${e.effort})` : ''} for ${STEP_BACKOFF_MS / 60000} min`)
+        }
       }
       r = again
-    }
+    } else if (want) stepFails = null
     // The model that answered (usage.model, as the API reports it), else the one the request named
     const m = r?.usage?.model ?? (want && !noResponse(r) && stepRefused !== want ? (want.model ?? e.model) : e.model)
     if (e.agentId === undefined && typeof m === 'string' && m) {
       stepModel = m
       stepAsked = want?.model && !noResponse(r) && stepRefused !== want ? want.model : e.model
     }
+    return r
+  }).catch(async function* ($: any, e: any, next: any) {
+    // The hook failed (an argument the engine refused): the request goes as it came, and its model is still recorded
+    const r: any = yield* next(e)
+    const m = r?.usage?.model ?? e.model
+    if (e.agentId === undefined && typeof m === 'string' && m) stepModel = m
     return r
   })
 
