@@ -41,6 +41,10 @@ declare module 'claude-code' {
       /** This process's own id ('' until made): kept through a reload, new after a restart; a send's claim at the
        * permission prompt names it, so a later process knows the prompt went with the old one */
       processId: string
+      /** The version of the set of paths this session's classic.SessionStart handed the engine to watch (0: none yet).
+       * A module that finds its own set here gets fleet's files' changes by FileChanged (live updates); one that
+       * doesn't reads them on timers */
+      watching: number
       /** The section fleet last put this session in ('fleet:asking', 'none'; '' not known yet) */
       section: string
       /** What each thread of this session read of the world: 'main' or a helper's agentId → path → the read */

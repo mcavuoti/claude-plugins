@@ -24,6 +24,8 @@ test('/fleet init sets the project up: config, decisions folders, .gitignore; ag
   expect(await fleet($, '')).toContain('/fleet init')
   const said = await fleet($, 'init')
   expect(said).toContain(`Set up in ${FLEET}/`)
+  // Claude watches only what SessionStart named, before the project's folders existed: the reply says how to go live
+  expect(said).toContain("This session reads fleet's files on timers until /clear (or u)")
   expect(json(w, `${FLEET}/config.json`)).toEqual({ configFormat: 1, template: 'blank', commitRegister: false })
   expect(w.files.get(`${FLEET}/.gitignore`)).toContain('\ndecisions/\n')
   for (const d of ['queue', 'answers', 'register', 'tmp', 'prune']) expect(w.dirs.has(`${DEC}/${d}`)).toBe(true)
