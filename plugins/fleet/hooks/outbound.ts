@@ -495,19 +495,40 @@ function sentencesIn(t: string): string[] {
     .filter(Boolean)
 }
 
-/** The sentences a ready post may be made of, in the file's order: every block's, less a block marked not to post and
- * every block under a heading marked so (to the next heading of its level or above) */
+/** A hold line: a block that starts by saying its part isn't to go out ("DO NOT POST N-4 yet", "Held: waiting for the
+ * person", "Not ready"). It holds the whole section it's in, not only itself; a block that only mentions it further on
+ * ("Notes (internal, never post): …") marks only itself, as before */
+const HOLD_LINE = /^(?:do not post|don't post|never post(?:ed)?|not ready|not for posting|not to be posted|hold|held|unready)\b/i
+
+function holdsSection(block: { text: string; heading?: number }): boolean {
+  return !block.heading && HOLD_LINE.test(plainText(block.text))
+}
+
+/** The sentences a ready post may be made of, in the file's order: every block's, less a block marked not to post,
+ * every block under a heading marked so (to the next heading of its level or above), and every block of a section a
+ * hold line is in (the section of its nearest heading, its subsections with it; before any heading, the lines up to
+ * the first one) */
 export function postableSentences(source: string): string[] {
+  const blocks = blocksOf(source)
+  // The sections a hold line holds: by the index of their heading (-1, the lines before any heading)
+  const held = new Set<number>()
+  let section = -1
+  for (const [i, b] of blocks.entries()) {
+    if (b.heading) section = i
+    else if (holdsSection(b)) held.add(section)
+  }
   const out: string[] = []
   let skipBelow = 0
-  for (const b of blocksOf(source)) {
+  let before = held.has(-1)
+  for (const [i, b] of blocks.entries()) {
     if (b.heading) {
+      before = false
       if (skipBelow && b.heading > skipBelow) continue
-      skipBelow = notPosted(b) ? b.heading : 0
+      skipBelow = notPosted(b) || held.has(i) ? b.heading : 0
       if (!skipBelow) out.push(...sentencesIn(b.text))
       continue
     }
-    if (skipBelow || notPosted(b)) continue
+    if (before || skipBelow || notPosted(b)) continue
     out.push(...sentencesIn(b.text))
   }
   return out
@@ -1671,7 +1692,9 @@ export function checkSend(input: any): { ok: true; send: SendInput } | { ok: fal
 
 /** The outbound a queue record carries: what it is, where it goes, why; the exact call (its draft file, relative to
  * <project>/.claude/fleet/, which the person may edit), the files it sends with their versions when it was drafted,
- * the folder it runs from, and the version the person approves: the draft and the files together */
+ * the folder it runs from, and the version the person approves: the draft and the files together. sources: the files
+ * a calls entry checks a ready post against (its source), with their versions when it was drafted: not sent, so not
+ * in the version; the post is checked against them again when the person sends it */
 export type OutboundSpec = {
   to: string
   why: string
@@ -1681,6 +1704,7 @@ export type OutboundSpec = {
   files: { path: string; v: string | null }[]
   cwd: string
   hash: string
+  sources?: { path: string; v: string | null }[]
 }
 
 /** The draft file's text: the exact call, as fleet will make it */

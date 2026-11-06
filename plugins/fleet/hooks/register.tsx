@@ -101,6 +101,7 @@ import {
   changeLine,
   changedPaths,
   clock,
+  clockOn,
   digestItems,
   digestText,
   eventName,
@@ -1110,6 +1111,8 @@ async function closeNow($: any, id: string, how: CloseHow) {
       // A withdrawn one counts in no judge's stats: nobody answered it
       ...(jf && how.state !== 'withdrawn' ? { judge: judgeEntryOf(jf, outcomes, drop) } : {}),
       ...(rec.supersedes ? { supersedes: rec.supersedes } : {}),
+      ...(rec.supersedesAll ? { supersedesAll: rec.supersedesAll } : {}),
+      ...(rec.ruling ? { ruling: true as const } : {}),
     }
     // What an outbound would send (or sent), as the draft held it: the project's own record of what left it
     if (rec.outbound) {
@@ -1463,7 +1466,7 @@ const latest = new Map<string, ChangeEvent>()
 let mainTurnAt = 0
 /** When the person was last told whose instance he's typing to */
 let typingToldAt = 0
-const SEND_FRESH_MS = 30 * 60000
+const SEND_FRESH_MS = 12 * 3600000
 // The last landings of the window, newest last, for /fleet status
 const recent: ChangeEvent[] = []
 let otherEvents = 0
@@ -2681,8 +2684,9 @@ async function outboundGate($: any, e: any): Promise<{ held: { deny: string } | 
 }
 
 /** A send the gate let through (a calls entry, the person's recipients), from a thread that read a shared file in this
- * turn or the last 30 minutes which changed since: refused once, so what goes out is what's there now (G13). The same
- * call again passes: a hold that names its reason and lets the session decide */
+ * turn or the last 12 hours which changed since: refused once, so what goes out is what's there now (G13; a post went
+ * out from a read of an hour and more before). The same call again passes: a hold that names its reason and lets the
+ * session decide */
 async function staleSend($: any, thread: string): Promise<string | null> {
   if (!worldOn()) return null
   await eventsTick($)
@@ -2703,7 +2707,10 @@ async function staleSend($: any, thread: string): Promise<string | null> {
   await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), ...Object.fromEntries(fresh.map(s => [`send:${s.path}`, s.v])) } }))
   log($, `send refused once: ${fresh.map(s => s.path).join(', ')} changed since ${thread} read ${fresh.length === 1 ? 'it' : 'them'}`)
   const one = fresh.length === 1
-  return `fleet: this wasn't sent: ${one ? 'a shared file you read' : 'shared files you read'} changed since you read ${one ? 'it' : 'them'} (${fresh.map(s => `${s.path}: ${changeLine(s.e, me)}`).join('; ')}). Read ${one ? 'it' : 'them'} again and send what's there now. The same call again sends it as it is.`
+  return `fleet: this wasn't sent: ${one ? 'a shared file you read' : 'shared files you read'} changed since you read ${one ? 'it' : 'them'} (${fresh
+    .slice(0, 5)
+    .map(s => `${s.path}: ${changeLine(s.e, me)}`)
+    .join('; ')}${fresh.length > 5 ? `; and ${fresh.length - 5} more` : ''}). Read ${one ? 'it' : 'them'} again and send what's there now. The same call again sends it as it is.`
 }
 
 /** When a gate's hook threw before the call ran: in a background session of a fleet project, a call that may reach the
@@ -2713,6 +2720,51 @@ function heldOnError(e: any): { deny: string } | null {
   const tool = String(e?.tool ?? '')
   const risky = tool === 'Bash' ? mayReachNetwork(String(e?.command ?? '')) : tool.startsWith('mcp__') && !tool.startsWith('mcp__fleet__')
   return risky ? { deny: "fleet couldn't check whether this sends the project's content outside, so it was not run. If it should go out, draft it with mcp__fleet__send; the person approves it and fleet runs it." } : null
+}
+
+/** The approved draft fleet is making right now (/fleet n send, through the session's own tool call): fleet's own gate
+ * and its organisation-ask check let that one call through */
+let approvedNow: { tool: string; key: string } | null = null
+
+/** A call's input as one string, its keys in order at every level */
+function callKey(v: unknown): string {
+  const norm = (x: unknown): unknown => (Array.isArray(x) ? x.map(norm) : x && typeof x === 'object' ? Object.fromEntries(Object.keys(x as object).sort().map(k => [k, norm((x as Record<string, unknown>)[k])])) : x)
+  return JSON.stringify(norm(v) ?? null)
+}
+
+function callInput(e: any): Record<string, unknown> {
+  const { tool: _t, tool_use_id: _u, agentId: _a, ...input } = e ?? {}
+  return input
+}
+
+function approvedCall(tool: string, input: unknown): boolean {
+  return !!approvedNow && approvedNow.tool === tool && approvedNow.key === callKey(input)
+}
+
+/** In an instance of the roster (nobody sits at it), a call the gate lets out (a calls entry, the person's recipients) to
+ * a tool its organisation asks the person about on every call (the ceiling ask): refused before that prompt opens. It
+ * would wait there, maybe for hours, with its text as it is now, and go out when he answers, whatever its source says by
+ * then; as a /fleet draft it's checked against its source when he sends it, and his organisation's prompt follows
+ * there. A read of the tool's server, a query and the person's own sessions are left to the prompt */
+async function orgAskHold($: any, e: any): Promise<{ decision: 'deny'; reason: string } | null> {
+  if (e?.ceiling !== 'ask' || e?.approver !== 'person' || !e?.tool_use_id) return null
+  const tool = String(e.tool ?? '')
+  if (!tool.startsWith('mcp__') || tool.startsWith('mcp__fleet__')) return null
+  await locate($)
+  if (!root || !jobRef || !myInstance) return null
+  const input = e.input && typeof e.input === 'object' ? (e.input as Record<string, unknown>) : {}
+  if (approvedCall(tool, input)) return null
+  const c = await outboundConfig($)
+  // Only what the gate lets out: a send it holds never gets this far
+  const o = await outboundOf($, { tool, ...input }, c)
+  if (!o.allowed) return null
+  const sources = callSources(tool, input, c, myInstance.name)
+  const where = sources.length ? sources.join(', ') : null
+  log($, `refused before the organisation's prompt: ${tool} from ${myInstance.name} (a background instance): to be drafted for the person instead`)
+  return {
+    decision: 'deny',
+    reason: `fleet: this wasn't sent. Your organisation asks the person about every call of ${tool}, and in this background session the call would wait at that prompt, maybe for hours, with its text as it is now, and go out when he answers${where ? ` even if ${where} changed meanwhile` : ''}. So draft it with mcp__fleet__send (mcp_tool "${tool}", the same input): the person approves it in /fleet${where ? `, where fleet checks it against ${where} as ${sources.length === 1 ? 'it is' : 'they are'} then` : ''}, and his organisation's prompt follows there.`,
+  }
 }
 
 // ---- Outside content (decision 2b): a conversation that read a web page or an outside service's result is marked
@@ -2733,8 +2785,8 @@ async function restoreMark($: any) {
   if (p && 'threads' in p && p.outside && typeof p.outside.at === 'number') await update($, outside, () => p.outside as OutsideMark)
 }
 
-function markText(m: OutsideMark, offsetMin: number): string {
-  return markWords(m, ms => clock(ms, offsetMin))
+function markText(m: OutsideMark, offsetMin: number, now: number): string {
+  return markWords(m, ms => clockOn(ms, offsetMin, now))
 }
 
 // ---- The gate: a Write, Edit or NotebookEdit of a world file this thread didn't read as it is now, or whose pins it
@@ -6883,6 +6935,46 @@ async function withdrawHere($: any, e: any) {
   return w.deny ? { deny: w.text } : { result: w.text }
 }
 
+// The ruling recorded from the person's words of a turn: the same words again aren't recorded twice
+let lastRuling: { key: string; id: string } | null = null
+
+/** decide kind ruling (G29): what the person ruled, unasked, by typing in his own session (his console, never an
+ * instance's window; not words relayed from another session): recorded as a decision he answered, his words as fleet
+ * saw them typed this turn (never the model's account; about only names it), closed at once. The judges read it as his
+ * answer, and the brief lists it with the other answers */
+async function rulingHere($: any, e: any) {
+  const turn = await read($, personTurn)
+  if (!turn) return { deny: "kind ruling records the person's ruling only in a turn the person typed in this session: their words are the ruling. Nothing was recorded." }
+  if (myInstance) return { deny: `${myInstance.name} is an instance of the roster, not the person's own session: a ruling typed in its window isn't recorded (they can say it in their own session, or write it in the charter). Nothing was recorded.` }
+  const about = field(e.about, 300, 'about')
+  if ('reason' in about) return { deny: `${about.reason}. Nothing was recorded.` }
+  if (!about.text) return { deny: "about: one line on what the person ruled (fleet records their words as the ruling; this line only names it). Nothing was recorded." }
+  const words = (turn.text ?? turn.quoted).trim()
+  if (!words) return { deny: "the person's words this turn are empty: nothing to record as a ruling. Nothing was recorded." }
+  if (words.length > TYPED_MAX) return { deny: `the person's words this turn are over ${TYPED_MAX} characters, more than a ruling keeps whole: ask them to say it shorter, or write it in the charter. Nothing was recorded.` }
+  const key = `${turn.at ?? ''}\n${words}`
+  if (lastRuling?.key === key) return { result: `${lastRuling.id} has this ruling already (the person's words this turn): nothing new was recorded.` }
+  await ensureWorld($)
+  const area = areaOf(typeof e.area === 'string' ? e.area : undefined, worldTags)
+  const asker = await askerNow($)
+  const now = await $.clock.now()
+  const here = await sessionName($)
+  const record = await allocate($, id => ({ format: FORMAT, fleet: version, id, at: now, asker, questions: [{ question: about.text, options: [], recommended: '', why: '' }], ruling: true as const, ...(area.area ? { area: area.area } : {}) }))
+  const file: AnswerFile = { format: FORMAT, id: record.id, q: 1, text: words, origin: turn.origin === 'bridge' ? 'bridge' : 'composer', session: here, at: now, pre: true, quoted: turn.quoted }
+  if ((await publish($, dec(`answers/${answerName(record.id, 1)}`), json(file))) !== 'ok') {
+    await remove($, [dec(`queue/${queueName(record.id)}`)])
+    return { result: "fleet couldn't record this ruling: say it in your journal, and the person can write it in the charter" }
+  }
+  await close($, record.id, { state: 'delivered', how: 'result' })
+  lastRuling = { key, id: record.id }
+  log($, `${record.id}: the person's ruling, typed here (${about.text.slice(0, 80)})`)
+  try {
+    $.ui.log(`fleet: recorded as your ruling (${record.id}, on ${cut(about.text, 120)}): "${cut(words, 300)}". /fleet note ${record.id} adds to it.`)
+  } catch {}
+  bg(beat($))
+  return { result: `Recorded as ${record.id}: the person's ruling on ${about.text}, in his words, in the register, closed (the judges and the brief read it as his answer).${area.note ? ` (${area.note}.)` : ''} Act on it as his decision.` }
+}
+
 /** Withdraws this session's own open decision, unless the person answered any of it (his answer is never taken back) */
 async function withdraw($: any, id: string, why: string): Promise<{ done: boolean; deny?: true; text: string }> {
   const rec = await readQueue($, id)
@@ -6899,27 +6991,39 @@ async function withdraw($: any, id: string, why: string): Promise<{ done: boolea
   return { done: true, text: `${id} is withdrawn: it left the person's queue, and the register keeps it as withdrawn ("${why}"). No answer comes for it.` }
 }
 
-/** decide's supersedes, as the record keeps it */
-function supOf(e: any): { supersedes?: string } {
-  const s = String(e?.supersedes ?? '').trim().toUpperCase()
-  return isDecisionId(s) ? { supersedes: s } : {}
+/** decide's supersedes (one D-<n>, or a list), as the record keeps it: the first, and every one when there are several */
+function supOf(e: any): { supersedes?: string; supersedesAll?: string[] } {
+  const raw = Array.isArray(e?.supersedes) ? e.supersedes : [e?.supersedes]
+  const ids = [...new Set(raw.map((s: unknown) => String(s ?? '').trim().toUpperCase()).filter(isDecisionId))] as string[]
+  if (!ids.length) return {}
+  return ids.length === 1 ? { supersedes: ids[0] as string } : { supersedes: ids[0] as string, supersedesAll: ids }
 }
 
-/** After a decision filed with supersedes: the one it replaces is withdrawn when it's this session's own and the
- * person answered none of it; otherwise both stay, and /fleet shows which replaces which */
+/** The decisions a record replaces */
+function supersededBy(r: Pick<QueueRecord, 'supersedes' | 'supersedesAll'>): string[] {
+  return r.supersedesAll?.length ? r.supersedesAll : r.supersedes ? [r.supersedes] : []
+}
+
+/** After a decision filed with supersedes: each one it replaces is withdrawn when it's this session's own and the
+ * person answered none of it; otherwise it stays, and /fleet shows on both which replaces which */
 async function superseding<R extends { result: string } | { deny: string }>($: any, e: any, r: R): Promise<R> {
-  const old = supOf(e).supersedes
+  const olds = supersededBy(supOf(e))
   const id = 'result' in r ? /^(?:Queued|Filed) as (D-\d+)/.exec(r.result)?.[1] : undefined
-  if (!old || !id || !('result' in r)) return r
-  const w = await withdraw($, old, `replaced by ${id}`)
-  const said = w.done ? ` ${old}, which it replaces, is withdrawn.` : ` ${old} stays as it is (${w.text.replace(/ Nothing was changed\.$/, '').replace(/\.$/, '')}); the person sees that ${id} replaces it.`
+  if (!olds.length || !id || !('result' in r)) return r
+  let said = ''
+  for (const old of olds) {
+    const w = await withdraw($, old, `replaced by ${id}`)
+    said += w.done ? ` ${old}, which it replaces, is withdrawn.` : ` ${old} stays as it is (${w.text.replace(/ Nothing was changed\.$/, '').replace(/\.$/, '')}); the person sees that ${id} replaces it.`
+  }
   return { ...r, result: `${r.result}${said}` }
 }
 
-/** What /fleet adds under an item: the decision it replaces, and the other open changes to the same file */
+/** What /fleet adds under an item: the decisions it replaces, the open ones that replace it (another session's, or one
+ * the person answered in part, which stay), and the other open changes to the same file */
 function alsoLines(r: QueueRecord, records: readonly QueueRecord[]): string {
   const out: string[] = []
-  if (r.supersedes) out.push(`   replaces ${r.supersedes}${records.some(x => x.id === r.supersedes) ? ' (still open)' : ''}`)
+  for (const old of supersededBy(r)) out.push(`   replaces ${old}${records.some(x => x.id === old) ? ' (still open)' : ''}`)
+  for (const x of records.filter(x => x.id !== r.id && supersededBy(x).includes(r.id))) out.push(`   replaced by ${x.id} (${r.asker.name || r.asker.ref || 'its asker'} can withdraw it)`)
   const path = r.change?.path
   const same = path ? records.filter(x => x.id !== r.id && x.change?.path === path).map(x => x.id) : []
   if (same.length) out.push(`   ⚠ also open for ${path}: ${same.join(', ')}: applying one leaves the other${same.length > 1 ? 's' : ''} stale`)
@@ -7233,7 +7337,7 @@ async function fileChange($: any, e: any) {
     // His own turn: no queue, but fleet asks him here before it writes (its own dialog, from a timer: the tool's answer
     // never waits for him). Apply writes it as filed; Don't apply closes it; Esc leaves it in his queue
     const quoted = turn.quoted
-    const label = marked && mark ? markText(mark, (await meNow($)).offsetMin) : null
+    const label = marked && mark ? markText(mark, (await meNow($)).offsetMin, await $.clock.now()) : null
     $.clock.after(0, () => bg(confirmChange($, record, quoted, label)))
     log($, `${record.id} filed in the person's turn: asking them here before applying`)
     bg(beat($))
@@ -7270,10 +7374,14 @@ async function fileOutbound($: any, e: any) {
   const cwd = await folderOf($, null)
   const s = c.send
   let found: Send[] = []
+  // A ready post's source (a calls entry's): read for what it is now, and kept with its version, to check the post
+  // against when the person sends it (G28)
+  const sources: { path: string; v: string | null }[] = []
   if (s.command !== undefined) found = classifyBash(s.command, cfg).sends
   else {
-    const m = classifyMcp(s.tool as string, s.input ?? {}, cfg, myInstance?.name ?? null).send
+    const m = classifyMcp(s.tool as string, s.input ?? {}, cfg, myInstance?.name ?? null, await callSourceTexts($, s.tool as string, s.input ?? {}, cfg)).send
     found = m ? [m] : []
+    for (const p of callSources(s.tool as string, s.input ?? {}, cfg, myInstance?.name ?? null)) sources.push({ path: p, v: (await sourceOf($, `${root}/${p}`)).v })
   }
   const parts = s.tool ? mcpParts(s.tool) : null
   const pushes = s.command !== undefined ? classifyBash(s.command, cfg).pushes.length : 0
@@ -7292,7 +7400,7 @@ async function fileOutbound($: any, e: any) {
   const now = await $.clock.now()
   const mark = await read($, outside)
   const record = await allocate($, id => {
-    const spec: OutboundSpec = { to: s.to, why: s.why, what, how: s.command !== undefined ? 'command' : 'tool', draft: `decisions/drafts/${id}.json`, files, cwd, hash: outboundHash(draft, files, hashText) }
+    const spec: OutboundSpec = { to: s.to, why: s.why, what, how: s.command !== undefined ? 'command' : 'tool', draft: `decisions/drafts/${id}.json`, files, cwd, hash: outboundHash(draft, files, hashText), ...(sources.length ? { sources } : {}) }
     return { format: FORMAT, fleet: version, id, at: now, asker, questions: [], ...(s.blocks ? { blocks: s.blocks } : {}), kind: 'outbound', outbound: spec, ...(mark ? { outside: mark } : {}) }
   })
   const spec = record.outbound as OutboundSpec
@@ -7344,6 +7452,11 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
       const cfg = await outboundConfig($)
       const miss = sourceMiss(call.tool, call.input ?? {}, cfg, r.asker.name, await callSourceTexts($, call.tool, call.input ?? {}, cfg, r.asker.name))
       if (miss) lines.push(`   ⚠ ${missText(miss)}`)
+      // Its source edited since it was drafted: what it says may be stale even where the words still match
+      for (const s of o.sources ?? []) {
+        const now = (await sourceOf($, shownPath(s.path))).v
+        if (now !== s.v) lines.push(`   ⚠ ${s.path} changed since it was drafted (${now === null ? 'it is gone' : shortHash(now)}): /fleet ${n} send checks the text against it as it is then`)
+      }
     }
     if (shown.more) {
       cut = true
@@ -7382,7 +7495,7 @@ async function outboundHeld($: any, n: number, r: QueueRecord, asker: AskerView,
   const allow = call && 'command' in call ? ' (with --allow it also allows where it goes)' : ''
   lines.push(`   draft ${draftAbs} (${shortHash(hashNow)}) · ${send}${allow}, /fleet ${n} reject, /fleet ${n} edit to change it first, or /fleet ${n} done if you sent it yourself`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
-  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin)})` : ''}`)
+  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin, now)})` : ''}`)
   return lines.join('\n')
 }
 
@@ -7581,6 +7694,12 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   }
   const call = parseDraft(draft)
   if ('problem' in call) return `${n}: ${call.problem}: /fleet ${n} edit, or /fleet ${n} reject`
+  // A ready post is checked against its source as it is now (G28): edited since, it goes only with its version typed
+  if (!('command' in call)) {
+    const cfg = await outboundConfig($)
+    const miss = sourceMiss(call.tool, call.input ?? {}, cfg, rec.asker.name, await callSourceTexts($, call.tool, call.input ?? {}, cfg, rec.asker.name))
+    if (miss && !sameHash(it.hash, hashNow)) return `${n}: ${rec.id} wasn't sent: ${missText(miss)}. /fleet ${n} reject, and ${who} drafts it again from the file as it is now; or /fleet ${n} send ${shortHash(hashNow)} sends it as drafted.`
+  }
   // A call /fleet showed cut goes only with its version typed: the person read the rest in the draft
   const shown = callShown(call)
   if (shown.more && !sameHash(it.hash, hashNow)) {
@@ -7622,15 +7741,27 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   } else {
     const parts = mcpParts(call.tool) as { server: string; name: string }
     let res: any
+    // Through this session's own tool call: its permission check and dialog (the organisation's prompt for a tool it
+    // always asks about shows here, to the person who just approved it), then the tool. Fleet's own gate lets this one
+    // call through
+    approvedNow = { tool: call.tool, key: callKey(call.input ?? {}) }
     try {
-      res = await Promise.race([$.mcp.call(parts.server, parts.name, call.input), $.clock.sleep(60000).then(() => ({ timeout: true }))])
+      res = await Promise.race([$.tool.call({ tool: call.tool, ...(call.input ?? {}) }), $.clock.sleep(5 * 60000).then(() => ({ timeout: true }))])
     } catch (err) {
       // Nothing went out: the claim goes, so it can be sent from a session that has that server
       await remove($, [claimPath])
       return `${n}: couldn't call ${call.tool} from this session (${String(err).slice(0, 160)}): nothing was sent. Answer from a session that has ${parts.server}, or /fleet ${n} done once you sent it yourself.`
+    } finally {
+      approvedNow = null
     }
-    const text = res?.timeout ? '' : (Array.isArray(res?.content) ? res.content : []).map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join(' ').trim().slice(0, 200)
-    result = res?.timeout ? "it didn't answer within a minute" : res?.isError ? `it answered an error${text ? `: ${text}` : ''}` : `it answered${text ? `: ${text}` : ' with no text'}`
+    if (res && typeof res.deny === 'string') {
+      // Refused (the permission prompt said no, or a rule did): nothing went out
+      await remove($, [claimPath])
+      return `${n}: ${rec.id} wasn't sent: ${cut(res.deny, 200).replace(/\.+$/, '')}. /fleet ${n} send asks again, /fleet ${n} reject, or /fleet ${n} done once you sent it yourself.`
+    }
+    const raw = res?.timeout ? '' : typeof res?.text === 'string' ? res.text : typeof res?.result === 'string' ? res.result : (Array.isArray(res?.content) ? res.content : []).map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join(' ')
+    const text = String(raw ?? '').trim().slice(0, 200)
+    result = res?.timeout ? "it didn't answer within 5 minutes (a permission prompt may still be open in this session)" : res?.isError ? `it answered an error${text ? `: ${text}` : ''}` : `it answered${text ? `: ${text}` : ' with no text'}`
   }
   await saveNote($, rec.id, it.note, origin)
   // It went out; then what --allow adds, as the person's
@@ -7720,7 +7851,7 @@ async function changeHeld($: any, n: number, r: QueueRecord, asker: AskerView, n
   else lines.push(`   draft ${fleetDir()}/${spec.draft} (${shortHash(spec.result)}) · /fleet ${n} apply, /fleet ${n} reject, or /fleet ${n} edit to change the draft first`)
   if (spec.circular?.length) lines.push(`   ⚠ ${circularWords(spec.circular)}.`)
   const who = asker.state ? `${asker.name} (${asker.state})` : asker.name
-  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin)}): read the diff before you apply it` : ''}`)
+  lines.push(`   ${who} · ${r.id} · ${ago(now - r.at)} ago${r.blocks ? ` · blocks: ${r.blocks}` : ''}${r.outside ? ` · drafted after reading outside content (${markText(r.outside, (await meNow($)).offsetMin, now)}): read the diff before you apply it` : ''}`)
   return lines.join('\n')
 }
 
@@ -8442,7 +8573,7 @@ async function waveRecord($: any, earlier: readonly Instance[], n: number): Prom
     const mine = (w: { ref?: string | null; name?: string | null } | null | undefined) => !!w && ((!!hb?.ref && w.ref === hb.ref) || (!!w.name && w.name === inst.name))
     const landed = events.filter(e => e.by && !e.by.person && mine(e.by) && e.path !== inst.journal && e.to !== null)
     const files = [...new Set(landed.map(e => e.path))]
-    const asked = register.filter(r => r.source === 'decide' && mine(r.asker))
+    const asked = register.filter(r => r.source === 'decide' && !r.ruling && mine(r.asker))
     const rejected = asked.filter(r => (r.kind === 'change' || r.kind === 'outbound') ? r.answers[0]?.label === 'rejected' : r.kind === 'resource' && r.answers[0]?.label === 'no').map(r => r.id)
     const askedIds = new Set(asked.map(r => r.id))
     const overruled = [...new Set(overrules.filter(o => askedIds.has(o.overrules) || mine(o.asker)).map(o => o.overrules))]
@@ -9410,8 +9541,9 @@ async function tasteCall($: any, e: any) {
   const asker = await askerNow($)
   const all: string[] = []
   for (const m of await registerMonths($)) all.push(...(await names($, dec(`register/${m}`))))
-  // The same words recorded in the last hour (two sessions heard one "no", or one called twice): kept once
-  const since = now - HOUR
+  // The same words recorded in the last day, whatever their case, punctuation or spacing (two sessions heard one "no",
+  // a relay quoted it again, or one called twice): kept once
+  const since = now - 24 * HOUR
   for (const m of [monthOf(now), monthOf(since)].filter((x, i, a) => a.indexOf(x) === i)) {
     for (const name of (await names($, dec(`register/${m}`))).filter(x => /^T-\d+\.json$/.test(x))) {
       let t: RegisterRecord | null = null
@@ -9419,7 +9551,7 @@ async function tasteCall($: any, e: any) {
         t = JSON.parse((await readText($, dec(`register/${m}/${name}`))) ?? 'null') as RegisterRecord | null
       } catch {}
       // (kept again when this one is the person's own words and that one wasn't)
-      if (t?.taste && t.at >= since && loose(t.taste.said) === loose(spec.said) && (t.taste.person || !spec.person)) return { result: `${t.id} has these words already (recorded at ${clock(t.at, (await meNow($)).offsetMin)}): nothing new was recorded.` }
+      if (t?.taste && t.at >= since && sameWords(t.taste.said, spec.said) && (t.taste.person || !spec.person)) return { result: `${t.id} has these words already (recorded at ${clockOn(t.at, (await meNow($)).offsetMin, now)}): nothing new was recorded.` }
     }
   }
   let n = nextTasteNumber(all)
@@ -10367,6 +10499,12 @@ function loose(s: string): string {
   return s.toLowerCase().replace(/\s+/g, ' ').trim()
 }
 
+/** The same words, whatever their case, punctuation or spacing */
+function sameWords(a: string, b: string): boolean {
+  const w = (s: string) => s.toLowerCase().replace(/[\p{P}\p{S}]+/gu, ' ').replace(/\s+/g, ' ').trim()
+  return w(a) === w(b)
+}
+
 async function briefCommand($: any, chief: boolean, origin: string): Promise<string> {
   if (chief && origin !== 'composer') return onlyPerson("asks for the chief's lines (they cost a model call)", origin)
   const now = await $.clock.now()
@@ -10400,7 +10538,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
     const jf = r.kind === undefined ? await readJudge($, r.id) : null
     const firstOpen = p.answered.findIndex(a => !a) + 1
     const judge = jf ? proposalLine(jf, r.questions[firstOpen - 1], firstOpen) : null
-    needs.push({ id: r.id, kind: r.kind ?? 'choice', what, who, at: r.at, ...(r.blocks ? { blocks: r.blocks } : {}), ...(r.outside ? { outside: markText(r.outside, me.offsetMin) } : {}), ...(judge ? { judge } : {}) })
+    needs.push({ id: r.id, kind: r.kind ?? 'choice', what, who, at: r.at, ...(r.blocks ? { blocks: r.blocks } : {}), ...(r.outside ? { outside: markText(r.outside, me.offsetMin, await $.clock.now()) } : {}), ...(judge ? { judge } : {}) })
     if (r.blocks && now - r.at >= HOUR) blocks.push({ id: r.id, who, at: r.at, blocks: r.blocks })
   }
   // 2 and 5. The landings, by level (world.json); and the decisions carried out (a change applied, an outbound sent),
@@ -10640,7 +10778,7 @@ async function statusCommand($: any, all = false): Promise<string> {
     for (const l of callsLint(oc)) lines.push(`  ⚠ ${l}`)
     const mark = await read($, outside)
     if (mark) {
-      lines.push(`this conversation read outside content (${markText(mark, (await meNow($)).offsetMin)}): a change it files waits for /fleet <n> apply (one filed in your own turn: fleet's dialog asks you, with its diff), until /clear`)
+      lines.push(`this conversation read outside content (${markText(mark, (await meNow($)).offsetMin, await $.clock.now())}): a change it files waits for /fleet <n> apply (one filed in your own turn: fleet's dialog asks you, with its diff), until /clear`)
       // A connector of his own organisation (his mail, his directory, his chat) needn't mark: the exact line that says so
       const offer = insideOffer(mark)
       if (offer) lines.push(`  if what ${offer.tool} reads is your own organisation's (its directory, its files, its own people's messages), add ${offer.line} to outbound.json's "inside" (then /fleet accept outbound.json): reading it then marks nothing${offer.messages ? ". It reads messages, and one from an outside sender is outside content: leave it out if outside senders reach it" : ''}`)
@@ -10784,11 +10922,43 @@ function worldCommitWords(w: WorldConfig): string {
   return every ? ` World commits are on: every ${every} min the sweeper commits the shared files that changed, only them, and never pushes (world.json's "commit"; take it out to turn them off).` : ''
 }
 
+// A bare verb (/fleet apply): the kinds of item it answers, and what they're called
+const VERB_KINDS: Record<string, { kinds: string[]; one: string; many: string }> = {
+  apply: { kinds: ['change'], one: 'change', many: 'changes' },
+  send: { kinds: ['outbound'], one: 'outbound', many: 'outbounds' },
+  edit: { kinds: ['outbound'], one: 'outbound', many: 'outbounds' },
+  reject: { kinds: ['change', 'outbound'], one: 'change or outbound', many: 'changes or outbounds' },
+  no: { kinds: ['change', 'resource', 'outbound'], one: 'change, resource or outbound', many: 'items' },
+  done: { kinds: ['resource', 'outbound'], one: 'resource or outbound', many: 'items' },
+}
+
+/** /fleet apply (or send, reject, done, no, edit) with no number: the one item of its kind that waits, as if its number
+ * were typed; with none or several, one line on which to name */
+async function bareVerb($: any, e: any, verb: string, rest: string): Promise<string> {
+  const v = VERB_KINDS[verb] as { kinds: string[]; one: string; many: string }
+  let keys = await read($, listing)
+  if (!keys.length) {
+    await listCommand($)
+    keys = await read($, listing)
+  }
+  const fits: number[] = []
+  for (const [i, k] of keys.entries()) {
+    const m = listedMembers(k)[0]
+    const r = m ? await readQueue($, m.id) : null
+    if (r && !('otherFormat' in r) && v.kinds.includes(r.kind ?? 'choice')) fits.push(i + 1)
+  }
+  if (fits.length === 1) return fleetCommand($, { ...e, args: `${fits[0]} ${verb}${rest}` })
+  if (!fits.length) return `${verb} what? No ${v.one} waits for you (/fleet lists what does)`
+  return `${verb} what? ${fits.length} ${v.many} wait: ${fits.map(n => `/fleet ${n} ${verb}`).join(' or ')} (/fleet lists them)`
+}
+
 async function fleetCommand($: any, e: any): Promise<string> {
   const c = parseCommand(String(e.args ?? ''))
   await locate($)
   const origin = String(e.origin?.kind ?? '')
   if (c.kind === 'help') return HELP
+  const bare = /^\s*(apply|send|reject|done|no|edit)\b(.*)$/is.exec(String(e.args ?? ''))
+  if (c.kind === 'bad' && bare && root) return bareVerb($, e, (bare[1] as string).toLowerCase(), bare[2] ?? '')
   if (c.kind === 'bad') return `${c.reason}\n\n${HELP}`
   if (c.kind === 'status') return statusCommand($, c.all === true)
   if (c.kind === 'brief') return root ? briefCommand($, c.chief, origin) : `Not set up in this project: /fleet init sets it up in ${await $.session.root()}`
@@ -10998,6 +11168,14 @@ export const register: Register = on => {
   // What stands in for the classic hooks when a managed plugin sends them on past fleet (B3), by events it can't skip:
   // a permission prompt put to the person (an organisation's ceiling `ask` above all: allow rules don't lift it)...
   on('tool.check', async ($, e, next) => {
+    // A ready post from an instance that would wait at the organisation's prompt with its text frozen: a draft instead
+    try {
+      const held = await orgAskHold($, e)
+      if (held) {
+        if (e.tool) orgAsk.add(String(e.tool))
+        return held
+      }
+    } catch {}
     const r: any = await next(e)
     try {
       if (e.ceiling === 'ask' && e.tool) orgAsk.add(String(e.tool))
@@ -11168,13 +11346,15 @@ export const register: Register = on => {
     if (!root) return { deny: "fleet isn't set up in this project any more: ask the person in plain text" }
     const kind = (e as any).kind
     const sup = (e as any).supersedes
-    if (sup !== undefined && sup !== null && sup !== '' && !isDecisionId(String(sup).trim().toUpperCase())) return { deny: 'supersedes: your own open decision this one replaces, as D-<n>. Nothing was queued.' }
+    const sups = Array.isArray(sup) ? sup : sup === undefined || sup === null || sup === '' ? [] : [sup]
+    if (sups.length > 8 || sups.some(s => !isDecisionId(String(s).trim().toUpperCase()))) return { deny: 'supersedes: your own open decision this one replaces, as D-<n> (or a list of them, up to 8). Nothing was queued.' }
     if (kind === 'change') return superseding($, e, await fileChange($, e))
     if (kind === 'resource') return superseding($, e, await fileResource($, e))
     if (kind === 'answered') return answeredHere($, e)
     if (kind === 'wait') return waitFor($, e)
     if (kind === 'withdraw') return withdrawHere($, e)
-    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions), "change" (a change to a command-level file), "resource" (something only the person can get), "answered" (one of your own questions the person just answered here, with its id), "wait" (another session\'s decision your work waits on, with its id) or "withdraw" (one of your own open decisions you take back, with its id and why). Nothing was queued.' }
+    if (kind === 'ruling') return rulingHere($, e)
+    if (kind !== undefined && kind !== 'choice') return { deny: 'kind is "choice" (questions), "change" (a change to a command-level file), "resource" (something only the person can get), "answered" (one of your own questions the person just answered here, with its id), "wait" (another session\'s decision your work waits on, with its id), "withdraw" (one of your own open decisions you take back, with its id and why) or "ruling" (what the person just ruled, unasked, by typing in their own session, with about). Nothing was queued.' }
     const checked = checkDecide(e)
     if (!checked.ok) return { deny: `${checked.reason}. Nothing was queued: call mcp__fleet__decide again with that fixed.` }
     const asker = await askerNow($)
@@ -11271,6 +11451,8 @@ export const register: Register = on => {
       return answered(r)
     }
     await locate($)
+    // The draft the person just approved (/fleet n send), as fleet makes it: checked then, it goes as he saw it
+    if (next.origin?.plugin !== 'engine' && approvedCall(tool, callInput(e))) return answered(await next(e))
     const gate = await outboundGate($, e)
     if (gate.held) return gate.held
     if (gate.allowed) {
