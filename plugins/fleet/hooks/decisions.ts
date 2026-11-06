@@ -31,6 +31,8 @@
 //   reads/<sessionId>.json               wire: what that session's threads read of the world, the outside content its
 //                                        conversation read and the Bash commands it runs now, written only by it
 //   state/revs/<id>/<n>.json             wire: version n of the record <id> (records.ts), published no-clobber
+//   state/writing/<hash>-<sid8>-<thread>.json  wire: a Write or Edit of a world file in flight, put in place (mv) by
+//                                        its session every 10 s while it waits, done after its event; gone 10 min on
 //   state/suspects.json                  wire: the suspect files, written by the sweeper
 //   state/checks/<hash>.json             wire: the last results of the checks on one file (the last run wins)
 //   state/checks-stamp.json              wire: the checks the person stamped (/fleet accept checks)

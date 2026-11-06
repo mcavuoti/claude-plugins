@@ -491,7 +491,9 @@ export function bashWritesNothing(command: string, inWorld?: (target: string) =>
     const prog = (w[0] as string).split('/').pop() as string
     const args = w.slice(1)
     if (prog === 'sed') {
-      if (args.some(a => /^-[a-zA-Z]*i/.test(a) || a.startsWith('--in-place') || a === '--file' || a.startsWith('--file='))) return false
+      // In place: GNU's -i, BSD's -I, --in-place (or a prefix only it has, --in)
+      const long = (a: string) => (a.startsWith('--') ? sedLong(a) : a)
+      if (args.some(a => /^-[a-zA-Z]*[iI]/.test(a) || long(a).startsWith('--in-place'))) return false
       // Its scripts alone say whether it writes (a w or W command, an s command's w or e flag, the e command): never the
       // names of the files it reads. A script from a file (-f) can't be seen
       const scripts = sedScripts(args)
@@ -657,23 +659,30 @@ function sedScripts(args: readonly string[]): string[] | null {
   const scripts: string[] = []
   let first: string | undefined
   for (let i = 0; i < args.length; i++) {
-    const a = args[i] as string
-    if (a === '--') {
+    const raw = args[i] as string
+    if (raw === '--') {
       first ??= args[i + 1]
       break
     }
+    const a = raw.startsWith('--') ? sedLong(raw) : raw
     if (a.startsWith('--expression=')) scripts.push(a.slice('--expression='.length))
     else if (a === '--expression') scripts.push(String(args[++i] ?? ''))
+    else if (a === '--file' || a.startsWith('--file=')) return null
     else if (a === '--line-length') i++
     else if (a.startsWith('--')) continue
     else if (a.startsWith('-') && a !== '-') {
-      // A cluster of short options: e takes the rest or the next word, l a number, f a file
+      // A cluster of short options: e takes the rest or the next word, f a file; l (GNU's line length) a number when
+      // one follows, and nothing in BSD, where -l is a flag
       for (let k = 1; k < a.length; k++) {
         const ch = a[k]
         if (ch === 'f') return null
-        if (ch === 'e' || ch === 'l') {
-          const v = k + 1 < a.length ? a.slice(k + 1) : String(args[++i] ?? '')
-          if (ch === 'e') scripts.push(v)
+        if (ch === 'e') {
+          scripts.push(k + 1 < a.length ? a.slice(k + 1) : String(args[++i] ?? ''))
+          break
+        }
+        if (ch === 'l') {
+          if (k + 1 < a.length) break
+          if (/^\d+$/.test(args[i + 1] ?? '')) i++
           break
         }
       }
@@ -683,19 +692,45 @@ function sedScripts(args: readonly string[]): string[] | null {
   return first === undefined ? null : [first]
 }
 
-/** Whether a sed script writes a file or runs a command: a w, W or e command, or an s command's w or e flag. Read
- * command by command (addresses, regexes with their own delimiters and escapes, s and y's parts, text and labels); one
- * it can't read counts as writing */
+/** A GNU long option as written, or a prefix of one only one option has (--expr=x is --expression=x, --in is
+ * --in-place) as that option */
+const SED_LONG = ['--expression', '--file', '--in-place', '--line-length', '--quiet', '--silent', '--null-data', '--zero-terminated', '--separate', '--sandbox', '--debug', '--posix', '--regexp-extended', '--unbuffered', '--follow-symlinks', '--help', '--version']
+function sedLong(a: string): string {
+  const eq = a.indexOf('=')
+  const name = eq < 0 ? a : a.slice(0, eq)
+  const all = SED_LONG.filter(o => o.startsWith(name))
+  return all.length === 1 && all[0] !== name ? `${all[0]}${eq < 0 ? '' : a.slice(eq)}` : a
+}
+
+/** Whether a sed script writes a file or runs a command: a w, W or e command, or an s command's w or e flag, as GNU sed
+ * reads it or as BSD sed (macOS) does: a script that writes in either counts. They differ where a label ends (GNU: at
+ * a ;) and in a bracket expression (BSD reads [/] whole, a delimiter inside it included) */
 export function sedScriptWrites(script: string): boolean {
+  return sedReadWrites(script, 'gnu') || sedReadWrites(script, 'bsd')
+}
+
+/** One reading of a sed script, command by command (addresses, regexes with their own delimiters and escapes, s and
+ * y's parts, text and labels); one it can't read counts as writing */
+function sedReadWrites(script: string, dialect: 'gnu' | 'bsd'): boolean {
   const s = script
   let i = 0
   const space = () => {
     while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++
   }
-  // Past a regex or an s/y part ending at d (escapes kept whole); false when it doesn't end on the line
-  const part = (d: string): boolean => {
+  // Past a regex or an s/y part ending at d (escapes kept whole; in BSD's reading of a regex, a bracket expression
+  // whole, ] first in it a member); false when it doesn't end on the line
+  const part = (d: string, regex = true): boolean => {
     while (i < s.length && s[i] !== d) {
       if (s[i] === '\n') return false
+      if (dialect === 'bsd' && regex && s[i] === '[') {
+        let j = i + 1
+        if (s[j] === '^') j++
+        if (s[j] === ']') j++
+        while (j < s.length && s[j] !== ']' && s[j] !== '\n') j += s[j] === '[' && /[:.=]/.test(s[j + 1] ?? '') ? Math.max(2, s.indexOf(']', j + 2) - j + 1) : 1
+        if (s[j] !== ']') return false
+        i = j + 1
+        continue
+      }
       i += s[i] === '\\' ? 2 : 1
     }
     if (i >= s.length) return false
@@ -753,7 +788,7 @@ export function sedScriptWrites(script: string): boolean {
       const d = s[i]
       if (d === undefined || d === '\n' || d === '\\') return true
       i++
-      if (!part(d) || !part(d)) return true
+      if (!part(d, c === 's') || !part(d, false)) return true
       if (c === 's') {
         // Its flags: a w (a file follows) or an e writes or runs
         while (i < s.length && !/[;\n}\s]/.test(s[i] as string)) {
@@ -763,9 +798,14 @@ export function sedScriptWrites(script: string): boolean {
       }
       continue
     }
-    // Text (a, i, c), a file read (r, R) or a label (:) run to the line's end; a branch or an exit to the next ;
-    if ('aicrR:'.includes(c)) {
+    // Text (a, i, c) or a file read (r, R) runs to the line's end; a label (:) too in BSD, to the next ; in GNU; a
+    // branch or an exit to the next ;
+    if ('aicrR'.includes(c) || (c === ':' && dialect === 'bsd')) {
       toEnd(false)
+      continue
+    }
+    if (c === ':') {
+      toEnd(true)
       continue
     }
     if ('btTqQlLv'.includes(c)) {

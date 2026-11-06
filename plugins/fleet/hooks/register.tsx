@@ -389,6 +389,7 @@ import {
   behindLine,
   blindText,
   bodyHashOf,
+  bodyTextOf,
   confirmedBy,
   defaultKindOf,
   elsewhereText,
@@ -447,6 +448,7 @@ import {
   type Records,
   type Rev,
   type RevFix,
+  type Reason,
   type Suspect,
   type SuspectsFile,
   type Unproven,
@@ -2900,13 +2902,15 @@ async function gate($: any, e: any, next: any) {
   // A record fleet never saw a version of: the one there now is its first
   const id = records ? idOf(w.rel, records) : null
   if (id && cur.v !== null) await revsFor($, id, { rel: w.rel, v: cur.v, text: cur.text })
-  // In flight until its event is out: a peer's command that names the file and ends meanwhile leaves it to the scan
-  await markWriting($, w.rel, thread, false)
+  // In flight until its event is out: a peer's command that names the file and ends meanwhile leaves it to the scan.
+  // Rewritten every WRITING_REFRESH_MS while what runs beneath waits (a permission prompt can take minutes): its age is
+  // the wait's, and a session that died stops refreshing it, so it goes stale in WRITING_MS
+  const mark = await inFlight($, w.rel, thread)
   let r: any
   try {
     r = await next(e)
   } finally {
-    if (!r || r.deny !== undefined || r.isError) await markWriting($, w.rel, thread, true)
+    if (!r || r.deny !== undefined || r.isError) await mark.done()
   }
   if (!r || r.deny !== undefined || r.isError) return r
   const extra: string[] = []
@@ -2942,7 +2946,7 @@ async function gate($: any, e: any, next: any) {
   } catch (err) {
     log($, `after ${e.tool} of ${w.rel}: ${String(err).slice(0, 200)}`)
   } finally {
-    await markWriting($, w.rel, thread, true)
+    await mark.done()
   }
   return withLines($, r, thread, extra)
 }
@@ -2954,9 +2958,15 @@ async function gate($: any, e: any, next: any) {
 // the old ones ----
 
 const WRITING_MS = 30000
+/** How often a mark is rewritten while its write waits beneath the gate (a permission prompt) */
+const WRITING_REFRESH_MS = 10000
+/** How long a mark is kept after its last rewrite: a done one is never read again */
+const WRITING_KEEP_MS = 10 * 60000
 
-/** How long a revised record stays quiet before the owners of what cites it are told (a burst is told once) */
+/** How long a revised record stays quiet before the owners of what cites it are told (a burst is told once), and the
+ * longest that waits from its first move (a record that never stops moving is told anyway) */
 const REVISION_QUIET_MS = 2 * 60000
+const REVISION_WAIT_MS = 10 * 60000
 
 // ---- The model's steps: each loop's step now (its turn and index), the step of each refused write, and the writes a
 // step had refused (a SendMessage of that step is held once). Module state: after a reload no step is known, and the
@@ -2972,37 +2982,86 @@ function sameStepHold(thread: string): string | null {
   const r = refusedWrites.get(thread)
   if (step === undefined || !r || r.step !== step || r.held) return null
   refusedWrites.set(thread, { ...r, held: true })
-  const what = r.writes.length === 1 ? `your ${r.writes[0]}` : `your ${r.writes.slice(0, -1).join(', ')} and ${r.writes.at(-1)}`
-  return `fleet: this message wasn't sent: ${what} in this same batch was refused, so it didn't land${r.writes.length === 1 ? '' : ' (none of them)'}. Send it once the write lands, or send it again as it is.`
+  const one = r.writes.length === 1
+  const what = one ? `your ${r.writes[0]}` : `your ${r.writes.slice(0, -1).join(', ')} and ${r.writes.at(-1)}`
+  return `fleet: this message wasn't sent: ${what} in this same batch ${one ? 'was refused, so it didn\'t land' : 'were refused, so they didn\'t land'}. Send it once ${one ? 'the write lands' : 'they land'}, or send it again as it is.`
 }
 
 function writingPath(rel: string, sid8: string, thread: string): string {
   return stateDir(`writing/${hashText(rel).slice(1, 17)}-${sid8}-${thread.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`)
 }
 
+/** One write's mark: written now, rewritten every WRITING_REFRESH_MS until done() (which waits for a rewrite under
+ * way, so done is the last word) */
+async function inFlight($: any, rel: string, thread: string): Promise<{ done: () => Promise<void> }> {
+  let pending = true
+  let chain: Promise<void> = markWriting($, rel, thread, false)
+  // Written before the write goes on
+  await chain
+  const timer = $.clock.every(WRITING_REFRESH_MS, () => {
+    if (pending) chain = chain.then(() => (pending ? markWriting($, rel, thread, false) : undefined))
+  })
+  return {
+    done: async () => {
+      if (!pending) return
+      pending = false
+      timer.cancel()
+      chain = chain.then(() => markWriting($, rel, thread, true))
+      await chain
+    },
+  }
+}
+
+let writingDirMade = false
+
+/** A mark put in place whole (a temporary file moved over it), so a reader never meets half of one */
 async function markWriting($: any, rel: string, thread: string, done: boolean) {
   try {
     const sessionId = String(await $.session.id())
     const at = await $.clock.now()
-    await $.fs.write(writingPath(rel, sessionId.slice(0, 8), thread), json({ format: FORMAT, path: rel, sessionId, agentId: thread === 'main' ? null : thread, at, ...(done ? { done: true } : {}) }))
+    if (!writingDirMade) {
+      await run($, ['mkdir', '-p', stateDir('writing')])
+      writingDirMade = true
+    }
+    if (!(await replace($, writingPath(rel, sessionId.slice(0, 8), thread), json({ format: FORMAT, path: rel, sessionId, agentId: thread === 'main' ? null : thread, at, ...(done ? { done: true } : {}) })))) {
+      writingDirMade = false
+      log($, `couldn't mark ${rel} in flight`)
+    }
   } catch (err) {
     log($, `couldn't mark ${rel} in flight: ${String(err).slice(0, 120)}`)
   }
 }
 
-/** Whether a tool write of rel is in flight in some session (its mark there, not done, fresh) */
-async function writingNow($: any, rel: string): Promise<boolean> {
-  const prefix = `${hashText(rel).slice(1, 17)}-`
+/** The shared files a tool write is in flight for now, in any session (a mark at this format, not done, fresh): read
+ * once per post-scan, whatever it changed */
+async function writingNow($: any): Promise<Set<string>> {
+  const out = new Set<string>()
   const now = await $.clock.now()
   for (const name of await names($, stateDir('writing'))) {
-    if (!name.startsWith(prefix) || !name.endsWith('.json')) continue
+    if (!name.endsWith('.json')) continue
     let m: any = null
     try {
       m = JSON.parse((await readText($, stateDir(`writing/${name}`))) ?? 'null')
     } catch {}
-    if (m && m.path === rel && m.done !== true && typeof m.at === 'number' && now - m.at < WRITING_MS) return true
+    if (m && m.format === FORMAT && typeof m.path === 'string' && m.done !== true && typeof m.at === 'number' && now - m.at < WRITING_MS) out.add(m.path)
   }
-  return false
+  return out
+}
+
+let writingPrunedAt = 0
+
+/** The marks no write needs any more (done, or a dead session's, past WRITING_KEEP_MS by their time), removed at most
+ * every few minutes by the sweeper */
+async function pruneWriting($: any, now: number) {
+  if (now - writingPrunedAt < 5 * 60000) return
+  writingPrunedAt = now
+  let entries: any[] = []
+  try {
+    entries = await $.fs.list(stateDir('writing'))
+  } catch {
+    return
+  }
+  await remove($, entries.filter(x => x.kind === 'file' && now - Number(x.mtimeMs) > WRITING_KEEP_MS).map(x => stateDir(`writing/${x.name}`)))
 }
 
 /** Whether a world file is one that must carry a proof when world.json's proofs say so: a record, or a file under their
@@ -3125,8 +3184,9 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   }
   const todo: (Landing & { plan: RevPlan | null; skip?: boolean; takeover?: boolean })[] = []
   // The other commands running now (this session's other ones, other sessions'), asked once: one that names a file
-  // this one changed too may be its writer
+  // this one changed too may be its writer. And the tool writes in flight, read once
   let others: Running[] | null = null
+  let writing: Set<string> | null = null
   for (const rel of changed) {
     const s = after.get(rel)
     const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
@@ -3153,7 +3213,8 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
       continue
     }
     // Named, but a tool write of it is in flight (a peer's Edit whose event isn't out yet): the scan finds that event
-    if (await writingNow($, rel)) {
+    writing ??= await writingNow($)
+    if (writing.has(rel)) {
       unnamed++
       continue
     }
@@ -3169,9 +3230,16 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     let pc = f.text === null || isHistory(rel) ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []), isStrict(records, rel))
     // A copy of a shared file the command names (cp, tail -n +N, sed -n, cat … > x): the pins it carries over were that
     // file's already, so they need no read of their own (a stale one is still one)
-    if (pc?.problems.some(p => p.why === 'unread') && names && f.text !== null) {
+    if (pc?.problems.some(p => p.why === 'unread') && names && f.text !== null && records) {
       const unread = new Set(pc.problems.filter(p => p.why === 'unread').map(p => pinKey(p.pin)))
-      const inherited = [...known].filter(([p, kk]) => p !== rel && (kk.pins ?? []).some(x => unread.has(x)) && names(p)).flatMap(([, kk]) => kk.pins ?? [])
+      const written = bodyTextOf(f.text, records).trim()
+      const inherited: string[] = []
+      for (const [p, kk] of known) {
+        if (p === rel || !(kk.pins ?? []).some(x => unread.has(x)) || !names(p)) continue
+        // Only a real copy: what was written is a span of that file as it is (pins' numbers and change lines aside)
+        const src = (await versionOf($, `${realRoot}/${p}`)).text
+        if (written && src !== null && bodyTextOf(src, records).includes(written)) inherited.push(...(kk.pins ?? []))
+      }
       if (inherited.length) pc = await checkPins($, thread, f.text, new Set([...(k?.pins ?? []), ...inherited]), isStrict(records, rel))
     }
     const suspect = pc ? pc.problems.map(p => `${pinKey(p.pin)}:${p.why}`) : []
@@ -3481,6 +3549,7 @@ async function scanWorld($: any) {
   const snap = await snapshot($)
   if (!snap) return
   const now = await $.clock.now()
+  await pruneWriting($, now)
   if (!baselined) {
     known.clear()
     for (const [rel, s] of snap) {
@@ -3930,12 +3999,14 @@ async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   const at = await $.clock.now()
   for (const s of directSuspects()) {
     if (derivedKinds.length && derivedKindOf(s.path, derivedKinds)) continue
-    if (told[`s|${suspectKey(s)}`]) continue
     // A record still being revised (its last revision under REVISION_QUIET_MS old) is told once it's quiet: one line per
-    // burst, at the version it came to, not one per revision (G33)
-    if (s.reasons.some(r => r.why === 'stale' && r.moved && at - r.moved.at < REVISION_QUIET_MS)) continue
-    if (ownedBy(s.owner, me)) mine.push(s)
-    else if (janitor && untold(s.owner) && movesOf(s)) orphans.push(s)
+    // burst, at the version it came to, not one per revision (G33). Only that reason waits, and at most REVISION_WAIT_MS
+    // from the record's first move: the file's other reasons are told now
+    const busy = (r: Reason) => r.why === 'stale' && !!r.moved && at - r.moved.at < REVISION_QUIET_MS && at - (r.first ?? r.moved.at) < REVISION_WAIT_MS
+    const ready = s.reasons.some(busy) ? { ...s, reasons: s.reasons.filter(r => !busy(r)) } : s
+    if (!ready.reasons.length || told[`s|${suspectKey(ready)}`]) continue
+    if (ownedBy(ready.owner, me)) mine.push(ready)
+    else if (janitor && untold(ready.owner) && movesOf(ready)) orphans.push(ready)
   }
   const items = ownSuspectLines(mine, words).map(x => ({ keys: x.keys.map(k => `s|${k}`), line: x.line }))
   const strays = ownSuspectLines(orphans, words).map(x => ({ keys: x.keys.map(k => `s|${k}`), line: x.line }))
@@ -5191,7 +5262,6 @@ async function pruneWorld($: any, now: number) {
   }
   await old(eventsDir('claims'))
   await old(`${fleetDir()}/reads`)
-  await old(stateDir('writing'))
 }
 
 // ---- /fleet world, /fleet accept, and the world's part of /fleet status ----
