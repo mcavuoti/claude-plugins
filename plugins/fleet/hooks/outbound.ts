@@ -771,14 +771,16 @@ export function classifyMcp(tool: string, input: Record<string, unknown>, c: Out
 
 /** The simple commands of a shell line, each as its words (quotes taken off), with what $(…), `…`, bash -c and eval
  * run as commands of their own. Redirections and their targets are left out of the words; targets, when given, gets
- * the targets (a file, /dev/tcp/host/port). A best effort, not a shell */
-export function commandsOf(line: string, depth = 0, targets: string[] = []): string[][] {
+ * the targets (a file, /dev/tcp/host/port), and ops, when given, each target's operator (<, <<<, >, >>, <>…) at the same
+ * place. A best effort, not a shell */
+export function commandsOf(line: string, depth = 0, targets: string[] = [], ops?: string[]): string[][] {
   const out: string[][] = []
   if (depth > 4) return out
   let seg: string[] = []
   let word = ''
   let inWord = false
   let skip = false
+  let op = ''
   const heredocs: { delim: string; strip: boolean }[] = []
   const bodies: string[] = []
   const endWord = () => {
@@ -786,6 +788,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
       if (skip) {
         skip = false
         targets.push(word)
+        ops?.push(op)
       } else seg.push(word)
     }
     word = ''
@@ -829,7 +832,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
         }
         if (line[j] === '$' && line[j + 1] === '(') {
           const s = sub(j + 1)
-          out.push(...commandsOf(s.inner, depth + 1, targets))
+          out.push(...commandsOf(s.inner, depth + 1, targets, ops))
           word += `$(${s.inner})`
           j = s.end + 1
           continue
@@ -837,7 +840,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
         if (line[j] === '`') {
           const end = line.indexOf('`', j + 1)
           const inner = line.slice(j + 1, end < 0 ? line.length : end)
-          out.push(...commandsOf(inner, depth + 1, targets))
+          out.push(...commandsOf(inner, depth + 1, targets, ops))
           word += `\`${inner}\``
           j = end < 0 ? line.length : end + 1
           continue
@@ -859,7 +862,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
     }
     if ((ch === '$' || ch === '<' || ch === '>') && line[i + 1] === '(') {
       const s = sub(i + 1)
-      out.push(...commandsOf(s.inner, depth + 1, targets))
+      out.push(...commandsOf(s.inner, depth + 1, targets, ops))
       word += `${ch}(${s.inner})`
       inWord = true
       i = s.end + 1
@@ -868,7 +871,7 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
     if (ch === '`') {
       const end = line.indexOf('`', i + 1)
       const inner = line.slice(i + 1, end < 0 ? line.length : end)
-      out.push(...commandsOf(inner, depth + 1, targets))
+      out.push(...commandsOf(inner, depth + 1, targets, ops))
       word += `\`${inner}\``
       inWord = true
       i = end < 0 ? line.length : end + 1
@@ -911,8 +914,8 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
       } else endWord()
       let j = i
       while (j < line.length && (line[j] === '<' || line[j] === '>')) j++
-      const op = line.slice(i, j)
-      if (op === '<<') {
+      const rop = line.slice(i, j)
+      if (rop === '<<') {
         // A here-document (<<EOF, <<-'EOF'): its delimiter, without quotes; its lines are skipped at the next line
         const strip = line[j] === '-'
         if (strip) j++
@@ -941,9 +944,10 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
         j++
         while (j < line.length && /[\d-]/.test(line[j] as string)) j++
       } else {
-        // A file: >file, and >&file (both outputs to it)
+        // A file: >file, and >&file (both outputs to it); a here-string's word (<<<) is text
         if (line[j] === '&') j++
         skip = true
+        op = rop
       }
       i = j
       continue
@@ -967,12 +971,12 @@ export function commandsOf(line: string, depth = 0, targets: string[] = []): str
     const cmd = baseName(w[0] ?? '')
     if (SHELLS.includes(cmd)) {
       const k = w.findIndex((x, n) => n > 0 && /^-[a-z]*c[a-z]*$/.test(x))
-      if (k > 0 && w[k + 1] !== undefined) more.push(...commandsOf(w[k + 1] as string, depth + 1, targets))
+      if (k > 0 && w[k + 1] !== undefined) more.push(...commandsOf(w[k + 1] as string, depth + 1, targets, ops))
       else if (!w.slice(1).some(x => !x.startsWith('-')) || w.includes('-s')) script = true
-    } else if (cmd === 'eval' && w.length > 1) more.push(...commandsOf(w.slice(1).join(' '), depth + 1, targets))
+    } else if (cmd === 'eval' && w.length > 1) more.push(...commandsOf(w.slice(1).join(' '), depth + 1, targets, ops))
     else if (cmd === 'ssh') script = true
   }
-  if (script) for (const b of bodies) more.push(...commandsOf(b, depth + 1, targets))
+  if (script) for (const b of bodies) more.push(...commandsOf(b, depth + 1, targets, ops))
   return [...out, ...more]
 }
 

@@ -380,7 +380,7 @@ export function duringText(rel: string, last: ChangeEvent | null, me: Me): strin
 
 // Programs that only read, unless a flag or an operand below names a file they write. env and the like aren't here:
 // the shell reader takes them off and judges the command they run. ps, kill and the like write no file
-const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'printenv', 'id', 'whoami', 'hostname', 'uname', 'ps', 'pgrep', 'uptime', 'kill', 'qstat', 'nproc'])
+const READ_ONLY_PROGRAMS = new Set(['cat', 'nl', 'bat', 'batcat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'ls', 'stat', 'file', 'sort', 'uniq', 'cut', 'tr', 'jq', 'diff', 'cmp', 'comm', 'md5', 'md5sum', 'shasum', 'sha256sum', 'cksum', 'date', 'which', 'basename', 'dirname', 'realpath', 'readlink', 'du', 'df', 'pwd', 'cd', 'echo', 'printf', 'true', 'false', 'test', '[', 'sleep', 'column', 'fold', 'fmt', 'rev', 'tac', 'less', 'more', 'od', 'hexdump', 'xxd', 'strings', 'tree', 'printenv', 'id', 'whoami', 'hostname', 'uname', 'ps', 'pgrep', 'uptime', 'kill', 'qstat', 'nproc', 'read', 'wdiff'])
 const AWKS = new Set(['awk', 'gawk', 'mawk', 'nawk'])
 
 /** A project's check script as a command names it, from the project's folder */
@@ -453,9 +453,10 @@ export function bashWritesNothing(command: string, inWorld?: (target: string) =>
   const c = command.trim()
   if (!c || c.includes('`')) return false
   const targets: string[] = []
+  const ops: string[] = []
   let cmds: string[][]
   try {
-    cmds = commandsOf(c, 0, targets)
+    cmds = commandsOf(c, 0, targets, ops)
   } catch {
     return false
   }
@@ -466,17 +467,21 @@ export function bashWritesNothing(command: string, inWorld?: (target: string) =>
     if (/[$`*?]/.test(t)) return true
     return inWorld ? inWorld(t) : true
   }
-  if (targets.some(writes)) return false
+  // A file fed in (< file) is read; a here-string's word (<<< text) is no file; every other redirection writes
+  if (targets.some((t, k) => ops[k] !== '<' && ops[k] !== '<<<' && writes(t))) return false
   for (const words of cmds) {
+    // A loop's head (for f in a b; select f in …) runs nothing: its body's commands are judged as they come
+    if (words[0] === 'for' || words[0] === 'select') continue
     const w = stripPrefixes(words)
     if (!w.length) continue
     const prog = (w[0] as string).split('/').pop() as string
     const args = w.slice(1)
     if (prog === 'sed') {
-      if (args.some(a => /^-[a-zA-Z]*i/.test(a) || a.startsWith('--in-place') || /^-[a-zA-Z]*f/.test(a) || a === '--file')) return false
-      // A script's w or W command (/x/w file, 1,5w file) or an s command's w flag (s/a/b/gw file) writes a file: a w
-      // after a non-letter or after a / and flags (a pattern like /what/ counts too: the safe side)
-      if (args.some(a => !a.startsWith('-') && (/(^|[^A-Za-z])[wW]/.test(a) || /\/[gpiImMe0-9]*[wW]/.test(a)))) return false
+      if (args.some(a => /^-[a-zA-Z]*i/.test(a) || a.startsWith('--in-place') || a === '--file' || a.startsWith('--file='))) return false
+      // Its scripts alone say whether it writes (a w or W command, an s command's w or e flag, the e command): never the
+      // names of the files it reads. A script from a file (-f) can't be seen
+      const scripts = sedScripts(args)
+      if (scripts === null || scripts.some(sedScriptWrites)) return false
       continue
     }
     if (prog === 'find') {
@@ -630,6 +635,133 @@ export function bashWritesNothing(command: string, inWorld?: (target: string) =>
     if (!READ_ONLY_PROGRAMS.has(prog)) return false
   }
   return true
+}
+
+/** sed's scripts among its words: the values of -e (--expression), else its first operand; null when one comes from a
+ * file (-f) or none is there */
+function sedScripts(args: readonly string[]): string[] | null {
+  const scripts: string[] = []
+  let first: string | undefined
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] as string
+    if (a === '--') {
+      first ??= args[i + 1]
+      break
+    }
+    if (a.startsWith('--expression=')) scripts.push(a.slice('--expression='.length))
+    else if (a === '--expression') scripts.push(String(args[++i] ?? ''))
+    else if (a === '--line-length') i++
+    else if (a.startsWith('--')) continue
+    else if (a.startsWith('-') && a !== '-') {
+      // A cluster of short options: e takes the rest or the next word, l a number, f a file
+      for (let k = 1; k < a.length; k++) {
+        const ch = a[k]
+        if (ch === 'f') return null
+        if (ch === 'e' || ch === 'l') {
+          const v = k + 1 < a.length ? a.slice(k + 1) : String(args[++i] ?? '')
+          if (ch === 'e') scripts.push(v)
+          break
+        }
+      }
+    } else first ??= a
+  }
+  if (scripts.length) return scripts
+  return first === undefined ? null : [first]
+}
+
+/** Whether a sed script writes a file or runs a command: a w, W or e command, or an s command's w or e flag. Read
+ * command by command (addresses, regexes with their own delimiters and escapes, s and y's parts, text and labels); one
+ * it can't read counts as writing */
+export function sedScriptWrites(script: string): boolean {
+  const s = script
+  let i = 0
+  const space = () => {
+    while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++
+  }
+  // Past a regex or an s/y part ending at d (escapes kept whole); false when it doesn't end on the line
+  const part = (d: string): boolean => {
+    while (i < s.length && s[i] !== d) {
+      if (s[i] === '\n') return false
+      i += s[i] === '\\' ? 2 : 1
+    }
+    if (i >= s.length) return false
+    i++
+    return true
+  }
+  const address = (): boolean => {
+    space()
+    if (s[i] === '$') i++
+    else if (/[0-9]/.test(s[i] ?? '')) while (/[0-9~]/.test(s[i] ?? '')) i++
+    else if (s[i] === '/' || s[i] === '\\') {
+      const d = s[i] === '\\' ? (s[i + 1] ?? '') : '/'
+      i += s[i] === '\\' ? 2 : 1
+      if (!d || !part(d)) return false
+      while (/[IM]/.test(s[i] ?? '')) i++
+    }
+    return true
+  }
+  const toEnd = (alsoSemicolon: boolean) => {
+    while (i < s.length && s[i] !== '\n' && !(alsoSemicolon && (s[i] === ';' || s[i] === '}'))) i++
+  }
+  while (i < s.length) {
+    space()
+    const c0 = s[i]
+    if (c0 === undefined) break
+    if (c0 === ';' || c0 === '\n' || c0 === '}' || c0 === '{') {
+      i++
+      continue
+    }
+    if (c0 === '#') {
+      toEnd(false)
+      continue
+    }
+    if (!address()) return true
+    space()
+    if (s[i] === ',') {
+      i++
+      space()
+      if (s[i] === '+' || s[i] === '~') {
+        i++
+        while (/[0-9]/.test(s[i] ?? '')) i++
+      } else if (!address()) return true
+    }
+    space()
+    while (s[i] === '!') {
+      i++
+      space()
+    }
+    const c = s[i]
+    i++
+    if (c === undefined) break
+    if (c === '{' || c === '}' || c === ';' || c === '\n') continue
+    if (c === 'w' || c === 'W' || c === 'e') return true
+    if (c === 's' || c === 'y') {
+      const d = s[i]
+      if (d === undefined || d === '\n' || d === '\\') return true
+      i++
+      if (!part(d) || !part(d)) return true
+      if (c === 's') {
+        // Its flags: a w (a file follows) or an e writes or runs
+        while (i < s.length && !/[;\n}\s]/.test(s[i] as string)) {
+          if (s[i] === 'w' || s[i] === 'e') return true
+          i++
+        }
+      }
+      continue
+    }
+    // Text (a, i, c), a file read (r, R) or a label (:) run to the line's end; a branch or an exit to the next ;
+    if ('aicrR:'.includes(c)) {
+      toEnd(false)
+      continue
+    }
+    if ('btTqQlLv'.includes(c)) {
+      toEnd(true)
+      continue
+    }
+    if ('=dDgGhHnNpPxzF'.includes(c)) continue
+    return true
+  }
+  return false
 }
 
 /** Whether a command names a world file (rel): one of its words resolves to the file or to a folder it's in, or is a
