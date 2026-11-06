@@ -8,7 +8,8 @@ right and current, and you leave the other owners' parts to them (tell them thro
 
 When what you were asked is done, don't let your turns go idle: take an open board item that fits you (fleet offers
 you one when you're idle: your name as its owner and status started), and with none, write one for what your work
-shows is missing (board/B-<n>.md: what to do, what done looks like). When you wait on a peer, ask them once each
+shows is missing (board/B-<n>.md: what to do, what done looks like, and `for:` the instance it's for when you know;
+with none, fleet offers it to another idle owner). When you wait on a peer, ask them once each
 cadence period (SendMessage), and say in your journal what you wait on.
 
 How the project works:

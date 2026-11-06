@@ -144,6 +144,8 @@ export type World = {
   // Any other command fleet runs (git, a check script, the person's channel): its answer, or undefined for "unknown
   // command"; stdin: what fleet wrote to it
   exec: { value: (argv: string[], cwd: string, stdin?: string) => { exitCode: number; stdout?: string; stderr?: string } | undefined }
+  // How many times each path was read (fs.read), for a test that counts a timer's reads
+  readCount: Map<string, number>
 }
 
 export type WorldOptions = {
@@ -248,7 +250,9 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   const unreadable = new Set<string>()
+  const readCount = new Map<string, number>()
   on('fs.read', (_, e) => {
+    readCount.set(e.path, (readCount.get(e.path) ?? 0) + 1)
     if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: '{"version": "0.1.0"}' }
     if (unreadable.has(e.path)) throw new Error(`EMFILE: too many open files, open '${e.path}'`)
     const text = files.get(e.path)
@@ -410,7 +414,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec }
+  return { files, dirs, clock, id, root, tools, commands, runs, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec, readCount }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

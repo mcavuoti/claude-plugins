@@ -52,7 +52,7 @@ async function step($: any, model: string, extra: Record<string, unknown> = {}) 
   return s.result
 }
 
-test('a roster model the account refuses: the step goes again on the session\'s own model, fleet stops asking for it, and status says so', WITH_SESSIONS, async ($, on) => {
+test('a roster model the account refuses: each step goes again on the session\'s own model; three in a row and fleet stops asking for it a while, and status says so', WITH_SESSIONS, async ($, on) => {
   refused.add('fable')
   received.length = 0
   try {
@@ -62,13 +62,16 @@ test('a roster model the account refuses: the step goes again on the session\'s 
     // showed the turn answering on the session's model)
     await step($, 'claude-sonnet-5-5')
     expect(received.map(x => x.model)).toEqual(['fable', 'claude-sonnet-5-5'])
+    // Not yet refused after one: asked again, twice more, then left alone
     await step($, 'claude-sonnet-5-5')
-    expect(received.map(x => x.model)).toEqual(['fable', 'claude-sonnet-5-5', 'claude-sonnet-5-5'])
+    await step($, 'claude-sonnet-5-5')
+    await step($, 'claude-sonnet-5-5')
+    expect(received.map(x => x.model)).toEqual(['fable', 'claude-sonnet-5-5', 'fable', 'claude-sonnet-5-5', 'fable', 'claude-sonnet-5-5', 'claude-sonnet-5-5'])
     await tick(w, 31000)
     const hb = json(w, `${FLEET}/instances/owner-a/state.json`)
     expect(hb.model).toBe('claude-sonnet-5-5')
     expect(hb.modelRefused).toBe('fable')
-    expect(await fleet($, 'status')).toContain('runs claude-sonnet-5-5, roster says fable (the account refused fable: its requests run the session\'s own model; fleet asks for fable again after a restart)')
+    expect(await fleet($, 'status')).toMatch(/runs claude-sonnet-5-5, roster says fable \(fable got no response 3 times in a row: its requests run the session's own model; fleet asks for it again at \d\d:\d\d\)/)
   } finally {
     refused.clear()
   }

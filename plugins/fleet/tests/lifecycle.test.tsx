@@ -190,7 +190,7 @@ test("a result world.json says needs reproducing becomes a board item for its te
   expect([...w.files.keys()].filter(k => k.startsWith(`${ROOT}/board/`)).sort()).toEqual([`${ROOT}/board/B-3.md`, `${ROOT}/board/B-4.md`, `${ROOT}/board/B-9.md`])
 })
 
-// ---- One call that never returns (a liaison hung on one read for 1 h 42 min, and nothing said so) ----
+// ---- One call that never returns (a call that never returned for well over an hour, and nothing said so) ----
 
 test("an instance's heartbeat carries its main thread's tool call in flight, and drops it once the call returns", WITH_SESSIONS, async ($, on) => {
   const w = world(on, {
