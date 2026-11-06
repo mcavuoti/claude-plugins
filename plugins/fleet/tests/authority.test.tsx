@@ -392,11 +392,17 @@ test('a folder an outbound sends is listed and versioned: its count and first pa
   expect(await fleet($, '')).toMatch(/ {3}dist\/\*\.whl \(a pattern, 2 files, h[0-9a-f]{8}\):\n```\na\.whl\nb\.whl\n```/)
 })
 
-test('an outbound MCP call, approved: fleet makes it with the server’s own connection; rejected: the asker hears it', async ($, on) => {
+test('an outbound MCP call, approved: fleet makes it through the session’s own tool call (its permission check); rejected: the asker hears it', async ($, on) => {
   const w = project(on)
   const calls: any[] = []
+  const around: any[] = []
+  on('tool.call', { tool: 'mcp__claude_ai_Gmail__send_message' } as any, (_: any, e: any) => {
+    const { tool: _t, tool_use_id: _u, agentId: _a, ...args } = e
+    calls.push({ server: 'claude_ai_Gmail', tool: 'send_message', args })
+    return { result: 'message 17 sent', text: 'message 17 sent' } as any
+  })
   on('mcp.call', (_, e) => {
-    calls.push(e)
+    around.push(e)
     return { value: { content: [{ type: 'text', text: 'message 17 sent' }], isError: false } }
   })
   await startSession($, w)
@@ -418,6 +424,8 @@ test('an outbound MCP call, approved: fleet makes it with the server’s own con
   await tick(w)
   expect(w.submits.join('\n')).toContain("[D-2] The person rejected your outbound (send_message on claude_ai_Gmail to list@example.invalid) (note: not yet). Don't send it another way")
   expect(calls.length).toBe(1)
+  // Never around the session's permission check
+  expect(around).toEqual([])
 })
 
 test('outside content marks the conversation: a change filed in his own turn goes to his dialog, labelled; another waits; /clear ends it', async ($, on) => {

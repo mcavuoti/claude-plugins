@@ -297,6 +297,17 @@ export function clock(ms: number, offsetMin: number): string {
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** A time as the person reads it, in his own time: its clock, and its day when that isn't today ("18:57 on 3 Nov"), so
+ * a time two days old doesn't read as one still to come */
+export function clockOn(ms: number, offsetMin: number, now: number): string {
+  const d = new Date(ms + offsetMin * 60000)
+  const today = new Date(now + offsetMin * 60000)
+  const same = d.getUTCFullYear() === today.getUTCFullYear() && d.getUTCMonth() === today.getUTCMonth() && d.getUTCDate() === today.getUTCDate()
+  return same ? clock(ms, offsetMin) : `${clock(ms, offsetMin)} on ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`
+}
+
 export type Me = { sessionId: string; offsetMin: number }
 
 function sessionWords(by: Who, me: Me): string {

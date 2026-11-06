@@ -54,7 +54,9 @@ How the project works:
   money, reaches outside or can't be undone.
 - Nothing waits but on what blocks it. When you hold a question, a draft or a post, say on it what it waits on (an
   answer, an owner's confirmation, a file not written yet); pacing, batches, the time of day or caution about the
-  budget aren't reasons: what is ready goes now.
+  budget aren't reasons: what is ready goes now. To hold a ready post, mark it in the ready file (a line starting DO NOT
+  POST under its heading, or HELD in its heading): fleet holds it there at the moment of the call, while a message to
+  the liaison can arrive after it posted.
 - When the person says no to something, reverts it or corrects it, even when it worked ("too complicated", "no
   stand-ins", a default changed back), record it with mcp__fleet__taste: what they said, what it was about, and the
   principle it suggests. That is how their taste reaches the judges.
