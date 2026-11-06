@@ -5685,6 +5685,9 @@ type Heartbeat = {
   budget?: { day: string; usd: number; cap: number | null; state: BudgetState } | null
   /** The main thread's Bash commands running in the background (their text, when each started): told after a restart */
   bg?: { command: string; at: number }[]
+  /** The job's background tasks (Claude's state.json inFlight: an MCP call it moved to the background, a subagent),
+   * and since when it has had some */
+  tasks?: { count: number; kinds: string[]; since: number }
   /** The main thread's oldest tool call in flight (one that runs past STUCK_MS may hang: a call that never returns) */
   call?: { tool: string; since: number }
   /** The roster's model or effort that got no response STEP_FAILS times in a row: its requests run the session's own
@@ -5770,18 +5773,28 @@ function modelLine(inst: Instance, hb: { model?: unknown; modelRefused?: unknown
 function settingsCoreHash(text: string): string {
   try {
     const s = JSON.parse(text)
-    if (s && typeof s === 'object' && !Array.isArray(s) && ('model' in s || 'effortLevel' in s)) {
-      const { model: _m, effortLevel: _e, ...rest } = s
-      return hashText(settingsText(rest))
+    if (s && typeof s === 'object' && !Array.isArray(s)) {
+      // fleet's own deny rules (Edit(//<project>/…) on the command-level files): its gate refuses those writes live, so
+      // a change of them alone (a command channel's script) is no reason to restart
+      const deny = Array.isArray(s.permissions?.deny) ? s.permissions.deny : null
+      const own = deny ? deny.filter((d: unknown) => typeof d === 'string' && d.startsWith('Edit(//')) : []
+      if ('model' in s || 'effortLevel' in s || own.length) {
+        const { model: _m, effortLevel: _e, ...rest } = s
+        if (own.length) rest.permissions = { ...rest.permissions, deny: deny.filter((d: unknown) => !own.includes(d)) }
+        return hashText(settingsText(rest))
+      }
     }
   } catch {}
   return hashText(text)
 }
 
 /** One tool call in flight this long may hang (a subagent's is its own work, and a permission prompt has its mark) */
-const STUCK_MS = 30 * 60000
+const STUCK_MS = 20 * 60000
 const OWN_PACE_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task'])
-function hungCall(hb: { call?: { tool: string; since: number }; waitingOn?: unknown } | null, now: number): { tool: string; since: number } | null {
+function hungCall(hb: { call?: { tool: string; since: number }; waitingOn?: unknown; tasks?: { kinds?: unknown; since?: unknown } } | null, now: number): { tool: string; since: number } | null {
+  // An MCP call the engine moved to the background (it aborts one silent for 30 min): seen there that long
+  const t = hb?.tasks
+  if (t && Array.isArray(t.kinds) && t.kinds.includes('mcp_task') && typeof t.since === 'number' && now - t.since >= STUCK_MS) return { tool: 'a background MCP task', since: t.since }
   const c = hb?.call
   if (!c || typeof c.tool !== 'string' || typeof c.since !== 'number' || hb?.waitingOn || OWN_PACE_TOOLS.has(c.tool)) return null
   return now - c.since >= STUCK_MS ? c : null
@@ -6031,6 +6044,7 @@ async function heartbeat($: any) {
     waitingOn: permissionWait,
     ...(oldestCall() ? { call: oldestCall() as { tool: string; since: number } } : {}),
     remote: await remoteControl($),
+    ...(await jobTasks($)),
     contextTokens,
     model: stepModel,
     ...(stepAsked ? { asked: stepAsked } : {}),
@@ -6100,6 +6114,33 @@ async function noteBlock($: any, e: any) {
 
 async function blocksOf($: any, slug: string, now: number): Promise<BlocksFile | null> {
   return blocksToday(await readWire<BlocksFile>($, `${instDir(slug)}/blocks.json`), today(now))
+}
+
+/** The job's background tasks, from Claude's state.json (inFlight: { tasks, kinds }), and since when there have been
+ * some: { tasks } for the heartbeat, or nothing */
+let tasksSince = 0
+async function jobTasks($: any): Promise<{ tasks?: { count: number; kinds: string[]; since: number } }> {
+  if (!jobRef || !jobDir) return {}
+  let f: any = null
+  try {
+    f = JSON.parse((await readText($, `${jobDir}/state.json`)) ?? 'null')?.inFlight
+  } catch {}
+  const count = typeof f?.tasks === 'number' ? f.tasks : 0
+  if (!count) {
+    tasksSince = 0
+    return {}
+  }
+  if (!tasksSince) tasksSince = await $.clock.now()
+  const kinds = Array.isArray(f.kinds) ? f.kinds.filter((k: unknown): k is string => typeof k === 'string').slice(0, 10) : []
+  return { tasks: { count, kinds, since: tasksSince } }
+}
+
+/** A background task that keeps an instance at work though its row says idle: an MCP call moved to the background, a
+ * subagent */
+const BUSY_TASKS: ReadonlySet<string> = new Set(['mcp_task', 'agent'])
+function busyTasks(hb: { tasks?: { kinds?: unknown } } | null): boolean {
+  const k = hb?.tasks?.kinds
+  return Array.isArray(k) && k.some(x => BUSY_TASKS.has(x))
 }
 
 /** Whether this background session has Remote Control on: Claude's background service keeps its connection in the
@@ -6304,7 +6345,7 @@ async function openReproduceItem($: any, e: ChangeEvent, writer: Instance, rule:
     '',
     `fleet opened this item (world.json's reproduce: ${rule.glob}, for: ${rule.for}): ${writer.name} landed ${e.path}${cite ? ` (${cite})` : ''} at ${clock(e.at, me.offsetMin)}, a result, and nothing on the board reproduces it yet.`,
     '',
-    `Reproduce it on your own: rerun its \`run:\` (or the same experiment) where it says, and land a result of yours with its proof, citing ${cite ?? e.path}; then set this item done with where your result is, pass or fail. If it needs no reproduction, ${writer.name} or the front door sets it done saying why.`,
+    `Reproduce it on your own: rerun its \`run:\` (or the same experiment) where it says, and land a result of yours with its proof, citing ${cite ?? e.path}; then set this item done with where your result is, pass or fail. If you find it needs no reproduction, set it done saying why: that call is yours (the one who takes it), not ${writer.name}'s.`,
     '',
   ].join('\n')
   let n = Math.max(0, ...(await names($, dir)).map(x => /^B-(\d+)\.md$/.exec(x)).filter((m): m is RegExpExecArray => !!m).map(m => Number(m[1]))) + 1
@@ -6441,7 +6482,8 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
   const states = new Map<string, 'idle' | 'busy' | 'retired' | 'off'>()
   for (const i of insts) {
     const { running, stopped } = rowsOf(i, rows)
-    if (running) states.set(i.slug, running.state === 'idle' ? 'idle' : 'busy')
+    // Idle by its row, but at work on a background task (an MCP call the engine moved there, a subagent): busy
+    if (running) states.set(i.slug, running.state === 'idle' && !busyTasks(await heartbeatOf($, i.slug)) ? 'idle' : 'busy')
     else if (stopped && !['person', 'memory'].includes(stopReason(stopped) ?? '') && (await heartbeatOf($, i.slug))?.ref === stopped.ref) states.set(i.slug, 'retired')
     else states.set(i.slug, 'off')
   }
@@ -6618,7 +6660,8 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
   for (const [path, m] of Object.entries(repro?.made ?? {})) {
     if (m.writer !== inst.slug || told[`repro|${path}`] !== undefined || now - m.at > 24 * HOUR) continue
     if (!m.opened) continue
-    lines.push(`fleet: ${path} is a result world.json says needs reproducing, so fleet opened ${m.item} for its reproduction (offered to the ones it's for). If it needs none, set ${m.item} done saying why.`)
+    const by = (await reproduceRules($)).find(r => r.re.test(path))?.for ?? 'the ones it is for'
+    lines.push(`fleet: ${path} is a result world.json says needs reproducing, so fleet opened ${m.item} for its reproduction by ${by}. Whether it needs one is theirs to judge: go on with your own work.`)
     keys.push(`repro|${path}`)
   }
   for (const v of await runViews($)) {
@@ -6657,8 +6700,13 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     // Every instance an open item nobody owns fits, offered it yet or not
     const front = frontOf(roster?.r ?? null, roster?.instances ?? [])?.name ?? null
     for (const u of Object.values(work.unowned)) if (!u.allOffered) for (const i of candidatesFor(u.for, roster?.instances ?? [], front, u.writer ?? null)) waiting.add(i.name)
-    const bare = work.capacity.idle.filter(n => n !== inst.name && !waiting.has(n))
+    let bare = work.capacity.idle.filter(n => n !== inst.name && !waiting.has(n))
     const k = `nothing|${Math.floor(now / HOUR)}`
+    // An item opened since the sweep that wrote work.json (fleet's own, a peer's): the ones it fits aren't bare
+    if (bare.length && told[k] === undefined) {
+      for (const b of await boardItems($)) if (b.mtime >= work.at - 1000 && isUnowned(b)) for (const i of candidatesFor(b.for, roster?.instances ?? [], front)) waiting.add(i.name)
+      bare = bare.filter(n => !waiting.has(n))
+    }
     if (bare.length && told[k] === undefined) {
       lines.push(`fleet: idle with no item to take: ${bare.slice(0, 8).join(', ')}${bare.length > 8 ? ` and ${bare.length - 8} more` : ''}. Turn what the charter and the plan still need into board items (for:, what done looks like), or say in your journal why they wait.`)
       keys.push(k)
@@ -7114,7 +7162,7 @@ async function nudgeTick($: any) {
   const journal = await readText($, `${root}/${inst.journal}`)
   const journalAt = await mtimeOf($, `${root}/${inst.journal}`)
   const conv = await read($, conversationAt)
-  if (FRESH_PERIODS && journal !== null && (await read($, freshAt)) <= conv && freshDue({ context: inst.context, freshH: inst.freshH, conversationAt: conv, journalAt, now, idleMs: now - (await read($, idleSince)), pending: false })) {
+  if (FRESH_PERIODS && journal !== null && (await read($, freshAt)) <= conv && freshDue({ context: inst.context, freshH: inst.freshH, conversationAt: conv, journalAt, now, idleMs: now - (await read($, idleSince)), pending: !!(await pendingRestart($, inst)) })) {
     await update($, freshAt, () => now)
     await update($, nudgeAt, () => now)
     await counted()

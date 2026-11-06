@@ -32,6 +32,7 @@ function beat(extra: Record<string, unknown> = {}) {
 // The hash an instance keeps of its settings file: without its model and effort (they reach it at its next request)
 function coreHash(text: string): string {
   const { model: _m, effortLevel: _e, ...rest } = JSON.parse(text)
+  if (rest.permissions?.deny) rest.permissions = { ...rest.permissions, deny: rest.permissions.deny.filter((d: string) => !d.startsWith('Edit(//')) }
   return hashText(settingsText(rest))
 }
 
