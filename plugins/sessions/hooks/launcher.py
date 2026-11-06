@@ -28,7 +28,8 @@ person's sections, which ccc section changes, ringing <data>/bell/sections for t
 <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
 Claude's own files, read only, by ccc tidy: <jobs>/pins.json and <jobs>/<id>/state.json (the background service's:
 ~/.claude/jobs or SESSIONS_JOBS_DIR), <registry>/<pid>.json (the running sessions: ~/.claude/sessions or
-SESSIONS_REGISTRY_DIR).
+SESSIONS_REGISTRY_DIR), and when each stopped session's transcript was last written (~/.claude/projects/*/<sessionId>.jsonl,
+under HOME).
 Other environment: SESSIONS_CLAUDE (the claude command), SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the
 installed plugin, from the ccc command), SESSIONS_START_WAIT (seconds to wait for a new session's mod).
 """
@@ -54,6 +55,7 @@ DATA = os.environ.get('SESSIONS_DATA_DIR') or os.path.join(HOME, '.claude', 'mod
 CLAUDE = os.environ.get('SESSIONS_CLAUDE') or 'claude'
 JOBS = os.environ.get('SESSIONS_JOBS_DIR') or os.path.join(HOME, '.claude', 'jobs')
 REGISTRY = os.environ.get('SESSIONS_REGISTRY_DIR') or os.path.join(HOME, '.claude', 'sessions')
+PROJECTS = os.path.join(HOME, '.claude', 'projects')
 START_WAIT = float(os.environ.get('SESSIONS_START_WAIT') or '10')
 
 DIM, RESET, BOLD = '\033[2m', '\033[0m', '\033[1m'
@@ -968,10 +970,12 @@ def ring(name):
 # removed from the list (claude rm), an idle background one is stopped and removed (claude stop, then claude rm). Never
 # offered, each with why: a session that works or waits for him, one with tasks in the background, one a window shows,
 # a pinned one (unless --pinned) and a regular one. Nothing is done without a pick, running sessions need a second yes,
-# and each one is checked again just before it's stopped. --days N offers only the stopped sessions started more than N
-# days ago; --list prints the list and asks nothing. It reads, never writes: pins.json and each job's state.json in the
-# service's folder (JOBS), the registry file of a running session for how long it's been idle (REGISTRY), ps for the
-# windows. Exits 0 when it ran, picked or not; 1 when the list can't be read or a claude stop or rm failed; 2 for usage.
+# and each one is checked again just before it's stopped. --days N offers only the stopped sessions last used more than
+# N days ago (their transcript's time; without one, when they started); --list prints the list and asks nothing. It
+# reads, never writes: pins.json and each job's state.json in the service's folder (JOBS), the registry file of a running
+# session for how long it's been idle (REGISTRY), when each stopped session's transcript was last written (PROJECTS),
+# ps for the windows. Exits 0 when it ran, picked or not; 1 when the list can't be read or a claude stop or rm failed;
+# 2 for usage.
 
 TIDY_USAGE = 'usage: ccc tidy [--here] [--pinned] [--days <n>] [--list]'
 
@@ -1057,10 +1061,45 @@ def started_ago(s, now):
     return 'started %s ago' % span(now - t) if t else 'start time unknown'
 
 
+# When each session was last used: the modification time of its transcript, <projects>/<folder>/<sessionId>.jsonl, in
+# ms. Found by its name in every folder, one listing of each for all the sessions at once: a folder's name is the
+# project's path with each character other than a letter or a digit written as -, which can't be read back, and Claude
+# moves the file to another folder when the session moves (/cd). {sessionId: ms}: a session missing has no transcript
+def last_used(session_ids):
+    wanted = {sid + '.jsonl': sid for sid in session_ids if re.match(r'^[A-Za-z0-9-]+$', sid or '')}
+    used = {}
+    if not wanted:
+        return used
+    try:
+        with os.scandir(PROJECTS) as entries:
+            folders = [e.path for e in entries if e.is_dir()]
+    except OSError:
+        return used
+    for folder in folders:
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in wanted.keys() & set(names):
+            try:
+                t = os.stat(os.path.join(folder, name)).st_mtime * 1000
+            except OSError:
+                continue
+            used[wanted[name]] = max(used.get(wanted[name], 0), t)
+    return used
+
+
+# A stopped session's time: when it was last used (its transcript), else when it started, saying why
+def stopped_ago(s, used, now):
+    if used:
+        return 'last used %s ago' % span(now - used)
+    return "%s (its transcript wasn't found)" % started_ago(s, now)
+
+
 # What ccc tidy may do with a session, and the words for it: ('stopped', when) it can be removed, ('running', when) it
 # can be stopped and removed, ('kept', why) it's never offered. windows: read_windows(); pins: read_pins(); job: its
-# job_state(); pinned_ok: --pinned
-def tidy_verdict(s, windows, pins, job, pinned_ok, now):
+# job_state(); pinned_ok: --pinned; used: when it was last used (last_used), if known
+def tidy_verdict(s, windows, pins, job, pinned_ok, now, used=None):
     sid = s.get('id')
     if s.get('kind') != 'background':
         return 'kept', 'a regular session: /exit it in its window'
@@ -1085,7 +1124,7 @@ def tidy_verdict(s, windows, pins, job, pinned_ok, now):
             return 'kept', where
         if pinned:
             return 'kept', pinned
-        return 'stopped', started_ago(s, now) + note
+        return 'stopped', stopped_ago(s, used, now) + note
     status = s.get('status')
     if status == 'busy':
         return 'kept', 'busy: never stopped while it works'
@@ -1119,16 +1158,17 @@ def clip(text, width, left=False):
     return '…' + text[-(width - 1):] if left else text[:width - 1] + '…'
 
 
-# The inventory: the sessions to offer, numbered (stopped first, oldest first; then idle running ones, idle longest
-# first), the ones left alone with why, and how many stopped ones --days left out
-def tidy_inventory(sessions, windows, pins, pinned_ok, days, now):
+# The inventory: the sessions to offer, numbered (stopped first, used longest ago first; then idle running ones, idle
+# longest first), the ones left alone with why, and how many stopped ones --days left out. used: last_used()
+def tidy_inventory(sessions, windows, pins, pinned_ok, days, now, used):
     stopped, running, kept, recent = [], [], [], 0
     for s in sessions:
-        verdict, words = tidy_verdict(s, windows, pins, job_state(s.get('id')), pinned_ok, now)
+        verdict, words = tidy_verdict(s, windows, pins, job_state(s.get('id')), pinned_ok, now, used.get(s['sessionId']))
         item = {'session': s, 'group': verdict, 'words': words}
         if verdict == 'stopped':
-            started = number(s.get('startedAt'))
-            if days is not None and (not started or now - started <= days * 86400000):
+            # When it was last used, or else when it started
+            item['at'] = used.get(s['sessionId']) or number(s.get('startedAt'))
+            if days is not None and (not item['at'] or now - item['at'] <= days * 86400000):
                 recent += 1
                 continue
             stopped.append(item)
@@ -1136,7 +1176,7 @@ def tidy_inventory(sessions, windows, pins, pinned_ok, days, now):
             running.append(item)
         else:
             kept.append(item)
-    stopped.sort(key=lambda i: number(i['session'].get('startedAt')) or 0)
+    stopped.sort(key=lambda i: i['at'] or 0)
     running.sort(key=lambda i: idle_since(i['session']) or number(i['session'].get('startedAt')) or 0)
     kept.sort(key=lambda i: (i['session']['cwd'], title_of(i['session']).casefold()))
     for n, item in enumerate(stopped + running, 1):
@@ -1163,7 +1203,7 @@ def tidy_print(inv, heading, days, windows, pinned_ok):
         for item in inv['stopped']:
             line(item)
         if inv['recent']:
-            say('  %s%d more stopped, started in the last %g days (--days %g)%s' % (DIM, inv['recent'], days, days, RESET))
+            say('  %s%d more stopped, used in the last %g days (--days %g)%s' % (DIM, inv['recent'], days, days, RESET))
     if inv['running']:
         say('Running in the background, idle%s · stop and remove' % ('' if pinned_ok else ', not pinned'))
         for item in inv['running']:
@@ -1281,7 +1321,8 @@ def tidy(argv):
         sessions = [s for s in sessions if in_project(s['cwd'], root, HOME)]
         heading = os.path.basename(root) or root
     windows = read_windows()
-    inv = tidy_inventory(sessions, windows, read_pins(), pinned_ok, days, now)
+    used = last_used([s['sessionId'] for s in sessions if not s.get('pid')])
+    inv = tidy_inventory(sessions, windows, read_pins(), pinned_ok, days, now, used)
     tidy_print(inv, heading, days, windows, pinned_ok)
     offered = inv['stopped'] + inv['running']
     if only_list:

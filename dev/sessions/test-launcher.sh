@@ -448,14 +448,17 @@ grep -q '"sectionsFormat": 2' "$data/sections.json" || fail "section" "a newer s
 pass "section: the window's session or --session, as the person's, refused without one window, a newer file untouched"
 
 # 14. ccc tidy: every folder's sessions from the list, grouped and numbered (stopped, then idle running ones), and the
-#     ones it leaves alone with why (working, waiting, tasks in the background, a window, pinned, regular); --here,
-#     --days, --list; a pick of numbers and ranges or s, a second yes for running ones, each checked again just before
+#     ones it leaves alone with why (working, waiting, tasks in the background, a window, pinned, regular); a stopped
+#     one's time from its transcript (found by its id), else its start; --here, --days, --list; a pick of numbers and ranges or s, a second yes for running ones, each checked again just before
 #     it's stopped; never an unpin, never a regular session; the CLI's failures said, and exit 1
 other="$work/home/projects/other"
 mkdir -p "$other"
 other="$(cd "$other" && pwd -P)"
+# touch_ago <file> <seconds>: the file, last written that long ago
+touch_ago() { python3 -c 'import os, sys, time; open(sys.argv[1], "a").close(); t = time.time() - int(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$1" "$2"; }
+transcript() { echo "$HOME/.claude/projects/$1/$2-0000-0000-0000-000000000000.jsonl"; }
 tidy_world() {
-  rm -rf "$HOME/.claude/sessions" "$HOME/.claude/jobs"
+  rm -rf "$HOME/.claude/sessions" "$HOME/.claude/jobs" "$HOME/.claude/projects"
   NOW="$(now_ms)" PROJ="$proj" OTHER="$other" python3 - > "$fix/agents.json" <<'PY'
 import json, os
 now, proj, other = int(os.environ['NOW']), os.environ['PROJ'], os.environ['OTHER']
@@ -483,6 +486,11 @@ PY
   printf '{"bridgeSessionId": "session_x", "inFlight": {"tasks": 0}}\n' > "$HOME/.claude/jobs/eeeeeee1/state.json"
   printf '{"inFlight": {"tasks": 3, "drainableMonitors": 1, "kinds": ["agent", "shell", "artifact_watch"]}}\n' > "$HOME/.claude/jobs/fffffff1/state.json"
   printf '  501 ttys901  bash /x/hooks/visor.sh start\n  502 ttys901  claude attach ddddddd1\n' > "$fix/ps.txt"
+  # The transcripts: "old notes" was last used 10 days ago (found by its id, in folders whose names aren't its project's:
+  # the newest copy counts); "fresh stop" has none
+  mkdir -p "$HOME/.claude/projects/-elsewhere" "$HOME/.claude/projects/-an-older-copy"
+  touch_ago "$(transcript -elsewhere aaaaaaa1)" $((10 * 86400))
+  touch_ago "$(transcript -an-older-copy aaaaaaa1)" $((15 * 86400))
 }
 # tidy_run <answers> <args...>: ccc tidy from the project (or $TIDY_IN), the answers on stdin; the output without its
 # colours, and a line break after each question as a terminal shows once the answer is typed, in $work/out.txt; prints
@@ -502,8 +510,8 @@ tidy_world
 expect "$(tidy_run '' --list)" 0 "tidy --list"
 has '^Sessions · every folder$' "the heading"
 has '^Stopped \(no process: a list entry and its conversation on disk\) · remove$' "the stopped group"
-has '^  1  old notes +~/projects/myapp +started 20 d ago$' "the oldest stopped one first"
-has '^  2  fresh stop +~/projects/other +started 2 d ago$' "a stopped one in another folder"
+has '^  1  old notes +~/projects/myapp +last used 10 d ago$' "the one used longest ago first, by its transcript's time"
+has "^  2  fresh stop +~/projects/other +started 2 d ago \(its transcript wasn't found\)$" "no transcript: when it started, and why"
 has '^Running in the background, idle, not pinned · stop and remove$' "the running group"
 has '^  3  idle other +~/projects/other +idle, started 4 h ago$' "idle with no registry time: since it started"
 has '^  4  idle one +~/projects/myapp +idle 3 h$' "idle since the registry's statusUpdatedAt"
@@ -524,10 +532,19 @@ has '^  1  old notes ' "--here: the project's stopped one"
 has '^  2  idle one ' "--here: the project's idle one"
 lacks 'fresh stop|idle other|asker|pinned by hand' "--here: another folder's sessions"
 expect "$(tidy_run '' --days 7 --list)" 0 "tidy --days 7"
-has '^  1  old notes ' "--days: the old one"
-has '^  1 more stopped, started in the last 7 days \(--days 7\)$' "--days: says what it left out"
+has '^  1  old notes ' "--days: the one used 10 days ago"
+has '^  1 more stopped, used in the last 7 days \(--days 7\)$' "--days: says what it left out"
 has '^  2  idle other ' "--days doesn't filter running ones"
-lacks 'fresh stop' "--days: the recent one isn't listed"
+lacks 'fresh stop' "--days: one started 2 days ago, with no transcript, isn't listed"
+# Used since: started 20 days ago, but its transcript was written yesterday, so it comes last and --days 7 leaves it out
+touch_ago "$(transcript -elsewhere aaaaaaa1)" 86400
+tidy_run '' --list > /dev/null
+has '^  1  fresh stop ' "the one used longest ago first"
+has '^  2  old notes +~/projects/myapp +last used 24 h ago$' "last used yesterday"
+tidy_run '' --days 7 --list > /dev/null
+lacks 'old notes|fresh stop' "--days: by when it was last used, not when it started"
+has '^  2 more stopped, used in the last 7 days \(--days 7\)$' "--days: both left out"
+tidy_world
 # A pick of a number and a range, with the second yes for the running ones
 export SESSIONS_PLUGIN_VERSION=0.10.0 SESSIONS_PLUGIN_SINCE=0
 expect "$(tidy_run '1 3-4\ny\n')" 0 "a pick"
@@ -617,7 +634,7 @@ expect "$(tidy_run '')" 1 "an unreadable list"
 has "^Couldn't read the session list" "an unreadable list"
 expect "$(tidy_run '' --days)" 2 "--days without a number"
 expect "$(tidy_run '' --bogus)" 2 "an unknown option"
-pass "tidy: groups and reasons, --here, --days, --list, picks, s, Enter, the second yes, checked again, --pinned, failures"
+pass "tidy: groups and reasons, last used, --here, --days, --list, picks, s, Enter, the second yes, checked again, --pinned, failures"
 
 # What ccc hands the launcher (the installed version and since when) never reaches a claude it runs: a viewer or a
 # start that brings up the background service would pass it on to every session the service starts
