@@ -223,7 +223,7 @@ test('5: a command repository unstamped 45 min, then stamped: its commands run w
     await w.clock.settle()
   }
   expect(ran.length).toBeGreaterThan(0)
-  expect(ran[0] - stampedAt).toBeLessThanOrEqual(6 * MIN)
+  expect(ran[0]! - stampedAt).toBeLessThanOrEqual(6 * MIN)
 })
 
 // ---- 6: a slot given from the line to an idle instance (by another session's release): told within the old 5 s ----
