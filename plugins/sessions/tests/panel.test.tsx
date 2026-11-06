@@ -79,6 +79,10 @@ import {
   askRejection,
   UNSHOWN,
   worktreeBase,
+  sessionHome,
+  belongsTo,
+  parseTranscriptStarts,
+  outsideNote,
   wakeStagger,
   afterTick,
   rowsBelow,
@@ -595,7 +599,11 @@ test('shared files: key=value lines, one value per key, line breaks flattened', 
 test('heartbeat: fresh, same format and same process is ok; old, missing or another process is missing', () => {
   const now = 1_000_000
   const h = parseHeartbeat(heartbeatText({ pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' }))
-  expect(h).toEqual({ format: 3, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' })
+  expect(h).toEqual({ format: 3, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start', root: '' })
+  // The project the session belongs to (0.15.0): a line of its own, which an older reader ignores
+  const text = heartbeatText({ pid: 42, at: now, version: '0.15.0', via: 'session.start', root: '/Users/x/myapp' })
+  expect(text).toContain('root=/Users/x/myapp\n')
+  expect(parseHeartbeat(text)?.root).toBe('/Users/x/myapp')
   expect(heartbeatStatus(h, 42, now)).toBe('ok')
   expect(heartbeatStatus(h, 43, now)).toBe('missing')
   expect(heartbeatStatus(h, undefined, now)).toBe('ok')
@@ -658,6 +666,42 @@ test("project root: a worktree under <x>/.claude/worktrees/ is <x>'s project, it
   expect(rootFrom('/Users/x/myapp/.claude/worktrees/area-a', ['/Users/x/myapp', '/Users/x/myapp/.claude/worktrees/area-a'])).toBe('/Users/x/myapp')
   // A marker above the repository still wins, as for the main checkout
   expect(rootFrom('/Users/x/work/myapp/.claude/worktrees/area-a/src', ['/Users/x/work'])).toBe('/Users/x/work')
+})
+
+test('the project a session belongs to: where its own mod recorded, else where its transcript started, else where it is listed', () => {
+  const ROOT = '/Users/x/myapp'
+  const OUT = '/Users/x/wt-outside'
+  expect(sessionHome({ recorded: ROOT, first: OUT, cwd: OUT })).toBe(ROOT)
+  expect(sessionHome({ recorded: '', first: `${ROOT}/src`, cwd: OUT })).toBe(`${ROOT}/src`)
+  expect(sessionHome({ recorded: null, first: undefined, cwd: OUT })).toBe(OUT)
+  expect(sessionHome({ cwd: 42 })).toBe('')
+  // Listed in a worktree outside the project (EnterWorktree with a path), or anywhere /cd took it: still the project's
+  expect(belongsTo({ recorded: ROOT, cwd: OUT }, ROOT, '/Users/x')).toBe(true)
+  expect(belongsTo({ first: `${ROOT}/src`, cwd: OUT }, ROOT, '/Users/x')).toBe(true)
+  expect(belongsTo({ recorded: ROOT, cwd: OUT }, OUT, '/Users/x')).toBe(false)
+  // One that started elsewhere and moved in isn't
+  expect(belongsTo({ recorded: '/Users/x/other', cwd: `${ROOT}/src` }, ROOT, '/Users/x')).toBe(false)
+  // The rest as before: a worktree under <project>/.claude/worktrees/ is the project, the home folder only itself
+  expect(belongsTo({ cwd: `${ROOT}/.claude/worktrees/w1` }, ROOT, '/Users/x')).toBe(true)
+  expect(belongsTo({ recorded: ROOT }, '/Users/x', '/Users/x')).toBe(false)
+  expect(belongsTo({}, ROOT, '/Users/x')).toBe(false)
+})
+
+test("a transcript's first cwd, as the lookup prints it: the row read as JSON, or its cwd alone when the row was cut", () => {
+  const row = JSON.stringify({ parentUuid: null, cwd: '/Users/x/my "app"', sessionId: 'aaaaaaaa', message: { content: 'hi' } })
+  const cut = `{"cwd":"/Users/x/myapp","message":{"content":"a long first prompt`
+  expect(parseTranscriptStarts(`aaaaaaaa-1\t${row}\nbbbbbbbb-1\t${cut}\ncccccccc-1\t\ndddddddd-1\t{"cwd":"relative"}\n`)).toEqual({ 'aaaaaaaa-1': '/Users/x/my "app"', 'bbbbbbbb-1': '/Users/x/myapp' })
+  expect(parseTranscriptStarts('')).toEqual({})
+})
+
+test('the line a session working outside its project shows: its folder from ~, cut from the start to fit; none inside it', () => {
+  expect(outsideNote('/Users/x/wt-outside', '/Users/x/myapp', '/Users/x')).toBe('Working in ~/wt-outside, outside this project')
+  expect(outsideNote('/Users/x/myapp/.claude/worktrees/w1', '/Users/x/myapp', '/Users/x')).toBe('')
+  expect(outsideNote('/Users/x/myapp/src', '/Users/x/myapp', '/Users/x')).toBe('')
+  expect(outsideNote('', '/Users/x/myapp', '/Users/x')).toBe('')
+  const narrow = outsideNote('/Users/x/work/clients/area/wt-outside', '/Users/x/myapp', '/Users/x', 48)
+  expect(narrow).toBe('Working in …rea/wt-outside, outside this project')
+  expect(narrow.length).toBe(48)
 })
 
 test('project root: the folders to look for a marker in, outermost first, below the top two levels', () => {

@@ -672,6 +672,49 @@ expect "$(tidy_run '' --days)" 2 "--days without a number"
 expect "$(tidy_run '' --bogus)" 2 "an unknown option"
 pass "tidy: groups and reasons, last used, --here, --days, ended with the background service, --list, picks, s, Enter, the second yes, checked again, --pinned, failures"
 
+# 15. A session belongs to the project it started in, wherever Claude lists it now (session_homes, the rule of
+#     sessionHome in state.ts): its heartbeat's root (its own mod's record, however old), else its transcript's first
+#     cwd, else the folder it's listed in. "mover" moved to a worktree of the project's repository outside it, with its
+#     own CLAUDE.md; "quiet" moved there too and stopped (no heartbeat, its transcript started in the project);
+#     "visitor" started in another project and moved into this one. ccc's pick, ccc <name> and ccc tidy --here go by it
+reset
+rm -rf "$HOME/.claude/projects" "$HOME/.claude/jobs" "$HOME/.claude/sessions"
+outside="$work/home/wt-outside"
+mkdir -p "$outside"
+touch "$outside/CLAUDE.md"
+outside="$(cd "$outside" && pwd -P)"
+# beat_root <id> <pid> <root>: a heartbeat that names the project its session belongs to
+beat_root() { beat "$1" "$2"; printf 'root=%s\n' "$3" >> "$data/alive/$1-0000-0000-0000-000000000000"; }
+sessions "aaaaaaaa:mover:waiting:600:$outside" "bbbbbbbb:quiet:-:600:$outside" "cccccccc:visitor:idle:600:$proj/src"
+beat_root aaaaaaaa 1000 "$proj"
+beat_root cccccccc 1002 "$other"
+mkdir -p "$HOME/.claude/projects/-wt-outside"
+printf '{"type":"permission-mode"}\n{"type":"user","cwd":"%s","message":{"content":"hi"}}\n{"type":"user","cwd":"%s"}\n' "$proj" "$outside" > "$(transcript -wt-outside bbbbbbbb)"
+expect "$(field "$(pick)" session)" aaaaaaaa "ccc's pick: the project's session that moved out, by its heartbeat"
+expect "$(field "$(PICK_IN="$proj/src" pick)" session)" aaaaaaaa "ccc's pick from a subfolder"
+d="$(pick mover)"
+expect "$(field "$d" action)" attach "ccc <name>: a session that moved out is still found"
+expect "$(field "$d" session)" aaaaaaaa "ccc <name>: that session"
+expect "$(field "$(pick visitor)" action)" create "ccc <name>: one that moved in from another project isn't this one's"
+d="$(PICK_IN="$outside" pick)"
+expect "$(field "$d" action)" prompt "the outside worktree's own folder: none of them is its"
+expect "$(field "$d" stopped)" "[]" "the outside worktree's own folder: not the stopped one either"
+# Both stopped: the Name prompt lists them, one by its old heartbeat, one by its transcript's first row with a cwd (its
+# last row is outside)
+sessions "aaaaaaaa:mover:-:600:$outside" "bbbbbbbb:quiet:-:600:$outside" "cccccccc:visitor:idle:600:$proj/src"
+d="$(pick)"
+expect "$(field "$d" action)" prompt "only stopped ones of the project: the Name prompt"
+expect "$(field "$d" stopped)" "['aaaaaaaa', 'bbbbbbbb']" "they're listed, by heartbeat and by transcript"
+sessions "aaaaaaaa:mover:waiting:600:$outside" "bbbbbbbb:quiet:-:600:$outside" "cccccccc:visitor:idle:600:$proj/src"
+expect "$(tidy_run '' --here --list)" 0 "tidy --here --list with moved sessions"
+has '^Sessions · myapp$' "--here: the project"
+has '^  1  quiet +~/wt-outside +last used ' "--here: the stopped one that moved out, from its transcript"
+has '^     mover +~/wt-outside +waiting for you' "--here: the running one that moved out, from its heartbeat"
+lacks 'visitor' "--here: one that moved in from another project"
+TIDY_IN="$outside" tidy_run '' --here --list > /dev/null
+lacks 'quiet|mover|visitor' "--here in the outside worktree: none of them"
+pass "membership: the project a session started in, for ccc's pick, ccc <name> and ccc tidy --here (heartbeat, transcript)"
+
 # What ccc hands the launcher (the installed version and since when) never reaches a claude it runs: a viewer or a
 # start that brings up the background service would pass it on to every session the service starts
 [ ! -s "$LEAKS" ] || fail "environment" "claude saw SESSIONS_PLUGIN_VERSION/SINCE: $(sort -u "$LEAKS" | head -5 | tr '\n' ';')"

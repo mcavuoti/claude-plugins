@@ -51,6 +51,8 @@ export type World = {
   bandLate: { value: number }
   // The start of the session's transcript (WorldOptions.transcript), which a test can change
   transcript: { value: string | undefined }
+  // The folder of each session's transcript's first row (where it started), by session id: none by default
+  starts: Map<string, string>
   // What claude --bg prints when it refuses to start a session ('': it starts it)
   bgError: { value: string }
   // macOS's memory pressure level (sysctl kern.memorystatus_vm_pressure_level): 1 normal, 4 critical
@@ -117,6 +119,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const usage = { value: { context: { percent: 10 }, rateLimits: [] } as any }
   const band = { value: '' }
   const transcript = { value: options.transcript }
+  const starts = new Map<string, string>()
   const bgError = { value: '' }
   const memory = { value: '1' }
   const ps = { value: '' }
@@ -273,6 +276,10 @@ export function world(on: On, options: WorldOptions = {}): World {
       return installedLate.value > 0 ? clock.sleep(installedLate.value).then(answer) : answer()
     }
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok(`${options.system ?? 'Darwin'}|`)
+    // The first row with a cwd of each session's transcript (firstCwds): the ones starts has, by session id
+    if (argv[0] === '/bin/sh' && String(argv[2]).includes(`'"cwd":"'`)) {
+      return ok(argv.slice(5).filter(id => starts.has(id)).map(id => `${id}\t${JSON.stringify({ type: 'user', cwd: starts.get(id) })}\n`).join(''))
+    }
     // The transcript's first row (readAgent)
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('.jsonl')) return transcript.value === undefined ? failed() : ok(transcript.value)
     return ok()
@@ -313,7 +320,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, starts, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

@@ -26,10 +26,11 @@ The files it reads and writes are the mod's (hooks/state.ts has the formats): <d
 next), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), <data>/sections.json (the
 person's sections, which ccc section changes, ringing <data>/bell/sections for the panels that watch it), with
 <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
-Claude's own files, read only, by ccc tidy: <jobs>/pins.json and <jobs>/<id>/state.json (the background service's:
-~/.claude/jobs or SESSIONS_JOBS_DIR), <registry>/<pid>.json (the running sessions: ~/.claude/sessions or
-SESSIONS_REGISTRY_DIR), when each stopped session's transcript was last written (~/.claude/projects/*/<sessionId>.jsonl,
-under HOME), and the background service's log for the stopped ones that ended with it (~/.claude/daemon.log or
+Claude's own files, read only: the first row of a session's transcript (~/.claude/projects/*/<sessionId>.jsonl, under
+HOME), for the project of a session whose heartbeat doesn't name one (session_homes); and by ccc tidy, <jobs>/pins.json
+and <jobs>/<id>/state.json (the background service's: ~/.claude/jobs or SESSIONS_JOBS_DIR), <registry>/<pid>.json (the
+running sessions: ~/.claude/sessions or SESSIONS_REGISTRY_DIR), when each stopped session's transcript was last
+written, and the background service's log for the stopped ones that ended with it (~/.claude/daemon.log or
 SESSIONS_DAEMON_LOG).
 Other environment: SESSIONS_CLAUDE (the claude command), SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE (the
 installed plugin, from the ccc command), SESSIONS_START_WAIT (seconds to wait for a new session's mod).
@@ -137,6 +138,31 @@ def in_project(cwd, root, home):
     return cwd.startswith(root + '/')
 
 
+# The folder that says which project a session belongs to (sessionHome in state.ts): the one it started in, wherever
+# it went afterwards (a worktree inside or outside the project, /cd), which `claude agents` lists it in. In order: the
+# project root its own mod recorded (its heartbeat's root, in this format, however old: a stopped session's too), the
+# first cwd row of its transcript, the folder it's listed in. {sessionId: folder}, for the sessions given
+def session_homes(sessions):
+    homes, missing = {}, []
+    for s in sessions:
+        beat = read_heartbeat(s['sessionId'])
+        root = beat['root'] if beat and beat['format'] == FORMAT else ''
+        if root.startswith('/'):
+            homes[s['sessionId']] = root
+        else:
+            missing.append(s['sessionId'])
+    starts = {sid: first_cwd(path) for sid, (path, _) in transcripts(missing).items()}
+    for s in sessions:
+        homes.setdefault(s['sessionId'], starts.get(s['sessionId']) or s['cwd'])
+    return homes
+
+
+# The sessions of the list that belong to the project at root (session_homes)
+def project_sessions(sessions, root):
+    homes = session_homes(sessions)
+    return [s for s in sessions if in_project(homes[s['sessionId']], root, HOME)]
+
+
 # What ccc hands the launcher (the installed plugin's version and since when) is for the launcher alone. A claude it ran
 # with them would pass them on: to the background service, when that call is what starts it, and from there to every
 # session the service starts, whose mod would keep its data apart (a store namespace, as a test session's). Every other
@@ -189,7 +215,7 @@ def read_heartbeat(session_id):
         pid = int(k.get('pid') or 0)
     except ValueError:
         pid = 0
-    return {'format': int(k['format']) if k['format'].isdigit() else 0, 'pid': pid, 'at': at, 'version': k.get('version', '')}
+    return {'format': int(k['format']) if k['format'].isdigit() else 0, 'pid': pid, 'at': at, 'version': k.get('version', ''), 'root': k.get('root', '')}
 
 
 # heartbeatStatus in state.ts
@@ -293,7 +319,7 @@ def context(tty, exclude=()):
     root = project_root(cwd)
     now = now_ms()
     sessions = list_sessions()
-    rows = [s for s in (sessions or []) if in_project(s['cwd'], root, HOME) and s.get('id') not in exclude]
+    rows = [s for s in project_sessions(sessions or [], root) if s.get('id') not in exclude]
     rows = order_rows(rows, read_order(root, now))
     beats = {s['sessionId']: read_heartbeat(s['sessionId']) for s in rows}
     return {
@@ -656,7 +682,7 @@ def find_tell_target(sessions, target, folder):
     def named(rows):
         exact = [s for s in rows if s.get('name') == target]
         return exact or [s for s in rows if str(s.get('name') or '').casefold() == target.casefold()]
-    found = named([s for s in background if in_project(s['cwd'], root, HOME)]) or named(background)
+    found = named(project_sessions(background, root)) or named(background)
     if len(found) == 1:
         return found[0], None
     if found:
@@ -751,7 +777,8 @@ def tell(argv):
         # Stopped: a running session's mod wakes it, if the rules allow (retired for being idle)
         others = [x for x in sessions if x['sessionId'] != s['sessionId'] and is_live(x)
                   and heartbeat_status(read_heartbeat(x['sessionId']), x.get('pid'), now) == 'ok']
-        answer = ask_helpers(sorted(others, key=lambda x: not in_project(x['cwd'], s['cwd'], HOME)), 'wake', ref=ref)
+        homes = session_homes(others + [s])
+        answer = ask_helpers(sorted(others, key=lambda x: not in_project(homes[x['sessionId']], homes[s['sessionId']], HOME)), 'wake', ref=ref)
         if not answer or answer.get('state') not in ('running', 'queued'):
             reason = answer.get('reason') if answer else 'it is stopped, and no session with a running panel answered to wake it'
             for ending in ('.req', '.txt'):
@@ -912,7 +939,7 @@ def section(argv):
         say("Couldn't read the session list (claude agents --json)")
         return 1
     root = project_root(os.path.realpath(os.getcwd()))
-    rows = [s for s in sessions if in_project(s['cwd'], root, HOME)]
+    rows = project_sessions(sessions, root)
     s, why = section_target(sessions, rows, name, root)
     if not s:
         say(why)
@@ -1065,32 +1092,59 @@ def started_ago(s, now):
     return 'started %s ago' % span(now - t) if t else 'start time unknown'
 
 
-# When each session was last used: the modification time of its transcript, <projects>/<folder>/<sessionId>.jsonl, in
-# ms. Found by its name in every folder, one listing of each for all the sessions at once: a folder's name is the
-# project's path with each character other than a letter or a digit written as -, which can't be read back, and Claude
-# moves the file to another folder when the session moves (/cd). {sessionId: ms}: a session missing has no transcript
-def last_used(session_ids):
+# Each session's transcript, <projects>/<folder>/<sessionId>.jsonl, and when it was last written (ms). Found by its name
+# in every folder, one listing of each for all the sessions at once: a folder's name is the project's path with each
+# character other than a letter or a digit written as -, which can't be read back, and Claude moves the file to another
+# folder when the session moves (/cd, a worktree). {sessionId: (path, ms)}, the newest file when there are two; a
+# session missing has no transcript
+def transcripts(session_ids):
     wanted = {sid + '.jsonl': sid for sid in session_ids if re.match(r'^[A-Za-z0-9-]+$', sid or '')}
-    used = {}
+    found = {}
     if not wanted:
-        return used
+        return found
     try:
         with os.scandir(PROJECTS) as entries:
             folders = [e.path for e in entries if e.is_dir()]
     except OSError:
-        return used
+        return found
     for folder in folders:
         try:
             names = os.listdir(folder)
         except OSError:
             continue
         for name in wanted.keys() & set(names):
+            path = os.path.join(folder, name)
             try:
-                t = os.stat(os.path.join(folder, name)).st_mtime * 1000
+                t = os.stat(path).st_mtime * 1000
             except OSError:
                 continue
-            used[wanted[name]] = max(used.get(wanted[name], 0), t)
-    return used
+            if t >= found.get(wanted[name], ('', -1))[1]:
+                found[wanted[name]] = (path, t)
+    return found
+
+
+# When each session was last used: the modification time of its transcript (transcripts), in ms. {sessionId: ms}
+def last_used(session_ids):
+    return {sid: t for sid, (_, t) in transcripts(session_ids).items()}
+
+
+# The cwd of a transcript's first row that has one: where its session started (the rows after a move carry the new
+# folder, and the file moves, but the first row stays); '' without one (usage.py's first_cwd)
+def first_cwd(path):
+    try:
+        with open(path, 'rb') as f:
+            for n, line in enumerate(f):
+                if b'"cwd":"' in line:
+                    try:
+                        cwd = json.loads(line).get('cwd')
+                    except (ValueError, AttributeError):
+                        return ''
+                    return cwd if isinstance(cwd, str) and cwd.startswith('/') else ''
+                if n >= 1000:
+                    break
+    except OSError:
+        pass
+    return ''
 
 
 # A stopped session's time: when it was last used (its transcript), else when it started, saying why
@@ -1415,7 +1469,7 @@ def tidy(argv):
     heading = 'every folder'
     if here:
         root = project_root(os.path.realpath(os.getcwd()))
-        sessions = [s for s in sessions if in_project(s['cwd'], root, HOME)]
+        sessions = project_sessions(sessions, root)
         heading = os.path.basename(root) or root
     windows = read_windows()
     used = last_used([s['sessionId'] for s in sessions if not s.get('pid')])

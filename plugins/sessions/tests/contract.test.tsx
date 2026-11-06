@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { keepPluginPins, pluginPinChange } from '../hooks/state'
+import { heartbeatText, keepPluginPins, pluginPinChange } from '../hooks/state'
 import { WATCH_SET } from '../hooks/watch'
 import { COMMAND, DATA, ROOT, SID, startSession, world } from './world'
 
@@ -238,6 +238,29 @@ test('start: checked, queued and started from the mod\'s own timer, with its age
   expect(await call($, 'start', { name: 'TEST v', cwd: ROOT })).toEqual({ ok: true, queued: true })
   await w.clock.advance(600)
   expect(w.toasts).toEqual([`Couldn't start “TEST v”: Claude doesn't trust ${ROOT} yet, so it can't start a session there in the background: run claude there once and accept its question`])
+})
+
+// Each session in the project it started in, wherever Claude lists it now (sessionHome in state.ts)
+test('start, status and current go by the project a session started in: a name kept by one that moved out, each root where it started', WITH_PROBE, async ($, on) => {
+  const OUTSIDE = '/Users/x/wt-outside'
+  const sessions = list()
+  // "two" started in the project and moved to a worktree outside it (EnterWorktree with a path): Claude lists it there
+  sessions[1] = { ...sessions[1], cwd: OUTSIDE }
+  const w = world(on, { list: sessions })
+  w.dirs.add(OUTSIDE)
+  w.write(`${DATA}/alive/${TWO}`, heartbeatText({ pid: 4243, at: w.clock.now(), version: '0.15.0', via: 'session.start', root: ROOT }))
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const r = await call($, 'start', { name: 'two', cwd: ROOT })
+  expect(`${r.reason}: ${r.detail}`).toBe(`refused: a session named “two” is already in ${ROOT}`)
+  expect((await call($, 'status', { refs: ['bbbbbbbb'] })).rows[0].root).toBe(ROOT)
+  // This session moves there too: still the project it started in
+  w.root.value = OUTSIDE
+  w.cwd.value = OUTSIDE
+  sessions[0] = { ...sessions[0], cwd: OUTSIDE }
+  await w.clock.advance(4000)
+  expect((await call($, 'current')).root).toBe(ROOT)
+  expect((await call($, 'status', { refs: ['aaaaaaaa'] })).rows[0].root).toBe(ROOT)
 })
 
 test('wake: only a background session the service retired for being idle is restarted; the rest is running or refused with why', WITH_PROBE, async ($, on) => {

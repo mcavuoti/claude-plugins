@@ -9,3 +9,6 @@ bash "$here/test-setup.sh"
 
 # What ccc opens (the launcher's decisions and its window loop), with a stand-in claude in a throwaway home folder
 bash "$here/test-launcher.sh"
+
+# Which project usage.py counts each response in, from conversation logs written in a throwaway folder
+bash "$here/test-usage.sh"

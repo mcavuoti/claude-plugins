@@ -225,6 +225,7 @@ declare module 'claude-code' {
       tellInFlight: TellInFlight
       watching: Watching
       ended: EndedNote
+      away: string
     }
   }
 }

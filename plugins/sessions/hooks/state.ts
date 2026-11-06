@@ -480,6 +480,65 @@ export function rootCandidates(start: string): string[] {
   return out
 }
 
+// The project a session belongs to is the one it started in, wherever it goes afterwards: a worktree inside or outside
+// the project, of its repository or of another one, a folder /cd took it to. Claude lists it where it is now (its
+// registry file and `claude agents` follow a worktree move and /cd), so that folder alone would take it out of its
+// project's list. The folder that says which project, from the best source there is:
+// - recorded: the project root its own mod recorded at its first start, from the folder it started in, and kept across
+//   restarts, /clear and /resume (the store's project:<sessionId>), published as its heartbeat's root (Heartbeat);
+// - first: the cwd of the first row of its transcript that has one (where it started: the rows after a move carry the
+//   new folder, and the file itself moves, but the first row stays), for a session whose mod doesn't run (stopped, or
+//   an older mod);
+// - cwd: the folder Claude lists it in now, the last resort.
+// inProject takes any of them, a project root or a folder in it. hooks/launcher.py (session_home) and hooks/usage.py
+// (home_of) go by the same rule
+export type Whereabouts = { recorded?: string | null; first?: string | null; cwd?: unknown }
+export function sessionHome(w: Whereabouts): string {
+  for (const f of [w.recorded, w.first, w.cwd]) if (typeof f === 'string' && f.startsWith('/')) return f
+  return ''
+}
+
+export function belongsTo(w: Whereabouts, root: string, home: string): boolean {
+  const folder = sessionHome(w)
+  return folder !== '' && inProject(folder, root, home)
+}
+
+// The first cwd of each session's transcript, from the command that looks for them (`<sessionId>\t<its first row with
+// a "cwd">` per line, the row cut at 64 KiB): the row read as JSON, or its cwd field alone when it was cut
+export function parseTranscriptStarts(text: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const line of text.split('\n')) {
+    const tab = line.indexOf('\t')
+    if (tab <= 0) continue
+    const id = line.slice(0, tab)
+    const row = line.slice(tab + 1)
+    let cwd: unknown
+    try {
+      cwd = JSON.parse(row)?.cwd
+    } catch {
+      const m = row.match(/"cwd":"((?:[^"\\]|\\.)*)"/)
+      try {
+        cwd = m ? JSON.parse(`"${m[1]}"`) : undefined
+      } catch {}
+    }
+    if (typeof cwd === 'string' && cwd.startsWith('/')) out[id] = cwd
+  }
+  return out
+}
+
+// The session's own panel says so when it works outside its project (a worktree outside it, a folder /cd took it to):
+// "Working in ~/x/wt, outside this project", the folder cut from its start to fit width. Nothing inside the project
+// (a subfolder, a worktree under <project>/.claude/worktrees/)
+export function outsideNote(here: string, root: string, home: string, width = Infinity): string {
+  if (!here || !root || inProject(here, root, home)) return ''
+  const before = 'Working in '
+  const after = ', outside this project'
+  const folder = Array.from(tildePath(here, home))
+  const room = Math.max(8, width - before.length - after.length)
+  const shown = folder.length <= room ? folder.join('') : `…${folder.slice(folder.length - room + 1).join('')}`
+  return `${before}${shown}${after}`
+}
+
 // The pinned sessions (Ctrl+T in `claude agents`): ~/.claude/jobs/pins.json, a list of ids the background service
 // doesn't close for being idle. If the file changes shape, null: it isn't touched
 export function parsePins(text: string): string[] | null {
@@ -832,17 +891,19 @@ export function fileKey(path: string): string {
 // The heartbeat: <data>/alive/<sessionId>, rewritten by the session's own mod every 15 s while it runs. It's how the
 // launcher and the other panels tell a session whose mod is running from one whose mod never started (a pre-started
 // process that was claimed with stale state, for one). pid: the session's process as the official list shows it;
-// via: what started the mod (session.start, or the first draw, turn or prompt when that didn't come)
-export type Heartbeat = { format: number; pid: number; at: number; version: string; via: string }
-export function heartbeatText(h: Omit<Heartbeat, 'format'>): string {
-  return keyLines({ format: FORMAT, pid: h.pid || '', at: h.at, version: h.version, via: h.via })
+// via: what started the mod (session.start, or the first draw, turn or prompt when that didn't come); root: the project
+// the session belongs to (sessionHome's recorded: where it started, whatever folder it's in now; 0.15.0, absent from
+// older mods, whose readers ignore it)
+export type Heartbeat = { format: number; pid: number; at: number; version: string; via: string; root: string }
+export function heartbeatText(h: Omit<Heartbeat, 'format' | 'root'> & { root?: string }): string {
+  return keyLines({ format: FORMAT, pid: h.pid || '', at: h.at, version: h.version, via: h.via, root: h.root || undefined })
 }
 
 export function parseHeartbeat(text: string): Heartbeat | null {
   const k = parseKeyLines(text)
   const at = Number(k.at)
   if (!k.format || !Number.isFinite(at) || at <= 0) return null
-  return { format: Number(k.format) || 0, pid: Number(k.pid) || 0, at, version: k.version ?? '', via: k.via ?? '' }
+  return { format: Number(k.format) || 0, pid: Number(k.pid) || 0, at, version: k.version ?? '', via: k.via ?? '', root: k.root ?? '' }
 }
 
 // A heartbeat is fresh for 45 s (three beats). ok: fresh, same format, same process; other-format: a session on
