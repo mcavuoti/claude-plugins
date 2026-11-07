@@ -160,9 +160,12 @@ main() {
       [ -n "$title" ] && printf '\033[2m→ %s\033[0m\n' "$title"
     else
       # A switch: the last frame stays on the alternate screen until the next viewer draws over it, with no blank
-      # screen in between, and a key typed meanwhile isn't echoed over it (the next viewer reads it)
+      # screen in between, and a key typed meanwhile isn't echoed over it. In this mode (canonical, no echo) the
+      # window's watcher drops what's typed until the next viewer takes the terminal (drop_typed in launcher.py), and
+      # Enter (CR) doesn't end a line (-icrnl): claude attach reads its input as soon as it starts, and a whole line
+      # would reach it before the watcher drops it
       modes_off
-      stty sane -echo 2>/dev/null
+      stty sane -echo -icrnl 2>/dev/null
     fi
     # Outside macOS, the window title is the session's name: the panel brings a window forward by its title (wmctrl,
     # xdotool). On macOS Terminal.app keeps the title the panel gave the window when it opened it

@@ -20,7 +20,8 @@ the desktop (X11 or Wayland) and the terminal app.
    in the second one.
 6. **Switch in place:** select the other session, Enter: the same window shows it at once, and its panel has the
    keyboard. The session you left stays on screen until the other one draws (no blank screen, no shell line in
-   between), and an arrow key pressed right after Enter isn't printed as `^[[B`. While a session shows,
+   between), and an arrow key or a letter pressed right after Enter isn't printed as `^[[B` and doesn't reach the other
+   session (nothing lands in its prompt box). While a session shows,
    `~/.claude/mods/sessions-data/windows/` has a `<tty>.showing` naming it (the launcher's watcher runs: `launcher.py
    watch` in `ps`; inotify). Enter back. Then `a`: the same window shows the agent view.
 7. **Inside the agent view:** open a session from the agent view, then Enter on another row in its panel: the window

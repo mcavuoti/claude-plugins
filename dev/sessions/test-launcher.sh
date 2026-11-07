@@ -59,6 +59,23 @@ PY
   # With $FIX/attach-wait, a viewer that runs until it's ended (as itself: its pid stays the viewer's)
   "attach "*)
     if [ -f "$FIX/attach-wait" ]; then echo "$$" > "$FIX/viewer-$2"; exec sleep 600; fi
+    # With $FIX/attach-read, a viewer on a real terminal: what it reads as it takes the terminal (raw, 0.3 s) into
+    # $FIX/read-<id>, then what comes in the next 2 s into $FIX/read2-<id>. $FIX/attach-early-<id>: first, like claude
+    # attach, it reads the terminal as it starts, in the mode the launcher left (a line only once it's whole), for 1 s,
+    # and says in $FIX/early-<id> whether a line came; then it takes the terminal, as claude attach does about 0.1 s in
+    if [ -f "$FIX/attach-read" ]; then
+      echo "$$" > "$FIX/viewer-$2"
+      if [ -f "$FIX/attach-early-$2" ]; then
+        if IFS= read -r -t 1 _; then echo line > "$FIX/early-$2"; else echo none > "$FIX/early-$2"; fi
+      fi
+      stty -icanon min 0 time 3 2>/dev/null
+      dd bs=256 count=1 2>/dev/null > "$FIX/read-$2.part"
+      mv -f "$FIX/read-$2.part" "$FIX/read-$2"
+      stty -icanon min 0 time 20 2>/dev/null
+      dd bs=256 count=1 2>/dev/null > "$FIX/read2-$2.part"
+      mv -f "$FIX/read2-$2.part" "$FIX/read2-$2"
+      exec sleep 600
+    fi
     exit "$(cat "$FIX/attach-exit-$2" 2>/dev/null || echo 0)" ;;
   "respawn "*) exit 0 ;;
   "agents --cwd") exit 0 ;;
@@ -885,6 +902,68 @@ wait "$launcher" || true
 rm -f "$fix/attach-wait"
 unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
 pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; without python3"
+
+# 17. What's typed during a switch is dropped, on a real terminal (a pty): what was pending when the switch was asked
+#     and what's typed while the next viewer starts never reach it (an Enter neither: the next viewer reads from its
+#     start, and a whole line would reach it first), what's typed once it has the terminal does, and what was typed
+#     before the first viewer (from the shell) reaches the first viewer
+reset
+export SESSIONS_PLUGIN_VERSION=0.16.0 SESSIONS_PLUGIN_SINCE=0
+touch "$fix/attach-read" "$fix/attach-early-bbbbbbbb"
+python3 - "$hooks/visor.sh" "$data/windows" "$fix" > "$work/typed.txt" 2> "$work/typed.err" <<'PY' || fail "typed" "the pty run failed: $(cat "$work/typed.err")"
+import os, pty, sys, threading, time
+visor, windows, fix = sys.argv[1:4]
+
+def until(cond, seconds=10):
+    end = time.time() + seconds
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+def text(name):
+    path = os.path.join(fix, name)
+    return open(path).read() if os.path.exists(path) else None
+
+pid, master = pty.fork()
+if pid == 0:
+    os.environ.pop('SESSIONS_TTY', None)
+    os.environ['TERM'] = 'xterm-256color'
+    os.execvp('bash', ['bash', visor, 'attach', 'aaaaaaaa'])
+# What the window shows is read and thrown away, so the terminal never blocks
+threading.Thread(target=lambda: [os.read(master, 65536) for _ in iter(int, 1)], daemon=True).start()
+os.write(master, b'first')
+until(lambda: text('read-aaaaaaaa') is not None)
+print('first viewer read: %r' % text('read-aaaaaaaa'))
+until(lambda: any(n.endswith('.showing') for n in os.listdir(windows)))
+showing = [n for n in os.listdir(windows) if n.endswith('.showing')][0]
+until(lambda: text('read2-aaaaaaaa') is not None, 5)
+time.sleep(0.3)
+# Pending when the switch is asked, then typed while the next viewer starts, with an Enter (it reads from its start
+# and takes the terminal 1 s later)
+os.write(master, b'pending')
+time.sleep(0.2)
+with open(os.path.join(windows, showing[:-len('.showing')]), 'w') as f:
+    f.write('format=3\ncommand=attach\nid=bbbbbbbb\ntitle=beta\nend=1\n')
+time.sleep(0.2)
+os.write(master, b'during\r')
+until(lambda: text('read-bbbbbbbb') is not None)
+print('next viewer, as it started: %s' % (text('early-bbbbbbbb') or '').strip())
+print('next viewer read: %r' % text('read-bbbbbbbb'))
+os.write(master, b'later')
+until(lambda: text('read2-bbbbbbbb') is not None, 5)
+print('then: %r' % text('read2-bbbbbbbb'))
+os.kill(int(text('viewer-bbbbbbbb')), 1)
+os.waitpid(pid, 0)
+PY
+grep -q "^first viewer read: 'first'$" "$work/typed.txt" || fail "typed" "the first viewer didn't get what was typed before it: $(cat "$work/typed.txt")"
+grep -q "^next viewer, as it started: none$" "$work/typed.txt" || fail "typed" "an Enter typed during the switch reached the next viewer as it started: $(cat "$work/typed.txt")"
+grep -q "^next viewer read: ''$" "$work/typed.txt" || fail "typed" "keys typed during the switch reached the next viewer: $(cat "$work/typed.txt")"
+grep -q "^then: 'later'$" "$work/typed.txt" || fail "typed" "a key typed once the next viewer had the terminal didn't reach it: $(cat "$work/typed.txt")"
+rm -f "$fix/attach-read" "$fix/attach-early-bbbbbbbb"
+unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
+pass "a switch drops what's typed until the next viewer has the terminal (a pty); the first viewer gets what was typed before it"
 
 # What ccc hands the launcher (the installed version and since when) never reaches a claude it runs: a viewer or a
 # start that brings up the background service would pass it on to every session the service starts

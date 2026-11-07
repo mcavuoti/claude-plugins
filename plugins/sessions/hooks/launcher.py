@@ -1528,9 +1528,9 @@ def tidy(argv):
 # opened with ccc, one per window for as long as its launcher (PID, its parent) runs, and ends that window's viewer as
 # soon as a panel asks for a switch, so the panel neither looks for the viewer nor closes it: the panel writes the next
 # session to FILE (the window's file) with end=1 as its last line, the watcher sends the viewer FILE.showing names (the
-# launcher writes it as each viewer starts) a SIGHUP, and the loop opens the next one. A file with no end=1 (claude
-# respawn's reopen, ccc switching another window, a panel of an older version, which closes the viewer itself) is left
-# to the loop, which reads it once the viewer ends.
+# launcher writes it as each viewer starts) a SIGHUP, and the loop opens the next one; what's typed meanwhile is
+# dropped (drop_typed). A file with no end=1 (claude respawn's reopen, ccc switching another window, a panel of an older
+# version, which closes the viewer itself) is left to the loop, which reads it once the viewer ends.
 #
 # It waits on FILE's folder and, while FILE is there, on FILE itself: with kqueue (macOS, the BSDs) the folder changes
 # when FILE appears or goes, but not when bytes reach a file that's there (and $.fs.write creates the file first, then
@@ -1540,6 +1540,8 @@ def tidy(argv):
 
 WATCH_PASS_S = 1.0
 POLL_S = 0.2
+# After it ends a viewer, what's typed until the next one takes the terminal is dropped (drop_typed), for this long at most
+DROP_S = 2.0
 
 
 # The window's file asks for its viewer to be ended now: whole (end=1 is its last line) and in this format
@@ -1641,6 +1643,39 @@ def folder_watch(folder, path, how=None):
     return PollWatch(folder, path)
 
 
+# What's typed during a switch is dropped, so a key meant for the panel you're leaving (a second Enter, an arrow)
+# never lands in the next session's prompt box: the next viewer (claude attach) takes the terminal (raw) about 0.1 s
+# after it starts, and would get every key typed meanwhile. From the moment the launcher puts the terminal in its own
+# mode between viewers (canonical, no echo, Enter no line end: stty sane -echo -icrnl, so nothing typed is a whole line
+# that the viewer, which reads from its start, could take first) until the next viewer takes it (raw), its input is
+# flushed every 2 ms; DROP_S at most. The shell's mode (echo on) is never touched, so the first viewer isn't either.
+# tty: this window's terminal, open; None where there's none (tests)
+def drop_typed(tty, seconds=DROP_S):
+    import termios
+    if tty is None:
+        return
+    end = time.time() + seconds
+    dropping = False
+    while time.time() < end:
+        try:
+            flags = termios.tcgetattr(tty)[3]
+            if flags & termios.ICANON and not flags & termios.ECHO:
+                termios.tcflush(tty, termios.TCIFLUSH)
+                dropping = True
+            elif dropping:
+                return
+        except (termios.error, OSError):
+            return
+        time.sleep(0.002)
+
+
+def open_terminal():
+    try:
+        return os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return None
+
+
 def watch(argv):
     import argparse
     import signal
@@ -1650,6 +1685,7 @@ def watch(argv):
     parser.add_argument('--how', choices=sorted(WATCHES))
     args = parser.parse_args(argv)
     w = folder_watch(os.path.dirname(args.file), args.file, args.how)
+    tty = open_terminal()
     ended = None
     while os.getppid() == args.launcher:
         w.arm()
@@ -1665,6 +1701,8 @@ def watch(argv):
                     os.kill(int(viewer), signal.SIGHUP)
                 except OSError:
                     pass
+                else:
+                    drop_typed(tty)
         w.wait(WATCH_PASS_S)
     return 0
 
