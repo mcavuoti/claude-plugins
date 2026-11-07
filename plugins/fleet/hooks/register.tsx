@@ -1631,6 +1631,9 @@ let otherEvents = 0
 let latestMark = -1
 let pulling: Promise<void> | null = null
 let pullAgain = false
+// What the pull asked for while one ran wanted (a start's 25 hours, from the indexes): the one after it does that
+let pullAgainHours = 2
+let pullAgainIndexed = false
 let eventCount = 0
 // The world as this session's scan last saw it (with the pins each file cites), and the changes nobody's event
 // explains yet (recorded as outside changes when they stay so for a scan)
@@ -2022,6 +2025,8 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
   // one listed too early to see)
   if (pulling) {
     pullAgain = true
+    pullAgainHours = Math.max(pullAgainHours, hours)
+    pullAgainIndexed ||= indexed
     return pulling
   }
   pulling = (async () => {
@@ -2029,8 +2034,9 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
     const folders = windowFolders(now, hours)
     for (let i = 0; i < folders.length; i++) {
       const dir = eventsDir(folders[i])
+      const listed = await names($, dir)
       let covered: Set<string> | null = null
-      if (indexed && i >= 2) {
+      if (indexed && i >= 2 && listed.includes(EVENT_INDEX)) {
         const ix = parseWire<EventIndex>((await readText($, `${dir}/${EVENT_INDEX}`)) ?? '')
         if (ix && 'value' in ix && Array.isArray(ix.value.entries)) {
           covered = new Set()
@@ -2043,7 +2049,7 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
           }
         }
       }
-      for (const name of await names($, dir)) {
+      for (const name of listed) {
         if (!name.endsWith('.json') || seen.has(name) || covered?.has(name)) continue
         const t = await readText($, `${dir}/${name}`)
         if (t === null) continue
@@ -2063,8 +2069,11 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
     .finally(() => {
       pulling = null
       if (pullAgain) {
+        const again = { hours: pullAgainHours, indexed: pullAgainIndexed }
         pullAgain = false
-        bg(pullEvents($))
+        pullAgainHours = 2
+        pullAgainIndexed = false
+        bg(pullEvents($, again.hours, again.indexed))
       }
     })
   return pulling
@@ -2397,7 +2406,8 @@ async function digestFor($: any, thread: string, withBudget = true, forNudge = f
   await eventsTick($)
   const mine = (await read($, reads))[thread]
   const me = await meNow($)
-  const items = await holdInputs($, mine && latest.size ? digestItems(mine, latest, me, thread) : [], await $.clock.now())
+  const toldNow = toldHere.get(thread)
+  const items = (await holdInputs($, mine && latest.size ? digestItems(mine, latest, me, thread) : [], await $.clock.now())).filter(i => toldNow?.get(i.path) !== i.event.to)
   let own: { lines: string[]; keys: string[] } = { lines: [], keys: [] }
   let intake: { lines: string[]; ids: string[]; at: number } = { lines: [], ids: [], at: 0 }
   if (thread === 'main') {
@@ -2412,6 +2422,9 @@ async function digestFor($: any, thread: string, withBudget = true, forNudge = f
     told: async () => {
       await alone()
       if (items.length) {
+        const memo = toldHere.get(thread) ?? new Map<string, string>()
+        for (const i of items) if (i.event.to !== null) memo.set(i.path, i.event.to)
+        toldHere.set(thread, memo)
         await update($, reads, m => {
           const t = { ...(m[thread] ?? {}) }
           for (const i of items) if (t[i.path] && i.event.to !== null) t[i.path] = { ...(t[i.path] as FleetRead), told: i.event.to }
@@ -2478,6 +2491,10 @@ async function busyDelivery($: any): Promise<{ text: string; told: () => Promise
 // each compute the same lines before any marked them told. A lock of this copy of the module only: what's told lives
 // in $.state
 const lineChains = new Map<string, Promise<unknown>>()
+// What this copy of the module told each thread, by path → the version told: $.state's marks reach a parallel call of
+// the same step only once the call that wrote them returns, so the calls of one batch, one after the other in the chain,
+// would each tell the same change again
+const toldHere = new Map<string, Map<string, string>>()
 
 /** A tool's result with the digest (and any other lines) for the model, when it can carry them. One at a time per
  * thread, from computing the lines to marking them told, so a change is told once however many calls run together */
