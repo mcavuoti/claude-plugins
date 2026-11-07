@@ -52,7 +52,7 @@ reset_terminal() {
 WATCHER=''
 SHOWING=''
 WINDOW_FILE=''
-# shellcheck disable=SC2329 # the EXIT trap runs it
+# shellcheck disable=SC2317,SC2329 # the EXIT trap runs it (shellcheck 0.9 calls it SC2317, 0.10 and later SC2329)
 cleanup() {
   if [ -n "$WATCHER" ]; then kill "$WATCHER" 2>/dev/null; fi
   if [ -n "$SHOWING" ]; then rm -f "$SHOWING"; fi
