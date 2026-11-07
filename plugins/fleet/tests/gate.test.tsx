@@ -370,7 +370,10 @@ test('/fleet world lists, adds and removes globs, typed by the person; /fleet in
   expect(w.files.get(`${FLEET}/.gitignore`)).toContain('\nevents/\nreads/\n')
   expect(await fleet($, 'world')).toContain('`notes/**`, `docs/**`')
   expect(await fleet($, 'world add specs', { kind: 'plugin', name: 'other' })).toContain('Only the person')
-  expect(await fleet($, 'world add specs')).toContain('Added `specs/**`')
+  const added = await fleet($, 'world add specs')
+  expect(added).toContain('Added `specs/**`')
+  // The other sessions reload world.json at their world tick: 10 s while Claude's watcher works
+  expect(added).toContain("Every session of the project follows within 10 s (2 where Claude's watcher is off).")
   expect(await fleet($, 'world remove docs/**')).toContain('`notes/**`, `specs/**`')
   expect(await fleet($, 'world add ../x')).toContain("can't have . or ..")
   expect(json(w, `${FLEET}/world.json`)).toEqual({ worldFormat: 1, paths: ['notes/**', 'specs/**'] })
