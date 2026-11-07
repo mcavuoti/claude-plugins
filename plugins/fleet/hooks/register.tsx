@@ -10091,7 +10091,8 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     out.push(...rec.lines)
     lint.warnings.push(...rec.warnings)
   }
-  if (c.force) {
+  // The dry run says what --force would wake; /fleet up itself says it once, beside the wakes
+  if (c.force && c.dryRun) {
     const person = plan.filter(p => p.action === 'wake' && p.why === 'person').map(p => p.inst.name)
     const unknown = plan.filter(p => p.action === 'wake' && p.why === null).map(p => p.inst.name)
     if (person.length || unknown.length) {
