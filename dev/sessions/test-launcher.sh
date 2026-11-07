@@ -7,7 +7,16 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 hooks="$root/plugins/sessions/hooks"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# What a failed check leaves running (a launcher with its watcher and stand-in viewer) ends with the test too: it would
+# run on for minutes, holding the test's output open
+kill_tree() {
+  local p
+  for p in $(pgrep -P "$1"); do
+    kill_tree "$p"
+    kill "$p" 2>/dev/null || true
+  done
+}
+trap 'kill_tree $$; rm -rf "$work"' EXIT
 fail() { echo "FAIL ($1): $2" >&2; exit 1; }
 pass() { echo "ok: $1"; }
 
@@ -47,7 +56,10 @@ json.dump(rows, open(path, 'w'))
 PY
     ;;
   "plugin list") cat "$FIX/plugins.json" 2>/dev/null || echo '[]' ;;
-  "attach "*) exit "$(cat "$FIX/attach-exit-$2" 2>/dev/null || echo 0)" ;;
+  # With $FIX/attach-wait, a viewer that runs until it's ended (as itself: its pid stays the viewer's)
+  "attach "*)
+    if [ -f "$FIX/attach-wait" ]; then echo "$$" > "$FIX/viewer-$2"; exec sleep 600; fi
+    exit "$(cat "$FIX/attach-exit-$2" 2>/dev/null || echo 0)" ;;
   "respawn "*) exit 0 ;;
   "agents --cwd") exit 0 ;;
   "--bg -n"|"--bg --debug-file")
@@ -714,6 +726,165 @@ lacks 'visitor' "--here: one that moved in from another project"
 TIDY_IN="$outside" tidy_run '' --here --list > /dev/null
 lacks 'quiet|mover|visitor' "--here in the outside worktree: none of them"
 pass "membership: the project a session started in, for ccc's pick, ccc <name> and ccc tidy --here (heartbeat, transcript)"
+
+# 16. A switch a panel asks for in the window's file (end=1, its last line) is done by the window's watcher
+#     (launcher.py watch): it ends the viewer at once, also when the file is made first and its bytes come later (as
+#     $.fs.write writes it: a watch of the folder alone misses those bytes), and the loop opens the next viewer over the
+#     last frame (no clear, the alternate screen kept) with no "Hangup" report. While a viewer runs, the window says
+#     what it shows (.showing, with its three processes); a file with no end (a restart's reopen, a panel that closes
+#     the viewer itself) waits for the viewer to end; .showing and the watcher go with the launcher. Without python3
+#     neither runs, and the window switches the old way
+reset
+export SESSIONS_PLUGIN_VERSION=0.16.0 SESSIONS_PLUGIN_SINCE=0
+touch "$fix/attach-wait"
+win="$data/windows/_dev_ttys900"
+until_true() { local n=$1; shift; for _ in $(seq 1 "$n"); do if "$@"; then return 0; fi; sleep 0.02; done; return 1; }
+showing_is() { grep -q "^id=$1\$" "$win.showing" 2>/dev/null; }
+key_of() { sed -n "s/^$1=//p" "$2"; }
+alive() { kill -0 "$1" 2>/dev/null; }
+# switch_ms <file> <viewer pid> <text> <split>: writes the window's file as a panel does (split 1: made first, its bytes
+# 50 ms later) and prints how long the viewer lived after the bytes, in ms (9999: still there after 3 s)
+switch_ms() {
+  python3 - "$@" <<'PY'
+import os, sys, time
+path, pid, text, split = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == '1'
+if split:
+    open(path, 'w').close()
+    time.sleep(0.05)
+with open(path, 'w') as f:
+    f.write(text)
+t = time.time()
+while time.time() - t < 3:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        print(int((time.time() - t) * 1000))
+        sys.exit()
+    time.sleep(0.002)
+print(9999)
+PY
+}
+SWITCH_B=$'format=3\ncommand=attach\nid=bbbbbbbb\ntitle=beta\nend=1\n'
+(cd "$proj" && TERM=xterm-256color /bin/bash "$hooks/visor.sh" attach aaaaaaaa < /dev/null > "$work/out.txt" 2>&1) &
+launcher=$!
+until_true 150 showing_is aaaaaaaa || fail "showing" "no .showing for the first viewer"
+until_true 150 test -s "$fix/viewer-aaaaaaaa" || fail "showing" "the first viewer didn't start"
+v1=$(key_of viewer "$win.showing")
+watcher=$(key_of watcher "$win.showing")
+expect "$v1" "$(cat "$fix/viewer-aaaaaaaa")" ".showing names the viewer's own pid"
+expect "$(key_of tty "$win.showing") $(key_of command "$win.showing")" "/dev/ttys900 attach" ".showing's terminal and command"
+expect "$(/bin/ps -o ppid= -p "$watcher" | tr -d ' ')" "$(key_of launcher "$win.showing")" "the watcher is the launcher's"
+/bin/ps -o command= -p "$watcher" | grep -q 'launcher.py watch' || fail "showing" "the watcher pid isn't the watcher"
+sleep 0.3
+ms=$(switch_ms "$win" "$v1" "$SWITCH_B" 1)
+[ "$ms" -lt 500 ] || fail "watcher" "the viewer lived $ms ms after the switch was asked"
+until_true 150 showing_is bbbbbbbb || fail "watcher" "the next viewer didn't open"
+v2=$(key_of viewer "$win.showing")
+printf 'format=3\ncommand=attach\nid=cccccccc\ntitle=gamma\n' > "$win"
+sleep 1.3
+alive "$v2" || fail "no end" "a file with no end=1 ended the viewer"
+kill -HUP "$v2"
+until_true 150 showing_is cccccccc || fail "no end" "not opened once the viewer ended"
+# A watcher that stopped: the next viewer's window says nothing (no switch would come of it), and switches the old way
+kill -9 "$watcher"
+sleep 0.2
+printf 'format=3\ncommand=attach\nid=dddddddd\ntitle=delta\n' > "$win"
+kill -HUP "$(key_of viewer "$win.showing")"
+until_true 150 grep -q '^attach dddddddd' "$fix/calls.log" || fail "watcher gone" "the next viewer didn't open"
+until_true 150 test -s "$fix/viewer-dddddddd" || fail "watcher gone" "the next viewer didn't start"
+[ ! -e "$win.showing" ] || fail "watcher gone" "a .showing with no watcher: $(cat "$win.showing")"
+kill -HUP "$(cat "$fix/viewer-dddddddd")"
+wait "$launcher" || true
+[ ! -e "$win.showing" ] || fail "cleanup" ".showing outlived the launcher"
+[ ! -e "$win" ] || fail "cleanup" "the window's file, read and left empty, outlived the launcher"
+watcher_gone() { ! alive "$watcher"; }
+until_true 50 watcher_gone || fail "cleanup" "the watcher outlived the launcher"
+expect "$(grep -c '^attach' "$fix/calls.log")" 4 "four viewers"
+grep -q Hangup "$work/out.txt" && fail "report" "bash reported the ended viewer: $(cat -v "$work/out.txt")"
+expect "$(grep -o $'\e\\[?1049l' "$work/out.txt" | wc -l | tr -d ' ')" 2 "the alternate screen is left only before the first viewer and at the end"
+expect "$(grep -o $'\e\\[2J' "$work/out.txt" | wc -l | tr -d ' ')" 1 "the screen is cleared only before the first viewer"
+# The watcher alone, with each watch this system has (--how): it ends the viewer within half its pass (1 s), whichever
+# way the file is written; a .showing that names another watcher, a file with no end=1 or of another format end none,
+# and a viewer gets one SIGHUP however often the folder changes before it ends
+watches=$(python3 -c 'import select, sys; print("kqueue" if hasattr(select, "kqueue") else "inotify" if sys.platform.startswith("linux") else "")')
+# showing_for <viewer> <watcher>: the .showing a launcher with that watcher writes for that viewer
+showing_for() { printf 'format=3\ntty=/dev/ttys900\ncommand=attach\nid=aaaaaaaa\nviewer=%s\nlauncher=%s\nwatcher=%s\n' "$1" $$ "$2" > "$win.showing"; }
+for how in $watches poll; do
+  rm -f "$win" "$win.showing"
+  python3 "$hooks/launcher.py" watch --file "$win" --launcher $$ --how "$how" &
+  w=$!
+  sleep 0.3
+  alive "$w" || fail "watch ($how)" "it didn't start"
+  for split in 1 0; do
+    sleep 600 &
+    v=$!
+    disown "$v"
+    showing_for "$v" "$w"
+    ms=$(switch_ms "$win" "$v" "$SWITCH_B" "$split")
+    [ "$ms" -lt 500 ] || fail "watch ($how)" "the viewer lived $ms ms after the switch was asked (bytes later: $split)"
+    rm -f "$win"
+  done
+  kill "$w"
+done
+python3 "$hooks/launcher.py" watch --file "$win" --launcher $$ &
+w=$!
+sleep 0.3
+sleep 600 &
+v=$!
+disown "$v"
+showing_for "$v" 1
+printf '%s' "$SWITCH_B" > "$win"
+printf 'format=2\ncommand=attach\nid=bbbbbbbb\nend=1\n' > "$win.other"
+sleep 1.3
+alive "$v" || fail "watch" "it ended a viewer a .showing of another watcher names"
+printf 'format=2\ncommand=attach\nid=bbbbbbbb\ntitle=beta\nend=1\n' > "$win"
+showing_for "$v" "$w"
+sleep 1.3
+alive "$v" || fail "watch" "it followed a file of another format"
+kill "$v"
+bash -c 'trap "echo x >> \"$1\"" HUP; while :; do sleep 0.05; done' sh "$work/hups" &
+v=$!
+disown "$v"
+sleep 0.3
+showing_for "$v" "$w"
+printf '%s' "$SWITCH_B" > "$win"
+for i in 1 2 3; do sleep 0.2; touch "$win.other$i"; done
+sleep 0.3
+expect "$(wc -l < "$work/hups" | tr -d ' ')" 1 "one SIGHUP per viewer"
+kill "$v" "$w"
+rm -f "$win" "$win".*
+# A launcher killed outright (no trap runs): its watcher ends by itself within its pass
+bash -c 'python3 "$1" watch --file "$2" --launcher $$ < /dev/null > /dev/null 2>&1 & sleep 600' sh "$hooks/launcher.py" "$win" > /dev/null 2>&1 &
+outer=$!
+sleep 0.5
+w=$(pgrep -P "$outer" -f 'launcher.py watch' || true)
+[ -n "$w" ] || fail "orphan" "no watcher under the stand-in launcher"
+others=$(pgrep -P "$outer" -f '^sleep 600' || true)
+kill -9 "$outer"
+if [ -n "$others" ]; then kill "$others" 2>/dev/null || true; fi
+gone_pid() { ! kill -0 "$1" 2>/dev/null; }
+if ! until_true 100 gone_pid "$w"; then
+  kill "$w" 2>/dev/null || true
+  fail "orphan" "the watcher outlived a launcher killed outright"
+fi
+# Without python3: no watcher and no .showing; a file and the viewer closed by whoever switches, as before
+nopy="$work/nopy"
+mkdir -p "$nopy"
+for t in bash dirname uname mkdir rm stty clear sleep cat; do p=$(command -v "$t") && ln -sf "$p" "$nopy/$t"; done
+: > "$fix/calls.log"
+(cd "$proj" && PATH="$nopy" /bin/bash "$hooks/visor.sh" attach aaaaaaaa < /dev/null > "$work/out.txt" 2>&1) &
+launcher=$!
+until_true 150 grep -q '^attach aaaaaaaa' "$fix/calls.log" || fail "no python3" "the viewer didn't open: $(cat -v "$work/out.txt")"
+sleep 0.3
+[ ! -e "$win.showing" ] || fail "no python3" "a .showing with no watcher"
+printf 'format=3\ncommand=attach\nid=bbbbbbbb\ntitle=beta\n' > "$win"
+kill -HUP "$(cat "$fix/viewer-aaaaaaaa")"
+until_true 150 grep -q '^attach bbbbbbbb' "$fix/calls.log" || fail "no python3" "the switch didn't open the next one"
+kill -HUP "$(cat "$fix/viewer-bbbbbbbb")"
+wait "$launcher" || true
+rm -f "$fix/attach-wait"
+unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
+pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; without python3"
 
 # What ccc hands the launcher (the installed version and since when) never reaches a claude it runs: a viewer or a
 # start that brings up the background service would pass it on to every session the service starts
