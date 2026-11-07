@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { abbreviate, heartbeatText, storeNamespace } from '../hooks/state'
+import { abbreviate, fileKey, heartbeatText, orderFileText, storeNamespace } from '../hooks/state'
+import { WATCH_SET } from '../hooks/watch'
 import { BAND, COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // How the mod starts in a session (the world it sees is in world.ts)
@@ -244,6 +245,30 @@ test('the cleanup trusts no listing that lacks this very session; one that has i
   await w.clock.advance(600000)
   expect(w.store.has(`state:${GONE}`)).toBe(false)
   expect(w.store.has(`title:${GONE}`)).toBe(false)
+})
+
+test("the cleanup removes the order file of a folder that's gone, once no panel wrote it for a while; never one whose folder is there", SLOW, async ($, on) => {
+  const w = world(on)
+  const order = (root: string) => `${DATA}/order/${fileKey(root)}`
+  // A deleted worktree's (its name has an underscore: the root is read from the file), a folder that's there, and a
+  // file whose name isn't the root it names inside (two folders can share a name: left alone)
+  const gone = '/Users/x/myapp_wt'
+  const kept = '/Users/x/kept'
+  w.dirs.add(kept)
+  w.write(order(gone), orderFileText(gone, [], w.clock.now()))
+  w.write(order(kept), orderFileText(kept, [], w.clock.now()))
+  w.write(`${DATA}/order/_Users_x_other`, orderFileText('/Users/x/else', [], w.clock.now()))
+  await startSession($, w)
+  // The start's cleanup: all of them just written, so a folder being made isn't raced
+  await w.clock.advance(1000)
+  expect(w.files.has(order(gone))).toBe(true)
+  // The next one, 10 minutes on: the gone folder's file goes, the rest stay (this project's own, rewritten, too)
+  await w.clock.advance(600000)
+  expect(w.files.has(order(gone))).toBe(false)
+  expect(w.files.has(order(kept))).toBe(true)
+  expect(w.files.has(`${DATA}/order/_Users_x_other`)).toBe(true)
+  expect(w.files.has(order(ROOT))).toBe(true)
+  expect(w.runs.filter(a => a[0] === 'rm' && a.some(p => p.includes('/order/')))).toEqual([['rm', '-f', order(gone)]])
 })
 
 test('the reopen after a memory shortage runs under its lock, and reopens the session once', SLOW, async ($, on) => {
@@ -696,4 +721,162 @@ test("ccc's SESSIONS_PLUGIN_VERSION/SINCE alone make no test session: shared key
   await w.clock.advance(100)
   expect(JSON.stringify(await ui.drawn())).not.toContain('data apart')
   await ui.unmount()
+})
+
+// ---- Updating in place with the panel holding the keyboard ----
+
+const BRAVO = 'bbbbbbbb-0000-0000-0000-000000000000'
+const PANE = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
+function pair(): any[] {
+  return [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'alpha' },
+    { id: 'bbbbbbbb', sessionId: BRAVO, cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'bravo' },
+  ]
+}
+
+// A newer copy of the mod installed beside the running one (claude plugin list --json), as the update in place looks
+// for, watching the same paths as this one (its watch.ts), and this session with no background task
+function installNewer(w: World) {
+  const plugins = String((import.meta as any).dir).replace(/\/sessions\/tests$/, '')
+  w.plugins.value = JSON.stringify([{ id: 'sessions@x', enabled: true, version: '0.10.1', installPath: `${plugins}/sessions-0.10.1`, lastUpdated: '2026-01-01T00:00:00Z' }])
+  w.files.set(`${plugins}/sessions-0.10.1/hooks/watch.ts`, `export const WATCH_SET = ${WATCH_SET}\n`)
+  w.files.set('/Users/x/jobs/aaaaaaaa/state.json', JSON.stringify({ inFlight: { tasks: 0, queued: 0, kinds: [] } }))
+}
+
+// A list always fresh in the store (as when other sessions keep listing), for ms
+async function freshList(w: World, list: any[], ms: number) {
+  for (let t = 0; t < ms; t += 1000) {
+    w.store.set('list', { at: w.clock.now(), sessions: list })
+    await w.clock.advance(1000)
+  }
+}
+
+// Three sessions, this one first: with nothing selected the panel lands on the second (bravo), so a third (charlie)
+// selected shows the selection came back
+const CHARLIE = 'cccccccc-0000-0000-0000-000000000000'
+function trio(): any[] {
+  return [...pair(), { id: 'cccccccc', sessionId: CHARLIE, cwd: ROOT, kind: 'background', status: 'idle', pid: 4244, name: 'charlie' }]
+}
+
+// The start comes in by a reload: an older module drew in this session (its short id is in $.state, which a reload
+// keeps), watching the same paths
+function cameByReload(on: any) {
+  const left = new Map<string, unknown>([
+    ['shortId', 'aaaaaaaa'],
+    ['watching', { set: WATCH_SET, sessionId: SID, at: 1 }],
+  ])
+  on('state.set', (_: any, e: any, next: any) => {
+    if (e.plugin === 'sessions') left.delete(e.key)
+    return next(e)
+  })
+  on('state.get', (_: any, e: any, next: any) => (e.plugin === 'sessions' && left.has(e.key) ? { value: { value: left.get(e.key), version: 1 } } : next(e)))
+}
+
+// The row the panel lands on when it takes the keyboard (the session button drawn with autoFocus)
+async function landingRow($: any): Promise<string | undefined> {
+  const ui = await $.ui.mount(PANE)
+  const keys = [SID, BRAVO, CHARLIE].map(id => `s:${id}`)
+  let found: string | undefined
+  for (const key of keys) if ((await ui.find({ key }))?.props.autoFocus === true) found = key
+  await ui.unmount()
+  return found
+}
+
+test('the update in place goes ahead with the panel holding the keyboard, noting the row; never with a field open', { timeoutMs: 30000 }, async ($, on) => {
+  const list = pair()
+  const w = world(on, { list })
+  installNewer(w)
+  let reloads = 0
+  on('command.run', { command: 'reload-plugins' }, () => {
+    reloads++
+    return {}
+  })
+  await startSession($, w)
+  const ui = await $.ui.mount(PANE)
+  w.panes.find(p => p.id === 'sessions').isFocused = true
+  // Bravo selected (the engine landing the focus on its row), and the Rename field open: no update
+  await $.ui.focus({ requestId: 'sessions', key: `s:${BRAVO}`, element: `s:${BRAVO}`, component: 'Pane', origin: { kind: 'engine' } } as any)
+  await ui.press({ key: 'rename' })
+  expect(await ui.find({ key: 'rename-input' })).toBeDefined()
+  await freshList(w, list, 46000)
+  expect(reloads).toBe(0)
+  expect(w.store.has(`reloaded:${SID}`)).toBe(false)
+  // The field closed (r again), the panel still holding the keyboard: it updates, and notes the row it's on
+  await ui.press({ key: 'rename' })
+  await freshList(w, list, 46000)
+  expect(reloads).toBe(1)
+  expect(w.store.get(`reloaded:${SID}`)).toMatchObject({ from: '0.10.0', to: '0.10.1', focus: `s:${BRAVO}` })
+  await ui.unmount()
+})
+
+test('without the keyboard in the panel, the record of an update in place notes no row', { timeoutMs: 30000 }, async ($, on) => {
+  const list = pair()
+  const w = world(on, { list })
+  installNewer(w)
+  on('command.run', { command: 'reload-plugins' }, () => ({}))
+  await startSession($, w)
+  for (const p of w.panes) p.isFocused = false
+  await freshList(w, list, 46000)
+  const r: any = w.store.get(`reloaded:${SID}`)
+  expect(r).toMatchObject({ from: '0.10.0', to: '0.10.1' })
+  expect('focus' in r).toBe(false)
+})
+
+test('the new copy after an update in place gives the panel the keyboard back, on the same row', SLOW, async ($, on) => {
+  const now = 1_000_000_000
+  const w = world(on, { list: trio(), store: { [`reloaded:${SID}`]: { from: '0.9.0', to: '0.10.0', at: now - 5000, focus: `s:${CHARLIE}` } } })
+  cameByReload(on)
+  await startSession($, w)
+  await w.clock.advance(3000)
+  expect(w.opens.some(o => o.id === 'sessions' && o.focus === true)).toBe(true)
+  expect(w.panes.find(p => p.id === 'sessions')?.isFocused).toBe(true)
+  expect(await landingRow($)).toBe(`s:${CHARLIE}`)
+  expect(w.toasts).toContain('Panel updated to 0.10.0')
+  expect(w.store.has(`reloaded:${SID}`)).toBe(false)
+})
+
+test('a row that left the list: the keyboard back to the panel, where it lands by itself', SLOW, async ($, on) => {
+  const now = 1_000_000_000
+  const w = world(on, { list: trio(), store: { [`reloaded:${SID}`]: { from: '0.9.0', to: '0.10.0', at: now - 5000, focus: 's:dddddddd-0000-0000-0000-000000000000' } } })
+  cameByReload(on)
+  await startSession($, w)
+  await w.clock.advance(3000)
+  expect(w.panes.find(p => p.id === 'sessions')?.isFocused).toBe(true)
+  expect(await landingRow($)).toBe(`s:${BRAVO}`)
+})
+
+test('a reload into another version than the record names still gives the keyboard back, and only once', SLOW, async ($, on) => {
+  const now = 1_000_000_000
+  const w = world(on, { list: trio(), store: { [`reloaded:${SID}`]: { from: '0.9.0', to: '0.11.0', at: now - 5000, focus: `s:${CHARLIE}` } } })
+  cameByReload(on)
+  await startSession($, w)
+  await w.clock.advance(3000)
+  expect(w.panes.find(p => p.id === 'sessions')?.isFocused).toBe(true)
+  expect(await landingRow($)).toBe(`s:${CHARLIE}`)
+  expect(w.toasts).not.toContain('Panel updated to 0.10.0')
+  // The record stays for a start of the version it names, with no row in it: the keyboard isn't taken twice
+  expect(w.store.get(`reloaded:${SID}`)).toEqual({ from: '0.9.0', to: '0.11.0', at: now - 5000 })
+})
+
+for (const [why, record] of [
+  ['made without the keyboard in the panel', { at: 1_000_000_000 - 5000 }],
+  ['made more than two minutes ago', { at: 1_000_000_000 - 200000, focus: `s:${BRAVO}` }],
+] as const) {
+  test(`an update in place ${why} doesn't take the keyboard`, SLOW, async ($, on) => {
+    const w = world(on, { list: pair(), store: { [`reloaded:${SID}`]: { from: '0.9.0', to: '0.10.0', ...record } } })
+    cameByReload(on)
+    await startSession($, w)
+    await w.clock.advance(3000)
+    expect(w.opens.some(o => o.id === 'sessions' && o.focus === true)).toBe(false)
+    expect(w.store.has(`reloaded:${SID}`)).toBe(false)
+  })
+}
+
+test("a session restarted within two minutes of an update in place (no module before it) doesn't take the keyboard", SLOW, async ($, on) => {
+  const now = 1_000_000_000
+  const w = world(on, { list: trio(), store: { [`reloaded:${SID}`]: { from: '0.9.0', to: '0.10.0', at: now - 5000, focus: `s:${CHARLIE}` } } })
+  await startSession($, w)
+  await w.clock.advance(3000)
+  expect(w.opens.some(o => o.id === 'sessions' && o.focus === true)).toBe(false)
+  expect(w.store.has(`reloaded:${SID}`)).toBe(false)
 })

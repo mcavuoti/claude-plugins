@@ -8,7 +8,7 @@
     {
       "name": "sessions",
       "source": "./plugins/sessions",
-      "description": "Side panel with this folder's Claude Code sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, a notification when a session waits too long or spends far above its usual, spend and token usage, a status line, ccc tell and ccc section for scripts, ccc tidy to end the sessions you no longer need, and an API for other plugins",
+      "description": "Side panel with this folder's Claude Code sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, a notification when a session waits too long or spends far above its usual, spend and token usage, a status line, ccc tell and ccc section for scripts, ccc tidy to end the sessions you no longer need, tools for Claude to list this project's sessions and wake a retired one, and an API for other plugins",
       "category": "productivity",
       "tags": ["sessions", "background", "panel", "remote-control", "status-line"]
     },

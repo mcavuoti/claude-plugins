@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type {
+  AgentRole,
   Color,
   EndedNote,
   PaneNote,
@@ -122,6 +123,8 @@ import {
   keyLines,
   fileKey,
   orderFileText,
+  orderOrphanRoot,
+  ORDER_ORPHAN_MS,
   rootFrom,
   rootCandidates,
   worktreeBase,
@@ -174,6 +177,21 @@ import {
   usageSummaryOf,
   type ListedFile,
   nextLabelChange,
+  SESSION_TOOLS,
+  TOOLS_WAIT_MS,
+  type SessionTool,
+  roleTools,
+  modelWakesOf,
+  wakeLimit,
+  pickSession,
+  stoppedWords,
+  type ToolRow,
+  toolListText,
+  agentAddress,
+  WOKEN_MARK_MS,
+  wokenLine,
+  clockText,
+  sessionHome,
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
 import { bellFrom, bellOfKey, bellText, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchSetOf, type Locations, type RegistryNews } from './watch'
@@ -224,6 +242,9 @@ const watching = atom({ plugin: 'sessions', key: 'watching' } as const, null as 
 const ended = atom({ plugin: 'sessions', key: 'ended' } as const, null as EndedNote)
 // The folder this session works in when that's outside its project (followHere), or '': its panel says so in one line
 const away = atom({ plugin: 'sessions', key: 'away' } as const, '')
+// The agent this session runs as, from its last classic.SessionStart (agent_type): in $.state, which a reload keeps, so
+// a reload decides the same about the tools for Claude (offerTools); null when no SessionStart came in this session
+const agentRole = atom({ plugin: 'sessions', key: 'agentRole' } as const, null as AgentRole)
 
 // Every write of a value the panel or the band reads draws them again, equal or not (the engine compares nothing): so
 // each one is written only when its data changed (sameData), and a refresh that finds nothing new draws nothing. The
@@ -308,6 +329,9 @@ let quietHours: QuietHours | null = null
 let quietHoursText = ''
 let notificationsPerDay = 5
 let staleMs = 3600000
+// The plugin's option for the tools Claude gets (mcp__sessions__list and mcp__sessions__wake, "Tools for Claude" below):
+// on unless the person turned it off
+let sessionTools = true
 // The installed version this session's mod already tried to update itself to (once per version), and the one it
 // can't, since it watches another set of paths (said once in the debug log)
 let reloadTriedFor = ''
@@ -460,7 +484,8 @@ function debugLine($: any, text: string) {
 // autoPins (AutoPins), pluginPins (PluginPins: the sessions other plugins keep pinned through $.sessions.pin),
 // reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
-// session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
+// session's mod updated itself with /reload-plugins: from, to, at, and focus, the row selected when the panel had the
+// keyboard: s:<sessionId>, h:<section> or ''), waitingOnly (the f filter is on),
 // marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts), collapsed (the
 // sections the person folded, by id), needsSince:<id> (since when a plugin's mark says it needs the person: since, and
 // at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
@@ -473,8 +498,11 @@ function debugLine($: any, text: string) {
 // a notice: format, sessionId, action, cameBack, at; that session's panel takes it and deletes it), personStop:<id>
 // (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again),
 // endedDismissed (the time of the background service's death the person dismissed the panel's line for: Leave them
-// stopped), broughtBack (the sessions a panel is bringing back after such a death, by sessionId: since when, for two
-// minutes, so two panels never respawn the same one).
+// stopped), broughtBack (the sessions a panel is bringing back after such a death, or Claude is waking with
+// mcp__sessions__wake, by sessionId: since when, for two minutes, so two panels or callers never respawn the same one),
+// modelWakes (the wakes Claude asked for with mcp__sessions__wake in the last hour, for its limits: ModelWake in
+// state.ts; with broughtBack under the <data>/bringback.lock folder), marks:sessions:<sessionId> (the line "woken by
+// “<caller>”" on a woken session's row, a MarkSlot of the panel's own, for 15 minutes).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
@@ -1476,7 +1504,8 @@ async function beat($: any) {
 
 // Every 10 minutes, the data of sessions no longer in the official list (fetched right then) is deleted: their stored
 // keys, heartbeats and requests. Never that of a session created in the last 5 minutes, nor of one with a fresh
-// heartbeat: the agent view's pre-started session is running and hidden from the list
+// heartbeat: the agent view's pre-started session is running and hidden from the list. The order files of folders
+// that are gone go too (pruneOrders)
 let lastPrune = 0
 // The plugins' sections the last prune found empty
 let emptyBefore = new Set<string>()
@@ -1484,6 +1513,7 @@ async function prune($: any) {
   const now = await $.clock.now()
   if (now - lastPrune < 600000) return
   lastPrune = now
+  await pruneOrders($, now)
   // The shared list, at most 10 s old (one listing serves every session's prune: after a sleep they all come due at once)
   const list = await officialList($, 10000)
   // A listing that lacks this very session (short, or empty) isn't trusted with deleting anything
@@ -1543,6 +1573,30 @@ async function prune($: any) {
     for (const id of drop) emptyBefore.delete(id)
     return { file: dropSections(pruned, drop) }
   })
+}
+
+// The order files (<data>/order/<root as a file name>) of projects whose folder is gone: of the files no panel rewrote
+// for a while, the root each names (orderOrphanRoot) is looked for once a prune, and the file goes if it isn't there.
+// Never one whose folder is there, nor on a read or a look that fails
+async function pruneOrders($: any, now: number) {
+  let files: any[] = []
+  try {
+    files = await $.fs.list(`${dataDir}/order`)
+  } catch {
+    return
+  }
+  const gone: string[] = []
+  for (const f of files) {
+    const path = `${dataDir}/order/${String(f.name)}`
+    if (f.kind !== 'file' || !(now - Number(f.mtimeMs) >= ORDER_ORPHAN_MS)) continue
+    try {
+      const root = orderOrphanRoot(String(f.name), Number(f.mtimeMs), String(await $.fs.read(path)), now)
+      if (root && (await $.fs.exists(root)) === false) gone.push(path)
+    } catch {}
+  }
+  if (gone.length === 0) return
+  debugLine($, `prune: ${gone.length === 1 ? 'an order file' : `${gone.length} order files`} of a folder that's gone`)
+  await runSafe($, ['rm', '-f', ...gone])
 }
 
 // The version of a session whose own mod doesn't record it (no mod, or one that never started): the program its
@@ -2107,9 +2161,17 @@ async function bringBack($: any) {
   }
 }
 
+// The claims on sessions being brought back (the store's broughtBack: by sessionId, since when) that still hold: a
+// panel's b, or a wake Claude asked for (mcp__sessions__wake), for BROUGHT_BACK_MS
+function heldClaims(claims: unknown, at: number): Record<string, number> {
+  const held: Record<string, number> = {}
+  for (const [k, v] of Object.entries(claims && typeof claims === 'object' ? claims : {})) if (typeof v === 'number' && at - v < BROUGHT_BACK_MS) held[k] = v
+  return held
+}
+
 // Whether a session to bring back still ended with the service, right before its respawn: '' if so, and then it's
-// claimed (broughtBack, under the <data>/bringback.lock folder, so another panel bringing it back too skips it); else
-// why not
+// claimed (broughtBack, under the <data>/bringback.lock folder, so another panel bringing it back too, or Claude waking
+// it, skips it); else why not
 async function stillEnded($: any, s: EndedSession): Promise<string> {
   if (!dataDir) return 'no data folder'
   let why = 'another panel holds the lock'
@@ -2129,9 +2191,7 @@ async function stillEnded($: any, s: EndedSession): Promise<string> {
       return
     }
     const at = await $.clock.now()
-    const claims = await storeGet($, 'broughtBack')
-    const held: Record<string, number> = {}
-    for (const [k, v] of Object.entries(claims && typeof claims === 'object' ? claims : {})) if (typeof v === 'number' && at - v < BROUGHT_BACK_MS) held[k] = v
+    const held = heldClaims(await storeGet($, 'broughtBack'), at)
     if (held[s.sessionId] !== undefined) {
       why = 'another panel is bringing it back'
       return
@@ -2185,6 +2245,401 @@ async function runWakes($: any) {
   } finally {
     waking = false
   }
+}
+
+// ---- Tools for Claude: mcp__sessions__list and mcp__sessions__wake ----
+// Two deferred tools for the model of every interactive session (the sessionTools option), answered here and never by
+// the engine: the project's other sessions, and waking a stopped one so SendMessage can reach it (SendMessage to a
+// stopped session fails at once, and isn't kept for it). A wake starts no turn there: only the message that follows
+// does. They answer the main conversation only, and refuse in place of the question an ask rule wants (a hook that
+// answers a call never puts it to the person). A wake goes by wakeVerdict's rules ($.sessions.wake's) and more: a
+// session of this project other than this one, never while memory is short, at most so many wakes per caller and per
+// session (WAKE_LIMITS in state.ts, the store's modelWakes), claimed under <data>/bringback.lock (broughtBack, with the
+// panel's b) so two callers never restart one session twice; then the wake queue ($.sessions.wake's), and the answer
+// once it runs: the name to SendMessage to, from ListAgents. Their input stays as it is ({} and { session }): other
+// plugins code against it, and refuse a wake with a hook of their own: on tool.call (it stands before these only in a
+// plugin that depends on sessions) or on tool.check (heard whatever the order: toolGate asks it first). See
+// docs/plugin-contract.md
+const LIST_TOOL = 'mcp__sessions__list'
+const WAKE_TOOL = 'mcp__sessions__wake'
+const TOOL_SPECS: Record<SessionTool, { name: string; description: string; inputSchema: Record<string, unknown>; isDeferred: true }> = {
+  list: {
+    name: 'list',
+    description:
+      "Lists this project's other Claude sessions: each one's name as ListAgents and SendMessage know it, its short id, whether it's working, idle, waiting for the person or stopped (and why), whether mcp__sessions__wake can bring it back, and the agent it runs as. SendMessage reaches only running sessions: a message to a stopped one fails at once. Spends no tokens beyond this result.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    isDeferred: true,
+  },
+  wake: {
+    name: 'wake',
+    description:
+      "Brings back a stopped background session of this project so SendMessage can reach it: one the background service retired for being idle, or that ended with a crash or a restart. Never one the person stopped, a regular session, or one of another project. session: its name or short id, as mcp__sessions__list shows it. The wake itself starts no turn there; it waits until the session runs (a few seconds) and answers the name to SendMessage to. Main conversation only.",
+    inputSchema: {
+      type: 'object',
+      properties: { session: { type: 'string', description: "The session's name or short id, as mcp__sessions__list shows it" } },
+      required: ['session'],
+      additionalProperties: false,
+    },
+    isDeferred: true,
+  },
+}
+// How long a wake waits for the session to run before answering (a restart takes about a second)
+const WAKE_WAIT_MS = 5000
+// What the start registered, or why not, for /sessions status
+let toolsOffered = ''
+// classic.SessionStart, which says the agent, is raised beside session.start, not inside it (checked on 2.1.319: it
+// settled after session.start's whole chain): its hook notes the agent here at once (roleSeen), and session.start
+// waits for it while the mod's own start runs (startDone), ROLE_WAIT_MS at most: where none comes (a reload from a
+// version that didn't record it, a host with no classic hooks) that start ends the wait, a moment later
+const ROLE_WAIT_MS = 1000
+let roleSeen: AgentRole = null
+let roleKnown: () => void = () => {}
+const roleCame = new Promise<void>(resolve => (roleKnown = resolve))
+let startDone = false
+
+// A promise raced against the clock: its value, or null when it fails or takes longer than ms
+function within<T>($: any, work: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([work.catch(() => null), $.clock.sleep(ms).then(() => null)])
+}
+
+// The agent file of the agent this session runs as: <folder>/.claude/agents/<name>.md from the folder the session
+// started in up to the home folder, then ~/.claude/agents/<name>.md. null: none (a plugin's agent, --agents JSON)
+async function agentFile($: any, agent: string, cwd: string): Promise<string | null> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(agent)) return null
+  const h = String((await $.env.get('HOME')) ?? '')
+  const folders: string[] = []
+  for (let d = cwd, i = 0; d.startsWith('/') && d !== '/' && d !== h && i < 12; d = d.replace(/\/[^/]*$/, ''), i++) folders.push(`${d}/.claude/agents`)
+  if (h) folders.push(`${h}/.claude/agents`)
+  for (const f of folders) {
+    try {
+      return String(await $.fs.read(`${f}/${agent}.md`))
+    } catch {}
+  }
+  return null
+}
+
+// At session.start, after the plugins beneath, once the agent is known (classic.SessionStart, waited for a moment; a
+// reload finds it in $.state): the tools this session's agent can see, registered before the first request and awaited
+// for a moment only. An agent whose tools: line doesn't name them gets none (registering them would hold each start and
+// restart 8 s); one whose file isn't found, a short wait. A reload registers them again, which changes nothing
+async function offerTools($: any, cwd: string) {
+  if (!sessionTools) {
+    toolsOffered = 'off (the sessionTools option)'
+    return
+  }
+  let role = roleSeen ?? (await read($, agentRole))
+  if (role === null && starting && !startDone) {
+    await Promise.race([roleCame, $.clock.sleep(ROLE_WAIT_MS), starting].map(w => w.catch(() => {})))
+    role = roleSeen ?? (await read($, agentRole))
+  }
+  if (role === null) {
+    toolsOffered = 'not offered: no SessionStart reached the mod in this session (updated in place from an older version); a restart (u) offers them'
+    bg(offerAfterReload($))
+    return
+  }
+  const plan = role.agent ? roleTools(await agentFile($, role.agent, cwd)) : { tools: [...SESSION_TOOLS], waitMs: TOOLS_WAIT_MS, why: 'no agent' }
+  toolsOffered = plan.tools.length ? `${plan.tools.map(t => `mcp__sessions__${t}`).join(', ')} (${role.agent ? `agent ${role.agent}: ` : ''}${plan.why})` : `not offered: agent ${role.agent}, ${plan.why}`
+  if (!plan.tools.length) {
+    debugLine($, `tools for Claude: ${toolsOffered}`)
+    return
+  }
+  const done = await within($, Promise.all(plan.tools.map(t => $.tool.register(TOOL_SPECS[t]))), plan.waitMs)
+  debugLine($, `tools for Claude: ${toolsOffered}${done ? '' : `, still registering after ${plan.waitMs} ms`}`)
+}
+
+// A module that came in by an update in place from a version that didn't record the agent (0.15.1 and before: no
+// SessionStart in this module's life, no agentRole) learns it from the session's transcript instead (readAgent, a few
+// beats at most), in the background: session.start isn't held. With no agent the tools are registered then, which a
+// plain session sees from its next request, and that's recorded (agentRole) for later reloads; an agent session gets
+// none until it restarts (a registration not awaited at session.start never shows in one, and one it doesn't list
+// would hold its starts 8 s), and nothing is recorded: each reload decides the same until then
+async function offerAfterReload($: any) {
+  await (starting ?? Promise.resolve()).catch(() => {})
+  if (!reloadedInto || !sessionTools || roleSeen) {
+    debugLine($, `tools for Claude: ${toolsOffered}`)
+    return
+  }
+  for (let i = 0; i < 5 && agentFor !== myId; i++) {
+    await readAgent($)
+    if (agentFor !== myId) await $.clock.sleep(1000)
+  }
+  if (agentFor !== myId || roleSeen) {
+    debugLine($, `tools for Claude: ${toolsOffered} (the transcript couldn't say which agent it runs as)`)
+    return
+  }
+  if (myAgent) {
+    toolsOffered = `not offered: agent ${myAgent}, and this session was updated in place from a version without them; a restart (u) offers them`
+    debugLine($, `tools for Claude: ${toolsOffered}`)
+    return
+  }
+  const role: AgentRole = { agent: null }
+  try {
+    if (!sameData(await read($, agentRole), role)) await update($, agentRole, () => role)
+  } catch {}
+  toolsOffered = `${SESSION_TOOLS.map(t => `mcp__sessions__${t}`).join(', ')} (no agent, as its transcript says; offered after an update in place, from the next request on)`
+  const done = await within($, Promise.all(SESSION_TOOLS.map(t => $.tool.register(TOOL_SPECS[t]))), 10000)
+  debugLine($, `tools for Claude: ${toolsOffered}${done ? '' : ', still registering after 10 s'}`)
+}
+
+// Claude's own name for a session (what ListAgents and SendMessage use), '' when it has none; and its title in the panel
+function claudeName(s: any): string {
+  return typeof s?.name === 'string' && s.name && s.name !== s.id ? s.name : ''
+}
+function panelTitle(s: any): string {
+  return String(projectRows.find(f => f.sessionId === s.sessionId)?.title ?? (claudeName(s) || s.id || String(s.sessionId).slice(0, 8)))
+}
+function toolName(s: any): string {
+  return claudeName(s) || panelTitle(s)
+}
+
+// The guards both tools share: the option, the main conversation only, an ask rule (refused, since the call is never put
+// to the person), and a panel that has read the list. '' when the call goes on
+async function toolGate($: any, e: any, tool: string, input: Record<string, unknown>): Promise<string> {
+  if (!sessionTools) return `${tool} is turned off in the sessions plugin's options (sessionTools)`
+  if (e.agentId !== undefined) return `${tool} answers only the main conversation, not a subagent or a teammate`
+  const c: any = await within($, Promise.resolve($.tool.check({ tool, input })), 1000)
+  if (!c) return `couldn't check the permission rules for ${tool}: try again in a few seconds`
+  if (c.decision === 'ask' && typeof c.rule === 'string' && c.rule) {
+    return `a permission rule (${c.rule}) asks the person before ${tool} runs, and this tool can't put that question to them, so nothing was done: ask the person to do it, or to change that rule`
+  }
+  if (c.decision === 'deny') return `refused by a permission check${c.reason ? `: ${String(c.reason).slice(0, 200)}` : ''}`
+  if (!ready()) return "the sessions panel hasn't read the session list in this session yet: try again in a few seconds"
+  return ''
+}
+
+// mcp__sessions__wake's rules, for a session of the list: wakeVerdict's ($.sessions.wake's), for a session of this
+// project other than this one, and none while memory is short (short: platform.memoryNormal, when the caller has it),
+// worded for the model
+async function modelWakeVerdict($: any, s: any, short?: boolean): Promise<WakeVerdict> {
+  const name = toolName(s)
+  if (s.sessionId === myId) return { state: 'refused', detail: `“${name}” is this very session` }
+  if (!belongsHere(s)) return { state: 'refused', detail: `“${name}” belongs to another project (${sessionHome(whereabouts(s)) || 'not known'}): mcp__sessions__wake wakes only this project's sessions` }
+  const v = await wakeVerdict($, refOf(s))
+  if (v.state === 'refused' && s.kind === 'background' && !s.pid) {
+    const kind = await stoppedOf($, s, await stopLogNow($))
+    if (kind === 'person') return { state: 'refused', detail: `“${name}” was stopped by the person: only they restart it (Enter or u in the panel)` }
+    if (kind === 'unknown') return { state: 'refused', detail: `nothing says why “${name}” stopped (no idle retirement, crash or restart in the background service's log): only the person restarts it (Enter or u in the panel)` }
+  }
+  if (v.state === 'wake' && (short ?? (await platform.memoryNormal(sys($))) === false)) return { state: 'refused', detail: "memory is short on this computer, and no session is woken until it's normal again" }
+  return v
+}
+
+// Why a stopped background session stopped, and when when the log or the person's stop says: "retired for being idle
+// 2 h ago"
+async function stoppedNow($: any, s: any, log: StopLog): Promise<{ kind: 'person' | 'idle' | 'memory' | 'ended' | 'unknown'; at?: number }> {
+  const kind = await stoppedOf($, s, log)
+  let at = typeof s.id === 'string' ? log.reasons[s.id]?.at : undefined
+  if (kind === 'person' && !at) {
+    const p = await storeGet($, `personStop:${s.sessionId}`)
+    if (typeof p === 'number') at = p
+  }
+  return at ? { kind, at } : { kind }
+}
+async function stoppedText($: any, s: any, now: number): Promise<string> {
+  const why = await stoppedNow($, s, await stopLogNow($))
+  return `${stoppedWords(why.kind)}${why.at && why.at <= now ? ` ${howLong(now - why.at)} ago` : ''}`
+}
+
+// A wake limit, in words: whose, and when it can be asked again
+function limitText(l: NonNullable<ReturnType<typeof wakeLimit>>, name: string, now: number): string {
+  const when = `${clockText(new Date(l.until), new Date(now))} (in ${howLong(Math.max(60000, l.until - now))})`
+  return l.who === 'caller'
+    ? `this session already asked for ${l.count} wakes in the last ${howLong(l.ms)}: it can wake one again at ${when}`
+    : `“${name}” was woken ${l.count} times in the last hour (it may fail to start): it can be woken again at ${when}`
+}
+
+// The list as Claude's files show it now (read again when older than 2 s), with the panel refreshed from it: the
+// projects (learnHomes) and wakeVerdict go by the same list
+async function freshList($: any): Promise<any[]> {
+  await officialList($, 2000)
+  await requestRefresh($, false)
+  return lastList
+}
+
+// The session this call names, among the list's sessions of this project other than this one, or the refusal
+async function sessionNamed($: any, asked: string): Promise<{ s: any } | { deny: string }> {
+  const list = await freshList($)
+  const pickable = (s: any) => ({ s, sessionId: String(s.sessionId), id: typeof s.id === 'string' ? s.id : null, name: claudeName(s), title: panelTitle(s) })
+  const mine = list.filter(s => typeof s?.sessionId === 'string' && s.sessionId !== myId && belongsHere(s)).map(pickable)
+  const named = (p: { name: string; title: string; id: string | null }) => `“${p.name || p.title}” (${p.id ?? 'regular session'})`
+  const pick = pickSession(mine, asked)
+  if ('found' in pick) return { s: pick.found.s }
+  if ('many' in pick) return { deny: `Several sessions of this project match “${asked}”: ${pick.many.map(named).join(', ')}. Call again with the short id.` }
+  const self = list.find(s => s?.sessionId === myId)
+  if (self && 'found' in pickSession([pickable(self)], asked)) return { deny: `“${toolName(self)}” is this very session.` }
+  const elsewhere = pickSession(list.filter(s => typeof s?.sessionId === 'string' && !belongsHere(s)).map(pickable), asked)
+  if (!('none' in elsewhere)) return { deny: `“${asked}” belongs to another project: mcp__sessions__wake wakes only this project's sessions.` }
+  const some = mine.slice(0, 12).map(named)
+  return { deny: `No session of this project is called “${asked}”.${some.length ? ` This project's other sessions: ${some.join(', ')}.` : ' This project has no other sessions.'}` }
+}
+
+// Where SendMessage reaches a session that runs: "<name> [<ref>]" from ListAgents (raced against a second; never a
+// question to the person: only when the permission check allows it without one; no row of it reaches the model), else
+// its name alone
+async function sendAddress($: any, name: string): Promise<string> {
+  const c: any = await within($, Promise.resolve($.tool.check({ tool: 'ListAgents', input: {} })), 500)
+  if (c?.decision !== 'allow') return name
+  const r: any = await within($, Promise.resolve($.tool.call({ tool: 'ListAgents' } as any)), 1000)
+  const sections = Array.isArray(r?.result?.sections) ? r.result.sections : []
+  return agentAddress(
+    sections.flatMap((x: any) => (Array.isArray(x?.rows) ? x.rows : [])),
+    name,
+  )
+}
+
+// The claim on a wake, under <data>/bringback.lock with the panel's b: the session still stopped (a list read now), no
+// other claim on it (broughtBack), within the limits (modelWakes); then both recorded. why: '' when claimed (at: the
+// claim's time), 'running' when it runs by now, else why not
+async function claimWake($: any, s: any, name: string): Promise<{ why: string; at: number }> {
+  if (!dataDir) return { why: 'the sessions panel has no data folder in this session', at: 0 }
+  let why = 'another session holds the wake lock: try again in a few seconds'
+  let claimed = 0
+  await withLock(
+    $,
+    `${dataDir}/bringback`,
+    async () => {
+      const list = await officialList($, 0)
+      if (typeof list === 'string') {
+        why = `${list}: try again in a few seconds`
+        return
+      }
+      const now = list.find(x => x.sessionId === s.sessionId)
+      if (!now || now.id !== s.id) {
+        why = `“${name}” left the session list`
+        return
+      }
+      if (now.pid) {
+        why = 'running'
+        return
+      }
+      const at = await $.clock.now()
+      const held = heldClaims(await storeGet($, 'broughtBack'), at)
+      if (held[s.sessionId] !== undefined) {
+        why = `another session or panel is bringing “${name}” back right now: call mcp__sessions__list in a minute`
+        return
+      }
+      const log = modelWakesOf(await storeGet($, 'modelWakes'), at)
+      const limit = wakeLimit(log, myId, s.sessionId, at)
+      if (limit) {
+        why = limitText(limit, name, at)
+        return
+      }
+      await storeSet($, 'modelWakes', [...log, { at, by: myId, target: s.sessionId }])
+      await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at })
+      why = ''
+      claimed = at
+    },
+    20,
+  )
+  return { why, at: claimed }
+}
+
+// Once the woken session runs, this wake's claim goes (a later wake finds it running; one after it stops again needn't
+// wait the claim's two minutes): only this wake's own, under the lock (left to expire when the lock isn't taken)
+async function releaseClaim($: any, sessionId: string, at: number) {
+  if (!dataDir || !at) return
+  await withLock(
+    $,
+    `${dataDir}/bringback`,
+    async () => {
+      const held = heldClaims(await storeGet($, 'broughtBack'), await $.clock.now())
+      if (held[sessionId] !== at) return
+      delete held[sessionId]
+      await storeSet($, 'broughtBack', held)
+    },
+    10,
+  )
+}
+
+// Whether the session runs within ms, by the list read again every 250 ms
+async function runsWithin($: any, sessionId: string, ms: number): Promise<boolean> {
+  const until = (await $.clock.now()) + ms
+  for (;;) {
+    await $.clock.sleep(250)
+    const list = await officialList($, 0)
+    if (Array.isArray(list) && list.some(x => x.sessionId === sessionId && x.pid)) return true
+    if ((await $.clock.now()) >= until) return false
+  }
+}
+
+// "woken by “<caller>”" under the woken session's row, in every panel, for WOKEN_MARK_MS: a mark of the panel's own
+async function markWoken($: any, s: any, by: string) {
+  const now = await $.clock.now()
+  await storeSet($, `marks:sessions:${s.sessionId}`, { at: now, until: now + WOKEN_MARK_MS, rows: { [refOf(s)]: { line: wokenLine(by), tint: 'suggestion' } } })
+  forgetStored(k => k.startsWith('marks:'))
+}
+
+async function listTool($: any, e: any): Promise<{ result: string } | { deny: string }> {
+  const gate = await toolGate($, e, LIST_TOOL, {})
+  if (gate) return { deny: gate }
+  const list = await freshList($)
+  const others = list.filter(s => typeof s?.sessionId === 'string' && s.sessionId !== myId && belongsHere(s))
+  const now = await $.clock.now()
+  const log = await stopLogNow($)
+  const short = others.some(s => !s.pid) ? (await platform.memoryNormal(sys($))) === false : false
+  const wakeLog = modelWakesOf(await storeGet($, 'modelWakes'), now)
+  const rows: ToolRow[] = []
+  for (const s of others) {
+    const running = !!s.pid
+    const state = !running ? 'stopped' : s.status === 'busy' ? 'working' : s.status === 'waiting' ? 'waiting' : 'idle'
+    const stop = !running && s.kind === 'background' ? await stoppedNow($, s, log) : null
+    let wake = running ? 'it runs' : ''
+    if (!running) {
+      const v = await modelWakeVerdict($, s, short)
+      const limit = v.state === 'wake' ? wakeLimit(wakeLog, myId, s.sessionId, now) : null
+      wake = v.state === 'refused' ? v.detail : limit ? limitText(limit, toolName(s), now) : ''
+    }
+    const agent = (await readState($, s.sessionId))?.agent
+    rows.push({
+      sessionId: s.sessionId,
+      id: typeof s.id === 'string' ? s.id : null,
+      name: claudeName(s),
+      title: panelTitle(s),
+      state,
+      ...(stop ? { stopped: stop.kind, ...(stop.at ? { stoppedAt: stop.at } : {}) } : {}),
+      wake,
+      agent: typeof agent === 'string' && agent ? agent : null,
+    })
+  }
+  return { result: toolListText(rows, myCwd, now) }
+}
+
+async function wakeTool($: any, e: any): Promise<{ result: string } | { deny: string }> {
+  const asked = typeof e.session === 'string' ? e.session.trim().slice(0, 200) : ''
+  const refuse = (text: string) => {
+    debugLine($, `${WAKE_TOOL} “${asked}”: refused, ${text}`)
+    return { deny: text }
+  }
+  const gate = await toolGate($, e, WAKE_TOOL, { session: asked })
+  if (gate) return refuse(gate)
+  if (!asked) return refuse("session: the name or short id of a session of this project, as mcp__sessions__list shows it")
+  const found = await sessionNamed($, asked)
+  if ('deny' in found) return refuse(found.deny)
+  const s = found.s
+  const name = toolName(s)
+  const v = await modelWakeVerdict($, s)
+  if (v.state === 'refused') return refuse(`Not woken: ${v.detail}.`)
+  const ref = ' (the [ref] changes at each restart)'
+  if (v.state === 'running') return { result: `“${name}” already runs: SendMessage to "${await sendAddress($, claudeName(s) || name)}"${ref}.` }
+  const why = await stoppedText($, s, await $.clock.now())
+  const claim = await claimWake($, s, name)
+  if (claim.why === 'running') return { result: `“${name}” already runs: SendMessage to "${await sendAddress($, claudeName(s) || name)}"${ref}.` }
+  if (claim.why) return refuse(`Not woken: ${claim.why}.`)
+  // The wake queue $.sessions.wake fills, run from this mod's own timer: claude respawn, if it's still stopped then
+  const me = toolName(lastList.find(x => x.sessionId === myId) ?? { sessionId: myId, id: myShortId() })
+  if (!wakes.some(w => w.id === v.id)) wakes.push({ id: v.id, name: v.name, reason: `${WAKE_TOOL}, from this session's Claude` })
+  kickQueue()
+  await markWoken($, s, me)
+  debugLine($, `${WAKE_TOOL} “${name}” (${why}): asked`)
+  const runs = await runsWithin($, s.sessionId, WAKE_WAIT_MS)
+  bg(requestRefresh($, false))
+  if (!runs) {
+    $.ui.toast(`Asked “${name}” to restart, for this session's Claude`)
+    return { result: `Restart of “${name}” asked (it was ${why}), and it isn't running yet: call mcp__sessions__list in a few seconds, then SendMessage to it.` }
+  }
+  await releaseClaim($, s.sessionId, claim.at)
+  $.ui.toast(`Woke “${name}” for this session's Claude`)
+  return { result: `Woke “${name}” (${why}). It runs now: SendMessage to "${await sendAddress($, claudeName(s) || name)}"${ref}.` }
 }
 
 // The sessions other plugins asked to restart ($.sessions.restart), from this mod's own timer (at once when asked:
@@ -3965,7 +4420,8 @@ function queuedHere(): boolean {
 }
 
 // A newer version of this mod is installed: update this session's in place with /reload-plugins, when that cuts
-// nothing (reloadDecision). The new copy says so when it starts ("Panel updated"). /reload-plugins reloads every
+// nothing (reloadDecision). The new copy says so when it starts ("Panel updated"), and if the panel had the keyboard it
+// takes it back, on the same row (keyboardBack): the person sees a flicker at most. /reload-plugins reloads every
 // plugin of the session; a Claude update, settings and MCP servers still need u (a restart). If the update doesn't
 // take, the ↑ mark stays and u is the way
 async function updateInPlace($: any) {
@@ -3980,14 +4436,12 @@ async function updateInPlace($: any) {
     triedFor: reloadTriedFor,
     status: 'idle',
     tasks: 0,
-    paneFocused: false,
     fieldOpen: false,
   })
   if (quick !== 'reload' || !plugin) return
   // Not idle in the last list (working, waiting, not in it): no reload now, and no list read just to see that (one
   // every 15 s from each busy session would keep the list's lock taken)
   if (own?.status !== 'idle') return
-  const panes = await $.ui.panes()
   const tasks = own?.id ? ((await backgroundTasks($, own.id))?.count ?? null) : 0
   let installedSource: string | null = null
   try {
@@ -4000,7 +4454,6 @@ async function updateInPlace($: any) {
     triedFor: reloadTriedFor,
     status: await statusNow($, myId),
     tasks,
-    paneFocused: !!panes.find((p: any) => p.id === PANE)?.isFocused,
     fieldOpen: (await read($, askingName)) || !!(await read($, renaming)),
     // A copy that watches other paths can't be reloaded into (the ↑ mark stays, and u restarts it)
     watchSet: WATCH_SET,
@@ -4013,24 +4466,51 @@ async function updateInPlace($: any) {
   // Again: the checks above take seconds (a list read now), and a start, wake or restart may have been queued meanwhile
   if (decision !== 'reload' || queuedHere()) return
   reloadTriedFor = plugin.version
-  await storeSet($, `reloaded:${myId}`, { from: modVersion, to: plugin.version, at: await $.clock.now() })
+  // Whether the panel has the keyboard right now, and on which row: the new copy gives it back there
+  const focused = !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
+  await storeSet($, `reloaded:${myId}`, { from: modVersion, to: plugin.version, at: await $.clock.now(), ...(focused ? { focus: selectedRow ?? '' } : {}) })
   debugLine($, `updating in place: ${modVersion} → ${plugin.version}`)
   try {
     await $.command.run({ command: 'reload-plugins' })
   } catch {}
 }
 
-// The new copy, after updating in place: say so (only if it really is the new version)
-async function announceUpdate($: any) {
+// The new copy, after updating in place: say so (only if it really is the new version), and hand the start the row the
+// panel had the keyboard on, if it had it (once: a later start finds no focus in the record)
+async function announceUpdate($: any): Promise<string | undefined> {
   const r = await storeGet($, `reloaded:${myId}`)
-  if (!r || typeof r !== 'object') return
+  if (!r || typeof r !== 'object') return undefined
   if ((await $.clock.now()) - Number(r.at) > 120000) {
     await storeDelete($, `reloaded:${myId}`)
-    return
+    return undefined
   }
-  if (r.to !== modVersion) return
+  const focus = typeof r.focus === 'string' ? r.focus : undefined
+  if (r.to !== modVersion) {
+    if (focus !== undefined) await storeSet($, `reloaded:${myId}`, { from: r.from, to: r.to, at: r.at })
+    return focus
+  }
   await storeDelete($, `reloaded:${myId}`)
   $.ui.toast(`Panel updated to ${modVersion}`)
+  return focus
+}
+
+// After an update in place made while the panel had the keyboard (updateInPlace): the panel takes it back, on the row
+// that was selected (key: s:<sessionId> or h:<section>), or wherever Claude lands it if that row is gone or none was.
+// The rows are the old copy's ($.state stays across a reload; with none yet, it waits a little for the start's first
+// read); a panel you closed stays closed
+async function keyboardBack($: any, key: string) {
+  if (await closedByYou($)) return
+  let around = ringKeys(await read($, rows))
+  for (let i = 0; around.length === 0 && i < 30; i++) {
+    await $.clock.sleep(100)
+    around = ringKeys(await read($, rows))
+  }
+  const target = around.includes(key) ? key : undefined
+  debugLine($, `update in place: the keyboard back to the panel${target ? `, on ${target}` : ''}`)
+  if (target?.startsWith('s:')) return takeKeyboard($, target.slice(2))
+  if (target) selectedRow = target
+  await takeKeyboard($, undefined)
+  if (target) await focusElement($, target)
 }
 
 // /sessions status, about telling the person: the options as they apply, today's count, the last notification any
@@ -4069,6 +4549,7 @@ async function statusText($: any): Promise<string> {
     `Heartbeat: ${lastBeat ? `written ${ago(lastBeat)}` : 'not written'} (${dataDir}/alive)`,
     silent.length ? `No panel running in: ${silent.join(', ')}` : 'Every session of the project that should run a panel does',
     `For other plugins: $.sessions api ${SESSIONS_API} · ${Object.keys(METHODS).join(', ')} (${ready() ? 'ready' : 'not ready yet'})`,
+    `Tools for Claude: ${toolsOffered || (sessionTools ? 'not offered yet (they are at session.start)' : 'off (the sessionTools option)')}`,
     sectionsProblem ? `Sections: ${sectionsProblem}` : `Sections: ${sectionsNow.sections.length} (${dataDir}/sections.json)${myAgent ? ` · runs as agent ${myAgent}` : ''}`,
     markSources.length
       ? `Marks: ${markSources.map(m => `${m.source} (${m.rows === 1 ? '1 row' : `${m.rows} rows`}, ${Math.max(0, Math.ceil((m.until - now) / 60000))} min left)`).join(', ')}`
@@ -4377,7 +4858,7 @@ function sessionsApi($: any): Sessions {
 function ensureStarted($: any, via: string): Promise<void> {
   if (!starting) {
     startedVia = via
-    starting = start($)
+    starting = start($).finally(() => (startDone = true))
   }
   return starting
 }
@@ -4466,7 +4947,10 @@ async function start($: any) {
     // Here: the other panels read this session's record and heartbeat
     await ring($, myId)
   })
-  await step('update notice', () => announceUpdate($))
+  let keyboardTo: string | undefined
+  await step('update notice', async () => {
+    keyboardTo = await announceUpdate($)
+  })
   await step('timers', async () => {
     // If this session was restarted from its own panel (u), announce that it's back
     const restartedAt = Number(await storeGet($, `restarted:${myId}`)) || 0
@@ -4525,6 +5009,8 @@ async function start($: any) {
       bg(readUsage($, live ? USAGE_FOLLOWER_MS : USAGE_SHARED_MS))
     }
     await paneState($)
+    // Only into a module that came in by a reload: a session restarted meanwhile (a new process) starts as any other
+    if (keyboardTo !== undefined && reloadedInto) bg(keyboardBack($, keyboardTo))
   })
   await step('command', () =>
     $.command.register({
@@ -4545,6 +5031,7 @@ export const register: Register = (on, options) => {
   quietHoursText = typeof options?.quietHours === 'string' ? options.quietHours.trim() : ''
   quietHours = parseQuietHours(quietHoursText)
   notificationsPerDay = typeof options?.notificationsPerDay === 'number' && Number.isFinite(options.notificationsPerDay) ? Math.max(0, Math.floor(options.notificationsPerDay)) : 5
+  sessionTools = options?.sessionTools !== false
   // $.sessions for other plugins (sessionsApi). Nothing else happens here: a throw at this step unloads the whole mod.
   // Claude doesn't let the $ built here be handed to a function, so the methods get the few calls they make (files,
   // commands, the clock, the environment, the store) through closures over it
@@ -4592,19 +5079,34 @@ export const register: Register = (on, options) => {
     return { ...$, sessions: sessionsApi(calls) }
   })
   // In a non-interactive run (claude -p) the mod does nothing. The start isn't awaited before next(e): a step that hangs
-  // mustn't hold the session up
+  // mustn't hold the session up. After the plugins beneath, and once classic.SessionStart said the agent, the tools for
+  // Claude are registered, awaited for a moment at most (offerTools)
   on('session.start', async ($, e, next) => {
     if (e.isInteractive) {
       sawSessionStart = true
       bg(ensureStarted($, 'session.start'))
     }
-    return next(e)
+    const r = await next(e)
+    if (e.isInteractive) {
+      try {
+        await offerTools($, String(e.cwd ?? ''))
+      } catch {}
+    }
+    return r
   })
 
   // The paths the engine watches for this session (watch.ts), handed over with what the plugins beneath ask (fleet's
   // own, for one); and what changed in them: noted, read a moment later (flush), and passed on, since every plugin's
   // hook hears every watched path
   on('classic.SessionStart', async ($, e, next) => {
+    // The agent this session runs as, for the tools for Claude (offerTools, at session.start), noted at once and kept in
+    // $.state for a reload
+    const role: AgentRole = { agent: typeof e.agent_type === 'string' && e.agent_type ? e.agent_type : null }
+    roleSeen = role
+    roleKnown()
+    try {
+      if (!sameData(await read($, agentRole), role)) await update($, agentRole, () => role)
+    } catch {}
     const r = await next(e)
     try {
       const paths = await watchFor($, String(e.session_id ?? ''), String(e.source ?? ''))
@@ -4613,6 +5115,13 @@ export const register: Register = (on, options) => {
       return r
     }
   }).catch(($, e, next) => next(e))
+  // The tools for Claude (offerTools): answered here, never by the engine. A plugin that depends on sessions has its
+  // own tool.call hooks on them run before these (Claude registers a plugin's hooks before those of the plugins it
+  // depends on), and can refuse a call with { deny }; any plugin can with a tool.check hook (docs/plugin-contract.md)
+  on('tool.call', { tool: 'mcp__sessions__list' }, async ($, e) => listTool($, e)).catch(() => ({ result: `${LIST_TOOL} failed inside the sessions plugin: try again in a few seconds` }))
+  on('tool.call', { tool: 'mcp__sessions__wake' }, async ($, e) => wakeTool($, e)).catch(() => ({
+    result: `${WAKE_TOOL} failed inside the sessions plugin, and the session may or may not be restarting: call ${LIST_TOOL} in a few seconds to see whether it runs`,
+  }))
   on('classic.FileChanged', async ($, e, next) => {
     if (active && locations.registry) fileChanged($, String(e.file_path ?? ''), String(e.event ?? ''))
     return next(e)

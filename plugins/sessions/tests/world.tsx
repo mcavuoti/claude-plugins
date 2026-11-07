@@ -94,6 +94,10 @@ export type WorldOptions = {
   system?: string
   // What the plugins beneath answer to classic.SessionStart (nothing by default)
   sessionStart?: Record<string, unknown>
+  // Called with each command's argv before it's answered (a test that changes the world when one runs)
+  onRun?: (argv: readonly string[]) => void
+  // Run beneath the mod inside session.start, with the hook's $ (the engine raises SessionStart there)
+  onStart?: ($: any) => Promise<void>
 }
 
 // A session with an id and a root, an in-memory folder tree, a claude that lists one session
@@ -171,7 +175,10 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('session.usage', () => ({ value: usage.value }))
   on('session.version', () => ({ value: { version: '2.1.316' } as any }))
   on('session.messages', () => ({ value: [] as any }))
-  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.start', async ($, e) => {
+    if (options.onStart) await options.onStart($)
+    return { cwd: e.cwd }
+  })
   // The classic hooks the engine raises (a test raises them with $.classic): nothing of Claude's own beneath
   on('classic.SessionStart', () => (options.sessionStart ?? {}) as any)
   on('classic.FileChanged', () => ({}) as any)
@@ -211,6 +218,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const envs: (Record<string, string> | undefined)[] = []
   on('process.run', (_, e) => {
     const argv = e.argv
+    options.onRun?.(argv)
     runs.push([...argv])
     runAt.push(clock.now())
     cwds.push(e.init?.cwd)
