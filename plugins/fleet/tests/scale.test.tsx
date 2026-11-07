@@ -264,3 +264,24 @@ test('the register read for /fleet stats is let go ten minutes after, and read a
   // (kept parsed for the life of the process before)
   expect(w.readCount.get(one) ?? 0).toBeGreaterThan(first)
 })
+
+test('the register used again meanwhile is let go ten minutes after that last use, not a full period later', WITH_SESSIONS, async ($, on) => {
+  const files: Record<string, string> = {}
+  const month = new Date(Date.UTC(2026, 10, 2)).toISOString().slice(0, 7)
+  for (let i = 1; i <= 30; i++) files[`${FLEET}/decisions/register/${month}/D-${i}.json`] = JSON.stringify({ registerFormat: 1, id: `D-${i}`, at: 1, closedAt: 2, state: 'answered', questions: [], answers: {} })
+  const w = world(on, { files })
+  sessionsSay(w, CURRENT)
+  await startSession($, w)
+  await tick(w, 1100)
+  const one = `${FLEET}/decisions/register/${month}/D-1.json`
+  await fleet($, 'stats')
+  const first = w.readCount.get(one) ?? 0
+  await tick(w, MIN)
+  await fleet($, 'stats')
+  expect(w.readCount.get(one) ?? 0).toBe(first)
+  // 10.5 minutes after the last use (the first timer, at 10 minutes from the first, waits out the rest; it re-armed
+  // for a whole period before, keeping it to 20 minutes from the first use)
+  await tick(w, 10.5 * MIN)
+  await fleet($, 'stats')
+  expect(w.readCount.get(one) ?? 0).toBeGreaterThan(first)
+})

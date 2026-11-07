@@ -2245,6 +2245,9 @@ async function trigger($: any, name: string) {
 // ---- What each thread read ----
 
 async function setRead($: any, thread: string, rel: string, v: string | null, rev?: number) {
+  // A new read is what a later change is told against: the memo of what was told before it goes (a change back to that
+  // version, a toggle of a board item, is news again)
+  toldHere.get(thread)?.delete(rel)
   const now = await $.clock.now()
   await update($, reads, m => {
     const mine = { ...(m[thread] ?? {}) }
@@ -2330,12 +2333,14 @@ async function runningHere($: any): Promise<Running[]> {
 
 // A helper that finished takes its reads with it; a /clear starts a conversation that read nothing
 async function dropThread($: any, thread: string) {
+  toldHere.delete(thread)
   await update($, reads, m => (m[thread] ? omit(m, [thread]) : m))
   await update($, warned, m => (m[thread] ? omit(m, [thread]) : m))
   saveReadsSoon($)
 }
 
 async function clearReads($: any, oldSessionId: string) {
+  toldHere.clear()
   await update($, reads, () => ({}))
   await update($, warned, () => ({}))
   // The new conversation doesn't remember what it was told about the files it wrote: it hears it again. It read
@@ -2422,9 +2427,7 @@ async function digestFor($: any, thread: string, withBudget = true, forNudge = f
     told: async () => {
       await alone()
       if (items.length) {
-        const memo = toldHere.get(thread) ?? new Map<string, string>()
-        for (const i of items) if (i.event.to !== null) memo.set(i.path, i.event.to)
-        toldHere.set(thread, memo)
+        for (const i of items) if (i.event.to !== null) toldMemo(thread, i.path, i.event.to)
         await update($, reads, m => {
           const t = { ...(m[thread] ?? {}) }
           for (const i of items) if (t[i.path] && i.event.to !== null) t[i.path] = { ...(t[i.path] as FleetRead), told: i.event.to }
@@ -2491,10 +2494,16 @@ async function busyDelivery($: any): Promise<{ text: string; told: () => Promise
 // each compute the same lines before any marked them told. A lock of this copy of the module only: what's told lives
 // in $.state
 const lineChains = new Map<string, Promise<unknown>>()
-// What this copy of the module told each thread, by path → the version told: $.state's marks reach a parallel call of
+// What this copy of the module told each thread since its last read, by path → the version told: $.state's marks reach a parallel call of
 // the same step only once the call that wrote them returns, so the calls of one batch, one after the other in the chain,
 // would each tell the same change again
 const toldHere = new Map<string, Map<string, string>>()
+/** The memo follows every mark of what a thread was told (the digest's, the gate's refusal) */
+function toldMemo(thread: string, rel: string, v: string) {
+  const memo = toldHere.get(thread) ?? new Map<string, string>()
+  memo.set(rel, v)
+  toldHere.set(thread, memo)
+}
 
 /** A tool's result with the digest (and any other lines) for the model, when it can carry them. One at a time per
  * thread, from computing the lines to marking them told, so a change is told once however many calls run together */
@@ -2560,17 +2569,18 @@ function sortedRevs(c: { revs: Map<number, Rev> }): Rev[] {
   return [...c.revs.values()].sort((a, b) => a.rev - b.rev)
 }
 
-/** A record's versions, oldest first: state/revs/<id>/, listed again when the folder's time moved. The folder is looked
- * at again only after REVS_TRUST_MS, or at once after forget(id): every version written with an event (this session's,
- * or another's through pullEvents) forgets it, so the sweeper's suspects passes don't stat every record's folder each
- * time. A version written with no event (another session's first version of a record) is seen at the record's next
- * landing or within REVS_TRUST_MS */
+/** A record's versions, oldest first: state/revs/<id>/, listed again when the folder's time moved, looked at again
+ * after trustMs (a second: the gate, a read's cite line, a version's number see another session's new version at once,
+ * as the folder shows it before its event comes), or at once after forget(id). The sweeper's suspects pass trusts it
+ * REVS_TRUST_MS: every version written with an event (this session's, or another's through pullEvents) forgets it, so
+ * the pass doesn't stat every record's folder each time; a version written with no event (another session's first
+ * version of a record) is seen at the record's next landing or within REVS_TRUST_MS */
 const REVS_TRUST_MS = 10 * 60000
-async function revsOf($: any, id: string): Promise<Rev[]> {
+async function revsOf($: any, id: string, trustMs = 1000): Promise<Rev[]> {
   if (!/^[A-Za-z0-9._-]+$/.test(id) || id.startsWith('.')) return []
   const now = await $.clock.now()
   let c = revCache.get(id)
-  if (c && now - c.at < REVS_TRUST_MS) return sortedRevs(c)
+  if (c && now - c.at < trustMs) return sortedRevs(c)
   let m = -1
   try {
     m = Number((await $.fs.stat(revDir(id))).mtimeMs)
@@ -2621,8 +2631,8 @@ async function ensureBase($: any, id: string, rel: string, v: string, pins: stri
 }
 
 /** A record's versions, its first allocated when it has none (from what's there now, or what the caller read) */
-async function revsFor($: any, id: string, have?: { rel: string; v: string | null; text: string | null }): Promise<Rev[]> {
-  const revs = await revsOf($, id)
+async function revsFor($: any, id: string, have?: { rel: string; v: string | null; text: string | null }, trustMs = 1000): Promise<Rev[]> {
+  const revs = await revsOf($, id, trustMs)
   if (revs.length || !records) return revs
   const rel = have?.rel ?? idIndex.get(id)
   if (!rel) return revs
@@ -3163,7 +3173,10 @@ async function gate($: any, e: any, next: any) {
       await pullEvents($)
       const last = latest.get(w.rel)
       await update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: cur.v as string } }))
-      if (mine && cur.v) await update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } }))
+      if (mine && cur.v) {
+        toldMemo(thread, w.rel, cur.v)
+        await update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } }))
+      }
       texts.push(gateText(v, w.rel, last && last.to === cur.v ? last : null, cur.mtimeMs, me))
       // A new board item someone else just made under the id this thread meant for its own (ids race): the next free one
       const item = /^board\/B-(\d+)\.md$/.exec(w.rel)
@@ -4266,7 +4279,7 @@ async function computeSuspects($: any) {
   if (!records) return
   // Which file is each record's, from what the scans know now (a rename, a twin removed)
   indexIds()
-  const confs = await confirmationsNow($)
+  const confs = await confirmationsNow($, REVS_TRUST_MS)
   const facts: Facts[] = []
   for (const [rel, k] of [...known].sort((a, b) => a[0].localeCompare(b[0]))) {
     const id = idOf(rel, records)
@@ -4274,8 +4287,8 @@ async function computeSuspects($: any) {
     let blind: string[] | undefined
     let confirmed: string[] | undefined
     if (id && idIndex.get(id) === rel) {
-      let revs = await revsOf($, id)
-      if (!revs.length && k.v !== null) revs = await revsFor($, id)
+      let revs = await revsOf($, id, REVS_TRUST_MS)
+      if (!revs.length && k.v !== null) revs = await revsFor($, id, undefined, REVS_TRUST_MS)
       const last = revs[revs.length - 1]
       owner = ownerWho(last)
       if (last && last.hash === k.v) ({ suspect: blind, confirmed } = last)
@@ -4289,7 +4302,7 @@ async function computeSuspects($: any) {
     if ((k.pins?.length || blind?.length) && !isHistory(rel)) facts.push({ path: rel, id, pins: k.pins ?? [], owner, ...(blind ? { blind } : {}), ...(confirmed ? { confirmed } : {}) })
   }
   const cited = new Map<string, Rev[]>()
-  for (const id of new Set(facts.flatMap(f => f.pins.map(p => parsePin(p)?.id ?? '')))) if (id) cited.set(id, await revsFor($, id))
+  for (const id of new Set(facts.flatMap(f => f.pins.map(p => parsePin(p)?.id ?? '')))) if (id) cited.set(id, await revsFor($, id, undefined, REVS_TRUST_MS))
   const list = suspectsOf(facts, p => pinState(p, cited.get(p.id)))
   // The derived documents among them that a revised record made stale (their owners are told, debounced)
   const derived = derivedKinds.length ? staleDerived(list, derivedKinds) : []
@@ -4311,7 +4324,7 @@ function ownerWho(x: { by: Who | null; drafter?: Who } | undefined): Who | null 
 /** The confirmations (mcp__fleet__confirm) of records not revised or retracted since the version confirmed (an
  * editorial version doesn't spend one); one whose record was is spent, and the sweeper removes it after a day */
 const confCache = new Map<string, Confirmation | null>()
-async function confirmationsNow($: any): Promise<Confirmation[]> {
+async function confirmationsNow($: any, trustMs = 1000): Promise<Confirmation[]> {
   const dir = stateDir('confirms')
   const present = new Set(await names($, dir))
   for (const n of [...confCache.keys()]) if (!present.has(n)) confCache.delete(n)
@@ -4323,7 +4336,7 @@ async function confirmationsNow($: any): Promise<Confirmation[]> {
     if (!confCache.has(n)) confCache.set(n, parseConfirmation((await readText($, `${dir}/${n}`)) ?? ''))
     const c = confCache.get(n)
     if (!c) continue
-    const revs = await revsOf($, c.of)
+    const revs = await revsOf($, c.of, trustMs)
     if (revs.length && movedAt(revs) <= c.rev) out.push(c)
     else if (now - c.at > 24 * HOUR) spent.push(`${dir}/${n}`)
   }
@@ -10970,15 +10983,17 @@ const registerCache = new Map<string, RegisterRecord | OverruleRecord | null>()
 const REGISTER_KEEP_MS = 10 * 60000
 let registerUsedAt = 0
 let registerRelease = false
-function releaseRegisterLater($: any) {
+// One timer at a time; used meanwhile, it waits out what's left of the ten minutes from the last use
+function releaseRegisterLater($: any, ms = REGISTER_KEEP_MS) {
   if (registerRelease) return
   registerRelease = true
-  $.clock.after(REGISTER_KEEP_MS, () =>
+  $.clock.after(ms, () =>
     bg(
       (async () => {
         registerRelease = false
-        if ((await $.clock.now()) - registerUsedAt >= REGISTER_KEEP_MS - 1000) registerCache.clear()
-        else releaseRegisterLater($)
+        const left = REGISTER_KEEP_MS - ((await $.clock.now()) - registerUsedAt)
+        if (left <= 1000) registerCache.clear()
+        else releaseRegisterLater($, left)
       })(),
     ),
   )
