@@ -369,6 +369,45 @@ test('the world commit: only the shared files, with --only so other staged work 
   expect(await fleet($, 'status')).toMatch(/world commits: every 60 min, only the shared files; last at \d\d:\d\d \(the project is a linked worktree/)
 })
 
+test('many files written at once outside fleet are recorded in a few processes (claims, versions and events each in one), one event per file', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**', 'req/**'], files: { [PLAN]: 'plan\n' } })
+  await begin($, w)
+  await tick(w)
+  // 40 notes and 10 records arrive at once (a copy, an unpacked archive), nobody's command
+  for (let i = 1; i <= 40; i++) w.touch(`${ROOT}/notes/n-${i}.md`, `note ${i}\n`)
+  for (let i = 1; i <= 10; i++) w.touch(`${ROOT}/req/R-${i}.md`, `R-${i} v1\n`)
+  const before = w.runs.length
+  await tick(w, 10000)
+  await tick(w, 10000)
+  await tick(w)
+  const spawned = w.runs.slice(before).filter(a => a[0] === 'ln' || a[0] === 'sh' || a[0] === 'mv')
+  // It was two processes a file (a claim and an event, each its own ln) and a trigger each: about a hundred
+  expect(spawned.length).toBeLessThan(12)
+  const outside = events(w).filter(e => e.via === 'outside' && (e.path.startsWith('notes/n-') || e.path.startsWith('req/R-')))
+  expect(outside.length).toBe(50)
+  expect(json(w, `${STATE}/revs/R-7/1.json`)).toMatchObject({ rev: 1, path: 'req/R-7.md' })
+})
+
+test('a world commit in a project that is not a git repository backs off as a failure, and /fleet status says why', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], commit: { everyMin: 60 } }), [PLAN]: 'plan\n' } })
+  let revParses = 0
+  w.exec.value = argv => {
+    if (argv[0] !== 'git') return undefined
+    if (argv[3] === 'rev-parse') {
+      revParses++
+      return { exitCode: 128, stderr: 'fatal: not a git repository (or any of the parent directories): .git' }
+    }
+    return { exitCode: 0 }
+  }
+  await begin($, w)
+  // Half an hour of sweeps: the commit tried at the first, then 5 and 10 minutes after; the worktrees looked for every
+  // 10 minutes outside git (it was a rev-parse at every sweep, 30 more)
+  for (let i = 0; i < 30; i++) await tick(w, 60000)
+  expect(revParses).toBeLessThan(12)
+  expect(json(w, `${STATE}/commit.json`)).toMatchObject({ ok: false, failures: 3 })
+  expect(await fleet($, 'status')).toMatch(/world commits: every 60 min, only the shared files; none yet; the last try failed: not a git repository: world\.json's commit works in a project kept in git/)
+})
+
 test('R10: a world commit that fails waits 5, 10, 20 min for its next try; a check that can’t run waits 10 min or a change of its script', WITH_SESSIONS, async ($, on) => {
   const checks = [{ glob: 'notes/**', argv: ['bash', 'checks/notes.sh'] }]
   const w = world(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], checks, commit: { everyMin: 60 } }), [`${ROOT}/checks/notes.sh`]: 'echo\n', [PLAN]: 'plan\n' } })
