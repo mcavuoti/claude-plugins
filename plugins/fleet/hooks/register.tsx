@@ -595,6 +595,12 @@ const personTurn = atom({ plugin: 'fleet', key: 'personTurn' } as const, null as
 const fleetTurn = atom({ plugin: 'fleet', key: 'fleetTurn' } as const, null as { turnId: string; words: string } | null)
 const pendingPerson = atom({ plugin: 'fleet', key: 'pendingPerson' } as const, null as { text: string; at: number; origin?: string } | null)
 const turns = atom({ plugin: 'fleet', key: 'turns' } as const, 0)
+// The prompt box's submits not yet taken by a /fleet command (when each was): a command of the person's counts as typed
+// only when one came before it (prompt.change, clear); a launch prompt, a resumed job's new prompt, an agent's
+// initialPrompt or the interactive positional prompt arrive with none
+const typedSubmits = atom({ plugin: 'fleet', key: 'typedSubmits' } as const, [] as number[])
+// A submit stays good for a command this long (fleet's command runs at once, even in a busy session)
+const TYPED_SUBMIT_MS = 120000
 // /fleet up's wakes still to send, one every WAKE_GAP_MS (kept in $.state, so a hot reload doesn't lose them): each
 // checked again when its time comes (down since, or no longer stopped)
 const pendingWakes = atom({ plugin: 'fleet', key: 'pendingWakes' } as const, [] as PendingWake[])
@@ -9748,8 +9754,9 @@ function onlyPerson(what: string, origin: string): string {
 /** Where a refused command came from, in the refusal: Remote Control takes answers, and nothing that changes the
  * project */
 function originWords(origin: string): string {
-  if (origin === 'launch') return "this is this session's launch prompt (claude --bg \"/fleet …\"), not typed by you in your own session"
+  if (origin === 'launch') return "this is this session's launch prompt (claude --bg \"/fleet …\"), not typed in this session's prompt box: type it here"
   if (origin === 'shell') return "this session was started from another session's shell (an instance's claude -p, say), not typed by you in your own session"
+  if (origin === 'untyped') return "not typed in this session's prompt box: type it here"
   return origin === 'bridge' ? 'this came over Remote Control, which takes your answers only' : `this came from ${origin || 'somewhere else'}`
 }
 
@@ -9760,16 +9767,49 @@ function originWords(origin: string): string {
 async function commandOrigin($: any, kind: string, args: string): Promise<string> {
   if (kind !== 'composer' && kind !== 'bridge') return kind
   if (inheritedJob || (envInstance && !jobRef)) return 'shell'
+  // Remote Control from the phone is the person's own channel (it can't be started from a shell)
+  if (kind === 'bridge') return kind
   if (jobRef && (await read($, turns)) === 0) {
     let s: any = null
+    let readable = true
     try {
       s = JSON.parse((await readText($, `${jobDir}/state.json`)) ?? 'null')
-    } catch {}
-    // Only an intent Claude wrote that is this very command (a job with none, or one opened with ccc, has no launch
-    // prompt to be: the person types into it)
-    if (typeof s?.intent === 'string' && isLaunchPrompt({ background: true, turnsBefore: 0, text: `/fleet ${args}`.trim(), intent: s.intent })) return 'launch'
+      if (!s || typeof s !== 'object') readable = false
+    } catch {
+      readable = false
+    }
+    // A job whose state can't be read counts as launched with this; an intent that is this command, compared as the
+    // engine reads a command (whitespace of any kind as one space), is its launch prompt
+    if (!readable) return 'launch'
+    if (typeof s.intent === 'string' && s.intent.trim() && sameCommandText(s.intent, `/fleet ${args}`)) return 'launch'
   }
-  return kind
+  // The decisive check: a submit from this session's prompt box came before it and no command took it yet
+  return (await takeTypedSubmit($)) ? kind : 'untyped'
+}
+
+/** Two command lines that the engine reads as the same: whitespace of any kind (tabs, newlines, no-break and em spaces)
+ * as one space, none at the ends */
+function sameCommandText(a: string, b: string): boolean {
+  const norm = (s: string) => s.replace(/\s+/gu, ' ').trim()
+  return norm(a) === norm(b)
+}
+
+/** A submit from the prompt box (prompt.change, clear): kept for the command it may carry */
+async function noteTypedSubmit($: any) {
+  const now = await $.clock.now()
+  await update($, typedSubmits, ts => [...ts.filter(x => now - x < TYPED_SUBMIT_MS), now].slice(-20))
+}
+
+/** Takes the oldest submit still good, for one command: false when none came before it */
+async function takeTypedSubmit($: any): Promise<boolean> {
+  const now = await $.clock.now()
+  let took = false
+  await update($, typedSubmits, ts => {
+    const fresh = ts.filter(x => now - x < TYPED_SUBMIT_MS)
+    took = fresh.length > 0
+    return fresh.slice(1)
+  })
+  return took
 }
 
 async function freshRoster($: any): Promise<string | null> {
@@ -12479,11 +12519,11 @@ async function fleetCommand($: any, e: any): Promise<string> {
   // from another session's shell (a claude -p an instance ran: it inherited CLAUDE_JOB_DIR naming that session, or the
   // instance's FLEET_INSTANCE). Its origin becomes `launch` or `shell`, so every command that is the person's own
   // (up, down, accept, apply, send, budget, judges live, overrule, init, the answers…) refuses it with why
-  const origin = await commandOrigin($, String(e.origin?.kind ?? ''), String(e.args ?? ''))
+  const origin = e.originResolved ? String(e.origin?.kind ?? '') : await commandOrigin($, String(e.origin?.kind ?? ''), String(e.args ?? ''))
   if (c.kind === 'help') return HELP
   const bare = /^\s*(apply|send|reject|done|no|edit)\b(.*)$/is.exec(String(e.args ?? ''))
   // Its answer runs as this command's origin (a launch prompt's bare verb stays the launch prompt's)
-  if (c.kind === 'bad' && bare && root) return bareVerb($, { ...e, origin: { ...(e.origin ?? {}), kind: origin } }, (bare[1] as string).toLowerCase(), bare[2] ?? '')
+  if (c.kind === 'bad' && bare && root) return bareVerb($, { ...e, originResolved: true, origin: { ...(e.origin ?? {}), kind: origin } }, (bare[1] as string).toLowerCase(), bare[2] ?? '')
   if (c.kind === 'bad') return `${c.reason}\n\n${HELP}`
   if (c.kind === 'status') return statusCommand($, c.all === true)
   if (c.kind === 'brief') return root ? briefCommand($, c.chief, origin) : `Not set up in this project: /fleet init sets it up in ${await $.session.root()}`
@@ -12953,6 +12993,13 @@ export const register: Register = on => {
 
   // The person typed here: after an Esc, fleet may submit again. And a prompt that starts a turn carries the main
   // thread's digest (prompt.submit's context is in the turn's first request; an append there would not be)
+  // A submit from the main prompt box empties it (prompt.change, origin clear): what a /fleet command of the person's
+  // needs before it. A launch prompt, a resumed job's prompt or an agent's initialPrompt come with none
+  on('prompt.change', { origin: { kind: 'clear' } }, async ($, e, next) => {
+    await noteTypedSubmit($)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('prompt.submit', async ($, e, next) => {
     if ((e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') && timersOn) {
       bg(

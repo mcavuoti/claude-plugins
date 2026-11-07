@@ -387,6 +387,8 @@ export function world(on: On, options: WorldOptions = {}): World {
     addFile(path, text)
     mtimes.set(path, mtimeMs ?? clock.now() + ++bump / 1000)
   }
+  // The prompt box: a change of it is observed and echoed (what the engine does beneath the plugins)
+  on('prompt.change', (_, e) => ({ text: e.text }))
   on('tool.call', { tool: 'Read' }, (_, e) => {
     const text = files.get(real(e.file_path) ?? e.file_path)
     if (text === undefined) return { isError: true, result: undefined, text: `File does not exist: ${e.file_path}` }
@@ -436,8 +438,17 @@ export async function startSession($: any, w: World, isInteractive = true) {
   await w.clock.settle()
 }
 
+// /fleet typed in the prompt box: the submit empties the box first (prompt.change, clear), then the command runs. A
+// command with another origin comes with no submit
 export async function fleet($: any, args: string, origin: unknown = COMPOSER.origin): Promise<string> {
+  if ((origin as any)?.kind === 'composer') await $.prompt.change({ text: '', cursor: 0, origin: { kind: 'clear' } })
   const r: any = await $.command.run({ command: 'fleet', args, origin, presentation: COMPOSER.presentation })
+  return String(r.text ?? '')
+}
+
+// A /fleet that reads as composer with no submit from the prompt box before it (a launch prompt, an initialPrompt)
+export async function fleetUntyped($: any, args: string): Promise<string> {
+  const r: any = await $.command.run({ command: 'fleet', args, origin: COMPOSER.origin, presentation: COMPOSER.presentation })
   return String(r.text ?? '')
 }
 

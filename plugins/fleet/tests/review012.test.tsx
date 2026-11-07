@@ -55,7 +55,7 @@ test('a launch prompt of /fleet up --force (it reads as composer) wakes nothing,
   const up = await fleet($, 'up --force')
   await after(w, 7000)
   expect(up).toContain("Only the person starts instances, typing it at a terminal (this is this session's launch prompt")
-  expect(up).toContain('not typed by you in your own session')
+  expect(up).toContain("not typed in this session's prompt box: type it here")
   expect(wakes(w)).toEqual([])
 })
 
