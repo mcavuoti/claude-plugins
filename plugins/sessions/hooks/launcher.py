@@ -6,6 +6,7 @@
     launcher.py tell [--in DIR] [--wait[=S]] NAME|ID [TEXT... | -]   ccc tell: hand a background session text (tell())
     launcher.py section [--session NAME|ID] [TITLE | -]  ccc section: the person's section for a session (section())
     launcher.py tidy [--here] [--pinned] [--days N] [--list]   ccc tidy: end the sessions no longer needed (tidy())
+    launcher.py watch --file FILE --launcher PID          the window's watcher, beside visor.sh's loop (watch())
 
 start decides and, when something should open in this window, writes it to FILE (the window's file, which visor.sh
 reads): the project's top session, the session NAME (created if there's none), the agent view (--agents). In order:
@@ -23,7 +24,7 @@ asks whether to restart it first. On arrival the panel takes the keyboard: a req
 
 The files it reads and writes are the mod's (hooks/state.ts has the formats): <data>/alive/<sessionId> (heartbeats),
 <data>/order/<root> (the panel's order), <data>/inbox/<sessionId> (requests), <data>/windows/<tty> (what a window opens
-next), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), <data>/sections.json (the
+next; its watcher reads it and <tty>.showing, what the window shows), <data>/config (settings the mod mirrors), <data>/tell/<id>/ (ccc tell's requests), <data>/sections.json (the
 person's sections, which ccc section changes, ringing <data>/bell/sections for the panels that watch it), with
 <data> = ~/.claude/mods/sessions-data or SESSIONS_DATA_DIR.
 Claude's own files, read only: the first row of a session's transcript (~/.claude/projects/*/<sessionId>.jsonl, under
@@ -1521,7 +1522,194 @@ def tidy(argv):
     return 0 if ok else 1
 
 
+# --- the window's watcher -------------------------------------------------------------------------------------------
+#
+# launcher.py watch --file FILE --launcher PID [--how kqueue|inotify|poll]: runs beside visor.sh's loop in a window
+# opened with ccc, one per window for as long as its launcher (PID, its parent) runs, and ends that window's viewer as
+# soon as a panel asks for a switch, so the panel neither looks for the viewer nor closes it: the panel writes the next
+# session to FILE (the window's file) with end=1 as its last line, the watcher sends the viewer FILE.showing names (the
+# launcher writes it as each viewer starts) a SIGHUP, and the loop opens the next one; what's typed meanwhile is
+# dropped (drop_typed). A file with no end=1 (claude respawn's reopen, ccc switching another window, a panel of an older
+# version, which closes the viewer itself) is left to the loop, which reads it once the viewer ends.
+#
+# It waits on FILE's folder and, while FILE is there, on FILE itself: with kqueue (macOS, the BSDs) the folder changes
+# when FILE appears or goes, but not when bytes reach a file that's there (and $.fs.write creates the file first, then
+# writes it: the bytes come after the folder's change), so FILE gets its own watch; inotify (Linux) tells every change
+# of every file in the folder; with neither, a look every POLL_S. Besides, a look every WATCH_PASS_S, in case.
+# --how picks one (tests); by default the first one this system has
+
+WATCH_PASS_S = 1.0
+POLL_S = 0.2
+# After it ends a viewer, what's typed until the next one takes the terminal is dropped (drop_typed), for this long at most
+DROP_S = 2.0
+
+
+# The window's file asks for its viewer to be ended now: whole (end=1 is its last line) and in this format
+def switch_asked(text):
+    k = parse_key_lines(text)
+    return text.endswith('\n') and k.get('end') == '1' and k.get('format') == str(FORMAT)
+
+
+class KqueueWatch:
+    def __init__(self, folder, path):
+        import select
+        self.select, self.path, self.fd, self.inode = select, path, None, None
+        self.kq = select.kqueue()
+        self.folder = os.open(folder, os.O_RDONLY)
+        self.kq.control([select.kevent(self.folder, select.KQ_FILTER_VNODE, select.KQ_EV_ADD | select.KQ_EV_CLEAR, select.KQ_NOTE_WRITE)], 0)
+
+    # Before each look at the file: a watch on the file that's there now (closing the old one's descriptor drops its
+    # watch), so that a write after the look wakes the wait
+    def arm(self):
+        try:
+            inode = os.stat(self.path).st_ino
+        except OSError:
+            inode = None
+        if self.fd is not None and inode != self.inode:
+            os.close(self.fd)
+            self.fd = None
+        if inode is None or self.fd is not None:
+            return
+        try:
+            fd = os.open(self.path, os.O_RDONLY)
+        except OSError:
+            return
+        s = self.select
+        try:
+            self.kq.control([s.kevent(fd, s.KQ_FILTER_VNODE, s.KQ_EV_ADD | s.KQ_EV_CLEAR, s.KQ_NOTE_WRITE | s.KQ_NOTE_EXTEND | s.KQ_NOTE_DELETE | s.KQ_NOTE_RENAME)], 0)
+        except OSError:
+            os.close(fd)
+            return
+        self.fd, self.inode = fd, os.fstat(fd).st_ino
+
+    def wait(self, seconds):
+        self.kq.control(None, 16, seconds)
+
+
+class InotifyWatch:
+    MASK = 0x2 | 0x8 | 0x80 | 0x100 | 0x200  # IN_MODIFY, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE, IN_DELETE
+
+    def __init__(self, folder, path):
+        import ctypes
+        import select
+        self.select = select
+        libc = ctypes.CDLL(None, use_errno=True)
+        init, add = libc.inotify_init1, libc.inotify_add_watch
+        init.argtypes, add.argtypes = [ctypes.c_int], [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        self.fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), 'inotify_init1')
+        if add(self.fd, os.fsencode(folder), self.MASK) < 0:
+            os.close(self.fd)
+            raise OSError(ctypes.get_errno(), 'inotify_add_watch')
+
+    def arm(self):
+        pass
+
+    def wait(self, seconds):
+        ready, _, _ = self.select.select([self.fd], [], [], seconds)
+        if not ready:
+            return
+        try:
+            while os.read(self.fd, 65536):
+                pass
+        except OSError:
+            pass
+
+
+class PollWatch:
+    def __init__(self, folder, path):
+        pass
+
+    def arm(self):
+        pass
+
+    def wait(self, seconds):
+        time.sleep(min(seconds, POLL_S))
+
+
+WATCHES = {'kqueue': KqueueWatch, 'inotify': InotifyWatch, 'poll': PollWatch}
+
+
+# The first watch this system has; the one named, or an error, when one is named
+def folder_watch(folder, path, how=None):
+    if how:
+        return WATCHES[how](folder, path)
+    for watch_class in WATCHES.values():
+        try:
+            return watch_class(folder, path)
+        except (AttributeError, ImportError, OSError):
+            continue
+    return PollWatch(folder, path)
+
+
+# What's typed during a switch is dropped, so a key meant for the panel you're leaving (a second Enter, an arrow)
+# never lands in the next session's prompt box: the next viewer (claude attach) takes the terminal (raw) about 0.1 s
+# after it starts, and would get every key typed meanwhile. From the moment the launcher puts the terminal in its own
+# mode between viewers (canonical, no echo, Enter no line end: stty sane -echo -icrnl, so nothing typed is a whole line
+# that the viewer, which reads from its start, could take first) until the next viewer takes it (raw), its input is
+# flushed every 2 ms; DROP_S at most. The shell's mode (echo on) is never touched, so the first viewer isn't either.
+# tty: this window's terminal, open; None where there's none (tests)
+def drop_typed(tty, seconds=DROP_S):
+    import termios
+    if tty is None:
+        return
+    end = time.time() + seconds
+    dropping = False
+    while time.time() < end:
+        try:
+            flags = termios.tcgetattr(tty)[3]
+            if flags & termios.ICANON and not flags & termios.ECHO:
+                termios.tcflush(tty, termios.TCIFLUSH)
+                dropping = True
+            elif dropping:
+                return
+        except (termios.error, OSError):
+            return
+        time.sleep(0.002)
+
+
+def open_terminal():
+    try:
+        return os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return None
+
+
+def watch(argv):
+    import argparse
+    import signal
+    parser = argparse.ArgumentParser(prog='launcher.py watch')
+    parser.add_argument('--file', required=True)
+    parser.add_argument('--launcher', type=int, required=True)
+    parser.add_argument('--how', choices=sorted(WATCHES))
+    args = parser.parse_args(argv)
+    w = folder_watch(os.path.dirname(args.file), args.file, args.how)
+    tty = open_terminal()
+    ended = None
+    while os.getppid() == args.launcher:
+        w.arm()
+        if switch_asked(read_text(args.file)):
+            # The viewer the launcher published, from a whole .showing that names this watcher (never a pid read off
+            # a file being written). Once per viewer: the file stays until the loop reads it, after the viewer ended
+            shown = read_text(args.file + '.showing')
+            k = parse_key_lines(shown)
+            viewer = k.get('viewer', '') if shown.endswith('\n') and k.get('watcher') == str(os.getpid()) else ''
+            if viewer.isdigit() and viewer != ended:
+                ended = viewer
+                try:
+                    os.kill(int(viewer), signal.SIGHUP)
+                except OSError:
+                    pass
+                else:
+                    drop_typed(tty)
+        w.wait(WATCH_PASS_S)
+    return 0
+
+
 def main(argv):
+    if argv[:1] == ['watch']:
+        return watch(argv[1:])
     if argv[:1] == ['tell']:
         return tell(argv[1:])
     if argv[:1] == ['section']:

@@ -266,9 +266,13 @@ export function world(on: On, options: WorldOptions = {}): World {
     if (argv[0] === 'sysctl') return ok(`${memory.value}\n`)
     // As a real ps reads -o (POSIX, which procps keeps to the letter): in `name=header` the header runs to the end of
     // that -o argument, so `-o pid=,tty=,command=` is one pid column headed ",tty=,command=", and only pids are listed
+    // -p <pids>: only those processes, and exit code 1 when none of them runs
     if (argv[0] === 'ps') {
       const header = argv.find((a, i) => argv[i - 1] === '-o' && /=./.test(a))
-      return ok(header ? [header.slice(header.indexOf('=') + 1), ...ps.value.split('\n').map(l => l.trim().split(/\s+/)[0])].join('\n') : ps.value)
+      const pids = argv.includes('-p') ? new Set(String(argv[argv.indexOf('-p') + 1]).split(',')) : null
+      const lines = ps.value.split('\n').filter(l => !pids || pids.has(l.trim().split(/\s+/)[0] ?? ''))
+      if (pids && !lines.length) return failed()
+      return ok(header ? [header.slice(header.indexOf('=') + 1), ...lines.map(l => l.trim().split(/\s+/)[0])].join('\n') : lines.join('\n'))
     }
     if (argv[0] === 'osascript') {
       const answer = () => ok(terminal.value(argv.slice(2)))

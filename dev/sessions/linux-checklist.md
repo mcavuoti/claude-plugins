@@ -18,8 +18,12 @@ the desktop (X11 or Wayland) and the terminal app.
    with `wmctrl` or `xdotool`: the first window comes forward and the second says the project is already open there.
    Otherwise: the second says it couldn't bring it forward and opens the next session itself. `ccc --new` always opens
    in the second one.
-6. **Switch in place:** select the other session, Enter: the same window shows it in about a second, and its panel has
-   the keyboard. Enter back. Then `a`: the same window shows the agent view.
+6. **Switch in place:** select the other session, Enter: the same window shows it at once, and its panel has the
+   keyboard. The session you left stays on screen until the other one draws (no blank screen, no shell line in
+   between), and an arrow key or a letter pressed right after Enter isn't printed as `^[[B` and doesn't reach the other
+   session (nothing lands in its prompt box). While a session shows,
+   `~/.claude/mods/sessions-data/windows/` has a `<tty>.showing` naming it (the launcher's watcher runs: `launcher.py
+   watch` in `ps`; inotify). Enter back. Then `a`: the same window shows the agent view.
 7. **Inside the agent view:** open a session from the agent view, then Enter on another row in its panel: the window
    switches to that session.
 8. **Another window:** open a second terminal with `ccc --new`, open the other session there. From the first window,
@@ -54,4 +58,4 @@ the desktop (X11 or Wayland) and the terminal app.
     _NET_ACTIVE_WINDOW | grep -o '0x[0-9a-f]*' | head -1)" _NET_WM_NAME` holds the session's name. On Wayland or
     without `xprop` it stays yellow until you type in it, use its panel or arrive there.
 
-Anything off: note what you pressed, what the window showed, and the output of `ps -A -o pid= -o tty= -o command= | grep -E 'claude|visor'`.
+Anything off: note what you pressed, what the window showed, the output of `ps -A -o pid= -o tty= -o command= | grep -E 'claude|visor|launcher.py'`, and `head ~/.claude/mods/sessions-data/windows/*`.

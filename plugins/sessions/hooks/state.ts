@@ -1022,12 +1022,73 @@ export function tellIdIn(text: string): string | null {
 }
 
 // What the launcher opens next in a window: <data>/windows/<tty as a file name>. attach a session by its id, or the
-// agent view in a folder; the title is shown while it opens (and is the window's title outside macOS)
-export type WindowTarget = { command: 'attach'; id: string; title: string } | { command: 'agents'; title: string; folder: string }
+// agent view in a folder; the title is shown while it opens (and is the window's title outside macOS). end: the
+// window's watcher (launcher.py watch) ends the viewer it shows now, at once, so the launcher opens this one; written
+// last, so a file read before it's whole doesn't ask it. Only for a window whose launcher publishes what it shows
+// (Showing): any other file is opened once the viewer ends by itself, or once the panel or ccc closed it
+export type WindowTarget = { command: 'attach'; id: string; title: string; end?: true } | { command: 'agents'; title: string; folder: string }
 export function windowTargetText(t: WindowTarget): string {
   return t.command === 'attach'
-    ? keyLines({ format: FORMAT, command: 'attach', id: t.id, title: t.title })
+    ? keyLines({ format: FORMAT, command: 'attach', id: t.id, title: t.title, end: t.end ? 1 : undefined })
     : keyLines({ format: FORMAT, command: 'agents', title: t.title, folder: t.folder })
+}
+
+// What a window opened with ccc shows: <data>/windows/<tty as a file name>.showing, written by its launcher
+// (hooks/visor.sh) as each viewer starts there and removed when the launcher ends. Its terminal, what it shows (a
+// session by its short id, or the agent view: id empty), and three processes: the viewer, the launcher (bash
+// visor.sh) and its watcher (launcher.py watch), which ends the viewer when the window's file asks for it (end=1). Only
+// a launcher whose watcher runs publishes one (without python3 there's none): with none, the panel finds the window
+// with ps and closes its viewer itself. Whole only once it ends with a line break
+export const SHOWING = '.showing'
+export type Showing = { tty: string; command: 'attach' | 'agents'; id: string; viewer: string; launcher: string; watcher: string }
+export function showingText(s: Showing): string {
+  return keyLines({ format: FORMAT, tty: s.tty, command: s.command, id: s.id, viewer: s.viewer, launcher: s.launcher, watcher: s.watcher })
+}
+export function parseShowing(text: string): Showing | null {
+  if (!text.endsWith('\n')) return null
+  const k = parseKeyLines(text)
+  const pid = (v: string | undefined) => (v && /^\d+$/.test(v) ? v : '')
+  const [viewer, launcher, watcher] = [pid(k.viewer), pid(k.launcher), pid(k.watcher)]
+  if (k.format !== String(FORMAT) || !k.tty?.startsWith('/dev/') || !viewer || !launcher || !watcher) return null
+  if (k.command === 'attach' && /^[0-9a-f]{8}$/.test(k.id ?? '')) return { tty: k.tty, command: 'attach', id: k.id ?? '', viewer, launcher, watcher }
+  return k.command === 'agents' ? { tty: k.tty, command: 'agents', id: '', viewer, launcher, watcher } : null
+}
+
+// Whether a window's launcher and its watcher still run as its .showing says, from `ps -p <launcher>,<watcher> -o pid=
+// -o tty= -o command=`: both there, on that terminal, running those programs. A file a launcher left behind (killed, the
+// window gone with it, the computer restarted) names processes that are gone, or other processes that took those
+// numbers since, and doesn't pass
+export function showingRuns(s: Showing, ps: string): boolean {
+  let launcher = false
+  let watcher = false
+  for (const line of ps.split('\n')) {
+    const [pid, tty, ...rest] = line.trim().split(/\s+/)
+    if (!pid || `/dev/${tty}` !== s.tty) continue
+    const command = rest.join(' ')
+    if (pid === s.launcher && /^(\S*\/)?bash \S*\/visor\.sh( |$)/.test(command)) launcher = true
+    if (pid === s.watcher && /\S*\/launcher\.py watch( |$)/.test(command)) watcher = true
+  }
+  return launcher && watcher
+}
+
+// A switch from this session's panel by what the launcher windows publish, with no ps and no question to the terminal
+// (jump in register.tsx): 'switch' the one launcher window showing this session (its watcher ends the viewer there),
+// or 'bring' forward one that shows the target. null, the usual way (ps, and on macOS the window in front), whenever
+// that isn't certain: no launcher window shows this session, or several do; an agent view is open, in a launcher
+// window or in any window the last listing saw (it may show the target, which only the usual way reads); or the last
+// windows listing any session took (listed: the store's windowsList, of any age) has a viewer of this session or of
+// the target in a window that publishes nothing (one not opened with ccc, or opened with an older launcher)
+export type SwitchPlan = { kind: 'switch'; from: Showing } | { kind: 'bring'; from: Showing; to: Showing }
+export function planSwitch(shown: Showing[], me: string, target: string, listed: Windows | null): SwitchPlan | null {
+  if (shown.some(s => s.command === 'agents')) return null
+  const mine = shown.filter(s => s.id === me)
+  const from = mine[0]
+  if (!from || mine.length > 1) return null
+  const published = new Set(shown.map(s => s.tty))
+  const elsewhere = (ttys: string[] | undefined) => (ttys ?? []).some(t => !published.has(t))
+  if (listed && (elsewhere(listed.agentsViews.map(a => a.tty)) || elsewhere(listed.byId[me]) || elsewhere(listed.byId[target]))) return null
+  const to = shown.find(s => s.id === target && s.tty !== from.tty)
+  return to ? { kind: 'bring', from, to } : { kind: 'switch', from }
 }
 
 // The name the panel's New field gives a session when you press Enter without typing one: the project folder's name

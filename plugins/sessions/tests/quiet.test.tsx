@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { heartbeatText, labelMinute, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, sameData, sessionTags, usageSummaryOf } from '../hooks/state'
+import { heartbeatText, labelMinute, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, parseShowing, parseWindows, planSwitch, sameData, sessionTags, showingRuns, showingText, usageSummaryOf, windowTargetText, type Showing } from '../hooks/state'
 import { COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel costs while nothing happens: it draws only what changed, reads the session list again only when
@@ -458,4 +458,190 @@ test('Enter: one ps for the whole switch, and the viewer closed before the arriv
   const focus = notices.find(n => n.kind === 'focus')
   expect(focus).toBeDefined()
   expect(focus!.at).toBeGreaterThan(kill)
+})
+
+// A window opened with ccc whose launcher says what it shows (<data>/windows/<tty>.showing): its launcher, viewer and
+// watcher as ps lists them, and that file
+const shows = (tty: string, id: string, launcher: number): Showing => ({ tty, command: 'attach', id, viewer: String(launcher + 1), launcher: String(launcher), watcher: String(launcher + 2) })
+const psOf = (s: Showing) =>
+  [
+    `  ${s.launcher} ${s.tty.slice(5)}  bash /Users/x/p/hooks/visor.sh start`,
+    `  ${s.viewer} ${s.tty.slice(5)}  claude attach ${s.id}`,
+    `  ${s.watcher} ${s.tty.slice(5)}  /usr/bin/python3 /Users/x/p/hooks/launcher.py watch --file /x --launcher ${s.launcher}`,
+  ].join('\n')
+const showingFile = (tty: string) => `${DATA}/windows/${tty.replace(/\//g, '_')}.showing`
+const launched = (w: World, s: Showing) => w.files.set(showingFile(s.tty), showingText(s))
+const ME = shows('/dev/ttys001', 'aaaaaaaa', 100)
+
+// Enter on bravo's row with the keyboard in the panel; where the key's commands start, and the notices sent (with the
+// number of commands that had run by then)
+async function enterOnBravo($: any, w: World, on: any) {
+  w.files.set(`${DATA}/alive/${BRAVO}`, heartbeatText({ pid: 4243, at: w.clock.now() + 600000, version: '0.13.2', via: 'session.start' }))
+  const notices: { kind: string; at: number }[] = []
+  on('session.send', (_: any, e: any) => {
+    const n = parseNotice(String(e.text))
+    if (n) notices.push({ kind: n.kind, at: w.runs.length })
+    return { isDelivered: true }
+  })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  w.panes.find((p: any) => p.id === 'sessions').isFocused = true
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  const from = w.runs.length
+  await ui.press({ key: `s:${BRAVO}` })
+  await w.clock.settle()
+  await ui.unmount()
+  return { from, notices }
+}
+
+for (const system of ['Darwin', 'Linux']) {
+  test(`Enter in a window whose launcher says what it shows (${system}): one file that asks its watcher to end the viewer, one ps of that launcher and watcher; no ps of every process, no question to Terminal, no kill`, async ($, on) => {
+    const w = world(on, { list: list(), system })
+    w.ps.value = psOf(ME)
+    launched(w, ME)
+    w.terminal.value = (args: string[]) => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+    const { from, notices } = await enterOnBravo($, w, on)
+    const after = w.runs.slice(from)
+    expect(after.filter(a => a[0] === 'ps')).toEqual([['ps', '-p', '100,102', '-o', 'pid=', '-o', 'tty=', '-o', 'command=']])
+    expect(after.filter(a => ['osascript', 'kill', 'xprop', 'wmctrl', 'xdotool'].includes(a[0] ?? ''))).toEqual([])
+    expect(w.files.get(`${DATA}/windows/_dev_ttys001`)).toBe(windowTargetText({ command: 'attach', id: 'bbbbbbbb', title: 'bravo', end: true }))
+    expect(w.files.get(`${DATA}/windows/_dev_ttys001`)).toMatch(/\nend=1\n$/)
+    // The target takes the keyboard once the launcher is known to run
+    const check = from + after.findIndex(a => a[0] === 'ps')
+    expect(notices.find(n => n.kind === 'focus')?.at).toBeGreaterThan(check)
+  })
+}
+
+test('a .showing its launcher left behind (its processes gone): checked, both files go, and the usual way switches the window (ps, the window in front, kill)', async ($, on) => {
+  const w = world(on, { list: list() })
+  launched(w, shows('/dev/ttys001', 'aaaaaaaa', 300))
+  // That terminal now runs an older launcher, which says nothing
+  w.ps.value = '  100 ttys001  bash /Users/x/old/hooks/visor.sh start\n  201 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = (args: string[]) => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  const { from } = await enterOnBravo($, w, on)
+  const after = w.runs.slice(from)
+  const at = (p: (a: string[]) => boolean) => after.findIndex(p)
+  const checked = at(a => a[0] === 'ps' && a[1] === '-p' && a[2] === '300,302')
+  const dropped = at(a => a[0] === 'rm' && a.includes(showingFile('/dev/ttys001')))
+  const listed = at(a => a[0] === 'ps' && a[1] === '-A')
+  const front = at(a => a[0] === 'osascript' && a[2] === 'frente')
+  const kill = at(a => a[0] === 'kill')
+  expect([checked >= 0, checked < dropped, dropped < listed, listed < front, front < kill]).toEqual([true, true, true, true, true])
+  expect(after[kill]).toEqual(['kill', '-HUP', '201'])
+  expect(w.files.has(showingFile('/dev/ttys001'))).toBe(false)
+  expect(w.files.get(`${DATA}/windows/_dev_ttys001`)).toBe(windowTargetText({ command: 'attach', id: 'bbbbbbbb', title: 'bravo' }))
+})
+
+test("a .showing under another terminal's name than the one it names is left out: the usual way", async ($, on) => {
+  const w = world(on, { list: list() })
+  w.files.set(showingFile('/dev/ttys009'), showingText(ME))
+  w.ps.value = psOf(ME)
+  w.terminal.value = (args: string[]) => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  const { from } = await enterOnBravo($, w, on)
+  const after = w.runs.slice(from)
+  expect(after.some(a => a[0] === 'ps' && a[1] === '-p')).toBe(false)
+  expect(after.filter(a => a[0] === 'kill')).toEqual([['kill', '-HUP', '101']])
+  expect(w.files.has(showingFile('/dev/ttys009'))).toBe(true)
+})
+
+test("a ps that can't run says nothing against the launcher: the window's file stays, and the switch is done", async ($, on) => {
+  const w = world(on, {
+    list: list(),
+    onRun: argv => {
+      if (argv[0] === 'ps' && argv[1] === '-p') throw new Error('no ps here')
+    },
+  })
+  w.ps.value = psOf(ME)
+  launched(w, ME)
+  const { from } = await enterOnBravo($, w, on)
+  const after = w.runs.slice(from)
+  expect(after.some(a => (a[0] === 'ps' && a[1] === '-A') || a[0] === 'kill' || a[0] === 'rm')).toBe(false)
+  expect(w.files.get(`${DATA}/windows/_dev_ttys001`)).toMatch(/\nend=1\n$/)
+  expect(w.files.has(showingFile('/dev/ttys001'))).toBe(true)
+})
+
+test("the target in another window that says what it shows: that window is checked, then brought forward (Terminal's traer of it); no ps of every process, no window in front asked, nothing written", async ($, on) => {
+  const w = world(on, { list: list() })
+  const there = shows('/dev/ttys002', 'bbbbbbbb', 110)
+  w.ps.value = `${psOf(ME)}\n${psOf(there)}`
+  launched(w, ME)
+  launched(w, there)
+  w.terminal.value = (args: string[]) => (args[0] === 'traer' ? 'ok' : args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  const { from, notices } = await enterOnBravo($, w, on)
+  const after = w.runs.slice(from)
+  expect(after.filter(a => a[0] === 'osascript').map(a => a.slice(2))).toEqual([['traer', '/dev/ttys002']])
+  expect(after.filter(a => a[0] === 'ps')).toEqual([['ps', '-p', '110,112', '-o', 'pid=', '-o', 'tty=', '-o', 'command=']])
+  expect([...w.files.keys()].filter(p => p.startsWith(`${DATA}/windows/`) && !p.endsWith('.showing'))).toEqual([])
+  expect(notices.some(n => n.kind === 'focus')).toBe(true)
+})
+
+test('the target in another window that says what it shows but whose launcher is gone: that .showing goes, and the usual way switches this window', async ($, on) => {
+  const w = world(on, { list: list() })
+  launched(w, ME)
+  launched(w, shows('/dev/ttys002', 'bbbbbbbb', 110))
+  w.ps.value = psOf(ME)
+  w.terminal.value = (args: string[]) => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  const { from } = await enterOnBravo($, w, on)
+  const after = w.runs.slice(from)
+  expect(after.some(a => a[0] === 'osascript' && a[2] === 'traer')).toBe(false)
+  expect(w.files.has(showingFile('/dev/ttys002'))).toBe(false)
+  expect(after.filter(a => a[0] === 'kill')).toEqual([['kill', '-HUP', '101']])
+})
+
+test("the window in front is still asked when this session is also shown in a window that says nothing (the last listing has its viewer there): the usual way, whose listing is then every session's", async ($, on) => {
+  const w = world(on, { list: list() })
+  launched(w, ME)
+  // A plain claude attach of this session in ttys003, where Enter was pressed
+  w.ps.value = `${psOf(ME)}\n  301 ttys003  claude attach aaaaaaaa`
+  w.store.set('windowsList', { at: 1, windows: parseWindows(w.ps.value) })
+  w.terminal.value = (args: string[]) => (args[0] === 'frente' ? 'true /dev/ttys003' : args[0] === 'abrir' ? '/dev/ttys004' : '')
+  const { from } = await enterOnBravo($, w, on)
+  const after = w.runs.slice(from)
+  expect(after.some(a => a[0] === 'ps' && a[1] === '-p')).toBe(false)
+  expect(after.some(a => a[0] === 'ps' && a[1] === '-A')).toBe(true)
+  expect(after.filter(a => a[0] === 'osascript').map(a => a[2])).toEqual(['frente', 'abrir'])
+  expect(w.files.has(`${DATA}/windows/_dev_ttys001`)).toBe(false)
+  expect((w.store.get('windowsList') as any).at).toBeGreaterThan(1)
+  expect((w.store.get('windowsList') as any).windows.byId.aaaaaaaa).toEqual(['/dev/ttys001', '/dev/ttys003'])
+})
+
+test('planSwitch: the one launcher window showing this session switches, one showing the target is brought; anything unclear goes the usual way', () => {
+  const me = shows('/dev/ttys001', 'aaaaaaaa', 100)
+  const there = shows('/dev/ttys002', 'bbbbbbbb', 110)
+  const other = shows('/dev/ttys005', 'cccccccc', 150)
+  expect(planSwitch([me, other], 'aaaaaaaa', 'bbbbbbbb', null)).toEqual({ kind: 'switch', from: me })
+  expect(planSwitch([me, there], 'aaaaaaaa', 'bbbbbbbb', null)).toEqual({ kind: 'bring', from: me, to: there })
+  // No launcher window shows this session, or two do
+  expect(planSwitch([there], 'aaaaaaaa', 'bbbbbbbb', null)).toBe(null)
+  expect(planSwitch([me, shows('/dev/ttys006', 'aaaaaaaa', 160)], 'aaaaaaaa', 'bbbbbbbb', null)).toBe(null)
+  // An agent view: in a launcher window, or in a window the last listing saw that says nothing
+  expect(planSwitch([me, { ...other, command: 'agents', id: '' }], 'aaaaaaaa', 'bbbbbbbb', null)).toBe(null)
+  expect(planSwitch([me], 'aaaaaaaa', 'bbbbbbbb', parseWindows('  401 ttys009  claude agents --cwd .'))).toBe(null)
+  // A viewer of this session or of the target where nothing is said
+  expect(planSwitch([me], 'aaaaaaaa', 'bbbbbbbb', parseWindows('  402 ttys009  claude attach aaaaaaaa'))).toBe(null)
+  expect(planSwitch([me], 'aaaaaaaa', 'bbbbbbbb', parseWindows('  402 ttys009  claude attach bbbbbbbb'))).toBe(null)
+  // The listing's windows that do say count by what they say now; other sessions' viewers don't matter
+  expect(planSwitch([me, other], 'aaaaaaaa', 'bbbbbbbb', parseWindows(`${psOf(me)}\n  402 ttys005  claude agents\n  403 ttys009  claude attach cccccccc`))).toEqual({ kind: 'switch', from: me })
+})
+
+test('parseShowing and showingRuns: a whole file in this format, and processes that are its launcher and watcher on its terminal', () => {
+  const s = shows('/dev/ttys001', 'aaaaaaaa', 100)
+  const text = showingText(s)
+  expect(parseShowing(text)).toEqual(s)
+  expect(parseShowing(showingText({ ...s, command: 'agents', id: '' }))).toEqual({ ...s, command: 'agents', id: '' })
+  // Cut off while it's written, another format, a pid that isn't one, an id that isn't one
+  expect(parseShowing(text.slice(0, -1))).toBe(null)
+  expect(parseShowing(text.slice(0, text.indexOf('watcher=')))).toBe(null)
+  expect(parseShowing(text.replace('format=3', 'format=2'))).toBe(null)
+  expect(parseShowing(text.replace('viewer=101', 'viewer=x'))).toBe(null)
+  expect(parseShowing(text.replace('id=aaaaaaaa', 'id=zz'))).toBe(null)
+  expect(showingRuns(s, psOf(s))).toBe(true)
+  // Gone, or those numbers taken by other programs or on another terminal since
+  expect(showingRuns(s, '')).toBe(false)
+  expect(showingRuns(s, '  100 ttys001  bash /Users/x/p/hooks/visor.sh start')).toBe(false)
+  expect(showingRuns(s, '  100 ttys001  vim notes\n  102 ttys001  python3 serve.py')).toBe(false)
+  expect(showingRuns(s, '  100 ttys001  bash /Users/x/p/hooks/visor.sh start\n  102 ttys001  python3 serve.py')).toBe(false)
+  expect(showingRuns(s, '  100 ttys001  vim notes\n  102 ttys001  python3 /Users/x/p/hooks/launcher.py watch --file /x --launcher 100')).toBe(false)
+  expect(showingRuns(s, psOf(s).replace(/ttys001/g, 'ttys007'))).toBe(false)
+  expect(showingRuns({ ...s, tty: '/dev/pts/3' }, psOf({ ...s, tty: '/dev/pts/3' }))).toBe(true)
 })

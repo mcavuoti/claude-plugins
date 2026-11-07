@@ -1,6 +1,6 @@
 {
   "name": "sessions",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "Side panel with this folder's sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, a notification when a session waits too long or spends far above its usual, spend and token usage, a status line, ccc tell and ccc section for scripts, ccc tidy to end the sessions you no longer need, tools for Claude to list this project's sessions and wake a retired one, and an API for other plugins",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
