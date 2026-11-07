@@ -1070,8 +1070,9 @@ export function checkStart(input: any): { ok: true; request: StartRequest } | (S
 // Whether to update this session's mod in place with /reload-plugins: only when a newer version of the same install
 // is installed (the running copy's folder is a sibling of the installed one: <cache>/<marketplace>/sessions/<version>),
 // once per version, and only when nothing would be cut or confused: the session idle (no turn, nothing waiting for
-// you, no background task), and you not in its panel (it has the keyboard, or a New or Rename field is open). 'wait'
-// means try again later; 'no', not for this version
+// you, no background task), and no New or Rename field open in its panel (what you typed would go). A panel that has
+// the keyboard doesn't hold it back: the new copy gives the keyboard back, on the same row. 'wait' means try again
+// later; 'no', not for this version
 export type ReloadCheck = {
   running: string
   runningDir: string
@@ -1079,7 +1080,6 @@ export type ReloadCheck = {
   triedFor: string
   status: string | null | undefined
   tasks: number | null
-  paneFocused: boolean
   fieldOpen: boolean
   // The set of paths this copy watches (WATCH_SET in watch.ts) and the installed copy's (0: one from before the set had
   // a number). Left out, not compared
@@ -1095,7 +1095,7 @@ export function reloadDecision(c: ReloadCheck): 'reload' | 'wait' | 'no' {
   const parent = (dir: string) => dir.replace(/\/+$/, '').replace(/\/[^/]+$/, '')
   if (!v.path || parent(v.path) !== parent(c.runningDir) || v.path === c.runningDir) return 'no'
   if (c.triedFor === v.version) return 'no'
-  if (c.status !== 'idle' || c.tasks !== 0 || c.paneFocused || c.fieldOpen) return 'wait'
+  if (c.status !== 'idle' || c.tasks !== 0 || c.fieldOpen) return 'wait'
   return 'reload'
 }
 

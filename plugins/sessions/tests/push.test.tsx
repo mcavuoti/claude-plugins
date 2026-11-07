@@ -223,7 +223,7 @@ test("the rows' next time change: the next minute under an hour, the next hour u
 })
 
 test('updating in place never crosses into a copy that watches another set of paths', () => {
-  const base = { running: '0.14.0', runningDir: '/Users/x/.claude/plugins/cache/m/sessions/0.14.0', installed: { path: '/Users/x/.claude/plugins/cache/m/sessions/0.14.1', version: '0.14.1', since: 1 }, triedFor: '', status: 'idle', tasks: 0, paneFocused: false, fieldOpen: false }
+  const base = { running: '0.14.0', runningDir: '/Users/x/.claude/plugins/cache/m/sessions/0.14.0', installed: { path: '/Users/x/.claude/plugins/cache/m/sessions/0.14.1', version: '0.14.1', since: 1 }, triedFor: '', status: 'idle', tasks: 0, fieldOpen: false }
   expect(reloadDecision({ ...base, watchSet: 1, installedWatchSet: 1 })).toBe('reload')
   expect(reloadDecision({ ...base, watchSet: 1, installedWatchSet: 2 })).toBe('no')
   // The copy before the set had a number

@@ -747,7 +747,6 @@ test('updating in place: only to a newer version of the same install, once, and 
     triedFor: '',
     status: 'idle',
     tasks: 0,
-    paneFocused: false,
     fieldOpen: false,
   }
   expect(reloadDecision(base)).toBe('reload')
@@ -758,13 +757,13 @@ test('updating in place: only to a newer version of the same install, once, and 
   // Once per version: if it didn't take, the ↑ mark and u remain
   expect(reloadDecision({ ...base, triedFor: '0.11.0' })).toBe('no')
   expect(reloadDecision({ ...base, triedFor: '0.10.5' })).toBe('reload')
-  // Not now: working, waiting for you, background tasks (or unknown), you in the panel or in a field
+  // Not now: working, waiting for you, background tasks (or unknown), a New or Rename field open (the panel having the
+  // keyboard doesn't hold it back: the new copy gives it back)
   expect(reloadDecision({ ...base, status: 'busy' })).toBe('wait')
   expect(reloadDecision({ ...base, status: 'waiting' })).toBe('wait')
   expect(reloadDecision({ ...base, status: null })).toBe('wait')
   expect(reloadDecision({ ...base, tasks: 1 })).toBe('wait')
   expect(reloadDecision({ ...base, tasks: null })).toBe('wait')
-  expect(reloadDecision({ ...base, paneFocused: true })).toBe('wait')
   expect(reloadDecision({ ...base, fieldOpen: true })).toBe('wait')
 })
 

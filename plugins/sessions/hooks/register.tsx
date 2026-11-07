@@ -460,7 +460,8 @@ function debugLine($: any, text: string) {
 // autoPins (AutoPins), pluginPins (PluginPins: the sessions other plugins keep pinned through $.sessions.pin),
 // reopenPass (last reopen pass, and normalSince: since when memory has been normal),
 // panelClosed (you closed the panel: sessions start without it until you open it again), reloaded:<id> (this
-// session's mod updated itself with /reload-plugins: from, to, at), waitingOnly (the f filter is on),
+// session's mod updated itself with /reload-plugins: from, to, at, and focus, the row selected when the panel had the
+// keyboard: s:<sessionId>, h:<section> or ''), waitingOnly (the f filter is on),
 // marks:<source>:<sessionId> (the marks that session of that plugin set: MarkSlot in state.ts), collapsed (the
 // sections the person folded, by id), needsSince:<id> (since when a plugin's mark says it needs the person: since, and
 // at, when a panel last saw it so), pushed:<id> (the since of the wait the person was last pushed about), spend:<id>
@@ -3965,7 +3966,8 @@ function queuedHere(): boolean {
 }
 
 // A newer version of this mod is installed: update this session's in place with /reload-plugins, when that cuts
-// nothing (reloadDecision). The new copy says so when it starts ("Panel updated"). /reload-plugins reloads every
+// nothing (reloadDecision). The new copy says so when it starts ("Panel updated"), and if the panel had the keyboard it
+// takes it back, on the same row (keyboardBack): the person sees a flicker at most. /reload-plugins reloads every
 // plugin of the session; a Claude update, settings and MCP servers still need u (a restart). If the update doesn't
 // take, the ↑ mark stays and u is the way
 async function updateInPlace($: any) {
@@ -3980,14 +3982,12 @@ async function updateInPlace($: any) {
     triedFor: reloadTriedFor,
     status: 'idle',
     tasks: 0,
-    paneFocused: false,
     fieldOpen: false,
   })
   if (quick !== 'reload' || !plugin) return
   // Not idle in the last list (working, waiting, not in it): no reload now, and no list read just to see that (one
   // every 15 s from each busy session would keep the list's lock taken)
   if (own?.status !== 'idle') return
-  const panes = await $.ui.panes()
   const tasks = own?.id ? ((await backgroundTasks($, own.id))?.count ?? null) : 0
   let installedSource: string | null = null
   try {
@@ -4000,7 +4000,6 @@ async function updateInPlace($: any) {
     triedFor: reloadTriedFor,
     status: await statusNow($, myId),
     tasks,
-    paneFocused: !!panes.find((p: any) => p.id === PANE)?.isFocused,
     fieldOpen: (await read($, askingName)) || !!(await read($, renaming)),
     // A copy that watches other paths can't be reloaded into (the ↑ mark stays, and u restarts it)
     watchSet: WATCH_SET,
@@ -4013,24 +4012,51 @@ async function updateInPlace($: any) {
   // Again: the checks above take seconds (a list read now), and a start, wake or restart may have been queued meanwhile
   if (decision !== 'reload' || queuedHere()) return
   reloadTriedFor = plugin.version
-  await storeSet($, `reloaded:${myId}`, { from: modVersion, to: plugin.version, at: await $.clock.now() })
+  // Whether the panel has the keyboard right now, and on which row: the new copy gives it back there
+  const focused = !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
+  await storeSet($, `reloaded:${myId}`, { from: modVersion, to: plugin.version, at: await $.clock.now(), ...(focused ? { focus: selectedRow ?? '' } : {}) })
   debugLine($, `updating in place: ${modVersion} → ${plugin.version}`)
   try {
     await $.command.run({ command: 'reload-plugins' })
   } catch {}
 }
 
-// The new copy, after updating in place: say so (only if it really is the new version)
-async function announceUpdate($: any) {
+// The new copy, after updating in place: say so (only if it really is the new version), and hand the start the row the
+// panel had the keyboard on, if it had it (once: a later start finds no focus in the record)
+async function announceUpdate($: any): Promise<string | undefined> {
   const r = await storeGet($, `reloaded:${myId}`)
-  if (!r || typeof r !== 'object') return
+  if (!r || typeof r !== 'object') return undefined
   if ((await $.clock.now()) - Number(r.at) > 120000) {
     await storeDelete($, `reloaded:${myId}`)
-    return
+    return undefined
   }
-  if (r.to !== modVersion) return
+  const focus = typeof r.focus === 'string' ? r.focus : undefined
+  if (r.to !== modVersion) {
+    if (focus !== undefined) await storeSet($, `reloaded:${myId}`, { from: r.from, to: r.to, at: r.at })
+    return focus
+  }
   await storeDelete($, `reloaded:${myId}`)
   $.ui.toast(`Panel updated to ${modVersion}`)
+  return focus
+}
+
+// After an update in place made while the panel had the keyboard (updateInPlace): the panel takes it back, on the row
+// that was selected (key: s:<sessionId> or h:<section>), or wherever Claude lands it if that row is gone or none was.
+// The rows are the old copy's ($.state stays across a reload; with none yet, it waits a little for the start's first
+// read); a panel you closed stays closed
+async function keyboardBack($: any, key: string) {
+  if (await closedByYou($)) return
+  let around = ringKeys(await read($, rows))
+  for (let i = 0; around.length === 0 && i < 30; i++) {
+    await $.clock.sleep(100)
+    around = ringKeys(await read($, rows))
+  }
+  const target = around.includes(key) ? key : undefined
+  debugLine($, `update in place: the keyboard back to the panel${target ? `, on ${target}` : ''}`)
+  if (target?.startsWith('s:')) return takeKeyboard($, target.slice(2))
+  if (target) selectedRow = target
+  await takeKeyboard($, undefined)
+  if (target) await focusElement($, target)
 }
 
 // /sessions status, about telling the person: the options as they apply, today's count, the last notification any
@@ -4466,7 +4492,10 @@ async function start($: any) {
     // Here: the other panels read this session's record and heartbeat
     await ring($, myId)
   })
-  await step('update notice', () => announceUpdate($))
+  let keyboardTo: string | undefined
+  await step('update notice', async () => {
+    keyboardTo = await announceUpdate($)
+  })
   await step('timers', async () => {
     // If this session was restarted from its own panel (u), announce that it's back
     const restartedAt = Number(await storeGet($, `restarted:${myId}`)) || 0
@@ -4525,6 +4554,8 @@ async function start($: any) {
       bg(readUsage($, live ? USAGE_FOLLOWER_MS : USAGE_SHARED_MS))
     }
     await paneState($)
+    // Only into a module that came in by a reload: a session restarted meanwhile (a new process) starts as any other
+    if (keyboardTo !== undefined && reloadedInto) bg(keyboardBack($, keyboardTo))
   })
   await step('command', () =>
     $.command.register({
