@@ -821,26 +821,33 @@ async function publish($: any, path: string, text: string): Promise<'ok' | 'exis
 // start) is published on its own
 const LN_ALL = 'while [ "$#" -gt 1 ]; do t=$1; d=$2; shift 2; if ln "$t" "$d" 2>/dev/null || { [ ! -e "$d" ] && mkdir -p "${d%/*}" && ln "$t" "$d" 2>/dev/null; }; then echo "ok $d"; elif [ -e "$d" ]; then echo "exists $d"; else echo "failed $d"; fi; rm -f "$t"; done'
 
+/** How many files one shell of publishAll publishes: a few seconds each, an argv far from ARG_MAX */
+const PUBLISH_CHUNK = 300
 async function publishAll($: any, items: readonly { path: string; text: string }[]): Promise<Map<string, 'ok' | 'exists' | 'failed'>> {
   const out = new Map<string, 'ok' | 'exists' | 'failed'>()
   if (items.length < 2) {
     for (const x of items) out.set(x.path, await publish($, x.path, x.text))
     return out
   }
-  const pairs: string[] = []
-  for (const x of items) {
-    wrote(x.path)
-    pairs.push(await tmpFile($, x.text), x.path)
-  }
-  const r = await run($, ['sh', '-c', LN_ALL, 'sh', ...pairs], { timeoutMs: 30000 })
-  for (const line of r.stdout.split('\n')) {
-    const m = /^(ok|exists|failed) (.+)$/.exec(line)
-    if (m) out.set(m[2] as string, m[1] as 'ok' | 'exists' | 'failed')
-  }
-  const left = items.filter(x => !out.has(x.path))
-  if (left.length) {
-    await remove($, pairs.filter((_, i) => i % 2 === 0 && !out.has(pairs[i + 1] as string)))
-    for (const x of left) out.set(x.path, await publish($, x.path, x.text))
+  for (let at = 0; at < items.length; at += PUBLISH_CHUNK) {
+    const chunk = items.slice(at, at + PUBLISH_CHUNK)
+    const pairs: string[] = []
+    for (const x of chunk) {
+      wrote(x.path)
+      pairs.push(await tmpFile($, x.text), x.path)
+    }
+    const r = await run($, ['sh', '-c', LN_ALL, 'sh', ...pairs], { timeoutMs: 30000 })
+    for (const line of r.stdout.split('\n')) {
+      const m = /^(ok|exists|failed) (.+)$/.exec(line)
+      if (m) out.set(m[2] as string, m[1] as 'ok' | 'exists' | 'failed')
+    }
+    // What the shell didn't report (cut short: a timeout): one by one, its own leftovers removed first. One it linked
+    // before it was cut comes back "exists": its caller tells its own from another's by the text
+    const left = chunk.filter(x => !out.has(x.path))
+    if (left.length) {
+      await remove($, pairs.filter((_, i) => i % 2 === 0 && !out.has(pairs[i + 1] as string)))
+      for (const x of left) out.set(x.path, await publish($, x.path, x.text))
+    }
   }
   return out
 }
@@ -1641,6 +1648,11 @@ type Known = { mtimeMs: number; size: number; v: string | null; pins?: string[] 
 const known = new Map<string, Known>()
 // waited: a scan found a foreground command running that may be its author, and waited for it
 const unexplained = new Map<string, { v: string | null; since: number; waited?: boolean }>()
+/** Outside changes another scan claimed and hasn't recorded yet (path → its version, when it was claimed, the claim,
+ * what this session knew before it): taken over past CLAIM_TAKEOVER_MS with no event for that version */
+const foreignClaims = new Map<string, { v: string | null; at: number; claim: string; k: Known | undefined }>()
+const CLAIM_TAKEOVER_MS = 3 * 60000
+let scanCount = 0
 let baselined = false
 let worldStarted = false
 let tooBig = false
@@ -3962,12 +3974,28 @@ async function scanWorld($: any) {
     return
   }
   const changed = removalsLast(changedPaths(knownSnapshot(), snap), snap)
-  if (!changed.length) return
+  if (!changed.length && !foreignClaims.size) return
   await pullEvents($)
   // Asked once a scan, when a change is to be recorded: the commands running that may be its author
   let running: RunningNow | null = null
   // The changes this scan records (once their claims are taken), each settled after
   const todo: { rel: string; s: ReturnType<typeof snap.get>; f: { v: string | null; text: string | null }; v: string | null; k: ReturnType<typeof known.get>; last: ChangeEvent | undefined; claim: string; author: Author; settle: () => void }[] = []
+  // Changes another scan claimed and hasn't recorded (no event for that version yet): once its event is in, nothing
+  // to do; one CLAIM_TAKEOVER_MS old with none (that scan died between its claims and its events), this scan records it
+  for (const [rel, c] of foreignClaims) {
+    if (latest.get(rel)?.to === c.v) {
+      foreignClaims.delete(rel)
+      continue
+    }
+    if (now - c.at < CLAIM_TAKEOVER_MS) continue
+    foreignClaims.delete(rel)
+    const s = snap.get(rel)
+    const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
+    // Changed again since: the change in front of the scan now is recorded as any other
+    if (f.v !== c.v) continue
+    todo.push({ rel, s, f, v: f.v, k: c.k, last: latest.get(rel), claim: `${c.claim}.taken`, author: { who: null, candidates: [] }, settle: () => {} })
+    log($, `${rel}: claimed ${Math.round((now - c.at) / 60000)} min ago by a scan that recorded nothing: recorded here`)
+  }
   for (const rel of changed) {
     const s = snap.get(rel)
     const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
@@ -4003,9 +4031,28 @@ async function scanWorld($: any) {
   if (!todo.length) return
   // What the scan records, in a few shells whatever its size (a folder of 1,500 files written at once outside fleet was
   // 3,000 processes and as many triggers): the claims in one, the records' new versions in one, the events in one, and
-  // one trigger for them all, as a command's post-scan does
-  const claims = await publishAll($, todo.map(x => ({ path: x.claim, text: json({ format: FORMAT, path: x.rel, at: now }) })))
-  const mine = todo.filter(x => claims.get(x.claim) === 'ok')
+  // one trigger for them all, as a command's post-scan does. A claim names this scan: one its own cut-short shell linked
+  // comes back "exists" and is still its own
+  const scan = `${String(await $.session.id()).slice(0, 8)}:${now}:${++scanCount}`
+  const claims = await publishAll($, todo.map(x => ({ path: x.claim, text: json({ format: FORMAT, path: x.rel, at: now, scan }) })))
+  const mine: typeof todo = []
+  for (const x of todo) {
+    const r = claims.get(x.claim)
+    let theirs: { at?: unknown; scan?: unknown } | null = null
+    if (r === 'exists') {
+      try {
+        theirs = JSON.parse((await readText($, x.claim)) ?? '')
+      } catch {}
+    }
+    if (r === 'ok' || (theirs && theirs.scan === scan)) {
+      mine.push(x)
+      continue
+    }
+    // Another scan's (or a cut one's): known now, so a removal reckoned below finds its record's new file, and kept to
+    // be taken over if that scan never records it
+    if (r === 'exists' && !x.claim.endsWith('.taken')) foreignClaims.set(x.rel, { v: x.v, at: typeof theirs?.at === 'number' ? theirs.at : now, claim: x.claim, k: x.k })
+    x.settle()
+  }
   const plans: { x: (typeof todo)[number]; by: Who | null; plan: RevPlan | null }[] = []
   for (const x of mine) {
     const id = records ? idOf(x.rel, records) : null
@@ -6701,7 +6748,7 @@ type WorkFile = {
  * oldest waits, the slots free, the runs in flight and those finished but not recorded; flags: an idle instance an
  * item that waits FLAG_AFTER_MS fits (the band's red flag, and the front's hourly note); nobody: open items nobody owns
  * that no instance can be offered (no for:, and the roster has no front door), waiting FLAG_AFTER_MS */
-type Capacity = { idle: string[]; unowned: number; oldest: number | null; slotsFree: number | null; slotsTotal: number | null; runs: number; unrecorded: number; flags: { inst: string; item: string }[]; nobody?: string[]; stuck?: { inst: string; tool: string; since: number }[] }
+type Capacity = { idle: string[]; unowned: number; oldest: number | null; slotsFree: number | null; slotsTotal: number | null; runs: number; unrecorded: number; flags: { inst: string; item: string }[]; nobody?: string[]; stuck?: { inst: string; tool: string; since: number }[]; idleSince?: Record<string, number> }
 
 /** An item offered to one instance is offered to the next after this long while still nobody owns it; each instance it's
  * for once (a round), and again only when its file changed: a later round counts within the wakes' daily cap */
@@ -7093,7 +7140,15 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
     const c = hungCall(hb, now)
     if (c) stuck.push({ inst: i.name, tool: c.tool, since: c.since })
   }
-  const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}), ...(stuck.length ? { stuck } : {}) }
+  // Since when each idle one is: its start, last landing or last turn's end, from its heartbeat (the front door's line
+  // waits FRONT_IDLE_MS on it, read here once a sweep rather than at each of the front door's steps)
+  const idleSince: Record<string, number> = {}
+  for (const i of insts) {
+    if (!idle.includes(i.name)) continue
+    const hb = await heartbeatOf($, i.slug)
+    if (hb) idleSince[i.name] = Math.max(hb.idleSince ?? 0, hb.startedAt ?? 0, hb.lastLanding ?? 0)
+  }
+  const capacity: Capacity = { idle, unowned: ages.length, oldest: ages.length ? Math.min(...ages) : null, slotsFree, slotsTotal, runs: views.filter(v => !v.done).length, unrecorded: views.filter(v => v.done && !v.recorded).length, flags: flags.slice(0, 5), ...(nobody.length ? { nobody: nobody.slice(0, 10) } : {}), ...(stuck.length ? { stuck } : {}), ...(Object.keys(idleSince).length ? { idleSince } : {}) }
   const next: WorkFile = { format: FORMAT, at: now, unowned, capacity, ...(Object.keys(quiet).length ? { quiet } : {}), ...(restart ? { restart } : {}) }
   const same = !!had && JSON.stringify({ ...had, at: 0 }) === JSON.stringify({ ...next, at: 0 })
   if (!same || now - had.at > 10 * 60000) {
@@ -7220,15 +7275,9 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     // turn: one that just seeded, or just finished its work, isn't idle with nothing yet (a told line costs the front a turn)
     const lastTold = Math.max(0, ...Object.entries(told).filter(([key]) => key.startsWith('nothing|')).map(([, at]) => at))
     if (bare.length && told[k] === undefined && now - lastTold >= HOUR) {
-      const longIdle: string[] = []
-      for (const n of bare) {
-        const i = (roster?.instances ?? []).find(x => x.name === n)
-        const hb = i ? await heartbeatOf($, i.slug) : null
-        if (!hb) continue
-        const since = Math.max(hb.idleSince ?? 0, hb.startedAt ?? 0, hb.lastLanding ?? 0)
-        if (now - since >= FRONT_IDLE_MS) longIdle.push(n)
-      }
-      bare = longIdle
+      // Since when, as the sweeper read their heartbeats: one it has no time for isn't told
+      const since = work.capacity.idleSince ?? {}
+      bare = bare.filter(n => since[n] !== undefined && now - (since[n] as number) >= FRONT_IDLE_MS)
     } else bare = []
     // An item opened since the sweep that wrote work.json (fleet's own, a peer's): the ones it fits aren't bare
     if (bare.length && told[k] === undefined) {
