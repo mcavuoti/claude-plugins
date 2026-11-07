@@ -233,13 +233,14 @@ test("mcp__sessions__wake of an instance of the roster (by name, any case, or it
   w.files.set(`${FLEET}/instances/owner-b/state.json`, JSON.stringify({ format: 1, instance: 'Owner B', slug: 'owner-b', ref: 'bbbbbbb1', sessionId: 'bbbbbbb1-0000-0000-0000-000000000000', at: 0, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0 }))
   await startSession($, w)
   const wake = async (session: string): Promise<any> => $.tool.call({ tool: 'mcp__sessions__wake', session } as any)
-  for (const target of ['Owner A', 'owner a', 'bbbbbbb1', 'sid:bbbbbbb1-0000']) {
+  // Every form sessions' wake reads: quoted, "name [ref]" as it hands back for SendMessage, the full session id
+  for (const target of ['Owner A', 'owner a', 'bbbbbbb1', 'sid:bbbbbbb1-0000', '“Owner A”', '"owner a"', 'Owner A [aaaaaaa1]', 'Someone [bbbbbbb1]', 'bbbbbbb1-0000-0000-0000-000000000000', '  "Owner B [sid:bbbbbbb1]"  ']) {
     const r = await wake(target)
     expect(String(r?.deny ?? '')).toContain("is an instance of this project's fleet, and fleet wakes its instances itself")
     expect(String(r?.deny ?? '')).toContain('/fleet up --force')
   }
   // Not an instance: fleet lets it through to the tool
-  const other = await wake('Research notes')
+  const other = await wake('"Research notes [ccccccc9]"')
   expect(String(other?.deny ?? '')).not.toContain("instance of this project's fleet")
   expect(wakes(w)).toEqual([])
 })
