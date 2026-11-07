@@ -595,6 +595,9 @@ const personTurn = atom({ plugin: 'fleet', key: 'personTurn' } as const, null as
 const fleetTurn = atom({ plugin: 'fleet', key: 'fleetTurn' } as const, null as { turnId: string; words: string } | null)
 const pendingPerson = atom({ plugin: 'fleet', key: 'pendingPerson' } as const, null as { text: string; at: number; origin?: string } | null)
 const turns = atom({ plugin: 'fleet', key: 'turns' } as const, 0)
+// /fleet up's wakes still to send, one every WAKE_GAP_MS (kept in $.state, so a hot reload doesn't lose them): each
+// checked again when its time comes (down since, or no longer stopped)
+const pendingWakes = atom({ plugin: 'fleet', key: 'pendingWakes' } as const, [] as PendingWake[])
 const conversationAt = atom({ plugin: 'fleet', key: 'conversationAt' } as const, 0)
 const landedAt = atom({ plugin: 'fleet', key: 'landedAt' } as const, 0)
 const workLandedAt = atom({ plugin: 'fleet', key: 'workLandedAt' } as const, 0)
@@ -977,8 +980,11 @@ async function start($: any) {
       immediate: true,
     })
     .catch(() => {})
-  if (root) timers($)
-  else {
+  if (root) {
+    timers($)
+    // A reload cancels the module's timers: the wakes /fleet up still had to send are sent from here
+    bg(drainWakes($))
+  } else {
     // Set up later from another session (/fleet init): this one joins within a minute
     const look = $.clock.every(60000, () => {
       bg(
@@ -9742,7 +9748,28 @@ function onlyPerson(what: string, origin: string): string {
 /** Where a refused command came from, in the refusal: Remote Control takes answers, and nothing that changes the
  * project */
 function originWords(origin: string): string {
+  if (origin === 'launch') return "this is this session's launch prompt (claude --bg \"/fleet …\"), not typed by you in your own session"
+  if (origin === 'shell') return "this session was started from another session's shell (an instance's claude -p, say), not typed by you in your own session"
   return origin === 'bridge' ? 'this came over Remote Control, which takes your answers only' : `this came from ${origin || 'somewhere else'}`
+}
+
+/** The origin a /fleet command counts as: `launch` for a background session's launch prompt (its first prompt, before any
+ * turn, that is the job's intent: claude --bg "/fleet up --force" reads as composer), `shell` in a session started from
+ * another session's shell (CLAUDE_JOB_DIR naming that session, or FLEET_INSTANCE outside a background session), else as
+ * the engine says */
+async function commandOrigin($: any, kind: string, args: string): Promise<string> {
+  if (kind !== 'composer' && kind !== 'bridge') return kind
+  if (inheritedJob || (envInstance && !jobRef)) return 'shell'
+  if (jobRef && (await read($, turns)) === 0) {
+    let s: any = null
+    try {
+      s = JSON.parse((await readText($, `${jobDir}/state.json`)) ?? 'null')
+    } catch {}
+    // Only an intent Claude wrote that is this very command (a job with none, or one opened with ccc, has no launch
+    // prompt to be: the person types into it)
+    if (typeof s?.intent === 'string' && isLaunchPrompt({ background: true, turnsBefore: 0, text: `/fleet ${args}`.trim(), intent: s.intent })) return 'launch'
+  }
+  return kind
 }
 
 async function freshRoster($: any): Promise<string | null> {
@@ -9984,7 +10011,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
     // --stopped (the band's line after a restart): wake the stopped ones, start none that was never started.
     // --restart-when-idle: restarts running ones only, starts and wakes none (a stopped one takes its settings when woken)
     const action = down.has(inst.slug) && !c.names.length ? 'down' : running ? 'running' : c.restartWhenIdle ? (retired ? 'kept' : 'unstarted') : retired ? 'wake' : c.stopped ? 'unstarted' : 'start'
-    return { inst, action, ref: (running ?? retired)?.ref ?? null, state: (running ?? retired)?.state ?? null, why: !running && retired ? stopReason(retired) : null }
+    return { inst, action, ref: (running ?? retired)?.ref ?? null, state: (running ?? retired)?.state ?? null, root: ((running ?? retired)?.root ?? null) as string | null, why: !running && retired ? stopReason(retired) : null }
   })
   const wakes = wakesOf(r.r)
   const f = forecastOf(chosen, wakes, sizes)
@@ -10054,6 +10081,8 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (isolated.length) {
     lint.warnings.push(`${isolated.join(', ')}: the project is in a git repository and ${isolated.length === 1 ? 'this instance edits' : 'these instances edit'} files with no worktree.bgIsolation, so a background session may move into a worktree copy before its first edit, and its shared files land in the copy (the README's Worktrees section; roster.json's settings can say "worktree": { "bgIsolation": "none" })`)
   }
+  // --force wakes the ones the person stopped through wake's force, which sessions serves from 0.15.1
+  const forceServed = c.force && (await has($, 'wake')) && versionAtLeast(found?.version, FORCE_SINCE)
   const out: string[] = [`${c.dryRun ? 'The plan' : '/fleet up'} for ${chosen.length} of the roster's ${all.length} instance(s)${c.wave !== null && !c.names.length ? ` (waves 1 to ${c.wave})` : ''}${c.restartWhenIdle ? ' (--restart-when-idle: restarts running ones once idle; starts and wakes none)' : ''}${c.force ? ' (--force: wakes the ones you stopped too)' : ''}:`]
   for (const p of plan) {
     const i = p.inst
@@ -10071,14 +10100,14 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
           ? `running (${p.state}): placed, not started again (fleet doesn't restart a running session: a model or effort change reaches it at its next request)${rewritten.has(i.slug) ? `; ${c.dryRun ? 'its settings would be rewritten' : 'settings rewritten'}: ${c.restartWhenIdle ? 'it restarts with them once idle' : 'u restarts it with them, or /fleet up --restart-when-idle restarts it once idle'}` : ''}`
           : p.action === 'wake'
             ? p.why === 'person'
-              ? c.force
+              ? c.force && forceServed
                 ? 'stopped by you: to wake (--force)'
                 : 'stopped by you: not woken (Enter or u in the panel restarts it, or /fleet up --force)'
               : p.why === 'memory'
                 ? 'closed for lack of memory: to wake (sessions holds it while memory is still short)'
                 : p.why === 'ended'
                   ? 'stopped by a restart: to wake'
-                  : p.why === null && c.force
+                  : p.why === null && c.force && forceServed
                     ? 'stopped, nothing says why: to wake (--force)'
                     : 'stopped: to wake'
             : p.action === 'unstarted'
@@ -10102,10 +10131,9 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (c.force && c.dryRun) {
     const person = plan.filter(p => p.action === 'wake' && p.why === 'person').map(p => p.inst.name)
     const unknown = plan.filter(p => p.action === 'wake' && p.why === null).map(p => p.inst.name)
-    if (person.length || unknown.length) {
-      const old = (await has($, 'wake')) && !versionAtLeast(found?.version, FORCE_SINCE)
-      out.push(old ? `--force needs sessions ${FORCE_SINCE} or later to wake the ones you stopped (this one is ${found?.version ?? 'older'}): update it, or Enter or u in the panel restarts them.` : `${forceLine(person, unknown)}.`)
-    } else out.push('--force: none of them is stopped by you.')
+    if (!forceServed && person.length) out.push(`--force needs sessions ${FORCE_SINCE} or later to wake the ones you stopped (this one is ${found?.version || 'older'}): update it, or Enter or u in the panel restarts them.`)
+    else if (person.length || unknown.length) out.push(`${forceLine(person, forceServed ? unknown : [])}.`)
+    else out.push('--force: none of them is stopped by you.')
   }
   out.push(
     `Cost, estimated at list price: the budgets add up to ${usd(f.caps)} a day${cap !== null ? ` (the project's cap: ${usd(cap)})` : ''}; wakes about ${usd(f.wakesUsd)} a day (each instance at most ${effectivePerDay(wakes)} a day: one every ${wakes.everyMin} min${Number.isFinite(wakes.perDay) ? `, ${wakes.perDay} a day` : ', no daily cap'}; each reopening its context at the cache-write price: a running one's own size, ~40k tokens for one not started)${f.polls ? `; routine polls about ${usd(f.pollsUsd)} a day (${f.polls} turns a day, on their own count, apart from the wakes' caps)` : ''}${f.unpriced.length ? `; not priced: ${f.unpriced.join(', ')}` : ''}. On a subscription it counts against your plan's limits instead.`,
@@ -10139,12 +10167,15 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   const canStart = await has($, 'start')
   const canWake = await has($, 'wake')
   // --force wakes the ones the person stopped (and one nothing says why stopped) through wake's force, which sessions
-  // serves from 0.15.1: an older one would refuse them as before
-  const canForce = c.force && canWake && versionAtLeast(found?.version, FORCE_SINCE)
+  // serves from 0.15.1: an older one would refuse them as before, so then only his stops are held back
+  const canForce = forceServed && canWake
   const results: string[] = [...restarts]
   // Wakes go one every WAKE_GAP_MS (the first at once, so its answer is in this reply), as sessions' own bring-back
   // after its service died paces its respawns: sixteen sessions starting together load the machine
   const queue: { inst: Instance; ref: string; force: boolean; person: boolean }[] = []
+  // A forced wake only for this project's own session: its row's folder is this project, or the instance's heartbeat
+  // names that job (a row with no folder of the same name could be another project's)
+  const ownRow = async (p: { inst: Instance; ref: string | null; root: string | null }) => sameProject(p.root) || (!!p.ref && (await heartbeatOf($, p.inst.slug))?.ref === p.ref)
   for (const p of plan) {
     if (p.action === 'start') {
       if (!canStart) {
@@ -10154,13 +10185,15 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
       const s = await race<Result>($, () => $.sessions.start!({ name: p.inst.name, cwd: root as string, agent: p.inst.agent, settings: settingsPath(p.inst.slug) }))
       results.push(s?.ok ? `  ${p.inst.name}: starting` : `  ${p.inst.name}: not started: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions didn't answer"}`)
       log($, `start ${p.inst.name}: ${s?.ok ? 'queued' : s && !s.ok ? s.reason : 'no answer'}`)
-    } else if (p.action === 'wake' && p.ref && (p.why === 'person' || (p.why === null && c.force)) && !canForce) {
+    } else if (p.action === 'wake' && p.ref && p.why === 'person' && !canForce) {
       // Left alone: the person stopped it (Enter or u restarts it), or --force asked of a sessions that can't
       results.push(
         c.force && canWake
-          ? `  ${p.inst.name}: ${p.why === 'person' ? 'stopped by you' : 'stopped, nothing says why'}, not woken: --force needs sessions ${FORCE_SINCE} or later (this one is ${found?.version ?? 'older'}): update it, or Enter or u in the panel restarts it`
+          ? `  ${p.inst.name}: stopped by you, not woken: --force needs sessions ${FORCE_SINCE} or later (this one is ${found?.version || 'older'}): update it, or Enter or u in the panel restarts it`
           : `  ${p.inst.name}: stopped by you, left alone (Enter or u in the panel restarts it, or /fleet up --force wakes it)`,
       )
+    } else if (p.action === 'wake' && p.ref && canForce && (p.why === 'person' || p.why === null) && !(await ownRow(p))) {
+      results.push(`  ${p.inst.name}: ${p.why === 'person' ? 'stopped by you' : 'stopped'}, not woken: the stopped session of that name isn't known to be this project's (Enter or u in the panel restarts it)`)
     } else if (p.action === 'wake' && p.ref) {
       // A restart's, a crash's, an idle retire's, or a memory closure's (sessions refuses that one while memory is still
       // short, and says so); with --force also the person's own stop and one nothing explains
@@ -10170,24 +10203,87 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   }
   const forced = queue.filter(q => q.force && q.person).map(q => q.inst.name)
   const unexplained = queue.filter(q => q.force && !q.person).map(q => q.inst.name)
+  const at = await $.clock.now()
+  const later: PendingWake[] = []
   for (const [k, q] of queue.entries()) {
-    const ask = () => race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: q.ref, reason: q.force ? 'fleet up --force (the person typed it)' : 'fleet up', ...(q.force ? { force: true as const } : {}) }))
+    const w: PendingWake = { ref: q.ref, slug: q.inst.slug, name: q.inst.name, force: q.force, named: c.names.length > 0, due: at + k * WAKE_GAP_MS }
     if (k === 0) {
-      const s = await ask()
+      const s = await sendWake($, w)
       results.push(s?.ok ? `  ${q.inst.name}: waking${q.force ? ' (--force)' : ''}` : `  ${q.inst.name}: not woken: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions can't wake it"} (u in the panel restarts it)`)
-      log($, `wake ${q.inst.name}${q.force ? ' (forced)' : ''}: ${s?.ok ? (s.state ?? 'queued') : s && !s.ok ? s.reason : 'no answer'}`)
       continue
     }
     results.push(`  ${q.inst.name}: waking${q.force ? ' (--force)' : ''} in ${Math.round((k * WAKE_GAP_MS) / 1000)} s`)
-    $.clock.after(k * WAKE_GAP_MS, async () => {
-      const s = await ask()
-      log($, `wake ${q.inst.name}${q.force ? ' (forced)' : ''}: ${s?.ok ? (s.state ?? 'queued') : s && !s.ok ? s.reason : 'no answer'}`)
-      if (!s?.ok) $.ui.log(`${q.inst.name} wasn't woken: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions didn't answer"} (u in the panel restarts it)`)
-    })
+    later.push(w)
+  }
+  if (later.length) {
+    // A later /fleet up's wakes replace the same instance's
+    await update($, pendingWakes, ws => [...ws.filter(x => !later.some(l => l.slug === x.slug)), ...later])
+    armWakes($, WAKE_GAP_MS)
   }
   if (forced.length || unexplained.length) results.unshift(`  ${forceLine(forced, unexplained)}${queue.length > 1 ? `; one every ${WAKE_GAP_MS / 1000} s` : ''}`)
+  if (later.length) results.push(`  (the later wakes are sent from this session: if it ends before the last one, /fleet up${c.force ? ' --force' : ''} again sends the rest; /fleet down <name> before then keeps one stopped)`)
   if (!results.length) return [...out, c.stopped ? 'Nothing stopped to wake.' : "Nothing to start: they're running. Their settings files were written again: one whose settings changed takes them when restarted (u)."].join('\n')
   return [...out, 'Now:', ...results, 'Each one binds and seeds itself within a minute (/fleet status shows them); a row marked ✗ has no fleet and needs a restart (u).'].join('\n')
+}
+
+/** Why sessions' mcp__sessions__wake is refused for this target: an instance of this project's roster, named by its name
+ * (as the roster or the panel spells it, any case) or by its job's short id (its heartbeat's ref or sessionId). Null for
+ * anything else, or with no roster here */
+async function rosterWakeRefusal($: any, target: unknown): Promise<string | null> {
+  await locate($)
+  const want = typeof target === 'string' ? target.trim().replace(/^sid:/, '') : ''
+  if (!root || !want) return null
+  await loadRoster($)
+  const all = roster ? roster.instances : []
+  let inst = all.find(i => i.name.toLowerCase() === want.toLowerCase()) ?? null
+  if (!inst && /^[0-9a-f-]{6,}$/i.test(want))
+    for (const i of all) {
+      const hb = await heartbeatOf($, i.slug)
+      if (hb && (hb.ref === want || (typeof hb.sessionId === 'string' && hb.sessionId.startsWith(want)))) {
+        inst = i
+        break
+      }
+    }
+  if (!inst) return null
+  return `“${inst.name}” is an instance of this project's fleet, and fleet wakes its instances itself: when there's something for it (a board item for: it, an answer, a watched change, its cadence). One that's stopped the person brings back with /fleet up (/fleet up --force for one he stopped). If it should run now, ask him with mcp__fleet__decide; this wake wasn't sent.`
+}
+
+/** One /fleet up wake: the instance, its job, with wake's force or not, whether the person named it (a down one he named
+ * goes), and when it's due */
+type PendingWake = { ref: string; slug: string; name: string; force: boolean; named: boolean; due: number }
+
+/** Sends one of /fleet up's wakes, checked again first: an instance the person took down since (and didn't name) stays
+ * stopped. sessions itself skips one that runs again */
+async function sendWake($: any, w: PendingWake): Promise<(Result & { state?: string }) | null> {
+  if (!w.named && (await downSet($)).has(w.slug)) {
+    log($, `wake ${w.name}: not sent, it's down now`)
+    return { ok: false, reason: 'refused', detail: "it's down now (/fleet down)" }
+  }
+  const s = await race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: w.ref, reason: w.force ? 'fleet up --force (the person typed it)' : 'fleet up', ...(w.force ? { force: true as const } : {}) }))
+  log($, `wake ${w.name}${w.force ? ' (forced)' : ''}: ${s?.ok ? (s.state ?? 'queued') : s && !s.ok ? s.reason : 'no answer'}`)
+  return s
+}
+
+let wakeTimer: { cancel(): void } | null = null
+/** Arms the drain of /fleet up's pending wakes in `ms` (one timer at a time) */
+function armWakes($: any, ms: number) {
+  wakeTimer?.cancel()
+  wakeTimer = $.clock.after(Math.max(0, ms), () => bg(drainWakes($)))
+}
+
+/** Sends the pending wakes that are due, one per call (WAKE_GAP_MS apart), and arms the next. From start() too, so a
+ * reload sends what the old module had left */
+async function drainWakes($: any) {
+  const now = await $.clock.now()
+  const ws = await read($, pendingWakes)
+  if (!ws.length) return
+  const next = ws.reduce((a, b) => (b.due < a.due ? b : a))
+  if (next.due > now) return armWakes($, next.due - now)
+  await update($, pendingWakes, xs => xs.filter(x => x !== next && !(x.slug === next.slug && x.due === next.due)))
+  const s = await sendWake($, next)
+  if (!s?.ok && !(s && !s.ok && s.detail?.startsWith("it's down now"))) $.ui.log(`${next.name} wasn't woken: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions didn't answer"} (u in the panel restarts it)`)
+  const rest = await read($, pendingWakes)
+  if (rest.length) armWakes($, Math.max(WAKE_GAP_MS, Math.min(...rest.map(x => x.due)) - (await $.clock.now())))
 }
 
 // What /fleet up --force wakes that a plain /fleet up leaves alone: the person's stops, and the ones nothing explains
@@ -10204,6 +10300,8 @@ async function downCommand($: any, names: string[], origin: string): Promise<str
   const p = names.length ? pickInstances(names, all) : { picked: all, unknown: [] }
   if (p.unknown.length) return `Not in roster.json: ${p.unknown.join(', ')}`
   await setDown($, p.picked.map(i => i.slug), true)
+  // A wake /fleet up still had to send for one of them isn't sent
+  await update($, pendingWakes, ws => ws.filter(w => !p.picked.some(i => i.slug === w.slug)))
   const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: p.picked.map(i => i.name) })) : null
   const running = st?.ready ? p.picked.filter(i => rowsOf(i, st.rows).running) : []
   return [
@@ -10376,11 +10474,11 @@ async function rosterStatus($: any): Promise<string[]> {
             : why === 'idle'
               ? 'retired for being idle (fleet wakes it when something is for it)'
               : why === 'person'
-                ? 'stopped by you (/fleet up --force wakes it)'
+                ? `stopped by you (/fleet up --force${down.has(inst.slug) ? ` "${inst.name}"` : ''} wakes it)`
                 : why === 'memory'
                   ? 'closed for lack of memory (fleet wakes it once memory is back)'
                   : (retired as any)?.stopped === 'unknown'
-                    ? 'stopped, and nothing says why (Enter or u in the panel restarts it)'
+                    ? `stopped, and nothing says why (Enter or u in the panel restarts it, or /fleet up --force${down.has(inst.slug) ? ` "${inst.name}"` : ''})`
                     : row.state === 'idle' && running && busyTasks(hb)
                       ? `idle, with ${backgroundTasksText(hb)} running (busy for offers and capacity)`
                       : String(row.state),
@@ -12376,10 +12474,16 @@ async function bareVerb($: any, e: any, verb: string, rest: string): Promise<str
 async function fleetCommand($: any, e: any): Promise<string> {
   const c = parseCommand(String(e.args ?? ''))
   await locate($)
-  const origin = String(e.origin?.kind ?? '')
+  // A command that reads as typed (composer, or the phone's bridge) but that nobody typed in this session: a background
+  // session's launch prompt (claude --bg "/fleet …" runs the command as composer, tried on 2.1.319), or a session started
+  // from another session's shell (a claude -p an instance ran: it inherited CLAUDE_JOB_DIR naming that session, or the
+  // instance's FLEET_INSTANCE). Its origin becomes `launch` or `shell`, so every command that is the person's own
+  // (up, down, accept, apply, send, budget, judges live, overrule, init, the answers…) refuses it with why
+  const origin = await commandOrigin($, String(e.origin?.kind ?? ''), String(e.args ?? ''))
   if (c.kind === 'help') return HELP
   const bare = /^\s*(apply|send|reject|done|no|edit)\b(.*)$/is.exec(String(e.args ?? ''))
-  if (c.kind === 'bad' && bare && root) return bareVerb($, e, (bare[1] as string).toLowerCase(), bare[2] ?? '')
+  // Its answer runs as this command's origin (a launch prompt's bare verb stays the launch prompt's)
+  if (c.kind === 'bad' && bare && root) return bareVerb($, { ...e, origin: { ...(e.origin ?? {}), kind: origin } }, (bare[1] as string).toLowerCase(), bare[2] ?? '')
   if (c.kind === 'bad') return `${c.reason}\n\n${HELP}`
   if (c.kind === 'status') return statusCommand($, c.all === true)
   if (c.kind === 'brief') return root ? briefCommand($, c.chief, origin) : `Not set up in this project: /fleet init sets it up in ${await $.session.root()}`
@@ -12726,6 +12830,13 @@ export const register: Register = on => {
   // A guard that throws is skipped and the tool runs: before the command ran, the one hard line holds one that may reach
   // the network (in a background session); after it, or for any other command, it fails open as the rest of fleet
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => bashHook($, e, next)).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
+
+  // sessions' model tool mcp__sessions__wake: an instance of this project's roster isn't a model's to wake (its fleet
+  // wakes it when something is for it; the person brings a stopped one back with /fleet up). Anything else passes
+  on('tool.call', { tool: /^mcp__sessions__wake$/ }, async ($, e, next) => {
+    const refused = await rosterWakeRefusal($, (e as any).session)
+    return refused ? { deny: refused } : next(e)
+  }).catch(($, e, next) => next(e))
 
   // An instance's main-loop requests run the roster's model and effort (B24/G32): a respawn replays the launch's
   // --model whatever the settings file says now, and /model in a background session waits on a dialog nobody answers,

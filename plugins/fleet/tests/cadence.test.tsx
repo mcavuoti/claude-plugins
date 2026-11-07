@@ -307,7 +307,7 @@ test('the sweeper wakes one a restart stopped once per stop, again after it ran 
   await ui.unmount()
   const status = await fleet($, 'status')
   expect(status).toContain('Owner A · owner · Owners · wave 1 · stopped since a restart; woken 3 times today, so not again by itself (/fleet up --stopped wakes it)')
-  expect(status).toContain('Owner C · owner · Owners · wave 1 · stopped, and nothing says why (Enter or u in the panel restarts it)')
+  expect(status).toContain('Owner C · owner · Owners · wave 1 · stopped, and nothing says why (Enter or u in the panel restarts it, or /fleet up --force)')
   expect(await fleet($, 'brief')).toContain('Owner A (')
   // These wakes aren't nudges: the wakes' count is untouched
   expect(json(w, `${FLEET}/state/wakes.json`).instances['owner-a']).toMatchObject({ count: 0, restartCount: 3 })
