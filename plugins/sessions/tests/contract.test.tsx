@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { heartbeatText, keepPluginPins, pluginPinChange } from '../hooks/state'
+import { heartbeatText, keepPluginPins, pluginPinChange, showingText } from '../hooks/state'
 import { WATCH_SET } from '../hooks/watch'
 import { COMMAND, DATA, ROOT, SID, startSession, world } from './world'
 
@@ -859,6 +859,63 @@ test("restart of the caller's own session: refused while a window not opened wit
   expect(w.files.has(windowFiles[0] ?? '')).toBe(false)
   expect(w.toasts).toContain("Couldn't restart “one”")
 })
+
+// A session shown in two windows opened with ccc: one whose launcher says what it shows (.showing, with its watcher),
+// one of an older launcher that says nothing
+const SHOWN_THREE = [
+  '  100 ttys002  bash /Users/x/p/hooks/visor.sh start',
+  '  101 ttys002  claude attach dddddddd',
+  '  102 ttys002  /usr/bin/python3 /Users/x/p/hooks/launcher.py watch --file /x --launcher 100',
+  '  200 ttys003  bash /Users/x/old/hooks/visor.sh start',
+  '  201 ttys003  claude attach dddddddd',
+].join('\n')
+const SHOWING_THREE = `${DATA}/windows/_dev_ttys002.showing`
+
+test("restart with ccc windows showing the session: each is told to reopen it once the viewer ends (no end=1: the restart ends it), the new launcher's and the old one's, and its .showing stays", WITH_PROBE, async ($, on) => {
+  const w = world(on, { list: moreSessions() })
+  w.files.set('/Users/x/jobs/dddddddd/state.json', NO_TASKS)
+  const showing = showingText({ tty: '/dev/ttys002', command: 'attach', id: 'dddddddd', viewer: '101', launcher: '100', watcher: '102' })
+  w.files.set(SHOWING_THREE, showing)
+  await startSession($, w)
+  w.ps.value = SHOWN_THREE
+  expect(await call($, 'restart', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  await w.clock.advance(600)
+  const reopen = 'format=3\ncommand=attach\nid=dddddddd\ntitle=three\n'
+  const written = [...w.files].filter(([p]) => p.startsWith(`${DATA}/windows/`) && !p.endsWith('.showing'))
+  expect(written.sort()).toEqual([
+    [`${DATA}/windows/_dev_ttys002`, reopen],
+    [`${DATA}/windows/_dev_ttys003`, reopen],
+  ])
+  expect(w.runs.filter(a => a[1] === 'respawn')).toEqual([['/bin/claude', 'respawn', 'dddddddd']])
+  expect(w.files.get(SHOWING_THREE)).toBe(showing)
+  expect(w.runs.some(a => a[0] === 'kill')).toBe(false)
+})
+
+for (const force of [false, true]) {
+  test(`wake${force ? ' with force' : ''} with a .showing that names the session (left by a launcher that ended with it, or live): claude respawn, and no window touched`, WITH_PROBE, async ($, on) => {
+    const bg = (id: string, name: string) => ({ id, sessionId: `${id}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', name, startedAt: Date.parse('2026-10-26T08:00:00.000Z') })
+    const w = world(on, { list: [...list(), bg('dddddddd', 'idle one'), bg('eeeeeeee', 'stopped by the person')] })
+    w.files.set(
+      '/Users/x/daemon.log',
+      [
+        '[2026-10-26T09:00:00.000Z] [bg] bg retire dddddddd: settled, idle 61m',
+        '[2026-10-26T09:00:01.000Z] [bg] bg settled dddddddd (done)',
+        '[2026-10-26T09:30:00.000Z] [bg] bg settled eeeeeeee (killed)',
+      ].join('\n'),
+    )
+    const target = force ? 'eeeeeeee' : 'dddddddd'
+    const stale = showingText({ tty: '/dev/ttys002', command: 'attach', id: target, viewer: '101', launcher: '100', watcher: '102' })
+    w.files.set(SHOWING_THREE, stale)
+    w.ps.value = force ? SHOWN_THREE.replace(/dddddddd/g, target) : ''
+    await startSession($, w)
+    const before = new Map([...w.files].filter(([p]) => p.startsWith(`${DATA}/windows/`)))
+    expect(await call($, 'wake', { ref: target, reason: 'x', ...(force ? { force: true } : {}) })).toEqual({ ok: true, state: 'queued' })
+    await w.clock.advance(600)
+    expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual([target])
+    expect(new Map([...w.files].filter(([p]) => p.startsWith(`${DATA}/windows/`)))).toEqual(before)
+    expect(w.runs.some(a => a[0] === 'kill' || (a[0] === 'rm' && a.some(p => p.includes('/windows/'))))).toBe(false)
+  })
+}
 
 test("a plugin's pins: it unpins only what it pinned, Remote Control's own pin stays its own, and a session that's gone leaves the record", () => {
   const none = { ids: [], added: [] }

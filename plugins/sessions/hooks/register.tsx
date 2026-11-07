@@ -134,6 +134,11 @@ import {
   type Whereabouts,
   sortRows,
   windowTargetText,
+  SHOWING,
+  type Showing,
+  parseShowing,
+  showingRuns,
+  planSwitch,
   autoName,
   bgRefusal,
   checkStart,
@@ -493,7 +498,8 @@ function debugLine($: any, text: string) {
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
 // and the window in front, shared by the seen check for SEEN_WINDOWS_MS and FRONT_SHARED_MS: at, windows / tty, and
 // frontWindow's tags, the sessions an agent view in front shows; both also pendingAt, a session asking right now, and
-// windowsList until, when a slow ps pushed the next one back),
+// windowsList until, when a slow ps pushed the next one back; windowsList is also what a switch's own ps found, which
+// the next switch by the launcher windows reads for viewers in windows that publish nothing: planSwitch),
 // answer:<id> (the answer to a Stop or Restart question that session asked, when the asked session couldn't send it as
 // a notice: format, sessionId, action, cameBack, at; that session's panel takes it and deletes it), personStop:<id>
 // (when the person stopped that session from a panel: a plugin's wake leaves it stopped until it's started again),
@@ -707,6 +713,81 @@ async function switchInPlace($: any, target: WindowTarget, front: string, listed
   return true
 }
 
+// The launcher windows that say what they show (<data>/windows/<tty>.showing: Showing in state.ts), read with no
+// command. A file under another terminal's name than the one it names is left out
+async function launcherWindows($: any): Promise<Showing[]> {
+  if (!dataDir) return []
+  let names: string[]
+  try {
+    names = (await $.fs.list(`${dataDir}/windows`)).filter((e: any) => e.kind === 'file' && String(e.name).endsWith(SHOWING)).map((e: any) => String(e.name))
+  } catch {
+    return []
+  }
+  const read = await Promise.all(
+    names.map(async name => {
+      try {
+        const s = parseShowing(String(await $.fs.read(`${dataDir}/windows/${name}`)))
+        return s && `${fileKey(s.tty)}${SHOWING}` === name ? s : null
+      } catch {
+        return null
+      }
+    }),
+  )
+  return read.filter((s): s is Showing => s !== null)
+}
+
+// Whether a window's launcher and its watcher still run as its .showing says (showingRuns in state.ts): one ps of those
+// two processes, never of all of them. A ps that can't run (127) says nothing against it
+async function launcherRuns($: any, s: Showing): Promise<boolean> {
+  const r = await run($, ['ps', '-p', `${s.launcher},${s.watcher}`, '-o', 'pid=', '-o', 'tty=', '-o', 'command='])
+  return r.exitCode === 127 || showingRuns(s, r.stdout)
+}
+
+// A .showing its launcher left behind goes, with what was just written for that window
+async function dropShowing($: any, s: Showing) {
+  debugLine($, `switch: the launcher of ${s.tty} isn't running; its ${SHOWING} file goes`)
+  await runSafe($, ['rm', '-f', windowFile(s.tty), `${windowFile(s.tty)}${SHOWING}`])
+}
+
+// A switch by what the launcher windows publish (planSwitch in state.ts), with no ps of every process and no question
+// to Terminal: true once done, false to go the usual way (jump). The window's file asks its watcher to end the viewer
+// (end=1) and is written before the check that its launcher still runs, so the check costs the switch no time: a
+// .showing left behind gets a file nobody reads, both go, and the usual way follows. A window showing the target is
+// checked before it's brought forward
+async function switchByLaunchers($: any, f: Row): Promise<boolean> {
+  if (!f.id || !dataDir) return false
+  const shown = await launcherWindows($)
+  if (!shown.length) return false
+  const c = await storeGet($, 'windowsList')
+  const listed = c && Array.isArray(c.windows?.agentsViews) && c.windows.byId ? (c.windows as Windows) : null
+  const plan = planSwitch(shown, myShortId(), f.id, listed)
+  if (!plan) return false
+  if (plan.kind === 'bring') {
+    if (!(await launcherRuns($, plan.to))) {
+      await dropShowing($, plan.to)
+      return false
+    }
+    if (await platform.bringWindow(sys($), plan.to.tty, f.title)) return true
+    // Where it can't be brought forward (Linux without wmctrl/xdotool, or Wayland) it's shown here too; else the
+    // usual way tries again, and says so
+    if (!platform.showHereIfCantBring) return false
+  }
+  const file = windowFile(plan.from.tty)
+  try {
+    await $.fs.write(file, windowTargetText({ command: 'attach', id: f.id, title: f.title, end: true }))
+  } catch {
+    return false
+  }
+  if (await launcherRuns($, plan.from)) return true
+  await dropShowing($, plan.from)
+  return false
+}
+
+// The listing the usual way took, for the next switch of every session (planSwitch reads it) and the seen check
+async function shareWindows($: any, v: Windows) {
+  await storeSet($, 'windowsList', { at: await $.clock.now(), windows: v })
+}
+
 // The windows showing this session: its viewers, and a regular session's own window (a background session's process
 // has the background service's internal terminal, which isn't a window)
 function myWindowsIn(v: Windows): string[] {
@@ -724,7 +805,9 @@ async function myWindows($: any): Promise<string[]> {
 // session for SEEN_WINDOWS_MS (5 s in the first minute after a finish; which windows are open changes rarely, and
 // arriving in a session marks it seen without it), and one question to Terminal for FRONT_SHARED_MS, a little under
 // the fastest pace of the check. Only for that
-// check: what acts on a window (closing a viewer, a switch) reads the listing right then. Like the session list:
+// check: what acts on a window (closing a viewer, a switch) reads the listing right then, and a switch the usual way
+// stores what it read (shareWindows); a switch by the launcher windows reads the stored one only to know whether a
+// window that publishes nothing shows either session (planSwitch), never to act on a window. Like the session list:
 // stamped when ps came back; a session about to list says so (`pendingAt`), and the others use the stored windows
 // meanwhile; a ps that took longer than SHARED_MS pushes every session's next one back (twice its time, up to 30 s)
 const SHARED_MS = 1500
@@ -3294,10 +3377,12 @@ function peerRow(sessionId: string, carried: Record<string, unknown> = {}): Row 
 }
 
 // Switches the front window to another session. With notifyFocus set to false, the target doesn't take the keyboard
-// with its panel (when it's about to show a question, or when it'll do so itself afterwards). One ps serves the whole
-// switch (which window is this one, which shows the target, the viewer to close), and nothing waits before the viewer
-// is closed: the notice that gives the target's panel the keyboard and this panel's release of it go once the window
-// went (the target takes the keyboard with no window attached too, and gets it when the window attaches)
+// with its panel (when it's about to show a question, or when it'll do so itself afterwards). From a window opened with
+// ccc, by what its launcher publishes (switchByLaunchers: one file, no ps of every process, no question to Terminal);
+// else one ps serves the whole switch (which window is this one, which shows the target, the viewer to close). Nothing
+// waits before the viewer is told to end or closed: the notice that gives the target's panel the keyboard and this
+// panel's release of it go once the window went (the target takes the keyboard with no window attached too, and gets
+// it when the window attaches)
 async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
   if (f.current) return false
   // If the jump was made with the keyboard in the panel, the target session receives you with the focus on its panel.
@@ -3312,7 +3397,10 @@ async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
     )
     return true
   }
+  // A background session, from a window opened with ccc: by what the launcher windows publish, when that's certain
+  if (f.background && (await switchByLaunchers($, f))) return gone()
   const v = await windows($)
+  bg(shareWindows($, v))
   // A regular session lives in its own window: bring that one forward, whichever is in front. If it runs where the
   // panel can't reach (another terminal app, tmux, an editor), say so instead of doing nothing
   if (!f.background) {
