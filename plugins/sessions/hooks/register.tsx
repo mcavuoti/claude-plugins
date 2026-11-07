@@ -122,6 +122,8 @@ import {
   keyLines,
   fileKey,
   orderFileText,
+  orderOrphanRoot,
+  ORDER_ORPHAN_MS,
   rootFrom,
   rootCandidates,
   worktreeBase,
@@ -1477,7 +1479,8 @@ async function beat($: any) {
 
 // Every 10 minutes, the data of sessions no longer in the official list (fetched right then) is deleted: their stored
 // keys, heartbeats and requests. Never that of a session created in the last 5 minutes, nor of one with a fresh
-// heartbeat: the agent view's pre-started session is running and hidden from the list
+// heartbeat: the agent view's pre-started session is running and hidden from the list. The order files of folders
+// that are gone go too (pruneOrders)
 let lastPrune = 0
 // The plugins' sections the last prune found empty
 let emptyBefore = new Set<string>()
@@ -1485,6 +1488,7 @@ async function prune($: any) {
   const now = await $.clock.now()
   if (now - lastPrune < 600000) return
   lastPrune = now
+  await pruneOrders($, now)
   // The shared list, at most 10 s old (one listing serves every session's prune: after a sleep they all come due at once)
   const list = await officialList($, 10000)
   // A listing that lacks this very session (short, or empty) isn't trusted with deleting anything
@@ -1544,6 +1548,30 @@ async function prune($: any) {
     for (const id of drop) emptyBefore.delete(id)
     return { file: dropSections(pruned, drop) }
   })
+}
+
+// The order files (<data>/order/<root as a file name>) of projects whose folder is gone: of the files no panel rewrote
+// for a while, the root each names (orderOrphanRoot) is looked for once a prune, and the file goes if it isn't there.
+// Never one whose folder is there, nor on a read or a look that fails
+async function pruneOrders($: any, now: number) {
+  let files: any[] = []
+  try {
+    files = await $.fs.list(`${dataDir}/order`)
+  } catch {
+    return
+  }
+  const gone: string[] = []
+  for (const f of files) {
+    const path = `${dataDir}/order/${String(f.name)}`
+    if (f.kind !== 'file' || !(now - Number(f.mtimeMs) >= ORDER_ORPHAN_MS)) continue
+    try {
+      const root = orderOrphanRoot(String(f.name), Number(f.mtimeMs), String(await $.fs.read(path)), now)
+      if (root && (await $.fs.exists(root)) === false) gone.push(path)
+    } catch {}
+  }
+  if (gone.length === 0) return
+  debugLine($, `prune: ${gone.length === 1 ? 'an order file' : `${gone.length} order files`} of a folder that's gone`)
+  await runSafe($, ['rm', '-f', ...gone])
 }
 
 // The version of a session whose own mod doesn't record it (no mod, or one that never started): the program its

@@ -33,6 +33,8 @@ import {
   parseWindows,
   sortRows,
   orderFileText,
+  orderOrphanRoot,
+  ORDER_ORPHAN_MS,
   parseOrderFile,
   fileKey,
   keyLines,
@@ -765,6 +767,19 @@ test('updating in place: only to a newer version of the same install, once, and 
   expect(reloadDecision({ ...base, tasks: 1 })).toBe('wait')
   expect(reloadDecision({ ...base, tasks: null })).toBe('wait')
   expect(reloadDecision({ ...base, fieldOpen: true })).toBe('wait')
+})
+
+test("an order file to remove: an old one's root, read from the file and matching its name; never a fresh one", () => {
+  const now = 10_000_000
+  const text = orderFileText('/Users/x/my_wt', [], 0)
+  expect(orderOrphanRoot('_Users_x_my_wt', now - ORDER_ORPHAN_MS, text, now)).toBe('/Users/x/my_wt')
+  // Fresh (a panel of the project wrote it lately, or its folder is being made), or its time unknown
+  expect(orderOrphanRoot('_Users_x_my_wt', now - ORDER_ORPHAN_MS + 1, text, now)).toBe(null)
+  expect(orderOrphanRoot('_Users_x_my_wt', Number.NaN, text, now)).toBe(null)
+  // A name that isn't the root's (another folder with the same file name), no root, or not a path
+  expect(orderOrphanRoot('_Users_x_my_wt_2', 0, text, now)).toBe(null)
+  expect(orderOrphanRoot('_Users_x', 0, 'format=3\nat=1\n', now)).toBe(null)
+  expect(orderOrphanRoot('x', 0, 'format=3\nroot=x\n', now)).toBe(null)
 })
 
 test('refs: the official short id, or sid:<sessionId> for a regular session (it has none)', () => {

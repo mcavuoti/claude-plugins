@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { abbreviate, heartbeatText, storeNamespace } from '../hooks/state'
+import { abbreviate, fileKey, heartbeatText, orderFileText, storeNamespace } from '../hooks/state'
 import { WATCH_SET } from '../hooks/watch'
 import { BAND, COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
@@ -245,6 +245,30 @@ test('the cleanup trusts no listing that lacks this very session; one that has i
   await w.clock.advance(600000)
   expect(w.store.has(`state:${GONE}`)).toBe(false)
   expect(w.store.has(`title:${GONE}`)).toBe(false)
+})
+
+test("the cleanup removes the order file of a folder that's gone, once no panel wrote it for a while; never one whose folder is there", SLOW, async ($, on) => {
+  const w = world(on)
+  const order = (root: string) => `${DATA}/order/${fileKey(root)}`
+  // A deleted worktree's (its name has an underscore: the root is read from the file), a folder that's there, and a
+  // file whose name isn't the root it names inside (two folders can share a name: left alone)
+  const gone = '/Users/x/myapp_wt'
+  const kept = '/Users/x/kept'
+  w.dirs.add(kept)
+  w.write(order(gone), orderFileText(gone, [], w.clock.now()))
+  w.write(order(kept), orderFileText(kept, [], w.clock.now()))
+  w.write(`${DATA}/order/_Users_x_other`, orderFileText('/Users/x/else', [], w.clock.now()))
+  await startSession($, w)
+  // The start's cleanup: all of them just written, so a folder being made isn't raced
+  await w.clock.advance(1000)
+  expect(w.files.has(order(gone))).toBe(true)
+  // The next one, 10 minutes on: the gone folder's file goes, the rest stay (this project's own, rewritten, too)
+  await w.clock.advance(600000)
+  expect(w.files.has(order(gone))).toBe(false)
+  expect(w.files.has(order(kept))).toBe(true)
+  expect(w.files.has(`${DATA}/order/_Users_x_other`)).toBe(true)
+  expect(w.files.has(order(ROOT))).toBe(true)
+  expect(w.runs.filter(a => a[0] === 'rm' && a.some(p => p.includes('/order/')))).toEqual([['rm', '-f', order(gone)]])
 })
 
 test('the reopen after a memory shortage runs under its lock, and reopens the session once', SLOW, async ($, on) => {

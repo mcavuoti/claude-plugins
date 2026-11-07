@@ -956,6 +956,17 @@ export function orderFileText(root: string, rows: readonly OrderRow[], now: numb
   )
 }
 
+// The leader's prune removes the order file of a project whose folder is gone (a test folder or a worktree deleted).
+// Only one no panel rewrote for ORDER_ORPHAN_MS (a project's panels rewrite theirs at least once a pass, so a folder
+// being made isn't raced), and only for the root the file names inside, which the file's name has to match (the name is
+// the root as a file name, which two folders can share): the folder to look for, or null to leave the file alone
+export const ORDER_ORPHAN_MS = 5 * 60000
+export function orderOrphanRoot(name: string, mtimeMs: number, text: string, now: number): string | null {
+  if (!(now - mtimeMs >= ORDER_ORPHAN_MS)) return null
+  const root = parseKeyLines(text).root ?? ''
+  return root.startsWith('/') && fileKey(root) === name ? root : null
+}
+
 export function parseOrderFile(text: string): { format: number; at: number; root: string; rows: OrderRow[] } | null {
   const k = parseKeyLines(text)
   if (!k.format) return null
