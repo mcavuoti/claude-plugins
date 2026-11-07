@@ -2334,7 +2334,7 @@ async function offerTools($: any, cwd: string) {
   }
   if (role === null) {
     toolsOffered = 'not offered: no SessionStart reached the mod in this session (updated in place from an older version); a restart (u) offers them'
-    debugLine($, `tools for Claude: ${toolsOffered}`)
+    bg(offerAfterReload($))
     return
   }
   const plan = role.agent ? roleTools(await agentFile($, role.agent, cwd)) : { tools: [...SESSION_TOOLS], waitMs: TOOLS_WAIT_MS, why: 'no agent' }
@@ -2345,6 +2345,40 @@ async function offerTools($: any, cwd: string) {
   }
   const done = await within($, Promise.all(plan.tools.map(t => $.tool.register(TOOL_SPECS[t]))), plan.waitMs)
   debugLine($, `tools for Claude: ${toolsOffered}${done ? '' : `, still registering after ${plan.waitMs} ms`}`)
+}
+
+// A module that came in by an update in place from a version that didn't record the agent (0.15.1 and before: no
+// SessionStart in this module's life, no agentRole) learns it from the session's transcript instead (readAgent, a few
+// beats at most), in the background: session.start isn't held. With no agent the tools are registered then, which a
+// plain session sees from its next request, and that's recorded (agentRole) for later reloads; an agent session gets
+// none until it restarts (a registration not awaited at session.start never shows in one, and one it doesn't list
+// would hold its starts 8 s), and nothing is recorded: each reload decides the same until then
+async function offerAfterReload($: any) {
+  await (starting ?? Promise.resolve()).catch(() => {})
+  if (!reloadedInto || !sessionTools || roleSeen) {
+    debugLine($, `tools for Claude: ${toolsOffered}`)
+    return
+  }
+  for (let i = 0; i < 5 && agentFor !== myId; i++) {
+    await readAgent($)
+    if (agentFor !== myId) await $.clock.sleep(1000)
+  }
+  if (agentFor !== myId || roleSeen) {
+    debugLine($, `tools for Claude: ${toolsOffered} (the transcript couldn't say which agent it runs as)`)
+    return
+  }
+  if (myAgent) {
+    toolsOffered = `not offered: agent ${myAgent}, and this session was updated in place from a version without them; a restart (u) offers them`
+    debugLine($, `tools for Claude: ${toolsOffered}`)
+    return
+  }
+  const role: AgentRole = { agent: null }
+  try {
+    if (!sameData(await read($, agentRole), role)) await update($, agentRole, () => role)
+  } catch {}
+  toolsOffered = `${SESSION_TOOLS.map(t => `mcp__sessions__${t}`).join(', ')} (no agent, as its transcript says; offered after an update in place, from the next request on)`
+  const done = await within($, Promise.all(SESSION_TOOLS.map(t => $.tool.register(TOOL_SPECS[t]))), 10000)
+  debugLine($, `tools for Claude: ${toolsOffered}${done ? '' : ', still registering after 10 s'}`)
 }
 
 // Claude's own name for a session (what ListAgents and SendMessage use), '' when it has none; and its title in the panel

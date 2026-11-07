@@ -331,10 +331,77 @@ test("a SessionStart that comes after session.start's plugins beneath answered: 
   open()
 })
 
-test('no SessionStart in this session (an update in place from an older version): nothing registered, said in /sessions status', async ($, on) => {
+test('no SessionStart and no module before this one (a host without classic hooks): nothing registered, said in /sessions status', async ($, on) => {
+  const t = setup(on)
+  t.w.transcript.value = ''
+  await startSession($, t.w)
+  await t.w.clock.advance(100)
+  expect(t.registered).toEqual([])
+  const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  expect(String(status.text)).toContain('Tools for Claude: not offered: no SessionStart reached the mod in this session')
+})
+
+// What a module before this one left in the session's $.state (a reload keeps it), answered until the mod writes it
+function stateSeeds(on: any, seeds: Record<string, unknown>) {
+  const left = new Map(Object.entries(seeds))
+  on('state.set', (_: any, e: any, next: any) => {
+    if (e.plugin === 'sessions') left.delete(e.key)
+    return next(e)
+  })
+  on('state.get', (_: any, e: any, next: any) => (e.plugin === 'sessions' && left.has(e.key) ? { value: { value: left.get(e.key), version: 1 } } : next(e)))
+}
+
+// The transcript reads that ask which agent the session runs as (readAgent)
+const agentReads = (t: Setup) => t.w.runs.filter(a => a[0] === '/bin/sh' && String(a[2]).includes('grep -e "^$3"')).length
+
+// An update in place from 0.15.1 or before: the module before this one drew (its shortId stays), recorded no agent, and
+// no SessionStart comes
+test("updated in place from a version that didn't record the agent: none in the transcript, the tools come in the background", async ($, on) => {
+  stateSeeds(on, { shortId: 'aaaaaaaa' })
+  const t = setup(on)
+  t.w.transcript.value = '{"type":"custom-title","customTitle":"lead"}\n'
+  // The registration answers only later: session.start isn't held for it
+  let open = () => {}
+  t.gate.value = new Promise<void>(r => (open = r))
+  let done = false
+  const start = $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true }).then(() => (done = true))
+  await t.w.clock.settle()
+  expect(done).toBe(true)
+  await start
+  open()
+  await t.w.clock.advance(100)
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
+  const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  expect(String(status.text)).toContain('Tools for Claude: mcp__sessions__list, mcp__sessions__wake (no agent, as its transcript says; offered after an update in place, from the next request on)')
+  expect((await listed($, t)).result).toContain('“worker a”')
+  // Recorded: the next reload registers them as a start does, awaited for a moment
+  await startSession($, t.w)
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake', 'list', 'wake'])
+})
+
+test("updated in place from a version that didn't record the agent: an agent in the transcript gets none until it restarts", async ($, on) => {
+  stateSeeds(on, { shortId: 'aaaaaaaa' })
+  const t = setup(on)
+  t.w.files.set(`${ROOT}/.claude/agents/lead.md`, '---\nname: lead\ntools: mcp__sessions__*, SendMessage\n---\n')
+  t.w.transcript.value = '{"type":"agent-setting","agentSetting":"lead","sessionId":"aaaaaaaa"}\n'
+  await startSession($, t.w)
+  await t.w.clock.advance(100)
+  expect(t.registered).toEqual([])
+  const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  expect(String(status.text)).toContain('Tools for Claude: not offered: agent lead, and this session was updated in place from a version without them; a restart (u) offers them')
+  // Nothing recorded: another reload decides the same
+  await startSession($, t.w)
+  await t.w.clock.advance(100)
+  expect(t.registered).toEqual([])
+})
+
+test("a transcript that can't be read after an update in place: nothing registered, read a few times, said", async ($, on) => {
+  stateSeeds(on, { shortId: 'aaaaaaaa' })
   const t = setup(on)
   await startSession($, t.w)
+  await t.w.clock.advance(6000)
   expect(t.registered).toEqual([])
+  expect(agentReads(t)).toBeGreaterThanOrEqual(5)
   const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
   expect(String(status.text)).toContain('Tools for Claude: not offered: no SessionStart reached the mod in this session')
 })
