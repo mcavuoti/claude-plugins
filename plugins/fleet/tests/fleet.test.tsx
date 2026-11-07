@@ -38,6 +38,19 @@ test('/fleet init sets the project up: config, decisions folders, .gitignore; ag
   expect(await fleet($, '')).toContain('Nothing is waiting for you')
 })
 
+test("/fleet status says when the project's .gitignore is an older fleet's, and /fleet init again brings it in line", WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { fleet: false, background: false })
+  await startSession($, w)
+  await fleet($, 'init')
+  expect(w.files.get(`${FLEET}/.gitignore`)).toContain('\nbell/\nruns/\n')
+  expect(await fleet($, 'status')).not.toContain('.gitignore is older')
+  // One an older fleet wrote: without the bells and the run register
+  w.files.set(`${FLEET}/.gitignore`, (w.files.get(`${FLEET}/.gitignore`) as string).replace('bell/\nruns/\n', ''))
+  expect(await fleet($, 'status')).toContain(".claude/fleet/.gitignore is older than this fleet's (it leaves out bell/ and runs/): /fleet init again rewrites it")
+  expect(await fleet($, 'init')).toContain('Up to date')
+  expect(await fleet($, 'status')).not.toContain('.gitignore is older')
+})
+
 test('/fleet init refuses the home folder and a config.json from a newer fleet', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { fleet: false })
   w.root.value = HOME

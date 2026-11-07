@@ -5573,7 +5573,7 @@ async function worldCommand($: any, action: 'list' | 'add' | 'remove', glob: str
   await writeStamps($, ['.claude/fleet/world.json'])
   world = null
   await loadWorld($)
-  return `${action === 'add' ? 'Added' : 'Removed'} ${globList(['added' in changed ? String(changed.added) : g])}. The world is now: ${w.paths.length ? globList(w.paths) : 'nothing'} (world.json). Every session of the project follows within 2 s.`
+  return `${action === 'add' ? 'Added' : 'Removed'} ${globList(['added' in changed ? String(changed.added) : g])}. The world is now: ${w.paths.length ? globList(w.paths) : 'nothing'} (world.json). Every session of the project follows within 10 s (2 where Claude's watcher is off).`
 }
 
 // The person stamps a change made outside fleet (his editor, a script) as his: sessions that read an older version
@@ -5730,9 +5730,16 @@ const PROOF_CHECK_MARK = 'proof-check-version: 2'
  * older fleet keeps its own copies, and fleet keeps no code for older ones): one line each, naming what to copy.
  * Nothing is held */
 async function worldNotes($: any): Promise<string[]> {
-  const w = worldJson
-  if (!w) return []
   const out: string[] = []
+  // .claude/fleet/.gitignore is fleet's own: /fleet init writes it whole each time it runs, so one an older fleet wrote
+  // (without bell/ or runs/, which then show as untracked and a plain git add -A commits) is fixed by running it again
+  const ignore = await readText($, `${fleetDir()}/.gitignore`)
+  const conf = ignore === null ? null : await readConfig($)
+  if (ignore !== null && conf && 'config' in conf && ignore !== gitignoreText(conf.config.commitRegister)) {
+    out.push(`.claude/fleet/.gitignore is older than this fleet's (it leaves out ${['bell/', 'runs/'].filter(d => !ignore.split('\n').includes(d)).join(' and ') || 'some of what fleet writes'}): /fleet init again rewrites it (it never writes over a file of yours).`)
+  }
+  const w = worldJson
+  if (!w) return out
   const paths = Array.isArray(w.paths) ? (w.paths as unknown[]) : []
   if (paths.includes('board/**') && (!w.defaultKind || typeof w.defaultKind !== 'object')) {
     out.push(`world.json has no defaultKind: this fleet's templates have "defaultKind": {"board/**": "editorial"}, so a board item's status edit flags nobody who cites it (only a change line saying revision does). Add it to world.json if that's what you want.`)
@@ -12250,8 +12257,8 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
       ? parsed.problem
       : `Shared files (world.json): ${parsed.world.paths.length ? globList(parsed.world.paths) : 'none'}. A session's write of one that changed since it read it is refused once with who changed it, and it hears of such changes at its next step. /fleet world changes the list.${worldCommitWords(parsed.world)}`,
     config.commitRegister
-      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git.'
-      : 'decisions/, events/, reads/, state/, instances/, inbox/ and intake/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
+      ? 'The register (decisions/register/) is committed with the project; the rest of decisions/, events/, reads/, state/, instances/, bell/, runs/, inbox/ and intake/ stay out of git.'
+      : 'decisions/, events/, reads/, state/, instances/, bell/, runs/, inbox/ and intake/ stay out of git (.claude/fleet/.gitignore); /fleet init --commit-register commits the register.',
     ...next,
     isolation,
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',

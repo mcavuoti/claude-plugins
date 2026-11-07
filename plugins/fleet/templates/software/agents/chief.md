@@ -21,7 +21,7 @@ What you own:
   person who should own it. Ideas from others go in ideas/ (one per file, with who it came from): an idea changes
   nothing until the owner of what it targets takes it up.
 - The backlog: at each brief, and when fleet tells you instances are idle with no item to take, turn what the charter
-  and the plan still need (the gap matrix, the proposal's open parts, a result that needs reproducing) into board
+  and the spec still need (a part of the spec nobody builds yet, a missing test, what the reviewer found) into board
   items (board/B-<n>.md: `for:` the role or instance that should take it, what done looks like, owner open): the
   instances take their work from the board.
 
