@@ -33,6 +33,7 @@
 //   bell/<kind>                          wire: live updates' bells (work, runs, restart, budget, probe): who rang and
 //                                        when, rewritten in place by whoever made the change; every session watches the folder
 //   events/claims/<hash>                 wire: an outside change claimed no-clobber, so one session records it
+//   events/YYYY-MM-DD/HH/index           wire: a closed hour's events in one file, written once by the sweeper (a start reads it)
 //   reads/<sessionId>.json               wire: what that session's threads read of the world, the outside content its
 //                                        conversation read and the Bash commands it runs now, written only by it
 //   state/revs/<id>/<n>.json             wire: version n of the record <id> (records.ts), published no-clobber
@@ -64,6 +65,7 @@
 //                                        quiet runs and the band's restart line (the sweeper's)
 //   state/pinned.json                    wire: the pins fleet asked sessions for (the sweeper's)
 //   state/reproduce.json                 wire: the results watched and the reproduction items opened (the sweeper's)
+//   state/spends.json                    wire: today's spend of every instance, by slug (the sweeper's; the budgets read it)
 //   runs/run-<n>.json, .done.json, .recorded.json  wire: a long run declared by its owner, its done-file seen by the
 //                                        sweeper, its result recorded by its owner; each published no-clobber (runs.ts)
 //   inbox/<source>/<name>.json, latest   a poller's items (itemFormat, intake.ts), and the trigger it rewrites

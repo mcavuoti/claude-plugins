@@ -1631,6 +1631,9 @@ let otherEvents = 0
 let latestMark = -1
 let pulling: Promise<void> | null = null
 let pullAgain = false
+// What the pull asked for while one ran wanted (a start's 25 hours, from the indexes): the one after it does that
+let pullAgainHours = 2
+let pullAgainIndexed = false
 let eventCount = 0
 // The world as this session's scan last saw it (with the pins each file cites), and the changes nobody's event
 // explains yet (recorded as outside changes when they stay so for a scan)
@@ -2014,20 +2017,40 @@ async function refreshName($: any) {
 
 // ---- Events ----
 
-// The event files of the trailing window not seen yet (the current hour and the one before; 25 hours at the start)
-function pullEvents($: any, hours = 2): Promise<void> {
+// The event files of the trailing window not seen yet (the current hour and the one before; 25 hours at the start:
+// there, each hour older than the two newest is taken from its index, when the sweeper wrote one, plus any file the
+// index doesn't list, so a restart reads about two hours of files, not twenty-five)
+function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
   // One at a time; a call that comes while one runs gets one more after it (its trigger may name a file the running
   // one listed too early to see)
   if (pulling) {
     pullAgain = true
+    pullAgainHours = Math.max(pullAgainHours, hours)
+    pullAgainIndexed ||= indexed
     return pulling
   }
   pulling = (async () => {
     const now = await $.clock.now()
-    for (const folder of windowFolders(now, hours)) {
-      const dir = eventsDir(folder)
-      for (const name of await names($, dir)) {
-        if (!name.endsWith('.json') || seen.has(name)) continue
+    const folders = windowFolders(now, hours)
+    for (let i = 0; i < folders.length; i++) {
+      const dir = eventsDir(folders[i])
+      const listed = await names($, dir)
+      let covered: Set<string> | null = null
+      if (indexed && i >= 2 && listed.includes(EVENT_INDEX)) {
+        const ix = parseWire<EventIndex>((await readText($, `${dir}/${EVENT_INDEX}`)) ?? '')
+        if (ix && 'value' in ix && Array.isArray(ix.value.entries)) {
+          covered = new Set()
+          for (const entry of ix.value.entries) {
+            if (!Array.isArray(entry) || typeof entry[0] !== 'string') continue
+            const [name, v] = entry as [string, unknown]
+            covered.add(name)
+            if (seen.has(name) || v === null) continue
+            await takeEvent($, name, v, now)
+          }
+        }
+      }
+      for (const name of listed) {
+        if (!name.endsWith('.json') || seen.has(name) || covered?.has(name)) continue
         const t = await readText($, `${dir}/${name}`)
         if (t === null) continue
         let v: any
@@ -2036,28 +2059,7 @@ function pullEvents($: any, hours = 2): Promise<void> {
         } catch {
           continue
         }
-        seen.set(name, now)
-        if (!isEvent(v)) {
-          if (v && v.format !== FORMAT) otherEvents++
-          continue
-        }
-        const prev = latest.get(v.path)
-        if (newer(prev, v)) {
-          latest.set(v.path, v)
-          if (v.probably) await overwroteLater($, v, prev)
-          // What this session knows of the file follows the landing at once, so the suspects reckoned next see it: only
-          // the sweeper scans the world every 10 s, and the other sessions know it from the landings (a new file's time
-          // and size come with the sweeper's next scan, or a command's here)
-          const k = known.get(v.path)
-          if (v.to === null) {
-            if (k) dropKnown(v.path)
-          } else if (!k) {
-            if (baselined && world && inWorld(v.path, world.res)) setKnown(v.path, { mtimeMs: 0, size: -1, v: v.to, pins: v.pins ?? [] })
-          } else if (k.v !== v.to) known.set(v.path, { ...k, v: v.to, pins: v.pins ?? (v.id ? [] : k.pins) })
-        }
-        remember(v)
-        sweep.dirty = true
-        if (v.id) forget(v.id)
+        await takeEvent($, name, v, now)
       }
     }
     for (const [name, at] of seen) if (now - at > 3 * HOUR) seen.delete(name)
@@ -2067,11 +2069,81 @@ function pullEvents($: any, hours = 2): Promise<void> {
     .finally(() => {
       pulling = null
       if (pullAgain) {
+        const again = { hours: pullAgainHours, indexed: pullAgainIndexed }
         pullAgain = false
-        bg(pullEvents($))
+        pullAgainHours = 2
+        pullAgainIndexed = false
+        bg(pullEvents($, again.hours, again.indexed))
       }
     })
   return pulling
+}
+
+/** One event file, as read (or as an hour's index has it) */
+async function takeEvent($: any, name: string, v: any, now: number) {
+  seen.set(name, now)
+  if (!isEvent(v)) {
+    if (v && v.format !== FORMAT) otherEvents++
+    return
+  }
+  const prev = latest.get(v.path)
+  if (newer(prev, v)) {
+    latest.set(v.path, v)
+    if (v.probably) await overwroteLater($, v, prev)
+    // What this session knows of the file follows the landing at once, so the suspects reckoned next see it: only
+    // the sweeper scans the world every 10 s, and the other sessions know it from the landings (a new file's time
+    // and size come with the sweeper's next scan, or a command's here)
+    const k = known.get(v.path)
+    if (v.to === null) {
+      if (k) dropKnown(v.path)
+    } else if (!k) {
+      if (baselined && world && inWorld(v.path, world.res)) setKnown(v.path, { mtimeMs: 0, size: -1, v: v.to, pins: v.pins ?? [] })
+    } else if (k.v !== v.to) known.set(v.path, { ...k, v: v.to, pins: v.pins ?? (v.id ? [] : k.pins) })
+  }
+  remember(v)
+  sweep.dirty = true
+  if (v.id) forget(v.id)
+}
+
+/** An hour's events in one file (events/<day>/<hour>/index, no .json: a reader that lists the hour's events skips it),
+ * written once by the sweeper when the hour is older than the two a start reads whole: every .json file of the hour
+ * by name, with what it holds (null: not JSON). A start takes the hour from it, plus any file it doesn't list */
+const EVENT_INDEX = 'index'
+type EventIndex = { format: number; hour: string; entries: [string, unknown][] }
+const indexedHours = new Set<string>()
+/** The sweeper: the indexes the start's window lacks, three hours a sweep at most (each hour's files read once, ever) */
+async function indexEvents($: any) {
+  const now = await $.clock.now()
+  let made = 0
+  for (const folder of windowFolders(now, 25).slice(2)) {
+    if (made >= 3) break
+    if (indexedHours.has(folder)) continue
+    const dir = eventsDir(folder)
+    if (await exists($, `${dir}/${EVENT_INDEX}`)) {
+      indexedHours.add(folder)
+      continue
+    }
+    const all = (await names($, dir)).filter(n => n.endsWith('.json')).sort()
+    if (!all.length) {
+      indexedHours.add(folder)
+      continue
+    }
+    const entries: [string, unknown][] = []
+    for (const name of all) {
+      const text = await readText($, `${dir}/${name}`)
+      if (text === null) continue
+      let v: unknown = null
+      try {
+        v = JSON.parse(text)
+      } catch {}
+      entries.push([name, v])
+    }
+    await publish($, `${dir}/${EVENT_INDEX}`, json({ format: FORMAT, hour: folder, entries }))
+    indexedHours.add(folder)
+    made++
+  }
+  const window = new Set(windowFolders(now, 26))
+  for (const h of [...indexedHours]) if (!window.has(h)) indexedHours.delete(h)
 }
 
 function remember(e: ChangeEvent) {
@@ -2334,7 +2406,8 @@ async function digestFor($: any, thread: string, withBudget = true, forNudge = f
   await eventsTick($)
   const mine = (await read($, reads))[thread]
   const me = await meNow($)
-  const items = await holdInputs($, mine && latest.size ? digestItems(mine, latest, me, thread) : [], await $.clock.now())
+  const toldNow = toldHere.get(thread)
+  const items = (await holdInputs($, mine && latest.size ? digestItems(mine, latest, me, thread) : [], await $.clock.now())).filter(i => toldNow?.get(i.path) !== i.event.to)
   let own: { lines: string[]; keys: string[] } = { lines: [], keys: [] }
   let intake: { lines: string[]; ids: string[]; at: number } = { lines: [], ids: [], at: 0 }
   if (thread === 'main') {
@@ -2349,6 +2422,9 @@ async function digestFor($: any, thread: string, withBudget = true, forNudge = f
     told: async () => {
       await alone()
       if (items.length) {
+        const memo = toldHere.get(thread) ?? new Map<string, string>()
+        for (const i of items) if (i.event.to !== null) memo.set(i.path, i.event.to)
+        toldHere.set(thread, memo)
         await update($, reads, m => {
           const t = { ...(m[thread] ?? {}) }
           for (const i of items) if (t[i.path] && i.event.to !== null) t[i.path] = { ...(t[i.path] as FleetRead), told: i.event.to }
@@ -2415,6 +2491,10 @@ async function busyDelivery($: any): Promise<{ text: string; told: () => Promise
 // each compute the same lines before any marked them told. A lock of this copy of the module only: what's told lives
 // in $.state
 const lineChains = new Map<string, Promise<unknown>>()
+// What this copy of the module told each thread, by path → the version told: $.state's marks reach a parallel call of
+// the same step only once the call that wrote them returns, so the calls of one batch, one after the other in the chain,
+// would each tell the same change again
+const toldHere = new Map<string, Map<string, string>>()
 
 /** A tool's result with the digest (and any other lines) for the model, when it can carry them. One at a time per
  * thread, from computing the lines to marking them told, so a change is told once however many calls run together */
@@ -2480,13 +2560,17 @@ function sortedRevs(c: { revs: Map<number, Rev> }): Rev[] {
   return [...c.revs.values()].sort((a, b) => a.rev - b.rev)
 }
 
-/** A record's versions, oldest first: state/revs/<id>/, listed again when the folder's time moved (looked at once a
- * second at most) */
+/** A record's versions, oldest first: state/revs/<id>/, listed again when the folder's time moved. The folder is looked
+ * at again only after REVS_TRUST_MS, or at once after forget(id): every version written with an event (this session's,
+ * or another's through pullEvents) forgets it, so the sweeper's suspects passes don't stat every record's folder each
+ * time. A version written with no event (another session's first version of a record) is seen at the record's next
+ * landing or within REVS_TRUST_MS */
+const REVS_TRUST_MS = 10 * 60000
 async function revsOf($: any, id: string): Promise<Rev[]> {
   if (!/^[A-Za-z0-9._-]+$/.test(id) || id.startsWith('.')) return []
   const now = await $.clock.now()
   let c = revCache.get(id)
-  if (c && now - c.at < 1000) return sortedRevs(c)
+  if (c && now - c.at < REVS_TRUST_MS) return sortedRevs(c)
   let m = -1
   try {
     m = Number((await $.fs.stat(revDir(id))).mtimeMs)
@@ -3675,11 +3759,25 @@ async function bashHook($: any, e: any, next: any) {
     return r
   }
   const thread = threadOf(e)
+  const command = String(e.command ?? '')
+  // Whether it writes nothing in the world, by its syntax (a file it writes outside the shared files doesn't count),
+  // decided before it runs: such a command lands nothing, so it takes no look at the world before and after (two walks
+  // of every folder of it at each call); only the files it names that its thread read are looked at, so its model hears
+  // when one changed under it
+  let readOnly = false
+  try {
+    readOnly = bashWritesNothing(command, await bashTargetPredicate($), await checkScriptPredicate($))
+  } catch {}
   // From before its look at the world: a landing from then on isn't the command's, and a change the scan sees from
   // then on may be
   const startedAt = await $.clock.now()
   let before: Snapshot | undefined
-  if (!tooBig) {
+  let watched: Snapshot | null = null
+  if (readOnly) {
+    try {
+      watched = await namedReadsNow($, thread, command)
+    } catch {}
+  } else if (!tooBig) {
     try {
       before = await snapshot($)
     } catch {}
@@ -3702,15 +3800,15 @@ async function bashHook($: any, e: any, next: any) {
   }
   if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
   const extra: string[] = []
-  // Whether it writes nothing in the world, by its syntax (a file it writes outside the shared files doesn't count)
-  let readOnly = false
-  try {
-    readOnly = bashWritesNothing(String(e.command ?? ''), await bashTargetPredicate($), await checkScriptPredicate($))
-  } catch {}
   // Run in the background (or moved there): what it writes comes later. Its world as it was is kept under its task id,
   // and compared with when it completes (bgDone); meanwhile the sweeper takes a change it can't explain as probably its
-  // (not a command that writes nothing)
+  // (not a command that writes nothing: kept with its text only, for the restart note, and nothing to compare)
   const task = typeof r?.result?.backgroundTaskId === 'string' && r.result.backgroundTaskId ? (r.result.backgroundTaskId as string) : null
+  if (task && readOnly) {
+    await update($, bgCommands, m => ({ ...m, [task]: { thread, at: startedAt, before: [], readOnly: true, command: command.slice(0, 300) } }))
+    beatSoon($)
+    watched = null
+  }
   if (task && before) {
     // The whole command: what it names is what it may land (the heartbeat keeps 300 characters of it for the restart note)
     const b: FleetBg = { thread, at: startedAt, before: [...before].map(([p, s]) => [p, s.mtimeMs, s.size]), command: String(e.command ?? ''), ...(readOnly ? { readOnly: true } : {}) }
@@ -3721,13 +3819,60 @@ async function bashHook($: any, e: any, next: any) {
     before = undefined
   }
   try {
-    if (before) extra.push(...(await afterBash($, thread, before, startedAt, readOnly, String(e.command ?? ''))))
-    const target = bashReadTarget(String(e.command ?? ''))
+    if (before) extra.push(...(await afterBash($, thread, before, startedAt, readOnly, command)))
+    if (watched?.size) extra.push(...(await namedReadsAfter($, watched, startedAt)))
+    const target = bashReadTarget(command)
     if (target && r && !r.isError && r.deny === undefined) extra.push(...(await noteRead($, thread, target)))
   } catch (err) {
     log($, `after a Bash command: ${String(err).slice(0, 200)}`)
   }
   return withLines($, r, thread, extra)
+}
+
+/** The files a command that writes nothing names, that its thread read (at most NAMED_READS_MAX: past that, its digest
+ * tells it at its next step), as they are now */
+const NAMED_READS_MAX = 50
+async function namedReadsNow($: any, thread: string, command: string): Promise<Snapshot> {
+  const out: Snapshot = new Map()
+  const mine = (await read($, reads))[thread]
+  if (!mine || !realRoot) return out
+  const names = await bashNamer($, command)
+  const rels = Object.keys(mine).filter(rel => names(rel))
+  if (rels.length > NAMED_READS_MAX) return out
+  for (const rel of rels) {
+    try {
+      const s = await $.fs.stat(`${realRoot}/${rel}`)
+      if (s.kind === 'file') out.set(rel, { mtimeMs: Number(s.mtimeMs), size: Number(s.size) })
+    } catch {}
+  }
+  return out
+}
+
+/** Which of those changed while the command ran: none of them its own (it writes nothing), so another session's write
+ * landed meanwhile; told now, as afterBash tells a command that writes nothing. One whose event already says so and that
+ * this session knows as it is now needs no word */
+async function namedReadsAfter($: any, before: Snapshot, startedAt: number): Promise<string[]> {
+  const changed: string[] = []
+  for (const [rel, s] of before) {
+    let now: { mtimeMs: number; size: number } | null = null
+    try {
+      const x = await $.fs.stat(`${realRoot}/${rel}`)
+      if (x.kind === 'file') now = { mtimeMs: Number(x.mtimeMs), size: Number(x.size) }
+    } catch {}
+    if (!now || now.mtimeMs !== s.mtimeMs || now.size !== s.size) changed.push(rel)
+  }
+  if (!changed.length) return []
+  await pullEvents($)
+  const sessionId = String(await $.session.id())
+  const out: string[] = []
+  for (const rel of changed) {
+    const v = (await versionOf($, `${realRoot}/${rel}`)).v
+    const last = latest.get(rel)
+    const k = known.get(rel)
+    if ((last && last.to === v && last.at >= startedAt - 1000) || (k && k.v === v && v !== null)) continue
+    out.push(duringText(rel, last && last.to === v && last.by?.sessionId !== sessionId ? last : null, await meNow($)))
+  }
+  return out
 }
 
 /** A background command completed (classic.Stop no longer lists it, or it's a day old): what it changed since it
@@ -3742,7 +3887,8 @@ async function bgDone($: any, task: string) {
   })
   if (b) beatSoon($)
   saveReadsSoon($)
-  if (!b || !worldOn()) return
+  // A command that writes nothing took no look at the world: nothing to compare
+  if (!b || !worldOn() || (b.readOnly && !b.before.length)) return
   const before: Snapshot = new Map(b.before.map(([p, mtimeMs, size]) => [p, { mtimeMs, size }]))
   const lines = await afterBash($, b.thread, before, b.at, b.readOnly === true, b.command ?? null).catch(err => [`after the background command ${task}: ${String(err).slice(0, 200)}`])
   log($, `Bash in the background (${task}) completed${lines.length ? `: ${lines.join(' | ').slice(0, 400)}` : ''}`)
@@ -3887,7 +4033,7 @@ async function startWorld($: any) {
     if (p && 'threads' in p && p.threads.main) await update($, reads, () => ({ main: p.threads.main as Record<string, FleetRead> }))
   }
   await refreshName($)
-  await pullEvents($, 25)
+  await pullEvents($, 25, true)
   // fleet's own state (versions, suspects, check results, the sweeper's lease) stays out of git whatever .gitignore says
   await run($, ['mkdir', '-p', stateDir('revs'), stateDir('checks')])
   if (!(await exists($, stateDir('.gitignore')))) {
@@ -4049,6 +4195,8 @@ async function sweepTick($: any) {
       // Wakes and alerts first: a check or a commit that hangs to its timeout doesn't hold them
       await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
       await alertsTick($).catch(err => log($, `alerts: ${String(err).slice(0, 200)}`))
+      await writeSpends($).catch(err => log($, `spends: ${String(err).slice(0, 200)}`))
+      if (worldOn()) await indexEvents($).catch(err => log($, `events index: ${String(err).slice(0, 200)}`))
       if (worldUp) {
         await sweepChecks($)
         await maybeCommit($)
@@ -7244,30 +7392,79 @@ const stoppedSizes = new Set<string>()
 // Today's spend and cap of every instance (instances/<slug>/spend.json, state/lifts.json) and of the project; an
 // instance is over when its own budget or the project's is. A minute's cache (BUDGET_CACHE_MS): spends move once per
 // turn, and the band, the nudges and the heartbeat read it many times a minute in every session; read fresh at each
-// heartbeat, after a lift, by the sweeper's alerts, and before a helper is refused
+// heartbeat, after a lift, by the sweeper's alerts, and before a helper is refused.
+// The other instances' spends come from the sweeper's summary (state/spends.json: one file, where every instance reading
+// every instance's spend made N² reads a minute a project); this session's own spend as it is now. exact (the sweeper,
+// a helper's refusal, a summary missing, stale or a 0.12.1 sweeper's, and near or past the project's cap, where the
+// summary may lag a sweep) reads every spend.json
 const BUDGET_CACHE_MS = 60000
-async function budgets($: any): Promise<BudgetRow[]> {
+/** The sweeper's summary of today's spends, by slug (state/spends.json, the sweeper's, replaced with mv) */
+type SpendsFile = { format: number; day: string; at: number; usd: Record<string, number> }
+/** A summary older than this isn't used: its sweeper rewrites it at each change, and every SPENDS_REFRESH_MS anyway */
+const SPENDS_FRESH_MS = 5 * 60000
+const SPENDS_REFRESH_MS = 4 * 60000
+async function budgets($: any, exact = false): Promise<BudgetRow[]> {
   if (!roster) return []
   const now = await $.clock.now()
-  if (now - budgetCache.at < BUDGET_CACHE_MS) return budgetCache.list
+  if (!exact && now - budgetCache.at < BUDGET_CACHE_MS) return budgetCache.list
   const day = today(now)
   const lifts = await readWire<LiftsFile>($, stateDir('lifts.json'))
+  let usd: Record<string, number> | null = null
+  if (!exact && !sweep.holding) {
+    const s = await readWire<SpendsFile>($, stateDir('spends.json'))
+    if (s && s.day === day && typeof s.at === 'number' && now - s.at < SPENDS_FRESH_MS && s.usd && typeof s.usd === 'object') {
+      const got: Record<string, number> = {}
+      for (const inst of roster.instances) {
+        const v = Number(s.usd[inst.slug])
+        got[inst.slug] = Number.isFinite(v) && v > 0 ? v : 0
+      }
+      if (myInstance && roster.instances.some(i => i.slug === myInstance?.slug)) {
+        const own = await readWire<SpendFile>($, `${instDir(myInstance.slug)}/spend.json`)
+        got[myInstance.slug] = own && own.day === day ? own.usd : 0
+      }
+      usd = got
+    }
+  }
+  const summary = usd !== null
+  if (!usd) {
+    usd = {}
+    for (const inst of roster.instances) {
+      const s = await readWire<SpendFile>($, `${instDir(inst.slug)}/spend.json`)
+      usd[inst.slug] = s && s.day === day ? s.usd : 0
+    }
+  }
   const rows: Omit<BudgetRow, 'state'>[] = []
   let total = 0
   for (const inst of roster.instances) {
-    const s = await readWire<SpendFile>($, `${instDir(inst.slug)}/spend.json`)
-    const spent = s && s.day === day ? s.usd : 0
+    const spent = usd[inst.slug] ?? 0
     total += spent
     const cap = capFor(inst.usdDay, lifts, day, inst.slug)
     rows.push({ inst, usd: spent, cap, own: budgetState(spent, cap) })
   }
   const pcap = capFor(projectCap(roster.r), lifts, day, null)
   const project: ProjectBudget = { usd: total, cap: pcap, state: budgetState(total, pcap) }
+  // Near or past the project's cap the summary may lag a sweep: every spend as it is now
+  if (summary && project.state !== 'ok') return budgets($, true)
   const worst = (a: BudgetState, b: BudgetState): BudgetState => (a === 'over' || b === 'over' ? 'over' : a === 'warn' || b === 'warn' ? 'warn' : 'ok')
   budgetCache.at = now
   budgetCache.list = rows.map(r => ({ ...r, state: worst(r.own, project.state) }))
   budgetCache.project = project
   return budgetCache.list
+}
+
+/** The sweeper's summary of today's spends (state/spends.json), from its own reading of every spend.json: rewritten when
+ * a spend moved, and every SPENDS_REFRESH_MS anyway so its readers know it's current */
+let spendsWritten = { key: '', at: 0 }
+async function writeSpends($: any) {
+  if (!roster || !sweep.holding) return
+  const now = await $.clock.now()
+  const rows = await budgets($)
+  const day = today(now)
+  const usd: Record<string, number> = {}
+  for (const r of rows) usd[r.inst.slug] = r.usd
+  const key = JSON.stringify([day, usd])
+  if (key === spendsWritten.key && now - spendsWritten.at < SPENDS_REFRESH_MS) return
+  if (await replace($, stateDir('spends.json'), json({ format: FORMAT, day, at: now, usd }))) spendsWritten = { key, at: now }
 }
 
 function budgetWords(b: BudgetRow): string {
@@ -7306,9 +7503,8 @@ async function budgetLine($: any): Promise<{ line: string; key: string; urgent?:
 async function spawnRefusal($: any): Promise<string | null> {
   const inst = myInstance
   if (!inst) return null
-  // Read as it is now (within the old 5 s), not as the minute's cache last saw it: a refusal is the one thing it holds
-  if ((await $.clock.now()) - budgetCache.at >= 5000) budgetCache.at = 0
-  const b = (await budgets($)).find(x => x.inst.slug === inst.slug)
+  // Read as it is now, every spend (not the sweeper's summary, nor the minute's cache): a refusal is the one thing it holds
+  const b = (await budgets($, true)).find(x => x.inst.slug === inst.slug)
   if (b?.state !== 'over') return null
   return `fleet: ${budgetWords(b)} is used up, so no new helper starts until the person lifts it (/fleet budget "${inst.name}" +<dollars>). Your other tools still work: finish what you can yourself, write down where you stopped, and end your turn.`
 }
@@ -10699,8 +10895,26 @@ async function copyTree($: any, from: string, to: string, rel: string, written: 
 // what's malformed, and he can overrule them ----
 
 const judging = new Set<string>()
-// The register's records as read (each file is written once, so what's read stays as it was)
+// The register's records as read (each file is written once, so what's read stays as it was), kept while they're used:
+// REGISTER_KEEP_MS after the last registerAll they're let go, so a long-lived instance that judged one choice, or a
+// person's session that ran the brief, doesn't hold the whole register parsed for the rest of its life
 const registerCache = new Map<string, RegisterRecord | OverruleRecord | null>()
+const REGISTER_KEEP_MS = 10 * 60000
+let registerUsedAt = 0
+let registerRelease = false
+function releaseRegisterLater($: any) {
+  if (registerRelease) return
+  registerRelease = true
+  $.clock.after(REGISTER_KEEP_MS, () =>
+    bg(
+      (async () => {
+        registerRelease = false
+        if ((await $.clock.now()) - registerUsedAt >= REGISTER_KEEP_MS - 1000) registerCache.clear()
+        else releaseRegisterLater($)
+      })(),
+    ),
+  )
+}
 
 function judgeFile(id: string): string {
   return dec(`judge/${id}.json`)
@@ -10741,6 +10955,8 @@ async function registerAll($: any): Promise<{ records: RegisterRecord[]; overrul
     }
   }
   for (const k of [...registerCache.keys()]) if (!seen.has(k)) registerCache.delete(k)
+  registerUsedAt = await $.clock.now()
+  releaseRegisterLater($)
   return { records, overrules }
 }
 
