@@ -20,8 +20,11 @@
 //                                        no-clobber (it's applied or sent once)
 //   decisions/register/YYYY-MM/<id>.json person data (registerFormat): every closed decision and recorded dialog, and
 //                                        each piece of the person's taste (T-<n>, mcp__fleet__taste)
+//   decisions/register/YYYY-MM/D-<n>.overrule.json  person data: the person's correction of a judge's answer, once
 //   decisions/judge/D-<n>.json           wire: what the judge proposed on a choice (judges.ts), written once by the session
 //                                        that asked; it goes into the register with the decision
+//   decisions/overrules/D-<n>.json, D-<n>.review.json  wire: an overrule on its way to the asker and to the reviewer,
+//                                        written once by the person's session
 //   decisions/last                       wire: the highest D-<n> handed out (a hint for the next one)
 //   decisions/prune/YYYY-MM-DD           wire: the session that publishes it runs that day's prune
 //   decisions/tmp/                       files about to be published or moved into place (events' too)
@@ -33,6 +36,10 @@
 //   reads/<sessionId>.json               wire: what that session's threads read of the world, the outside content its
 //                                        conversation read and the Bash commands it runs now, written only by it
 //   state/revs/<id>/<n>.json             wire: version n of the record <id> (records.ts), published no-clobber
+//   state/revs/<id>/<n>.by.json          wire: who really landed version n (a tool landing a peer's blind post-scan took
+//                                        first), written once
+//   state/confirms/<hash>.json           wire: files a session checked against a record as it is now (mcp__fleet__confirm),
+//                                        written once
 //   state/writing/<hash>-<sid8>-<thread>.json  wire: a Write or Edit of a world file in flight (the text it will leave,
 //                                        when first marked), put in place (mv) by its session every 10 s while it
 //                                        waits, done after its event; gone 10 min on
@@ -51,8 +58,12 @@
 //   state/slots/<slot>/<n>.json          wire: lease n of a slot, published no-clobber by its taker (slots.ts)
 //   state/slots/<slot>/waiting/<who>.json  wire: one in line for a slot, written by the session that waits
 //   state/judges/<day>/<sid8>.json       wire: a session's judge calls and their cost today, written only by it
-//   state/work.json                      wire: the open board items nobody owns, their offers, the capacity line
-//                                        (the sweeper's)
+//   state/judges.json                    wire: the live areas and the person's reviews of live answers (the last write wins)
+//   state/code.json                      wire: the code watch's markers and overlaps (code.ts), the sweeper's
+//   state/work.json                      wire: the open board items nobody owns, their offers, the capacity line, the
+//                                        quiet runs and the band's restart line (the sweeper's)
+//   state/pinned.json                    wire: the pins fleet asked sessions for (the sweeper's)
+//   state/reproduce.json                 wire: the results watched and the reproduction items opened (the sweeper's)
 //   runs/run-<n>.json, .done.json, .recorded.json  wire: a long run declared by its owner, its done-file seen by the
 //                                        sweeper, its result recorded by its owner; each published no-clobber (runs.ts)
 //   inbox/<source>/<name>.json, latest   a poller's items (itemFormat, intake.ts), and the trigger it rewrites
@@ -63,6 +74,9 @@
 //   instances/<slug>/state.json          wire: an instance's heartbeat, written only by its fleet
 //   instances/<slug>/spend.json, nudges.json, seed-<ref>.json  wire: its spend today, its nudges, its seed sent
 //   instances/<slug>/blocks.json         wire: what auto mode blocked it today (roster.ts), written only by its fleet
+//   instances/<slug>/poll.json           wire: its last routine poll, written only by its fleet
+//   instances/<slug>/restart.json        wire: the restart the person asked of it (/fleet up --restart-when-idle, a roster
+//                                        change), read by its own fleet
 // A reader that meets another format acts on nothing and says to restart (u): there is no code for older formats.
 
 import type { OutsideMark, ResourceSpec } from './authority'
@@ -70,8 +84,8 @@ import type { ChangeSpec } from './drafts'
 import type { JudgeEntry, TasteSpec } from './judges'
 import type { OutboundSpec } from './outbound'
 
-/** The format of the wire files: queue/, answers/, applied/, last, prune/, events/, reads/, state/, runs/, instances/. Raise it
- * when a key or its meaning changes */
+/** The format of the wire files: queue/, answers/, applied/, judge/, overrules/, last, prune/, events/, bell/, reads/,
+ * state/, runs/, intake/seen/, instances/. Raise it when a key or its meaning changes */
 export const FORMAT = 1
 /** Person data: the register. It only gains fields, and a write keeps the fields it doesn't know */
 export const REGISTER_FORMAT = 1
@@ -984,7 +998,7 @@ export function parseConfig(textIn: string): { config: Config } | { problem: str
 }
 
 export function gitignoreText(commitRegister: boolean): string {
-  const runtime = "# What fleet's sessions write as they work: the landings on shared files, what each session read, versions and flags, each instance's settings and state\nevents/\nreads/\nstate/\ninstances/\n# Items from outside as they arrived (the inbox, and intake's raw items, duplicates and seen marks)\ninbox/\nintake/\n"
+  const runtime = "# What fleet's sessions write as they work: the landings on shared files, what each session read, versions and flags, each instance's settings and state, the bells of live updates, the long runs declared\nevents/\nreads/\nstate/\ninstances/\nbell/\nruns/\n# Items from outside as they arrived (the inbox, and intake's raw items, duplicates and seen marks)\ninbox/\nintake/\n"
   return commitRegister
     ? `# Written by /fleet init from config.json ("commitRegister": true): the register is committed, the rest of decisions/ is not\ndecisions/*\n!decisions/register/\n${runtime}`
     : `# Written by /fleet init from config.json ("commitRegister": false): fleet's decisions and their register stay out of git\ndecisions/\n${runtime}`

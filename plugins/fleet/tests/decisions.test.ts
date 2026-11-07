@@ -247,6 +247,8 @@ test('formats: wire files of another format are recognised, config.json from a n
   expect(gitignoreText(false)).toContain('\ndecisions/\n')
   expect(gitignoreText(false)).toContain('\ninbox/\nintake/\n')
   expect(gitignoreText(true)).toContain('decisions/*\n!decisions/register/\n')
+  // The bells (live updates, rewritten all the time) and the run register stay out of git too, either way
+  for (const commit of [false, true]) expect(gitignoreText(commit)).toContain('\nbell/\nruns/\n')
 })
 
 test('register months', () => {

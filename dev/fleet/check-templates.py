@@ -6,7 +6,9 @@ roster has its role file with fleet's tools in it (without them they'd be hidden
 role, section and parent exist, and every role has its seed. Every template has its verify.md; world.json's code
 entries have a kind fleet knows and what it needs, its proofs lists are lists of strings, and a check's script under
 .claude/fleet/ ships with the template; a role verifies roles or instances of the roster, and a role's or an
-instance's code names world.json's. Sections are the person's across projects, so across the templates one id has one
+instance's code names world.json's. A template whose roles write board items has board/** in world.json, every role
+file keeps AskUserQuestion and SendMessage, subscriptions name world.json's tags and intake's kinds, and derived
+documents have an owner. Sections are the person's across projects, so across the templates one id has one
 title and order, and two ids never share an order. /fleet up --dry-run lints a project's own roster fully.
 """
 import json
