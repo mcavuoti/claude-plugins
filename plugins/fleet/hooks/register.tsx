@@ -10266,20 +10266,44 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   return [...out, 'Now:', ...results, 'Each one binds and seeds itself within a minute (/fleet status shows them); a row marked ✗ has no fleet and needs a restart (u).'].join('\n')
 }
 
+/** The ways a target names a session, as sessions' wake reads it: trimmed, its surrounding quotes taken off, "sid:" taken
+ * off, and the "name [ref]" form sessions hands back for SendMessage split into the name and the ref. Lower case */
+function wakeTargetKeys(target: unknown): string[] {
+  if (typeof target !== 'string') return []
+  let t = target.trim()
+  for (;;) {
+    const q = /^(["'“”‘’«»])([\s\S]*)(["'“”‘’«»])$/.exec(t)
+    if (!q) break
+    t = (q[2] ?? '').trim()
+  }
+  t = t.replace(/^sid:\s*/i, '')
+  const keys = new Set<string>()
+  const bracket = /^(.*?)\s*\[\s*(?:sid:\s*)?([^\]]+?)\s*\]$/.exec(t)
+  if (bracket) {
+    const name = (bracket[1] ?? '').trim()
+    if (name) keys.add(name.toLowerCase())
+    keys.add((bracket[2] ?? '').trim().toLowerCase())
+  } else if (t) keys.add(t.toLowerCase())
+  return [...keys]
+}
+
 /** Why sessions' mcp__sessions__wake is refused for this target: an instance of this project's roster, named by its name
- * (as the roster or the panel spells it, any case) or by its job's short id (its heartbeat's ref or sessionId). Null for
- * anything else, or with no roster here */
+ * (as the roster or the panel spells it, any case, quoted or not, alone or as "name [ref]") or by its job's id (its
+ * heartbeat's ref, or its session id whole or by a prefix of 6 or more). Null for anything else, or with no roster here */
 async function rosterWakeRefusal($: any, target: unknown): Promise<string | null> {
   await locate($)
-  const want = typeof target === 'string' ? target.trim().replace(/^sid:/, '') : ''
-  if (!root || !want) return null
+  const keys = wakeTargetKeys(target)
+  if (!root || !keys.length) return null
   await loadRoster($)
   const all = roster ? roster.instances : []
-  let inst = all.find(i => i.name.toLowerCase() === want.toLowerCase()) ?? null
-  if (!inst && /^[0-9a-f-]{6,}$/i.test(want))
+  let inst = all.find(i => keys.includes(i.name.toLowerCase())) ?? null
+  const ids = keys.filter(k => /^[0-9a-f-]{6,}$/.test(k))
+  if (!inst && ids.length)
     for (const i of all) {
       const hb = await heartbeatOf($, i.slug)
-      if (hb && (hb.ref === want || (typeof hb.sessionId === 'string' && hb.sessionId.startsWith(want)))) {
+      const ref = typeof hb?.ref === 'string' ? hb.ref.toLowerCase() : ''
+      const sid = typeof hb?.sessionId === 'string' ? hb.sessionId.toLowerCase() : ''
+      if (hb && ids.some(k => k === ref || (sid && sid.startsWith(k)))) {
         inst = i
         break
       }
