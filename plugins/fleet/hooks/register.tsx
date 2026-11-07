@@ -3820,6 +3820,8 @@ async function scanWorld($: any) {
   await pullEvents($)
   // Asked once a scan, when a change is to be recorded: the commands running that may be its author
   let running: RunningNow | null = null
+  // The changes this scan records (once their claims are taken), each settled after
+  const todo: { rel: string; s: ReturnType<typeof snap.get>; f: { v: string | null; text: string | null }; v: string | null; k: ReturnType<typeof known.get>; last: ChangeEvent | undefined; claim: string; author: Author; settle: () => void }[] = []
   for (const rel of changed) {
     const s = snap.get(rel)
     const f = s ? await versionOf($, `${realRoot}/${rel}`) : { v: null, text: null }
@@ -3850,24 +3852,63 @@ async function scanWorld($: any) {
       continue
     }
     const claim = `${eventsDir('claims')}/${hashText(`${rel}\n${v ?? 'removed'}\n${Math.floor(s?.mtimeMs ?? k?.mtimeMs ?? 0)}`).slice(1)}`
-    if ((await publish($, claim, json({ format: FORMAT, path: rel, at: now }))) === 'ok') {
-      const id = records ? idOf(rel, records) : null
-      if (id && k?.v) await ensureBase($, id, rel, k.v, k.pins ?? [], null)
-      // A background command ran when it changed, or one that didn't name it ran when it got its time, and nobody else's
-      // did: probably its doing (never the person's for sure), recorded as that session's, blind. With more than one,
-      // nobody's: outside fleet, with who ran then
-      const by = author.who
-      const fields = await landRecord($, rel, f, by ? 'bash' : 'outside', by)
-      // Recorded now: a copy that kept an older time (rsync -a, cp -p) is still news to a thread that read the file
-      // since. Its own time only says when it changed
-      const from = last && last.to !== v ? last.to : (k?.v ?? null)
-      if (by) {
-        const ev = await writeEvent($, { path: rel, from, to: v, via: 'bash', tool: 'Bash', blind: true, by, probably: true, ...fields })
-        if (ev) await overwroteLater($, ev, last)
-      } else await writeEvent($, { ...(s ? { changedAt: Math.floor(s.mtimeMs) } : {}), path: rel, from, to: v, via: 'outside', blind: true, by: null, ...(author.candidates.length ? { candidates: author.candidates } : {}), ...fields })
-    }
-    settle()
+    todo.push({ rel, s, f, v, k, last, claim, author, settle })
   }
+  if (!todo.length) return
+  // What the scan records, in a few shells whatever its size (a folder of 1,500 files written at once outside fleet was
+  // 3,000 processes and as many triggers): the claims in one, the records' new versions in one, the events in one, and
+  // one trigger for them all, as a command's post-scan does
+  const claims = await publishAll($, todo.map(x => ({ path: x.claim, text: json({ format: FORMAT, path: x.rel, at: now }) })))
+  const mine = todo.filter(x => claims.get(x.claim) === 'ok')
+  const plans: { x: (typeof todo)[number]; by: Who | null; plan: RevPlan | null }[] = []
+  for (const x of mine) {
+    const id = records ? idOf(x.rel, records) : null
+    if (id && x.k?.v) await ensureBase($, id, x.rel, x.k.v, x.k.pins ?? [], null)
+    // A background command ran when it changed, or one that didn't name it ran when it got its time, and nobody else's
+    // did: probably its doing (never the person's for sure), recorded as that session's, blind. With more than one,
+    // nobody's: outside fleet, with who ran then
+    const by = x.author.who
+    // A removal is reckoned once what came with it is landed (a renamed record's new file: its twin, not a retraction)
+    const plan = x.s ? await planRecord($, x.rel, x.f, by ? 'bash' : 'outside', by) : null
+    if (plan?.over) await correctRev($, plan.over, by, {})
+    plans.push({ x, by, plan })
+  }
+  const planned = plans.filter(y => y.plan?.entry)
+  const versions = await publishAll($, planned.map(y => ({ path: revPath(y.plan?.entry as Rev), text: json(y.plan?.entry) })))
+  const fieldsOf = new Map<string, Partial<ChangeEvent>>()
+  for (const { x, plan } of plans) {
+    if (!plan) continue
+    const r = plan.entry ? versions.get(revPath(plan.entry)) : undefined
+    fieldsOf.set(x.rel, !plan.entry ? plan.fields : r === 'ok' ? revLanded(plan, plan.entry.rev) : await publishRev($, plan, r ?? 'exists'))
+    // Known at once: a removal reckoned next finds its record's new file (a rename) and adds no version
+    x.settle()
+  }
+  for (const { x, by, plan } of plans) if (!plan) fieldsOf.set(x.rel, await landRecord($, x.rel, x.f, by ? 'bash' : 'outside', by))
+  const evs: { x: (typeof todo)[number]; ev: Awaited<ReturnType<typeof eventFor>> }[] = []
+  for (const { x, by } of plans) {
+    const fields = fieldsOf.get(x.rel) ?? {}
+    // Recorded now: a copy that kept an older time (rsync -a, cp -p) is still news to a thread that read the file
+    // since. Its own time only says when it changed
+    const from = x.last && x.last.to !== x.v ? x.last.to : (x.k?.v ?? null)
+    if (by) {
+      // Probably one session's (rare, one at a time): its own event, and the overwrite note to its writer
+      const ev = await writeEvent($, { path: x.rel, from, to: x.v, via: 'bash', tool: 'Bash', blind: true, by, probably: true, ...fields })
+      if (ev) await overwroteLater($, ev, x.last)
+    } else evs.push({ x, ev: await eventFor($, { ...(x.s ? { changedAt: Math.floor(x.s.mtimeMs) } : {}), path: x.rel, from, to: x.v, via: 'outside', blind: true, by: null, ...(x.author.candidates.length ? { candidates: x.author.candidates } : {}), ...fields }) })
+  }
+  const published = await publishAll($, evs.map(({ ev }) => ({ path: ev.path, text: json(ev.e) })))
+  let lastName = ''
+  for (const { x, ev } of evs) {
+    const r = published.get(ev.path)
+    if (r === 'ok') {
+      eventLanded($, ev)
+      lastName = ev.name
+    } else if (r === 'exists') await writeEvent($, { ...ev.e })
+    else log($, `couldn't write the event of ${x.rel}`)
+  }
+  if (lastName) await trigger($, lastName)
+  if (evs.length > 1) log($, `scan: ${evs.length} files changed outside fleet, recorded together`)
+  for (const x of todo) x.settle()
 }
 
 // At the start, from the timers: the world, this session's reads after a restart, the events of the last day

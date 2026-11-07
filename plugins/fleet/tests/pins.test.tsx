@@ -369,6 +369,25 @@ test('the world commit: only the shared files, with --only so other staged work 
   expect(await fleet($, 'status')).toMatch(/world commits: every 60 min, only the shared files; last at \d\d:\d\d \(the project is a linked worktree/)
 })
 
+test('many files written at once outside fleet are recorded in a few processes (claims, versions and events each in one), one event per file', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { worldPaths: ['notes/**', 'req/**'], files: { [PLAN]: 'plan\n' } })
+  await begin($, w)
+  await tick(w)
+  // 40 notes and 10 records arrive at once (a copy, an unpacked archive), nobody's command
+  for (let i = 1; i <= 40; i++) w.touch(`${ROOT}/notes/n-${i}.md`, `note ${i}\n`)
+  for (let i = 1; i <= 10; i++) w.touch(`${ROOT}/req/R-${i}.md`, `R-${i} v1\n`)
+  const before = w.runs.length
+  await tick(w, 10000)
+  await tick(w, 10000)
+  await tick(w)
+  const spawned = w.runs.slice(before).filter(a => a[0] === 'ln' || a[0] === 'sh' || a[0] === 'mv')
+  // It was two processes a file (a claim and an event, each its own ln) and a trigger each: about a hundred
+  expect(spawned.length).toBeLessThan(12)
+  const outside = events(w).filter(e => e.via === 'outside' && (e.path.startsWith('notes/n-') || e.path.startsWith('req/R-')))
+  expect(outside.length).toBe(50)
+  expect(json(w, `${STATE}/revs/R-7/1.json`)).toMatchObject({ rev: 1, path: 'req/R-7.md' })
+})
+
 test('a world commit in a project that is not a git repository backs off as a failure, and /fleet status says why', WITH_SESSIONS, async ($, on) => {
   const w = world(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], commit: { everyMin: 60 } }), [PLAN]: 'plan\n' } })
   let revParses = 0
