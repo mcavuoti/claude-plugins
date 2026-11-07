@@ -84,6 +84,10 @@ declare module 'claude-code' {
       pendingPerson: { text: string; at: number; origin?: string } | null
       /** Main-thread turns started in this process (a background session's first prompt can be its launch prompt) */
       turns: number
+      /** When the prompt box was submitted, for the /fleet commands those submits carry (one each, a short while) */
+      typedSubmits: number[]
+      /** /fleet up's wakes still to send, one every few seconds (survives a reload; checked again when sent) */
+      pendingWakes: { ref: string; slug: string; name: string; force: boolean; named: boolean; due: number }[]
       /** When this conversation started (the session's start, or its last /clear): its period, for fresh periods */
       conversationAt: number
       /** When this session last landed something in the shared world (an instance's cadence) */
