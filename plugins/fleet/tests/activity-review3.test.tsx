@@ -40,7 +40,11 @@ test('an item every tester was offered and none took: the front door still hears
   const w = world(on, {
     worldPaths: ['notes/**', 'board/**'],
     env: { FLEET_ROOT: ROOT, FLEET_INSTANCE: 'Chief', FLEET_ROLE: 'chief' },
-    files: { [`${FLEET}/roster.json`]: JSON.stringify(TEAM), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${FLEET}/instances/chief.json`]: '{"env":{}}\n', [`${ROOT}/notes/plan.md`]: '# plan\n', [`${ROOT}/board/B-5.md`]: '---\nowner: open\nstatus: open\nfor: tester\n---\n# Measure on the lab machine\n' },
+    files: { [`${FLEET}/roster.json`]: JSON.stringify(TEAM), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${FLEET}/instances/chief.json`]: '{"env":{}}\n', [`${ROOT}/notes/plan.md`]: '# plan\n', [`${ROOT}/board/B-5.md`]: '---\nowner: open\nstatus: open\nfor: tester\n---\n# Measure on the lab machine\n',
+      // Idle well past half an hour (the front door hears only those)
+      [`${FLEET}/instances/tester-1/state.json`]: JSON.stringify({ format: 1, instance: 'Tester 1', slug: 'tester-1', ref: 'ttttttt1', sessionId: 'ttttttt1-0000-0000-0000-000000000000', at: NOW, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: NOW - 2 * HOUR }),
+      [`${FLEET}/instances/tester-2/state.json`]: JSON.stringify({ format: 1, instance: 'Tester 2', slug: 'tester-2', ref: 'ttttttt2', sessionId: 'ttttttt2-0000-0000-0000-000000000000', at: NOW, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: NOW - 2 * HOUR }),
+    },
   })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: [], cost: { usd: 0.1 } } }))
   on('classic.SessionStart', () => ({}))

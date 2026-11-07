@@ -172,8 +172,8 @@ test('a fresh period waits while a restart is pending', WITH_SESSIONS, async ($,
 // ---- 5. the front door's idle line skips an item opened since the last sweep ----
 
 test("the front door's idle line leaves out an instance an item opened since the last sweep fits", WITH_SESSIONS, async ($, on) => {
-  const work = { format: 1, at: NOW, unowned: {}, capacity: { idle: ['PoC A', 'Tester 1'], unowned: 0, oldest: null, slotsFree: null, slotsTotal: null, runs: 0, unrecorded: 0, flags: [] } }
-  const w = member(on, 'Chief', { [`${FLEET}/state/work.json`]: JSON.stringify(work) })
+  const work = { format: 1, at: NOW, unowned: {}, capacity: { idle: ['PoC A', 'Tester 1'], unowned: 0, oldest: null, slotsFree: null, slotsTotal: null, runs: 0, unrecorded: 0, flags: [], idleSince: { 'PoC A': NOW - 2 * 3600000, 'Tester 1': NOW - 2 * 3600000 } } }
+  const w = member(on, 'Chief', { [`${FLEET}/state/work.json`]: JSON.stringify(work), [`${FLEET}/instances/poc-a/state.json`]: JSON.stringify({ format: 1, instance: 'PoC A', slug: 'poc-a', ref: 'ppppppp1', sessionId: 'ppppppp1-0000-0000-0000-000000000000', at: NOW, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: NOW - 2 * 3600000 }), [`${FLEET}/instances/tester-1/state.json`]: JSON.stringify({ format: 1, instance: 'Tester 1', slug: 'tester-1', ref: 'ttttttt1', sessionId: 'ttttttt1-0000-0000-0000-000000000000', at: NOW, cwd: ROOT, bound: true, settingsHash: null, agentType: 'owner', cost: 0, startedAt: NOW - 2 * 3600000 }) })
   await startSession($, w)
   await tick(w)
   // fleet opened B-1 for the testers a moment ago; the sweep that offers it hasn't written work.json yet
