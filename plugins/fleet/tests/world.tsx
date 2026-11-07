@@ -55,7 +55,8 @@ export const FAKE_SESSIONS = {
       const api: EngineInterface['sessions'] = {
         // extra: the methods sessions 0.13.8 added (pin, restart), listed only when a test says so: unlisted, fleet goes
         // on as with an older sessions
-        contract: async () => ({ api: 1, version: '0.13.0', format: 2, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', ...((await world()).extra ?? [])] }),
+        // version: what sessions says it is (a test sets it to try what a newer one serves, as wake's force from 0.15.1)
+        contract: async () => ({ api: 1, version: (await world()).version ?? '0.13.0', format: 2, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', ...((await world()).extra ?? [])] }),
         current: async () => (await world()).current ?? { ready: false, ref: null, sessionId: '', name: '', root: '', background: false, agent: null },
         status: async input => {
           // Logged too, so a test can count a session's status calls
