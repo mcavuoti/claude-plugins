@@ -369,6 +369,26 @@ test('the world commit: only the shared files, with --only so other staged work 
   expect(await fleet($, 'status')).toMatch(/world commits: every 60 min, only the shared files; last at \d\d:\d\d \(the project is a linked worktree/)
 })
 
+test('a world commit in a project that is not a git repository backs off as a failure, and /fleet status says why', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], commit: { everyMin: 60 } }), [PLAN]: 'plan\n' } })
+  let revParses = 0
+  w.exec.value = argv => {
+    if (argv[0] !== 'git') return undefined
+    if (argv[3] === 'rev-parse') {
+      revParses++
+      return { exitCode: 128, stderr: 'fatal: not a git repository (or any of the parent directories): .git' }
+    }
+    return { exitCode: 0 }
+  }
+  await begin($, w)
+  // Half an hour of sweeps: the commit tried at the first, then 5 and 10 minutes after; the worktrees looked for every
+  // 10 minutes outside git (it was a rev-parse at every sweep, 30 more)
+  for (let i = 0; i < 30; i++) await tick(w, 60000)
+  expect(revParses).toBeLessThan(12)
+  expect(json(w, `${STATE}/commit.json`)).toMatchObject({ ok: false, failures: 3 })
+  expect(await fleet($, 'status')).toMatch(/world commits: every 60 min, only the shared files; none yet; the last try failed: not a git repository: world\.json's commit works in a project kept in git/)
+})
+
 test('R10: a world commit that fails waits 5, 10, 20 min for its next try; a check that can’t run waits 10 min or a change of its script', WITH_SESSIONS, async ($, on) => {
   const checks = [{ glob: 'notes/**', argv: ['bash', 'checks/notes.sh'] }]
   const w = world(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], checks, commit: { everyMin: 60 } }), [`${ROOT}/checks/notes.sh`]: 'echo\n', [PLAN]: 'plan\n' } })

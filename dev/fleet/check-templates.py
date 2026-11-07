@@ -6,8 +6,8 @@ roster has its role file with fleet's tools in it (without them they'd be hidden
 role, section and parent exist, and every role has its seed. Every template has its verify.md; world.json's code
 entries have a kind fleet knows and what it needs, its proofs lists are lists of strings, and a check's script under
 .claude/fleet/ ships with the template; a role verifies roles or instances of the roster, and a role's or an
-instance's code names world.json's. A template whose roles write board items has board/** in world.json, every role
-file keeps AskUserQuestion and SendMessage, subscriptions name world.json's tags and intake's kinds, and derived
+instance's code names world.json's. A template whose roles write board items has board/** in world.json (and a world with board/**
+says it's editorial by default), every role file keeps AskUserQuestion and SendMessage, subscriptions name world.json's tags and intake's kinds, and derived
 documents have an owner. Sections are the person's across projects, so across the templates one id has one
 title and order, and two ids never share an order. /fleet up --dry-run lints a project's own roster fully.
 """
@@ -65,6 +65,10 @@ for t in templates:
     writes_board = agents.is_dir() and any('board/B-<n>.md' in f.read_text() for f in agents.glob('*.md'))
     if writes_board and isinstance(world, dict) and 'board/**' not in world.get('paths', []):
         say(t / 'fleet/world.json', 'its roles write board items (board/B-<n>.md) but its paths lack board/**')
+    # A world with the board says board items are editorial by default (only a revision change line tells their citers),
+    # as /fleet status asks of a project: a template without it shows that note in every project made from it
+    if isinstance(world, dict) and 'board/**' in world.get('paths', []) and 'board/**' not in (world.get('defaultKind') or {}):
+        say(t / 'fleet/world.json', 'its paths have board/** but defaultKind doesn\'t say board/** is editorial')
     if not (t / 'fleet/verify.md').is_file():
         say(t / 'fleet/verify.md', 'missing: how the project proves something works, which every role reads before it lands')
     # The code fleet watches: each repository or depot by a name the roster's "code" uses

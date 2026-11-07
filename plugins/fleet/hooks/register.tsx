@@ -5513,7 +5513,14 @@ async function maybeCommit($: any) {
     sweep.commitNote = n
   }
   const g = await gitOf($, realRoot)
-  if (!g) return note('not a git repository')
+  if (!g) {
+    // Not a repository (a template's commit in a project kept out of git): a failure like any other, so its next try
+    // waits 5, 10, 20… minutes instead of a git at every sweep, and /fleet status says why
+    const failures = Number(last?.format === FORMAT ? last.failures || 0 : 0) + 1
+    const error = "not a git repository: world.json's commit works in a project kept in git (git init, or take \"commit\" out of world.json)"
+    await replace($, stateDir('commit.json'), json({ format: FORMAT, at: Number(last?.format === FORMAT ? last.at || 0 : 0), tried: now, ok: false, files: 0, error, failures }))
+    return note('not a git repository')
+  }
   if (g.gitDir !== g.common) return note('the project is a linked worktree: fleet commits only in the main checkout')
   if (await exists($, `${g.common}/index.lock`)) return note('git is busy (index.lock): next minute')
   if ((await run($, ['git', '-C', realRoot, 'var', 'GIT_COMMITTER_IDENT'])).exitCode !== 0) return note('git has no user.name and user.email here')
@@ -5927,6 +5934,8 @@ type Heartbeat = {
   refusedUntil?: number
   /** The model its last request named (the roster's once fleet asked for it): a different one answered, the account's */
   asked?: string
+  /** When its last main-loop turn ended (idle since then while its row says idle); null before its first */
+  idleSince?: number | null
 }
 // That model, from turn.step (B4: a roster model the account lacks ran the org default, and nothing said so)
 let stepModel: string | null = null
@@ -6337,6 +6346,7 @@ async function heartbeat($: any, force = true) {
     ...(stepRefused?.effort ? { effortRefused: stepRefused.effort } : {}),
     ...(stepRefused ? { refusedTimes: stepRefused.times, refusedUntil: stepRefused.until } : {}),
     failed: turnFailed,
+    idleSince: (await read($, idleSince)) || null,
     classicStart: !!(await read($, classicSeen)).SessionStart,
     ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
     waits: await read($, waitsOn),
@@ -6711,6 +6721,9 @@ const runPolledAt = new Map<string, number>()
 /** Hosts a done-file poll couldn't reach, and until when they're left alone */
 const hostDown = new Map<string, { failures: number; until: number }>()
 const HOST_BACKOFF_MAX_MS = 30 * 60000
+/** How long an instance is idle (since it started, last landed or last ended a turn) before the front door hears it's
+ * idle with nothing to take */
+const FRONT_IDLE_MS = 30 * 60000
 async function pollRuns($: any, views: RunView[], now: number): Promise<boolean> {
   let any = false
   for (const v of views) {
@@ -7014,6 +7027,20 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
     for (const u of Object.values(work.unowned)) if (!u.allOffered) for (const i of candidatesFor(u.for, roster?.instances ?? [], front, u.writer ?? null)) waiting.add(i.name)
     let bare = work.capacity.idle.filter(n => n !== inst.name && !waiting.has(n))
     const k = `nothing|${Math.floor(now / HOUR)}`
+    // At most once an hour, and only about instances idle FRONT_IDLE_MS since they started, last landed or last ended a
+    // turn: one that just seeded, or just finished its work, isn't idle with nothing yet (a told line costs the front a turn)
+    const lastTold = Math.max(0, ...Object.entries(told).filter(([key]) => key.startsWith('nothing|')).map(([, at]) => at))
+    if (bare.length && told[k] === undefined && now - lastTold >= HOUR) {
+      const longIdle: string[] = []
+      for (const n of bare) {
+        const i = (roster?.instances ?? []).find(x => x.name === n)
+        const hb = i ? await heartbeatOf($, i.slug) : null
+        if (!hb) continue
+        const since = Math.max(hb.idleSince ?? 0, hb.startedAt ?? 0, hb.lastLanding ?? 0)
+        if (now - since >= FRONT_IDLE_MS) longIdle.push(n)
+      }
+      bare = longIdle
+    } else bare = []
     // An item opened since the sweep that wrote work.json (fleet's own, a peer's): the ones it fits aren't bare
     if (bare.length && told[k] === undefined) {
       for (const b of await boardItems($)) if (b.mtime >= work.at - 1000 && isUnowned(b)) for (const i of candidatesFor(b.for, roster?.instances ?? [], front)) waiting.add(i.name)
