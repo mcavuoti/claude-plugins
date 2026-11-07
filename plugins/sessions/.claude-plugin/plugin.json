@@ -30,6 +30,12 @@
       "description": "For all of the panel's notifications together. 0: none",
       "default": 5
     },
+    "sessionTools": {
+      "type": "boolean",
+      "title": "Tools for Claude to list and wake this project's sessions",
+      "description": "Claude in each session gets mcp__sessions__list (this project's other sessions) and mcp__sessions__wake (brings back a stopped background session of this project the background service retired, so SendMessage reaches it; never one you stopped). Off: neither is offered",
+      "default": true
+    },
     "staleMinutes": {
       "type": "number",
       "title": "⧗ after this many minutes",

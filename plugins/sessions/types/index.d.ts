@@ -78,6 +78,10 @@ export type TellInFlight = { id: string; at: number } | null
 // What this session's classic.SessionStart had the engine watch: the set of paths (WATCH_SET in hooks/watch.ts), for
 // which session id, and when; null when none came in this session (the panel then reads on a short timer)
 export type Watching = { set: number; sessionId: string; at: number } | null
+// The agent this session runs as (claude --agent), as its last classic.SessionStart said (agent_type; null: none), which
+// decides whether mcp__sessions__list and mcp__sessions__wake are registered; null when no SessionStart came in this
+// session (then they aren't)
+export type AgentRole = { agent: string | null } | null
 
 // ---- The API for other plugins: $.sessions, contract api 1 ----
 // What other plugins call. Everything above, and PluginState below, is this plugin's own and not part of it.
@@ -229,6 +233,7 @@ declare module 'claude-code' {
       watching: Watching
       ended: EndedNote
       away: string
+      agentRole: AgentRole
     }
   }
 }

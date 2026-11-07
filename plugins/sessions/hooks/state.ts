@@ -1707,3 +1707,173 @@ export function spendText(name: string, a: SpendAlert, mode: 'subscription' | 'a
   const usual = a.basis === 'project' ? `the project's sessions usually ${formatUsd(a.usual)}` : `usually ${formatUsd(a.usual)}`
   return `${who} spent ${formatUsd(a.hour)} in the last hour, ${usual}: check it isn't looping`
 }
+
+// ---- Tools for Claude: mcp__sessions__list and mcp__sessions__wake ----
+// Two tools the mod registers for the model of each interactive session (the sessionTools option, on by default): the
+// project's other sessions, and waking a stopped one so SendMessage can reach it. Their input stays as it is: other
+// plugins code against it (docs/plugin-contract.md)
+
+export type SessionTool = 'list' | 'wake'
+export const SESSION_TOOLS: readonly SessionTool[] = ['list', 'wake']
+
+// How long the start waits for their registration: an agent's file read and seen to allow them, or no agent; and an
+// agent whose file wasn't found (a plugin's agent, --agents JSON), where a registration the agent can't see would hold
+// it 8 s (Claude waits for the tool to show)
+export const TOOLS_WAIT_MS = 1000
+export const TOOLS_UNKNOWN_ROLE_WAIT_MS = 300
+
+// A list in an agent file's front matter (`tools: Read, Bash`, `tools: [Read, Bash]` or a `- Read` per line under it),
+// or null when the key isn't there
+function frontMatterList(front: string, key: string): string[] | null {
+  const lines = front.split(/\r?\n/)
+  const head = new RegExp(`^${key}\\s*:(.*)$`)
+  const i = lines.findIndex(l => head.test(l))
+  if (i < 0) return null
+  const rest = (lines[i]?.match(head)?.[1] ?? '').trim()
+  const items: string[] = []
+  if (rest) items.push(...rest.replace(/^\[/, '').replace(/\]$/, '').split(','))
+  else {
+    for (const l of lines.slice(i + 1)) {
+      const m = l.match(/^\s*-\s*(.*)$/)
+      if (m) items.push(m[1] ?? '')
+      else if (l.trim()) break
+    }
+  }
+  return items.map(s => s.trim().replace(/^['"]|['"]$/g, '').trim()).filter(Boolean)
+}
+
+// The tools of the two a list names: all of them for `*`, `mcp__sessions` or `mcp__sessions__*`
+function namedTools(items: readonly string[]): Set<SessionTool> {
+  const out = new Set<SessionTool>()
+  for (const t of items) {
+    if (t === '*' || t === 'mcp__sessions' || t === 'mcp__sessions__*') for (const x of SESSION_TOOLS) out.add(x)
+    else for (const x of SESSION_TOOLS) if (t === `mcp__sessions__${x}`) out.add(x)
+  }
+  return out
+}
+
+// Which of the tools to register in a session that runs as an agent (claude --agent <name>), from that agent's file
+// (null: none found), and how long the start waits for them. An agent whose `tools:` line doesn't name a tool can't see
+// it, and registering it anyway holds every start and restart of the session 8 s (Claude 2.1.319): those aren't
+// registered. No `tools:` line (the agent has every tool), or one that names them (`mcp__sessions__*`): registered.
+// `disallowedTools:` takes out the ones it names
+export function roleTools(file: string | null): { tools: SessionTool[]; waitMs: number; why: string } {
+  if (file === null) return { tools: [...SESSION_TOOLS], waitMs: TOOLS_UNKNOWN_ROLE_WAIT_MS, why: 'its agent file was not found (a plugin agent, or --agents)' }
+  const front = file.replace(/^﻿/, '').match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] ?? ''
+  const tools = frontMatterList(front, 'tools')
+  const allowed = tools === null ? new Set(SESSION_TOOLS) : namedTools(tools)
+  for (const t of namedTools(frontMatterList(front, 'disallowedTools') ?? [])) allowed.delete(t)
+  const out = SESSION_TOOLS.filter(t => allowed.has(t))
+  const why =
+    tools === null
+      ? 'its agent file has no tools: line'
+      : out.length
+        ? `its agent file's tools: line names ${out.map(t => `mcp__sessions__${t}`).join(' and ')}`
+        : "its agent file's tools: line doesn't name mcp__sessions__*"
+  return { tools: out, waitMs: TOOLS_WAIT_MS, why }
+}
+
+// The wakes Claude asked for through mcp__sessions__wake, shared by every session (the store's modelWakes, under the
+// <data>/bringback.lock folder): when, by which session and of which (session ids), kept for an hour. Limits: a caller
+// wakes at most 6 sessions in 10 minutes and 20 in an hour, and a session is woken at most 3 times in an hour (a
+// session that fails to start isn't woken in a loop)
+export type ModelWake = { at: number; by: string; target: string }
+export const WAKE_LIMITS = [
+  { who: 'caller', count: 6, ms: 600000 },
+  { who: 'caller', count: 20, ms: 3600000 },
+  { who: 'target', count: 3, ms: 3600000 },
+] as const
+export const WAKE_LOG_MS = 3600000
+export function modelWakesOf(value: unknown, now: number): ModelWake[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((w: any) => w && typeof w.at === 'number' && typeof w.by === 'string' && typeof w.target === 'string' && now - w.at < WAKE_LOG_MS && w.at <= now)
+    .map((w: any) => ({ at: w.at, by: w.by, target: w.target }))
+}
+
+// The limit a new wake would break, with when it can be asked again (the oldest wake that counts leaves its window),
+// or null
+export function wakeLimit(log: readonly ModelWake[], by: string, target: string, now: number): { who: 'caller' | 'target'; count: number; ms: number; until: number } | null {
+  for (const l of WAKE_LIMITS) {
+    const ats = log
+      .filter(w => (l.who === 'caller' ? w.by === by : w.target === target) && now - w.at < l.ms)
+      .map(w => w.at)
+      .sort((a, b) => a - b)
+    if (ats.length >= l.count) return { who: l.who, count: l.count, ms: l.ms, until: (ats[ats.length - l.count] ?? now) + l.ms }
+  }
+  return null
+}
+
+// A session as the tools name it: its short id (null for a regular session), Claude's name for it (what ListAgents and
+// SendMessage use; '' when it has none) and its title in the panel
+export type Pickable = { sessionId: string; id: string | null; name: string; title: string }
+
+// The sessions `asked` names, among a project's: by short id, session id, Claude's name or the panel's title, exactly,
+// else ignoring case; a name as ListAgents writes it ("W [ab12cd]") and quotes around it are taken too
+export function pickSession<T extends Pickable>(all: readonly T[], asked: string): { found: T } | { many: T[] } | { none: true } {
+  const text = asked
+    .trim()
+    .replace(/^["“'‘]+|["”'’]+$/g, '')
+    .replace(/\s+\[[0-9a-z]{4,12}\]$/i, '')
+    .trim()
+  if (!text) return { none: true }
+  const sid = text.startsWith('sid:') ? text.slice(4) : text
+  const pick = (match: (s: T) => boolean) => all.filter(match)
+  const tries = [
+    pick(s => s.id === text || s.sessionId === sid),
+    pick(s => s.name === text || s.title === text),
+    pick(s => s.name.toLowerCase() === text.toLowerCase() || s.title.toLowerCase() === text.toLowerCase()),
+  ]
+  for (const found of tries) {
+    if (found.length === 1 && found[0]) return { found: found[0] }
+    if (found.length > 1) return { many: found }
+  }
+  return { none: true }
+}
+
+// Why a stopped background session stopped, in the tools' words (SessionsStopped)
+export function stoppedWords(kind: 'person' | 'idle' | 'memory' | 'ended' | 'unknown'): string {
+  if (kind === 'idle') return 'retired for being idle'
+  if (kind === 'memory') return 'closed for lack of memory'
+  if (kind === 'person') return 'stopped by the person'
+  if (kind === 'ended') return 'ended by itself (a crash, or a restart of the machine or the background service)'
+  return 'stopped, and nothing says why'
+}
+
+// One line of mcp__sessions__list. wake: '' when mcp__sessions__wake would bring it back, else why not
+export type ToolRow = Pickable & { state: 'working' | 'idle' | 'waiting' | 'stopped'; stopped?: 'person' | 'idle' | 'memory' | 'ended' | 'unknown'; stoppedAt?: number; wake: string; agent: string | null }
+export function toolRowLine(r: ToolRow, now: number): string {
+  const name = r.name || r.title
+  const shown = r.name && r.title && r.title !== r.name ? ` (“${r.title}” in the panel)` : ''
+  const id = r.id ?? 'regular session'
+  const when = r.stoppedAt && r.stoppedAt <= now ? ` ${howLong(now - r.stoppedAt)} ago` : ''
+  const words = stoppedWords(r.stopped ?? 'unknown')
+  const state = r.state === 'stopped' ? `${words.startsWith('stopped') ? words : `stopped: ${words}`}${when}` : r.state === 'waiting' ? 'waiting for the person' : r.state
+  const wake = r.wake ? `wake: no (${r.wake})` : 'wake: yes'
+  return `- “${name}”${shown} · ${id} · ${state} · ${wake}${r.agent ? ` · runs as agent ${r.agent}` : ''}`
+}
+
+export function toolListText(rows: readonly ToolRow[], root: string, now: number): string {
+  if (rows.length === 0) return `This project (${root}) has no other sessions.`
+  return [
+    `This project's other sessions (${root}), by the name ListAgents and SendMessage know them:`,
+    ...rows.map(r => toolRowLine(r, now)),
+    'Running ones take SendMessage. SendMessage to a stopped one fails at once: one with "wake: yes" takes mcp__sessions__wake first (session: its name or short id), which says the name to SendMessage to.',
+  ].join('\n')
+}
+
+// Where SendMessage reaches a session, from ListAgents' rows (name, ref; every running session of the account, the
+// caller's own left out): "<name> [<ref>]" when one row has that name, its name alone when none or several do (the ref
+// is per process and changes at each restart)
+export function agentAddress(rows: readonly unknown[], name: string): string {
+  const same = rows.filter((r: any) => r && typeof r === 'object' && r.name === name) as { ref?: unknown }[]
+  const ref = same.length === 1 && typeof same[0]?.ref === 'string' && /^[0-9A-Za-z]{1,16}$/.test(same[0].ref) ? same[0].ref : ''
+  return ref ? `${name} [${ref}]` : name
+}
+
+// The line a woken session's row shows in every panel for WOKEN_MARK_MS: who woke it, a mark of the panel's own
+// (MarkSlot, under the store's marks:sessions:<its sessionId>)
+export const WOKEN_MARK_MS = 900000
+export function wokenLine(by: string): string {
+  return `woken by “${Array.from(by.trim() || 'another session').slice(0, 40).join('')}”`
+}
