@@ -244,7 +244,7 @@ test('after a restart: the sweeper wakes the one a restart stopped by itself, an
   const status = await fleet($, 'status')
   expect(status).toContain('after a restart: woke 1 after a restart')
   expect(status).toContain('Owner A · owner · Owners · wave 1 · stopped since a restart; fleet just woke it · job aaaaaaa1, session dddddddd')
-  expect(status).toContain('Owner C · owner · Owners · wave 1 · stopped by you · job ccccccc1')
+  expect(status).toContain('Owner C · owner · Owners · wave 1 · stopped by you (/fleet up --force wakes it) · job ccccccc1')
   expect(await fleet($, 'brief')).toContain('   - woken after a restart today: Owner A (')
   // Still stopped two minutes on (its wake didn't take): said as stopped again, not woken again for the same stop
   for (let k = 0; k < 3; k++) await tick(w, 61000)
@@ -256,7 +256,7 @@ test('after a restart: the sweeper wakes the one a restart stopped by itself, an
   // /fleet up still wakes it by hand; the person's stays stopped
   const up = await fleet($, 'up')
   expect(up).toContain('Owner A: waking')
-  expect(up).toContain('Owner C: stopped by you, left alone (Enter or u in the panel restarts it)')
+  expect(up).toContain('Owner C: stopped by you, left alone (Enter or u in the panel restarts it, or /fleet up --force wakes it)')
   expect(calls(w, 'wake').map(x => x.ref)).toEqual(['aaaaaaa1', 'aaaaaaa1'])
 })
 
@@ -333,6 +333,10 @@ test('/fleet up --stopped wakes the stopped ones and starts none never started',
   expect(up).toContain('never started: left alone (--stopped wakes stopped ones only)')
   expect(up).not.toContain('Owner B: starting')
   expect(calls(w, 'start')).toEqual([])
+  // One at once, the next 3 s later (the wakes are paced)
+  expect(up).toContain('Owner C: waking in 3 s')
+  await w.clock.advance(3000)
+  await w.clock.settle()
   expect(calls(w, 'wake').map(x => x.ref)).toEqual(['aaaaaaa1', 'ccccccc1'])
 })
 

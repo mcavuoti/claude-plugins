@@ -2149,20 +2149,21 @@ async function stillEnded($: any, s: EndedSession): Promise<string> {
 // Whether a session can be woken (another plugin's wake, ccc tell): running already, or stopped and wakeable. A
 // background session the service retired for being idle is woken, one that ended by itself (a crash, or the machine or
 // the service restarted under it: on the log's evidence), and one it closed for lack of memory once memory is normal
-// again. Never a regular session (it lives in its own window), one the person stopped, one with no evidence of why it
-// stopped, nor one closed for lack of memory while memory is short
-type WakeVerdict = { state: 'running' } | { state: 'refused'; detail: string } | { state: 'wake'; id: string; name: string }
-async function wakeVerdict($: any, ref: string): Promise<WakeVerdict> {
+// again. Never a regular session (it lives in its own window), nor one closed for lack of memory while memory is short;
+// one the person stopped, or one with no evidence of why it stopped, only when the caller acts on the person's own
+// command (force: wake's input, 0.15.1)
+type WakeVerdict = { state: 'running' } | { state: 'refused'; detail: string } | { state: 'wake'; id: string; name: string; why: string }
+async function wakeVerdict($: any, ref: string, force = false): Promise<WakeVerdict> {
   const s = lastList.find(x => refOf(x) === ref)
   if (!s) return { state: 'refused', detail: `${ref} isn't in the session list` }
   const name = String(projectRows.find(f => f.sessionId === s.sessionId)?.title ?? (s.name || s.id || ref))
   if (s.kind !== 'background' || typeof s.id !== 'string') return { state: 'refused', detail: `“${name}” is a regular session: it lives in its own window` }
   if (s.pid) return { state: 'running' }
   const why = await stoppedOf($, s, await stopLogNow($))
-  if (why === 'person') return { state: 'refused', detail: `“${name}” was stopped by you: Enter or u restarts it` }
-  if (why === 'unknown') return { state: 'refused', detail: `nothing says why “${name}” stopped (not a crash or a restart the service's log shows): Enter or u restarts it` }
+  if (why === 'person' && !force) return { state: 'refused', detail: `“${name}” was stopped by you: Enter or u restarts it` }
+  if (why === 'unknown' && !force) return { state: 'refused', detail: `nothing says why “${name}” stopped (not a crash or a restart the service's log shows): Enter or u restarts it` }
   if (why === 'memory' && (await platform.memoryNormal(sys($))) !== true) return { state: 'refused', detail: `Claude closed “${name}” for lack of memory, and memory is still short` }
-  return { state: 'wake', id: s.id, name }
+  return { state: 'wake', id: s.id, name, why }
 }
 
 // The sessions other plugins asked to wake ($.sessions.wake), from this mod's own 0.5 s timer: claude respawn, if
@@ -4268,10 +4269,14 @@ function sessionsApi($: any): Sessions {
       const ref = input?.ref
       if (!isRef(ref)) return { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' }
       if (!ready()) return { ok: false, reason: 'not-ready', detail: "sessions hasn't read the session list in this session yet: try again in a few seconds" }
-      const v = await wakeVerdict($, ref)
+      // force (0.15.1): the caller acts on the person's own command, so a stop of the person's (or one nothing explains)
+      // doesn't keep the session away
+      const force = input?.force === true
+      const v = await wakeVerdict($, ref, force)
       if (v.state === 'running') return { ok: true, state: 'running' }
       if (v.state === 'refused') return { ok: false, reason: 'refused', detail: v.detail, state: 'refused' }
-      const reason = typeof input?.reason === 'string' ? input.reason.trim().replace(/\s+/g, ' ').slice(0, 120) : ''
+      let reason = typeof input?.reason === 'string' ? input.reason.trim().replace(/\s+/g, ' ').slice(0, 120) : ''
+      if (force && (v.why === 'person' || v.why === 'unknown')) reason = `forced, ${v.why === 'person' ? 'stopped by the person' : 'nothing says why it stopped'}${reason ? `: ${reason}` : ''}`
       if (!wakes.some(w => w.id === v.id)) wakes.push({ id: v.id, name: v.name, reason })
       kickQueue()
       return { ok: true, state: 'queued' }

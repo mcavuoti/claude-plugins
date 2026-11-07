@@ -179,8 +179,11 @@ export type Sessions = {
    * service retired for being idle, and (0.13.4) one that ended by itself, after a crash or a restart of the machine or
    * the service (status's `stopped: 'ended'`). `running` (nothing to do), `queued`, or `refused` with why: a regular
    * session, one the person stopped (`stopped: 'person'`), one closed for lack of memory while memory is still short.
-   * `reason` goes to the debug log */
-  wake?: (input: { ref: SessionsRef; reason: string }) => Promise<SessionsResult & { state?: 'running' | 'queued' | 'refused' }>
+   * (0.15.1) `force: true`, for a caller acting on the person's own command (a command he typed): one he stopped, and
+   * one with no evidence why (`stopped: 'unknown'`), are woken too; a regular session and a memory close while memory is
+   * short are still refused, and an older sessions ignores the field (it refuses as before). `reason` goes to the debug
+   * log, with the forced wake noted */
+  wake?: (input: { ref: SessionsRef; reason: string; force?: true }) => Promise<SessionsResult & { state?: 'running' | 'queued' | 'refused' }>
   /** 0.12.0. Marks rows in every session's panel for `ttlMs` (at most 600000, 10 minutes): call again to keep them.
    * Each call replaces the marks this session of `source` set before; empty `rows` clears them. rejected (0.13.1): the
    * rows left out for breaking a limit (a key that isn't a ref, a badge over 3 columns, a status line over 60

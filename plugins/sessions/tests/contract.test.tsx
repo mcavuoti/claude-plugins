@@ -387,6 +387,46 @@ test("wake after a reboot or a crash: a background session that ended with no st
   expect(await wake('11111111')).toBe('refused: “stopped from the panel” was stopped by you: Enter or u restarts it')
   await w.clock.advance(600)
   expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['dddddddd', 'ffffffff', '22222222'])
+  // force (0.15.1): a caller acting on the person's own command brings back the ones he stopped and the one nothing
+  // explains
+  const forced = async (ref: string) => {
+    const r = await call($, 'wake', { ref, reason: 'the person asked', force: true })
+    return r.ok ? r.state : `${r.state}: ${r.detail}`
+  }
+  expect(await forced('eeeeeeee')).toBe('queued')
+  expect(await forced('11111111')).toBe('queued')
+  expect(await forced('55555555')).toBe('queued')
+  // force must be exactly true: anything else is a plain wake
+  expect(await (async () => { const r = await call($, 'wake', { ref: 'eeeeeeee', reason: 'x', force: 'yes' }); return r.ok ? 'queued' : r.state })()).toBe('refused')
+  await w.clock.advance(600)
+  expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['dddddddd', 'ffffffff', '22222222', 'eeeeeeee', '11111111', '55555555'])
+})
+
+test('wake with force still refuses a regular session and a memory close while memory is short', WITH_PROBE, async ($, on) => {
+  const bg = (id: string, name: string) => ({ id, sessionId: `${id}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', name, startedAt: Date.parse('2026-10-26T08:00:00.000Z') })
+  const w = world(on, { list: [...list(), bg('44444444', 'memory one'), bg('eeeeeeee', 'stopped by the person')] })
+  // Memory still short (4: critical)
+  w.memory.value = '4'
+  w.files.set(
+    '/Users/x/daemon.log',
+    [
+      '[2026-10-26T09:00:00.000Z] [bg] bg claimed-spare eeeeeeee (x)',
+      '[2026-10-26T09:30:00.000Z] [bg] bg settled eeeeeeee (killed)',
+      '[2026-10-26T09:33:00.000Z] [bg] bg retire 44444444: settled, idle 38h [low memory, pinned]',
+    ].join('\n'),
+  )
+  await startSession($, w)
+  const forced = async (ref: string) => {
+    const r = await call($, 'wake', { ref, reason: 'the person asked', force: true })
+    return r.ok ? r.state : `${r.state}: ${r.detail}`
+  }
+  expect(await forced('44444444')).toBe('refused: Claude closed “memory one” for lack of memory, and memory is still short')
+  expect(await forced('eeeeeeee')).toBe('queued')
+  // A regular session (sid:<sessionId>) lives in its own window
+  const regular = list().find((s: any) => s.kind !== 'background') as any
+  if (regular) expect((await forced(`sid:${regular.sessionId}`)).startsWith('refused')).toBe(true)
+  await w.clock.advance(600)
+  expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['eeeeeeee'])
 })
 
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
