@@ -11,7 +11,7 @@
 # The status line and the ccc command are installed in ~/.claude/mods/sessions-data/bin/ (SESSIONS_DATA_DIR): an
 # installed plugin lives in a folder that changes with each update, and nothing else writes there. ccc finds the
 # enabled plugin each time it runs, so it follows updates; the status line is a copy (run the setup again after an
-# update that changes it). An earlier setup's ccc and status line (in ~/.claude/mods/sessions-bin) are moved over.
+# update that changes it).
 #
 # Every file it changes is backed up first (<file>.bak-antes-<what>-<date-time>). Running it again changes nothing.
 #
@@ -27,7 +27,6 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 data="${SESSIONS_DATA_DIR:-$HOME/.claude/mods/sessions-data}"
 bin="$data/bin"
-old_bin="$HOME/.claude/mods/sessions-bin"
 settings="$HOME/.claude/settings.json"
 keybindings="$HOME/.claude/keybindings.json"
 stamp="$(date +%Y%m%d-%H%M%S)"
@@ -108,16 +107,16 @@ setup_statusline() {
   [ -f "$settings" ] && [ "$dry" -eq 0 ] && cp -p "$settings" "$settings.bak-antes-statusline-$stamp"
   local result
   result=$(edit_json "$settings" '
-want, force, old = sys.argv[1], sys.argv[2] == "1", sys.argv[3]
+want, force = sys.argv[1], sys.argv[2] == "1"
 current = (data.get("statusLine") or {}).get("command")
 if current == want:
     note = "(already set)"
-elif current and current != old and not force:
+elif current and not force:
     note = "(you already have one: " + str(current) + "; run with --force-statusline to replace it)"
 else:
     data["statusLine"] = {"type": "command", "command": want, "padding": 0}
     changed = True
-' "$want" "$force_statusline" "$old_bin/statusline.sh")
+' "$want" "$force_statusline")
   if [ "${result%% *}" = CHANGED ]; then
     if [ "$dry" -eq 1 ]; then say "  would set statusLine → $want"
     else [ -f "$settings.bak-antes-statusline-$stamp" ] && say "  backup: $settings.bak-antes-statusline-$stamp"; say "  statusLine → $want"; fi
@@ -248,28 +247,6 @@ setup_alias() {
   esac
   say "  shell: $shell → $rc"
   if [ -f "$rc" ] && grep -Fxq "$line" "$rc"; then say "  already set"; return; fi
-  # A ccc this plugin wrote before (inside its block, or pointing at an old launcher) is replaced; any other is yours
-  if [ -f "$rc" ] && { sed -n '/^# >>> sessions plugin >>>/,/^# <<< sessions plugin <<</p' "$rc" | grep -Eq '^[[:space:]]*alias ccc[= ]' \
-      || grep -Eq "^[[:space:]]*alias ccc[= ].*(sessions/hooks|sessions-bin)/visor\.sh" "$rc"; }; then
-    if [ "$dry" -eq 1 ]; then say "  would replace the plugin's earlier ccc with: $line"
-    else
-      backup "$rc" ccc-start
-      CCC_LINE="$line" CCC_COMMENT="$comment" python3 - "$rc" <<'PY'
-import os, re, sys
-path = sys.argv[1]
-text = open(path, encoding='utf-8').read()
-line, comment = os.environ['CCC_LINE'], os.environ['CCC_COMMENT']
-def block(m):
-    body = re.sub(r'(?m)^[ \t]*alias ccc[= ].*$', lambda _: line, m.group(0))
-    return re.sub(r'(?m)^# (Open this folder|ccc: open).*$', lambda _: comment, body)
-text = re.sub(r'(?ms)^# >>> sessions plugin >>>$.*?^# <<< sessions plugin <<<$', block, text)
-text = re.sub(r'(?m)^[ \t]*alias ccc[= ].*(sessions/hooks|sessions-bin)/visor\.sh.*$', lambda _: line, text)
-open(path, 'w', encoding='utf-8').write(text)
-PY
-      say "  replaced the plugin's earlier ccc (it opened the agent view): $line"
-    fi
-    return
-  fi
   if [ -f "$rc" ] && grep -Eq '^[[:space:]]*(alias ccc[= ]|function ccc|ccc[[:space:]]*\(\))' "$rc"; then
     say "  $rc already defines ccc: left as is. To use the plugin's, replace it with:"; say "    $line"; return
   fi
