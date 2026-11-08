@@ -112,6 +112,8 @@ declare module 'claude-code' {
       handoff: { text: string; at: number } | null
       /** What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing) */
       bandNote: string
+      /** What fleet needs and this session lacks (sessions at its version, python3, Claude Code), '' when all are here */
+      needs: string
       /** The intake records routed to this instance that its model was told of: id → when (first told) */
       intakeTold: Record<string, number>
       /** The intake records the conversation a /clear ended was told of: the new one hears them once more */

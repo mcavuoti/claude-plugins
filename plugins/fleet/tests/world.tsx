@@ -21,7 +21,7 @@ export const BAND = { plugin: 'fleet', component: 'AbovePrompt', requestId: 'ban
 export const COMPOSER = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
 
 // The golden list of what sessions api 1 serves (plugins/sessions/tests/contract.test.tsx has the same one)
-export const GOLDEN = ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks']
+export const GOLDEN = ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart']
 // Where the tests' templates are (FLEET_TEMPLATES_DIR), and the blank one every test has
 export const TEMPLATES = '/fake/templates'
 export const BLANK = {
@@ -53,10 +53,13 @@ export const FAKE_SESSIONS = {
         await $.fs.write('/fake/sessions.log', `${before}${JSON.stringify(line)}\n`)
       }
       const api: EngineInterface['sessions'] = {
-        // extra: the methods sessions 0.13.8 added (pin, restart), listed only when a test says so: unlisted, fleet goes
-        // on as with an older sessions
-        // version: what sessions says it is (a test sets it to try what a newer one serves, as wake's force from 0.15.1)
-        contract: async () => ({ api: 1, version: (await world()).version ?? '0.13.0', format: 2, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', ...((await world()).extra ?? [])] }),
+        // version: what sessions says it is (the version fleet requires by default; a test sets an older one, or `gone`
+        // for a sessions that doesn't answer, to try fleet's dependency check)
+        contract: async () => {
+          const w = await world()
+          if (w.gone) throw new Error('sessions is not loaded')
+          return { api: w.api ?? 1, version: w.version ?? '0.17.0', format: 3, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart'] }
+        },
         current: async () => (await world()).current ?? { ready: false, ref: null, sessionId: '', name: '', root: '', background: false, agent: null },
         status: async input => {
           // Logged too, so a test can count a session's status calls
@@ -305,6 +308,8 @@ export function world(on: On, options: WorldOptions = {}): World {
     if (other) return { value: { stdout: '', stderr: '', ...other, isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.init?.cwd !== '/') return failed('fleet runs every command from /')
     const [cmd, ...args] = argv
+    // python3 is here (fleet's dependency check); a test sets exec to answer otherwise
+    if (cmd === 'python3' && args.includes('-c') && args.includes('pass')) return ok
     if (cmd === 'ln') {
       const [from = '', to = ''] = args
       if (files.has(to)) return failed('File exists')
@@ -479,7 +484,7 @@ export function under(w: World, dir: string): string[] {
 }
 
 // The fake sessions' answers: this session as current, and the others by ref
-export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; extra?: string[]; refuseRestart?: string }) {
+export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; refuseRestart?: string; version?: string; api?: number; gone?: boolean }) {
   w.files.set(FAKE, JSON.stringify(say))
 }
 
