@@ -78,4 +78,45 @@ ls "$home"/.bashrc.bak-antes-ccc-start-* >/dev/null 2>&1 || fail "$label" "no ba
 ls "$home"/.claude/settings.json.bak-antes-statusline-* >/dev/null 2>&1 || fail "$label" "no backup of settings.json"
 unchanged "$label" "$(run_setup "$home" --shell=bash)"
 rm -rf "$home"
+
+# ccc already defined in a file the startup file loads (like Debian's ~/.bash_aliases): already set, nothing added or
+# backed up, in a dry run and a real one; a loaded file with no ccc doesn't count, and then ccc is added once
+for shell in bash zsh; do
+  label="ccc in a loaded file ($shell)"
+  home="$(mktemp -d)"
+  mkdir -p "$home/.claude"
+  if [ "$shell" = zsh ]; then rc="$home/.zshrc"; else rc="$home/.bashrc"; fi
+  cat > "$rc" <<'RC'
+export FOO=1
+if [ -f ~/.other_aliases ]; then
+    . ~/.other_aliases
+fi
+[ -f "$HOME/.my_aliases" ] && source "$HOME/.my_aliases"
+RC
+  printf 'alias ll="ls -l"\n' > "$home/.other_aliases"
+  printf '%s\n' "$line" > "$home/.my_aliases"
+  printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > "$home/.bash_profile"
+  before="$(cat "$rc")"
+  dry=$(run_setup "$home" "--shell=$shell" --alias --dry-run)
+  # shellcheck disable=SC2001 # a prefix on every line of a multi-line output
+  echo "$dry" | sed "s/^/[$label] /"
+  echo "$dry" | grep -Fq "already set (in $home/.my_aliases, which $rc loads)" || fail "$label" "the dry run doesn't find ccc in the loaded file"
+  if echo "$dry" | grep -q 'would add ccc'; then fail "$label" "the dry run would add ccc"; fi
+  real=$(run_setup "$home" "--shell=$shell" --alias)
+  echo "$real" | grep -Fq "already set (in $home/.my_aliases" || fail "$label" "the setup doesn't find ccc in the loaded file"
+  [ "$(cat "$rc")" = "$before" ] || fail "$label" "$rc changed"
+  if ls "$rc".bak-antes-* >/dev/null 2>&1; then fail "$label" "$rc was backed up, as if it changed"; fi
+  # Another ccc there is the person's: left as is
+  printf "alias ccc='echo mine'\n" > "$home/.my_aliases"
+  mine=$(run_setup "$home" "--shell=$shell" --alias)
+  echo "$mine" | grep -Fq "$home/.my_aliases (which $rc loads) already defines ccc: left as is" || fail "$label" "another ccc in a loaded file isn't left as is"
+  [ "$(cat "$rc")" = "$before" ] || fail "$label" "$rc changed over another ccc"
+  # None anywhere: added once
+  printf 'alias gs="git status"\n' > "$home/.my_aliases"
+  run_setup "$home" "--shell=$shell" --alias >/dev/null
+  unchanged "$label" "$(run_setup "$home" "--shell=$shell" --alias)"
+  [ "$(grep -c '^# >>> sessions plugin >>>' "$rc")" = 1 ] || fail "$label" "ccc wasn't added exactly once"
+  grep -Fxq "$line" "$rc" || fail "$label" "no ccc in $rc"
+  rm -rf "$home"
+done
 echo "setup: ok"

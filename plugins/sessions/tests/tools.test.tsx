@@ -1,7 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 
-import { agentAddress, modelWakesOf, pickSession, roleTools, toolRowLine, TOOLS_UNKNOWN_ROLE_WAIT_MS, TOOLS_WAIT_MS, wakeLimit, wokenLine } from '../hooks/state'
-import { COMMAND, ROOT, SID, SLOW, startSession, world, type World } from './world'
+import { agentAddress, agentFromFlags, modelWakesOf, pickSession, roleTools, toolRowLine, TOOLS_UNKNOWN_ROLE_WAIT_MS, TOOLS_WAIT_MS, wakeLimit, wokenLine } from '../hooks/state'
+import { parseRegistry } from '../hooks/watch'
+import { COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // The tools for Claude (mcp__sessions__list, mcp__sessions__wake): what the start registers for which agent, what
 // each tool answers, and every guard on a wake
@@ -331,14 +332,156 @@ test("a SessionStart that comes after session.start's plugins beneath answered: 
   open()
 })
 
-test('no SessionStart and no module before this one (a host without classic hooks): nothing registered, said in /sessions status', async ($, on) => {
+// ---- No SessionStart at a fresh start: a plugin that runs before this one (a managed or built-in one) sends
+// classic.SessionStart on past it, at every start ----
+
+// This session's entry in Claude's registry of running sessions, as Claude writes it (agent: the one it runs as, absent
+// with none)
+function registryEntry(t: Setup, extra: Record<string, unknown> = {}) {
+  t.w.files.set('/Users/x/.claude/sessions/4242.json', JSON.stringify({ pid: 4242, sessionId: SID, cwd: ROOT, kind: 'bg', jobId: 'aaaaaaaa', status: 'idle', ...extra }))
+}
+// One line of /sessions status, by how it starts
+async function statusLine($: any, head: string): Promise<string> {
+  const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  return String(status.text).split('\n').find(l => l.startsWith(head)) ?? `no line starts with ${head}`
+}
+
+test('agentFromFlags: --agent <name> or --agent=<name> among a job\'s respawnFlags; a name or settings text is never read as one', () => {
+  expect(agentFromFlags(['--settings', '{"enabledPlugins":{}}', '-n', 'lead', '--agent', 'probe', '--model', 'opus[1m]'])).toBe('probe')
+  expect(agentFromFlags(['-n', 'lead', '--agent=lead'])).toBe('lead')
+  expect(agentFromFlags(['-n', '--agent', '--model', 'opus'])).toBe(null)
+  expect(agentFromFlags(['--plugin-dir', '/Users/x/p', '--permission-mode', 'auto', '--name', 'x'])).toBe(null)
+  expect(agentFromFlags([])).toBe(null)
+})
+
+test("the registry's agent: a session's entry says the agent it runs as, and none when it has none", () => {
+  const entry = (extra: Record<string, unknown>) => (parseRegistry(JSON.stringify({ pid: 1, sessionId: SID, cwd: ROOT, kind: 'bg', ...extra })) as any).entry
+  expect(entry({ agent: 'lead' }).agent).toBe('lead')
+  expect(entry({}).agent).toBeUndefined()
+  expect(entry({ agent: '' }).agent).toBeUndefined()
+})
+
+test("no SessionStart at a fresh start: the agent from Claude's registry, the tools offered, the status says why and no u", async ($, on) => {
   const t = setup(on)
-  t.w.transcript.value = ''
+  registryEntry(t)
+  await startSession($, t.w)
+  await t.w.clock.advance(100)
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
+  expect(await statusLine($, 'Tools for Claude:')).toBe(
+    "Tools for Claude: mcp__sessions__list, mcp__sessions__wake (no agent; from Claude's registry of sessions, since no SessionStart reached the mod)",
+  )
+  const live = await statusLine($, 'Not live:')
+  expect(live).toContain('Not live: no SessionStart reached the mod in this session: a plugin that runs before sessions (such as a managed or built-in one) sent it on past it')
+  expect(live).toContain("which a restart doesn't change")
+  expect(live).toContain('reads them every 3 s')
+  expect(live).not.toContain('updated in place')
+  expect(live).not.toContain('(u)')
+  // This machine remembers, once it's clear none is coming, so its next starts don't wait for one
+  expect(t.w.store.get('startSkipped')).toBeUndefined()
+  await t.w.clock.advance(10000)
+  expect(typeof (t.w.store.get('startSkipped') as any)?.at).toBe('number')
+})
+
+test("no SessionStart: an agent the registry names decides as SessionStart's would; one whose file lists the tools gets them", async ($, on) => {
+  const t = setup(on)
+  registryEntry(t, { agent: 'lead' })
+  t.w.files.set(`${ROOT}/.claude/agents/lead.md`, '---\nname: lead\ntools: Read, SendMessage, mcp__sessions__*\n---\nLead.\n')
+  await startSession($, t.w)
+  await t.w.clock.advance(100)
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
+  expect(await statusLine($, 'Tools for Claude:')).toBe(
+    "Tools for Claude: mcp__sessions__list, mcp__sessions__wake (agent lead: its agent file's tools: line names mcp__sessions__list and mcp__sessions__wake; from Claude's registry of sessions, since no SessionStart reached the mod)",
+  )
+})
+
+test("no SessionStart: an agent whose file leaves the tools out gets none, so its start isn't held", async ($, on) => {
+  const t = setup(on)
+  registryEntry(t, { agent: 'coder' })
+  t.w.files.set('/Users/x/.claude/agents/coder.md', '---\nname: coder\ntools: Read, Edit, Bash\n---\nCode.\n')
+  // A registration would never answer: the start would wait for it
+  t.gate.value = new Promise<void>(() => {})
+  let done = false
+  const start = $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true }).then(() => (done = true))
+  await t.w.clock.settle()
+  expect(done).toBe(true)
+  await start
+  expect(t.registered).toEqual([])
+  expect(await statusLine($, 'Tools for Claude:')).toBe(
+    "Tools for Claude: not offered: agent coder, its agent file's tools: line doesn't name mcp__sessions__* (from Claude's registry of sessions, since no SessionStart reached the mod)",
+  )
+})
+
+test("no SessionStart: a background job's --agent wins over a registry entry that names none", async ($, on) => {
+  const t = setup(on)
+  registryEntry(t)
+  t.w.files.set('/Users/x/jobs/aaaaaaaa/state.json', JSON.stringify({ sessionId: SID, cwd: ROOT, respawnFlags: ['-n', 'lead', '--agent', 'coder', '--model', 'opus[1m]'] }))
+  t.w.files.set('/Users/x/.claude/agents/coder.md', '---\nname: coder\ntools: Read\n---\n')
   await startSession($, t.w)
   await t.w.clock.advance(100)
   expect(t.registered).toEqual([])
-  const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
-  expect(String(status.text)).toContain('Tools for Claude: not offered: no SessionStart reached the mod in this session')
+  expect(await statusLine($, 'Tools for Claude:')).toContain("not offered: agent coder, its agent file's tools: line doesn't name mcp__sessions__* (from its background job's flags")
+})
+
+test('no SessionStart and nothing on disk says the agent: taken as no agent, registered without holding the start', async ($, on) => {
+  const t = setup(on)
+  let open = () => {}
+  t.gate.value = new Promise<void>(r => (open = r))
+  let done = false
+  const start = $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true }).then(() => (done = true))
+  await t.w.clock.settle()
+  expect(done).toBe(true)
+  await start
+  open()
+  await t.w.clock.advance(100)
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
+  expect(await statusLine($, 'Tools for Claude:')).toBe(
+    "Tools for Claude: mcp__sessions__list, mcp__sessions__wake (taken as no agent, since no SessionStart reached the mod and Claude's files didn't say in time: from the next request on)",
+  )
+  expect(await statusLine($, 'Not live:')).toContain('Not live: no SessionStart reached the mod in this session')
+})
+
+// The mod's own start held up after its first step (its read of the launcher's settings waits), so that only the wait
+// for SessionStart, or the machine's memory of none, can end session.start's wait
+function holdStart(t: Setup): () => void {
+  let open = () => {}
+  t.w.readsHeld.set(`${DATA}/config`, new Promise<void>(r => (open = r)))
+  return open
+}
+
+test('without the memory, a start with no SessionStart waits a second for one', async ($, on) => {
+  const t = setup(on)
+  const open = holdStart(t)
+  registryEntry(t)
+  let done = false
+  const start = $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true }).then(() => (done = true))
+  await t.w.clock.advance(999)
+  expect(done).toBe(false)
+  await t.w.clock.advance(1)
+  expect(done).toBe(true)
+  await start
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
+  open()
+})
+
+test('a machine whose starts find no SessionStart remembers it: the next start takes the files at once, with no wait', async ($, on) => {
+  const t = setup(on, { store: { startSkipped: { at: 1 } } })
+  const open = holdStart(t)
+  registryEntry(t)
+  let done = false
+  const start = $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true }).then(() => (done = true))
+  await t.w.clock.advance(10)
+  expect(done).toBe(true)
+  await start
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
+  open()
+})
+
+test("a SessionStart that reaches the mod at a process's start: the machine's starts wait for one again", async ($, on) => {
+  const t = setup(on, { store: { startSkipped: { at: 1 } } })
+  await started($, t)
+  expect(t.w.store.has('startSkipped')).toBe(false)
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
+  expect(await statusLine($, 'Tools for Claude:')).toBe('Tools for Claude: mcp__sessions__list, mcp__sessions__wake (no agent)')
 })
 
 // What a module before this one left in the session's $.state (a reload keeps it), answered until the mod writes it
@@ -403,7 +546,34 @@ test("a transcript that can't be read after an update in place: nothing register
   expect(t.registered).toEqual([])
   expect(agentReads(t)).toBeGreaterThanOrEqual(5)
   const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
-  expect(String(status.text)).toContain('Tools for Claude: not offered: no SessionStart reached the mod in this session')
+  expect(String(status.text)).toContain('Tools for Claude: not offered: no SessionStart reached the mod in this session (updated in place from an older version); a restart (u) offers them')
+  // Its own text for not being live: a restart or /clear makes it live
+  expect(await statusLine($, 'Not live:')).toContain('Not live: this session was updated in place from a version that watched other files; it reads them every 3 s until it restarts (u) or is cleared (/clear)')
+})
+
+test("updated in place: Claude's registry says the agent before the transcript is read", async ($, on) => {
+  stateSeeds(on, { shortId: 'aaaaaaaa' })
+  const t = setup(on)
+  registryEntry(t)
+  await startSession($, t.w)
+  await t.w.clock.advance(100)
+  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
+  expect(await statusLine($, 'Tools for Claude:')).toBe(
+    "Tools for Claude: mcp__sessions__list, mcp__sessions__wake (no agent, as Claude's registry of sessions says; offered after an update in place, from the next request on)",
+  )
+})
+
+test('updated in place on a machine whose starts find no SessionStart: the status says so, and neither it nor the panel names u', async ($, on) => {
+  stateSeeds(on, { shortId: 'aaaaaaaa' })
+  const t = setup(on, { store: { startSkipped: { at: 1 } } })
+  await startSession($, t.w)
+  await t.w.clock.advance(100)
+  const live = await statusLine($, 'Not live:')
+  expect(live).toContain('Not live: no SessionStart reached the mod in this session: a plugin that runs before sessions')
+  expect(live).not.toContain('(u)')
+  const ui = await $.ui.mount(PANEL)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('Live updates off')
+  await ui.unmount()
 })
 
 test("the agent comes from the SessionStart inside session.start's plugins beneath, as in a session", async ($, on) => {

@@ -51,6 +51,8 @@ export type World = {
   bandLate: { value: number }
   // The start of the session's transcript (WorldOptions.transcript), which a test can change
   transcript: { value: string | undefined }
+  // A file read that answers only once its promise resolves, by path (a slow disk, or a start held up at that step)
+  readsHeld: Map<string, Promise<void>>
   // The folder of each session's transcript's first row (where it started), by session id: none by default
   starts: Map<string, string>
   // What claude --bg prints when it refuses to start a session ('': it starts it)
@@ -123,6 +125,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const usage = { value: { context: { percent: 10 }, rateLimits: [] } as any }
   const band = { value: '' }
   const transcript = { value: options.transcript }
+  const readsHeld = new Map<string, Promise<void>>()
   const starts = new Map<string, string>()
   const bgError = { value: '' }
   const memory = { value: '1' }
@@ -184,7 +187,9 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('classic.FileChanged', () => ({}) as any)
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
-  on('fs.read', (_, e) => {
+  on('fs.read', async (_, e) => {
+    const held = readsHeld.get(e.path)
+    if (held) await held
     if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: '{"version": "0.10.0"}' }
     const text = files.get(e.path)
     if (text === undefined) throw new Error(`no such file: ${e.path}`)
@@ -332,7 +337,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, starts, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

@@ -5,7 +5,8 @@
 #   - keyboard: shift+→ focuses the panel from the prompt, ← goes back to the prompt (~/.claude/keybindings.json)
 #   - shell: `ccc` opens the current folder's top session in the terminal window, with its panel (or a Name prompt
 #     when there's none). It goes in your shell's startup file: bash ~/.bashrc (plus making the login file load it,
-#     since macOS Terminal starts login shells), zsh ~/.zshrc, fish ~/.config/fish/config.fish
+#     since macOS Terminal starts login shells), zsh ~/.zshrc, fish ~/.config/fish/config.fish. A ccc already there,
+#     or in a file it loads (bash and zsh: `source`/`.`, one level), is left as is
 #
 # The status line and the ccc command are installed in ~/.claude/mods/sessions-data/bin/ (SESSIONS_DATA_DIR): an
 # installed plugin lives in a folder that changes with each update, and nothing else writes there. ccc finds the
@@ -176,6 +177,54 @@ add_block() {
   printf '\n# >>> sessions plugin >>>\n%s\n# <<< sessions plugin <<<\n' "$body" >> "$file"
 }
 
+# The first file a startup file loads (`source <file>` or `. <file>`, one level, files that exist) that defines ccc:
+# "ours <file>" when its ccc runs this command ($2), "other <file>" when it runs something else, nothing when none does.
+# Read, never run: a path is taken as written, with ~, $HOME, ${HOME} and $ZDOTDIR expanded and a relative one from the
+# home folder (where a new shell starts); one with any other variable or a pattern is skipped
+sourced_ccc() {
+  HOME_DIR="$HOME" ZDOT="${ZDOTDIR:-$HOME}" CCC="$2" python3 - "$1" <<'PY' || true
+import os, re, sys
+home, zdot, ccc = os.environ['HOME_DIR'], os.environ['ZDOT'], os.environ['CCC']
+def expand(word):
+    word = word.strip('\'"')
+    if word == '~' or word.startswith('~/'):
+        word = home + word[1:]
+    word = re.sub(r'\$\{?HOME\}?(?![A-Za-z0-9_])', lambda _: home, word)
+    word = re.sub(r'\$\{?ZDOTDIR\}?(?![A-Za-z0-9_])', lambda _: zdot, word)
+    if re.search(r'[$`*?\[]', word):
+        return None
+    return word if word.startswith('/') else os.path.join(home, word)
+def ours(text):
+    for m in re.finditer(r'(?m)^[ \t]*alias[ \t]+ccc[= ].*$', text):
+        line = re.sub(r'\$\{?HOME\}?(?![A-Za-z0-9_])|~(?=/)', lambda _: home, m.group(0))
+        if ccc in line:
+            return True
+    return False
+defines = re.compile(r'(?m)^[ \t]*(alias[ \t]+ccc[= ]|function[ \t]+ccc\b|ccc[ \t]*\(\))')
+loads = re.compile(r'(?:^|[;&|{(]|\bthen|\bdo|\belse)[ \t]*(?:source|\.)[ \t]+("[^"]*"|\'[^\']*\'|[^ \t;&|)}]+)')
+try:
+    text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+except OSError:
+    sys.exit(0)
+seen = set()
+for raw in text.splitlines():
+    if raw.lstrip().startswith('#'):
+        continue
+    for m in loads.finditer(raw):
+        path = expand(m.group(1))
+        if not path or path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        try:
+            body = open(path, encoding='utf-8', errors='replace').read()
+        except OSError:
+            continue
+        if defines.search(body):
+            print(('ours ' if ours(body) else 'other ') + path)
+            sys.exit(0)
+PY
+}
+
 setup_alias() {
   say "Shell shortcut (ccc)"
   local shell rc line comment="# ccc: open this folder's top Claude session here, with its panel (ccc <name>, ccc --new, ccc --agents)"
@@ -216,6 +265,16 @@ PY
   fi
   if [ -f "$rc" ] && grep -Eq '^[[:space:]]*(alias ccc[= ]|function ccc|ccc[[:space:]]*\(\))' "$rc"; then
     say "  $rc already defines ccc: left as is. To use the plugin's, replace it with:"; say "    $line"; return
+  fi
+  # A ccc in a file the startup file loads (bash and zsh): this command's is already set, any other is yours
+  if [ "$shell" != fish ] && [ -f "$rc" ]; then
+    local found
+    found="$(sourced_ccc "$rc" "$bin/ccc")"
+    case "$found" in
+      ours\ *) say "  already set (in ${found#ours }, which $rc loads)"; return ;;
+      other\ *) say "  ${found#other } (which $rc loads) already defines ccc: left as is. To use the plugin's, replace it with:"
+                say "    $line"; return ;;
+    esac
   fi
   if add_block "$rc" "$comment"$'\n'"$line"; then
     if [ "$dry" -eq 1 ]; then say "  would add ccc to $rc"; else say "  added ccc (open a new terminal to use it)"; fi
