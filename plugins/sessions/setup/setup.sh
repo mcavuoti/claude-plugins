@@ -6,7 +6,7 @@
 #   - shell: `ccc` opens the current folder's top session in the terminal window, with its panel (or a Name prompt
 #     when there's none). It goes in your shell's startup file: bash ~/.bashrc (plus making the login file load it,
 #     since macOS Terminal starts login shells), zsh ~/.zshrc, fish ~/.config/fish/config.fish. A ccc already there,
-#     or in a file it loads (bash and zsh: `source`/`.`, one level), is left as is
+#     or in a file it loads (bash and zsh: `source`/`.`, and the files those load), is left as is
 #
 # The status line and the ccc command are installed in ~/.claude/mods/sessions-data/bin/ (SESSIONS_DATA_DIR): an
 # installed plugin lives in a folder that changes with each update, and nothing else writes there. ccc finds the
@@ -183,7 +183,8 @@ add_block() {
   printf '\n# >>> sessions plugin >>>\n%s\n# <<< sessions plugin <<<\n' "$body" >> "$file"
 }
 
-# The first file a startup file loads (`source <file>` or `. <file>`, one level, files that exist) that defines ccc:
+# The first file a startup file loads (`source <file>` or `. <file>`, files that exist, and the ones those load in turn, in
+# the order a shell reaches them, MAX_DEPTH deep, each once) that defines ccc:
 # "ours <file>" when its ccc runs this command ($2), "other <file>" when it runs something else, nothing when none does.
 # Read, never run: a path is taken as written, with ~, $HOME, ${HOME} and $ZDOTDIR expanded and a relative one from the
 # home folder (where a new shell starts); one with any other variable or a pattern is skipped
@@ -208,26 +209,35 @@ def ours(text):
     return False
 defines = re.compile(r'(?m)^[ \t]*(alias[ \t]+ccc[= ]|function[ \t]+ccc\b|ccc[ \t]*\(\))')
 loads = re.compile(r'(?:^|[;&|{(]|\bthen|\bdo|\belse)[ \t]*(?:source|\.)[ \t]+("[^"]*"|\'[^\']*\'|[^ \t;&|)}]+)')
-try:
-    text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
-except OSError:
-    sys.exit(0)
+MAX_DEPTH = 8
 seen = set()
-for raw in text.splitlines():
-    if raw.lstrip().startswith('#'):
-        continue
-    for m in loads.finditer(raw):
-        path = expand(m.group(1))
-        if not path or path in seen or not os.path.isfile(path):
+def read(path):
+    try:
+        return open(path, encoding='utf-8', errors='replace').read()
+    except OSError:
+        return None
+def walk(text, depth):
+    for raw in text.splitlines():
+        if raw.lstrip().startswith('#'):
             continue
-        seen.add(path)
-        try:
-            body = open(path, encoding='utf-8', errors='replace').read()
-        except OSError:
-            continue
-        if defines.search(body):
-            print(('ours ' if ours(body) else 'other ') + path)
-            sys.exit(0)
+        for m in loads.finditer(raw):
+            path = expand(m.group(1))
+            if not path or not os.path.isfile(path) or os.path.realpath(path) in seen:
+                continue
+            seen.add(os.path.realpath(path))
+            body = read(path)
+            if body is None:
+                continue
+            if defines.search(body):
+                print(('ours ' if ours(body) else 'other ') + path)
+                sys.exit(0)
+            if depth < MAX_DEPTH:
+                walk(body, depth + 1)
+top = read(sys.argv[1])
+if top is None:
+    sys.exit(0)
+seen.add(os.path.realpath(sys.argv[1]))
+walk(top, 1)
 PY
 }
 

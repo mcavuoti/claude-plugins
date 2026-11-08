@@ -90,6 +90,14 @@ RC
   mine=$(run_setup "$home" "--shell=$shell" --alias)
   echo "$mine" | grep -Fq "$home/.my_aliases (which $rc loads) already defines ccc: left as is" || fail "$label" "another ccc in a loaded file isn't left as is"
   [ "$(cat "$rc")" = "$before" ] || fail "$label" "$rc changed over another ccc"
+  # Two levels down, through files that also load each other: found, and the loop ends
+  printf '[ -f ~/.level1 ] && . ~/.level1\n' > "$home/.my_aliases"
+  printf '. ~/.my_aliases\nsource ~/.level2\n' > "$home/.level1"
+  printf '. ~/.level1\n%s\n' "$line" > "$home/.level2"
+  deep=$(run_setup "$home" "--shell=$shell" --alias)
+  echo "$deep" | grep -Fq "already set (in $home/.level2, which $rc loads)" || fail "$label" "ccc two levels down isn't found: $deep"
+  [ "$(cat "$rc")" = "$before" ] || fail "$label" "$rc changed with ccc two levels down"
+  rm -f "$home/.level1" "$home/.level2"
   # None anywhere: added once
   printf 'alias gs="git status"\n' > "$home/.my_aliases"
   run_setup "$home" "--shell=$shell" --alias >/dev/null
