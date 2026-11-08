@@ -702,9 +702,8 @@ test('a test session says it keeps its panel data apart: /sessions status names 
   await ui.unmount()
 })
 
-// A session a background service handed ccc's variables (that service was brought up by a launcher before 0.13.6): it
-// isn't a test session, so it shares the store, reads the installed version as usual, and says the variables are ignored
-test("ccc's SESSIONS_PLUGIN_VERSION/SINCE alone make no test session: shared keys, the real installed version, said ignored", async ($, on) => {
+// A session with ccc's variables alone isn't a test session: it shares the store and reads the installed version as usual
+test("ccc's SESSIONS_PLUGIN_VERSION/SINCE alone make no test session: shared keys, the real installed version", async ($, on) => {
   const w = world(on, { env: { SESSIONS_CLAUDE: '', SESSIONS_JOBS_DIR: '', SESSIONS_DAEMON_LOG: '', SESSIONS_PLUGIN_VERSION: '0.13.2', SESSIONS_PLUGIN_SINCE: '1' } })
   await startSession($, w)
   await w.clock.advance(4000)
@@ -716,7 +715,6 @@ test("ccc's SESSIONS_PLUGIN_VERSION/SINCE alone make no test session: shared key
   expect(said).not.toContain('keeps its panel data apart')
   expect(said).not.toContain('installed (0.13.2)')
   expect(said).not.toContain('(installed: 0.13.2)')
-  expect(said).toContain('SESSIONS_PLUGIN_VERSION, SESSIONS_PLUGIN_SINCE: set in this session\'s environment and ignored')
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   await w.clock.advance(100)
   expect(JSON.stringify(await ui.drawn())).not.toContain('data apart')

@@ -202,7 +202,6 @@ expect "$(field "$(pick)" restart)" True "a heartbeat from another process"
 beat aaaaaaaa 1000 1
 expect "$(field "$(pick)" restart)" False "another format isn't a missing mod"
 SESSIONS_PLUGIN_SINCE="$(now_ms)" expect "$(field "$(SESSIONS_PLUGIN_SINCE="$(now_ms)" pick)" restart)" False "started before the install"
-SESSIONS_PLUGIN_VERSION=0.9.2 expect "$(field "$(SESSIONS_PLUGIN_VERSION=0.9.2 pick)" restart)" False "installed version has no heartbeats"
 pass "heartbeat expectations"
 
 # 5. The whole launcher, with the Name prompt: a new session whose mod never comes up gets exactly one restart, then

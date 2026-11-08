@@ -494,15 +494,11 @@ function stateSeeds(on: any, seeds: Record<string, unknown>) {
   on('state.get', (_: any, e: any, next: any) => (e.plugin === 'sessions' && left.has(e.key) ? { value: { value: left.get(e.key), version: 1 } } : next(e)))
 }
 
-// The transcript reads that ask which agent the session runs as (readAgent)
-const agentReads = (t: Setup) => t.w.runs.filter(a => a[0] === '/bin/sh' && String(a[2]).includes('grep -e "^$3"')).length
-
-// An update in place from 0.15.1 or before: the module before this one drew (its shortId stays), recorded no agent, and
-// no SessionStart comes
-test("updated in place from a version that didn't record the agent: none in the transcript, the tools come in the background", async ($, on) => {
+// A reload where the module before this one drew (its shortId stays), recorded no agent, and no SessionStart comes
+test("updated in place with no agent recorded: none in Claude's registry, the tools come in the background", async ($, on) => {
   stateSeeds(on, { shortId: 'aaaaaaaa' })
   const t = setup(on)
-  t.w.transcript.value = '{"type":"custom-title","customTitle":"lead"}\n'
+  registryEntry(t)
   // The registration answers only later: session.start isn't held for it
   let open = () => {}
   t.gate.value = new Promise<void>(r => (open = r))
@@ -515,52 +511,38 @@ test("updated in place from a version that didn't record the agent: none in the 
   await t.w.clock.advance(100)
   expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
   const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
-  expect(String(status.text)).toContain('Tools for Claude: mcp__sessions__list, mcp__sessions__wake (no agent, as its transcript says; offered after an update in place, from the next request on)')
-  expect((await listed($, t)).result).toContain('“worker a”')
+  expect(String(status.text)).toContain('Tools for Claude: mcp__sessions__list, mcp__sessions__wake (no agent, as Claude\'s registry of sessions says; offered after an update in place, from the next request on)')
   // Recorded: the next reload registers them as a start does, awaited for a moment
   await startSession($, t.w)
   expect(t.registered.map(r => r.name)).toEqual(['list', 'wake', 'list', 'wake'])
 })
 
-test("updated in place from a version that didn't record the agent: an agent in the transcript gets none until it restarts", async ($, on) => {
+test("updated in place with no agent recorded: an agent in Claude's registry gets none until it restarts", async ($, on) => {
   stateSeeds(on, { shortId: 'aaaaaaaa' })
   const t = setup(on)
   t.w.files.set(`${ROOT}/.claude/agents/lead.md`, '---\nname: lead\ntools: mcp__sessions__*, SendMessage\n---\n')
-  t.w.transcript.value = '{"type":"agent-setting","agentSetting":"lead","sessionId":"aaaaaaaa"}\n'
+  registryEntry(t, { agent: 'lead' })
   await startSession($, t.w)
   await t.w.clock.advance(100)
   expect(t.registered).toEqual([])
   const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
-  expect(String(status.text)).toContain('Tools for Claude: not offered: agent lead, and this session was updated in place from a version without them; a restart (u) offers them')
+  expect(String(status.text)).toContain('Tools for Claude: not offered: agent lead, and no SessionStart reached the mod in this session; a restart (u) offers them')
   // Nothing recorded: another reload decides the same
   await startSession($, t.w)
   await t.w.clock.advance(100)
   expect(t.registered).toEqual([])
 })
 
-test("a transcript that can't be read after an update in place: nothing registered, read a few times, said", async ($, on) => {
+test("updated in place and Claude's files don't say the agent: nothing registered, said", async ($, on) => {
   stateSeeds(on, { shortId: 'aaaaaaaa' })
   const t = setup(on)
   await startSession($, t.w)
   await t.w.clock.advance(6000)
   expect(t.registered).toEqual([])
-  expect(agentReads(t)).toBeGreaterThanOrEqual(5)
   const status: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
-  expect(String(status.text)).toContain('Tools for Claude: not offered: no SessionStart reached the mod in this session (updated in place from an older version); a restart (u) offers them')
+  expect(String(status.text)).toContain('Tools for Claude: not offered: no SessionStart reached the mod in this session (it came in by a reload); a restart (u) offers them')
   // Its own text for not being live: a restart or /clear makes it live
   expect(await statusLine($, 'Not live:')).toContain('Not live: this session was updated in place from a version that watched other files; it reads them every 3 s until it restarts (u) or is cleared (/clear)')
-})
-
-test("updated in place: Claude's registry says the agent before the transcript is read", async ($, on) => {
-  stateSeeds(on, { shortId: 'aaaaaaaa' })
-  const t = setup(on)
-  registryEntry(t)
-  await startSession($, t.w)
-  await t.w.clock.advance(100)
-  expect(t.registered.map(r => r.name)).toEqual(['list', 'wake'])
-  expect(await statusLine($, 'Tools for Claude:')).toBe(
-    "Tools for Claude: mcp__sessions__list, mcp__sessions__wake (no agent, as Claude's registry of sessions says; offered after an update in place, from the next request on)",
-  )
 })
 
 test('updated in place on a machine whose starts find no SessionStart: the status says so, and neither it nor the panel names u', async ($, on) => {
