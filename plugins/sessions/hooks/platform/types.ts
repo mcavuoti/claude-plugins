@@ -1,4 +1,5 @@
-// What each operating system provides so the shared panel (register.tsx) can work with windows, processes and memory.
+// What each operating system provides so the shared panel (register.tsx) can work with windows, processes, memory and
+// the kernel's file watch.
 // One implementation per system: macos.ts drives Terminal.app through AppleScript; linux.ts uses processes and the
 // launcher only, which every terminal has. Each can only be tested on its own system, so edit macos.ts from a Mac and
 // linux.ts from Linux; a change to this contract updates both in the same commit (see CONTRIBUTING.md at the repo root).
@@ -53,6 +54,9 @@ export type Platform = {
   // Whether the python3 found on the PATH (its path) can run without bothering the person (a system stub that asks to
   // install something first can't)
   pythonUsable(run: Run, path: string): Promise<boolean>
+  // The kernel's file watch for the mod's own watch (launcher.py watch-paths --how), where Claude watches nothing for the
+  // session (no SessionStart reached the mod)
+  fileWatch: 'kqueue' | 'inotify'
   // Notices whose advice depends on how windows work on this system
   text: {
     switchNeedsWindow: string

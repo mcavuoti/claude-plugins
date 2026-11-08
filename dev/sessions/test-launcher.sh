@@ -750,7 +750,7 @@ pass "membership: the project a session started in, for ccc's pick, ccc <name> a
 #     last frame (no clear, the alternate screen kept) with no "Hangup" report. While a viewer runs, the window says
 #     what it shows (.showing, with its three processes); a file with no end (a restart's reopen, a panel that closes
 #     the viewer itself) waits for the viewer to end; .showing and the watcher go with the launcher. Without python3
-#     neither runs, and the window switches the old way
+#     the window says it's needed and opens nothing
 reset
 export SESSIONS_PLUGIN_VERSION=0.16.0 SESSIONS_PLUGIN_SINCE=0
 touch "$fix/attach-wait"
@@ -884,24 +884,66 @@ if ! until_true 100 gone_pid "$w"; then
   kill "$w" 2>/dev/null || true
   fail "orphan" "the watcher outlived a launcher killed outright"
 fi
-# Without python3: no watcher and no .showing; a file and the viewer closed by whoever switches, as before
+# python3 is required: without it, a window says so and opens nothing
 nopy="$work/nopy"
 mkdir -p "$nopy"
 for t in bash dirname uname mkdir rm stty clear sleep cat; do p=$(command -v "$t") && ln -sf "$p" "$nopy/$t"; done
 : > "$fix/calls.log"
-(cd "$proj" && PATH="$nopy" /bin/bash "$hooks/visor.sh" attach aaaaaaaa < /dev/null > "$work/out.txt" 2>&1) &
-launcher=$!
-until_true 150 grep -q '^attach aaaaaaaa' "$fix/calls.log" || fail "no python3" "the viewer didn't open: $(cat -v "$work/out.txt")"
-sleep 0.3
-[ ! -e "$win.showing" ] || fail "no python3" "a .showing with no watcher"
-printf 'format=3\ncommand=attach\nid=bbbbbbbb\ntitle=beta\n' > "$win"
-kill -HUP "$(cat "$fix/viewer-aaaaaaaa")"
-until_true 150 grep -q '^attach bbbbbbbb' "$fix/calls.log" || fail "no python3" "the switch didn't open the next one"
-kill -HUP "$(cat "$fix/viewer-bbbbbbbb")"
-wait "$launcher" || true
+code=0
+(cd "$proj" && PATH="$nopy" /bin/bash "$hooks/visor.sh" attach aaaaaaaa < /dev/null > "$work/out.txt" 2>&1) || code=$?
+expect "$code" 1 "without python3, the window's launcher fails"
+grep -q 'needs python3' "$work/out.txt" || fail "no python3" "it didn't say python3 is needed: $(cat -v "$work/out.txt")"
+[ ! -s "$fix/calls.log" ] || fail "no python3" "it ran claude anyway: $(cat "$fix/calls.log")"
 rm -f "$fix/attach-wait"
 unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
-pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; without python3"
+pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; python3 required"
+
+# 16b. The mod's own watch (launcher.py watch-paths), with the kernel watch the platform picks (kqueue on macOS, inotify
+#      on Linux): ready once armed, then a line for a write, a new file, a removal, a file in a folder made after it
+#      started (a watched folder that was missing) and a watched file written beside and renamed over (how bells and
+#      pins.json are written); it ends as soon as its parent does, even one killed outright
+case "$(uname -s)" in
+  Darwin) how=kqueue ;;
+  Linux) how=inotify ;;
+  *) how='' ;;
+esac
+if [ -n "$how" ]; then
+  paths="$work/paths"
+  mkdir -p "$paths/reg" "$paths/jobs"
+  echo one > "$paths/reg/1.json"
+  bash -c 'python3 "$1" watch-paths --how "$2" "$3/reg" "$3/tell" "$3/jobs/pins.json" > "$3.out" 2> "$3.err" & echo $! > "$3.pid"; wait' sh "$hooks/launcher.py" "$how" "$paths" &
+  outer=$!
+  has_line() { grep -qxF "$1" "$paths.out"; }
+  until_true 150 test -s "$paths.out" || fail "watch-paths" "no ready: $(cat "$paths.err")"
+  helper=$(cat "$paths.pid")
+  tab=$'\t'
+  head -n 1 "$paths.out" | grep -q "^ready$tab$how$tab$helper${tab}[0-9]*\$" || fail "watch-paths" "not ready as expected: $(head -n 1 "$paths.out")"
+  echo two >> "$paths/reg/1.json"
+  until_true 100 has_line "change$tab$paths/reg/1.json" || fail "watch-paths ($how)" "no line for a write: $(cat "$paths.out")"
+  echo new > "$paths/reg/2.json"
+  until_true 100 has_line "add$tab$paths/reg/2.json" || fail "watch-paths ($how)" "no line for a new file: $(cat "$paths.out")"
+  rm "$paths/reg/1.json"
+  until_true 100 has_line "unlink$tab$paths/reg/1.json" || fail "watch-paths ($how)" "no line for a removal: $(cat "$paths.out")"
+  mkdir -p "$paths/tell/bbbbbbbb"
+  sleep 0.2
+  echo request > "$paths/tell/bbbbbbbb/1"
+  until_true 100 has_line "add$tab$paths/tell/bbbbbbbb/1" || fail "watch-paths ($how)" "no line for a file in a folder made since: $(cat "$paths.out")"
+  echo pins > "$paths/jobs/pins.json.tmp"
+  mv "$paths/jobs/pins.json.tmp" "$paths/jobs/pins.json"
+  until_true 100 has_line "add$tab$paths/jobs/pins.json" || fail "watch-paths ($how)" "no line for a watched file that came: $(cat "$paths.out")"
+  echo pins2 > "$paths/jobs/pins.json.tmp"
+  mv "$paths/jobs/pins.json.tmp" "$paths/jobs/pins.json"
+  until_true 100 has_line "change$tab$paths/jobs/pins.json" || fail "watch-paths ($how)" "no line for a file renamed over: $(cat "$paths.out")"
+  echo pins3 >> "$paths/jobs/pins.json"
+  sleep 0.3
+  expect "$(grep -c "^change$tab$paths/jobs/pins.json\$" "$paths.out")" 2 "a write to the file renamed over is heard too"
+  grep -q 'pins.json.tmp' "$paths.out" && fail "watch-paths ($how)" "a file beside a watched one was reported: $(cat "$paths.out")"
+  alive "$helper" || fail "watch-paths ($how)" "it ended on its own: $(cat "$paths.err")"
+  kill -9 "$outer"
+  wait "$outer" 2> /dev/null || true
+  until_true 100 gone_pid "$helper" || fail "watch-paths ($how)" "it outlived its parent, killed outright"
+  pass "the mod's own watch ($how): ready, a write, a new file, a removal, a folder made since, a file renamed over; it ends with its parent"
+fi
 
 # 17. What's typed during a switch is dropped, on a real terminal (a pty): what was pending when the switch was asked
 #     and what's typed while the next viewer starts never reach it (an Enter neither: the next viewer reads from its

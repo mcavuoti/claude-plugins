@@ -100,6 +100,8 @@ export type WorldOptions = {
   onRun?: (argv: readonly string[]) => void
   // Run beneath the mod inside session.start, with the hook's $ (the engine raises SessionStart there)
   onStart?: ($: any) => Promise<void>
+  // The python3 on the PATH (command -v python3); none by default
+  python?: string
 }
 
 // A session with an id and a root, an in-memory folder tree, a claude that lists one session
@@ -293,6 +295,7 @@ export function world(on: On, options: WorldOptions = {}): World {
       return installedLate.value > 0 ? clock.sleep(installedLate.value).then(answer) : answer()
     }
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok(`${options.system ?? 'Darwin'}|`)
+    if (argv[0] === '/bin/sh' && String(argv[2]) === 'command -v python3') return options.python ? ok(`${options.python}\n`) : failed()
     // The first row with a cwd of each session's transcript (firstCwds): the ones starts has, by session id
     if (argv[0] === '/bin/sh' && String(argv[2]).includes(`'"cwd":"'`)) {
       return ok(argv.slice(5).filter(id => starts.has(id)).map(id => `${id}\t${JSON.stringify({ type: 'user', cwd: starts.get(id) })}\n`).join(''))

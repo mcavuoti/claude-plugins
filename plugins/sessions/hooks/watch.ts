@@ -5,7 +5,8 @@
 // keeps that list across a hot reload of the mod, until the next SessionStart (a start, /clear, a compaction, a resume)
 // replaces it. A reload never raises SessionStart: a module that came in by a reload watches what the module before it
 // asked for, so the set of paths has a version of its own (WATCH_SET), which an update in place never crosses
-// (reloadDecision), and a module that finds no SessionStart of its own set behind it reads on a short timer instead.
+// (reloadDecision). A module that finds no SessionStart of its own set behind it (or a session no SessionStart reaches)
+// watches the same paths itself (launcher.py watch-paths, register.tsx's startHelper), on a short timer until that's up.
 //
 // The paths (watchPaths):
 // - Claude's registry of running sessions (~/.claude/sessions, or SESSIONS_REGISTRY_DIR): one <pid>.json per running

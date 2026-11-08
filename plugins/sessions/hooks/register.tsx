@@ -1323,14 +1323,16 @@ async function chores($: any) {
   await updateInPlace($)
 }
 
-// The short timer, while the engine watches nothing for this session (no SessionStart of this WATCH_SET came: updated
-// in place from an older version, or a host that never sends it), as the panel ran before: requests every 0.5 s, the
-// list every 3 s, the seen check every 2 s, the chores every 15 s, the leader's turn every 20 s, the token usage every
-// minute. Watched with a list that can't be read from Claude's files (slowList), only the list every 3 s
+// The short timer, while nothing watches this session's paths (no SessionStart of this WATCH_SET came: updated in place
+// from an older version, or a host that never sends it), until the mod's own watch is up (startHelper) and while it's
+// down, as the panel ran before: requests every 0.5 s, the list every 3 s, the seen check every 2 s, the chores every
+// 15 s, the leader's turn every 20 s, the token usage every minute. Watched with a list that can't be read from Claude's
+// files (slowList), only the list every 3 s
 let pollTimers: { cancel: () => void }[] = []
 let slowTimer: { cancel: () => void } | null = null
 function setPace($: any) {
   if (!active) return
+  if (!live) bg(startHelper($))
   if (!live && pollTimers.length === 0) {
     pollTimers = [
       $.clock.every(500, () => quickTick($)),
@@ -1391,6 +1393,136 @@ async function pollRefresh($: any) {
   // The poll is what reads the files: Claude's registry anew every time
   await syncFiles($)
   await requestRefresh($)
+}
+
+// ---- The mod's own watch (launcher.py watch-paths), where Claude watches nothing for this session ----
+// With no SessionStart of this WATCH_SET (a plugin ahead of sessions sends it on past it, or the session was updated in
+// place), Claude raises no classic.FileChanged for the mod. The mod then runs a watcher of its own, a process that
+// sleeps in the kernel's file watch the platform names (platform.fileWatch) over the same paths SessionStart would hand
+// Claude (watchPaths), and takes each of its lines as Claude's event (fileChanged). Its `ready` makes the session live,
+// and the short timer stops: from then on it runs as a watched one. It starts once no SessionStart is coming: at once
+// in a module that came in by a reload, or where this machine's starts get none (startSkipped), else
+// ROLE_SKIP_CHECK_MS after the start. When it ends, the short timer is back and it starts again HELPER_RETRY_MS later,
+// HELPER_TRIES times in a row at most (one that ran HELPER_STEADY_MS counts as none). A SessionStart ends it, since
+// Claude watches the paths from then on (stopHelper); a reload ends it with the module, and the new module starts its
+// own. It needs python3, which the plugin requires: without a usable one there's none, and /sessions status says so
+const WATCHER = `${(import.meta as any).dir}/launcher.py`
+const HELPER_RETRY_MS = 30000
+const HELPER_TRIES = 5
+const HELPER_STEADY_MS = 600000
+type Helper = { stream: any; how: string; paths: number; pid: string; watched: number; readyAt: number; stopping: boolean }
+let helper: Helper | null = null
+let helperLive = false
+let helperFailures = 0
+let helperRetry: { cancel: () => void } | null = null
+let helperRetryAt = 0
+// Why the last one ended, for /sessions status
+let helperEnded = ''
+// Claude watches this session's paths: its SessionStart of this WATCH_SET came, in this module or one before it in
+// this session (the watching state). live is that or the mod's own watch
+let engineWatch = false
+
+async function startHelper($: any) {
+  if (helper || live || !active || helperRetry || helperFailures >= HELPER_TRIES || !locations.registry || !locations.data || !myId) return
+  if (!reloadedInto && !startSkipped && (await $.clock.now()) - startedAt < ROLE_SKIP_CHECK_MS) return
+  const h: Helper = { stream: null, how: platform.fileWatch, paths: 0, pid: '', watched: 0, readyAt: 0, stopping: false }
+  helper = h
+  const py = await usablePython($)
+  if (!py) {
+    helper = null
+    return
+  }
+  let why = ''
+  let said = ''
+  try {
+    ownJob = (await ownJobOf($, locations, myId)) ?? ownJob
+    await makeOwnFolders($, locations)
+    const paths = watchPaths(locations, ownJob)
+    h.paths = paths.length
+    if (h.stopping) return
+    h.stream = $.process.spawn({ argv: [py, WATCHER, 'watch-paths', '--how', h.how, ...paths], cwd: workDir, env: LAUNCHER_ONLY })
+    let buf = ''
+    for await (const chunk of h.stream) {
+      if (chunk.stream === 'stderr') {
+        said = (said + chunk.text).slice(-400)
+        continue
+      }
+      buf += chunk.text
+      for (let i = buf.indexOf('\n'); i >= 0; i = buf.indexOf('\n')) {
+        const [kind = '', a = '', b = '', c = ''] = buf.slice(0, i).split('\t')
+        buf = buf.slice(i + 1)
+        if (kind === 'ready') await helperReady($, h, b, Number(c))
+        else if ((kind === 'add' || kind === 'change' || kind === 'unlink') && a && helper === h) fileChanged($, a, kind)
+      }
+    }
+    const end = await Promise.resolve(h.stream.result).catch(() => null)
+    why = end?.signal ? `ended by ${end.signal}` : end ? `exited with code ${end.code}` : 'ended'
+  } catch (err) {
+    why = `couldn't run: ${String(err).slice(0, 200)}`
+  } finally {
+    const last = said.trim().split('\n').at(-1) ?? ''
+    await helperGone($, h, last ? `${why}: ${last.slice(0, 200)}` : why)
+  }
+}
+
+async function helperReady($: any, h: Helper, pid: string, watched: number) {
+  h.pid = /^\d+$/.test(pid) ? pid : ''
+  // Stopped while it was starting: ended now that its process is known
+  if (h.stopping) {
+    if (h.pid) bg(runSafe($, ['kill', h.pid]))
+    return
+  }
+  h.watched = Number.isFinite(watched) ? watched : 0
+  h.readyAt = await $.clock.now()
+  helperLive = true
+  debugLine($, `own watch: ${h.how} on ${h.paths} paths (${h.watched} watched), process ${h.pid}${live ? '' : ', live now'}`)
+  if (live) return
+  live = true
+  setPace($)
+  scheduleFlush($, 0, d => (d.all = true))
+  bg(scheduleSeen($))
+}
+
+async function helperGone($: any, h: Helper, why: string) {
+  if (helper !== h) return
+  helper = null
+  const wasLive = helperLive
+  helperLive = false
+  if (h.stopping || engineWatch || !active) {
+    debugLine($, `own watch ended (${why}): Claude watches the paths now`)
+    return
+  }
+  const now = await $.clock.now()
+  if (wasLive && now - h.readyAt >= HELPER_STEADY_MS) helperFailures = 0
+  helperFailures++
+  helperEnded = why
+  const again = helperFailures < HELPER_TRIES
+  debugLine($, `own watch ended (${why}): ${again ? `the short timer, and it starts again in ${HELPER_RETRY_MS / 1000} s` : `the short timer from now on (${helperFailures} times in a row)`}`)
+  if (again) {
+    helperRetryAt = now + HELPER_RETRY_MS
+    helperRetry = $.clock.after(HELPER_RETRY_MS, () => {
+      helperRetry = null
+      setPace($)
+    })
+  }
+  if (wasLive) {
+    live = false
+    setPace($)
+  }
+}
+
+// A SessionStart came: Claude watches the paths from now on, and the mod's own watch ends (its process, by the pid its
+// ready said; the stream's end too)
+function stopHelper($: any) {
+  helperRetry?.cancel()
+  helperRetry = null
+  const h = helper
+  if (!h) return
+  h.stopping = true
+  if (h.pid) bg(runSafe($, ['kill', h.pid]))
+  try {
+    void Promise.resolve(h.stream?.return?.(undefined)).catch(() => {})
+  } catch {}
 }
 
 // A start, a wake or a restart another plugin queued ($.sessions.start, wake, restart) runs at once, from this mod's own
@@ -1534,11 +1666,11 @@ async function watchFor($: any, sessionId: string, source: string): Promise<stri
   if (!l.registry || !l.data) return []
   ownJob = (await ownJobOf($, l, sessionId)) ?? ownJob
   const paths = watchPaths(l, ownJob)
-  const missing: string[] = []
-  for (const dir of ownWatchedFolders(l)) if (!(await exists($, dir))) missing.push(dir)
-  if (missing.length && (await runSafe($, ['mkdir', '-p', ...missing])).exitCode !== 0) debugLine($, `couldn't make ${missing.join(', ')}: their file events may never come`)
+  await makeOwnFolders($, l)
   const was = live
   live = true
+  engineWatch = true
+  stopHelper($)
   {
     const next = { set: WATCH_SET, sessionId, at: await $.clock.now() }
     await update($, watching, () => next)
@@ -1550,6 +1682,14 @@ async function watchFor($: any, sessionId: string, source: string): Promise<stri
     scheduleFlush($, 0, d => (d.all = true))
   }
   return paths
+}
+
+// The mod's own folders among the watched paths, made where missing before they're watched (by Claude or the mod's own
+// watch): a folder missing when Claude is asked for it may never be watched (see watch.ts)
+async function makeOwnFolders($: any, l: Locations) {
+  const missing: string[] = []
+  for (const dir of ownWatchedFolders(l)) if (!(await exists($, dir))) missing.push(dir)
+  if (missing.length && (await runSafe($, ['mkdir', '-p', ...missing])).exitCode !== 0) debugLine($, `couldn't make ${missing.join(', ')}: their file events may never come`)
 }
 
 // The heartbeats of the sessions in a list, by sessionId (only the ones that exist and parse). The folder's listing
@@ -2497,6 +2637,8 @@ async function offerTools($: any, cwd: string) {
   }
   let role = roleSeen ?? (await read($, agentRole))
   if (role === null) startSkipped ||= (await storeGet($, START_SKIPPED)) != null
+  // This machine's starts get no SessionStart: the mod's own watch needn't wait for one
+  if (startSkipped && active && !live) setPace($)
   if (role === null && starting && !startDone) {
     await Promise.race([roleCame, startSkipped ? idCame : $.clock.sleep(ROLE_WAIT_MS), starting].map(w => w.catch(() => {})))
     role = roleSeen ?? (await read($, agentRole))
@@ -4769,6 +4911,10 @@ async function statusText($: any): Promise<string> {
   const apart = await apartText($)
   if (apart) lines.push(apart)
   if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)
+  // A requirement: its own watch (where no SessionStart comes), ccc and the token usage run on it
+  if (!(await usablePython($))) {
+    lines.push("Problem: python3 isn't usable here, and the plugin needs it (its own file watch where no SessionStart reaches it, ccc, token usage): install it (on a Mac, the developer tools: xcode-select --install)")
+  }
   return lines.join('\n')
 }
 
@@ -4776,13 +4922,25 @@ async function statusText($: any): Promise<string> {
 // from, and who does the machine-wide work
 async function liveText($: any, now: number): Promise<string> {
   const w = await read($, watching)
-  const how = live
-    ? `Live: the engine watches Claude's registry and the panel's files (set ${WATCH_SET}${w ? `, since ${Math.max(0, Math.round((now - w.at) / 1000))} s ago` : ''})${inboxTimer ? ', but not the inbox (a request came with no file event): read every 0.5 s' : ''}`
-    : roleSeen
-      ? "Not live: its SessionStart came but had no folders to hand Claude to watch (no home folder?); it reads the files every 3 s"
-      : reloadedInto && !startSkipped
-        ? 'Not live: this session was updated in place from a version that watched other files; it reads them every 3 s until it restarts (u) or is cleared (/clear)'
-        : `Not live: ${SKIPPED_START}. Claude watches files for a mod only when its SessionStart asks, so the panel reads them every 3 s`
+  const secondsAgo = (t: number) => `${Math.max(0, Math.round((now - t) / 1000))} s ago`
+  const noStart = reloadedInto && !startSkipped ? 'this session was updated in place' : 'a plugin that runs before sessions sends it on past it'
+  // The mod's own watch, where nothing else watches: starting, ended and starting again, or given up
+  const own = helper
+    ? 'its own watch is starting'
+    : helperRetry
+      ? `its own watch ended (${helperEnded}) and starts again in ${Math.max(0, Math.round((helperRetryAt - now) / 1000))} s`
+      : helperFailures >= HELPER_TRIES
+        ? `its own watch ended ${helperFailures} times in a row (last: ${helperEnded}), so it stays on the short timer until the session restarts`
+        : ''
+  const how = engineWatch
+    ? `Live: the engine watches Claude's registry and the panel's files (set ${WATCH_SET}${w ? `, since ${secondsAgo(w.at)}` : ''})${inboxTimer ? ', but not the inbox (a request came with no file event): read every 0.5 s' : ''}`
+    : helperLive && helper
+      ? `Live through the mod's own watch (no SessionStart came: ${noStart}): ${helper.how} on ${helper.paths} paths (${helper.watched} watched), process ${helper.pid}, since ${secondsAgo(helper.readyAt)}`
+      : (roleSeen
+          ? "Not live: its SessionStart came but had no folders to hand Claude to watch (no home folder?); it reads the files every 3 s"
+          : reloadedInto && !startSkipped
+            ? 'Not live: this session was updated in place from a version that watched other files; it reads them every 3 s until it restarts (u) or is cleared (/clear)'
+            : `Not live: ${SKIPPED_START}. Claude watches files for a mod only when its SessionStart asks, so the panel reads them every 3 s`) + (own ? `; ${own}` : '')
   const list = slowList ? `the list from claude agents (${sessionFiles?.problem || "this session isn't in Claude's registry"})` : "the list from Claude's files"
   let record: ReturnType<typeof parseLeader> = null
   try {
@@ -5111,6 +5269,7 @@ async function start($: any) {
     const before = await read($, shortId)
     reloadedInto = before !== ''
     live ||= (await read($, watching))?.set === WATCH_SET
+    engineWatch = live
     // The start's first write: started by the first draw, it waits for that draw to settle (afterDraw), and is written
     // even when it's the same, so that nothing after it writes before
     const next = myId.slice(0, 8)
@@ -5201,6 +5360,8 @@ async function start($: any) {
     })
     active = true
     setPace($)
+    // Nothing watched yet: the mod's own watch starts once no SessionStart is coming (startHelper)
+    if (!live) $.clock.after(ROLE_SKIP_CHECK_MS, () => setPace($))
     bg(
       (async () => {
         await syncFiles($, true)

@@ -216,6 +216,8 @@ export const linux: Platform = {
     return true
   },
 
+  fileWatch: 'inotify',
+
   text: {
     switchNeedsWindow: 'To switch, open this session with ccc (the launcher lets the panel switch that window)',
     agentsNeedsWindow: 'To open the agent view, open this session with ccc (the launcher lets the panel switch that window)',
