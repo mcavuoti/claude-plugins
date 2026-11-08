@@ -308,8 +308,8 @@ export function world(on: On, options: WorldOptions = {}): World {
     if (other) return { value: { stdout: '', stderr: '', ...other, isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.init?.cwd !== '/') return failed('fleet runs every command from /')
     const [cmd, ...args] = argv
-    // python3 is here (fleet's dependency check asks it once); a test sets exec to answer otherwise
-    if (cmd === 'python3' && args[0] === '-c' && args[1] === 'pass') return ok
+    // python3 is here (fleet's dependency check); a test sets exec to answer otherwise
+    if (cmd === 'python3' && args.includes('-c') && args.includes('pass')) return ok
     if (cmd === 'ln') {
       const [from = '', to = ''] = args
       if (files.has(to)) return failed('File exists')

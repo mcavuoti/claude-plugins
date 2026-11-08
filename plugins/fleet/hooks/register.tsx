@@ -718,11 +718,12 @@ let found: Contract | null | undefined
 let foundAt = 0
 
 /** Whether sessions is here at the version fleet needs: loaded, its contract api 1, and SESSIONS_MIN or later. One that
- * didn't answer is asked again a minute later (it may have been starting); not here, not ready and too old are one
- * state, said by sessionsNeed() */
+ * didn't answer, or answered with no version, is asked again a minute later (it may have been starting); not answering
+ * and too old are one state, said by sessionsNeed(). A sessions still starting answers not-ready call by call: that's
+ * not this state */
 async function sessionsReady($: any): Promise<boolean> {
   const now = await $.clock.now()
-  if (found === undefined || (found === null && now - foundAt > 60000)) {
+  if (found === undefined || ((found === null || !found.version) && now - foundAt >= 60000)) {
     foundAt = now
     try {
       found = await Promise.race([$.sessions.contract(), $.clock.sleep(500).then(() => null)])
@@ -739,13 +740,21 @@ function sessionsNeed(): string {
   return `fleet needs sessions ${SESSIONS_MIN} or later (${here}): update it (claude plugin update sessions@mcavuoti) and restart (u)`
 }
 
-// python3 and Claude Code, each looked at once per process (a dependency doesn't come and go)
-let python3Here: boolean | undefined
+// python3: only a success is kept. A probe that failed may be a hiccup (the machine busy, too many open files), so it's
+// asked again a minute later (refreshNeeds' tick), the way the parse runs it (-I: the environment can't break one and not
+// the other). Claude Code is looked at once per process
+let python3Here = false
+let python3At = -Infinity
 async function python3Ready($: any): Promise<boolean> {
-  if (python3Here === undefined) python3Here = (await run($, ['python3', '-c', 'pass'], { timeoutMs: 10000 })).exitCode === 0
+  if (python3Here) return true
+  const now = await $.clock.now()
+  if (now - python3At < 60000) return false
+  python3At = now
+  python3Here = (await run($, ['python3', '-I', '-c', 'pass'], { timeoutMs: 10000 })).exitCode === 0
   return python3Here
 }
 const PYTHON3_NEED = 'fleet needs python3 (a .py draft is parsed with it, and the proofs check runs with it): install it, then restart (u)'
+const PYTHON3_HICCUP = "couldn't run python3 just now: file it again"
 let claudeVersionHere: string | undefined
 async function claudeReady($: any): Promise<boolean> {
   if (claudeVersionHere === undefined) {
@@ -8771,13 +8780,16 @@ async function newsLines($: any, withApplied = true): Promise<{ lines: string[];
   }
 }
 
-/** A .py draft that Python won't parse (a warning counts: -W error): where and why; null when it parses or isn't Python.
- * python3 is a dependency: without it the draft isn't queued, and the reply says what to install */
+/** A .py draft that Python won't parse (a warning counts: -W error): where and why; null when it parses, isn't Python or
+ * the parse ran out of time (nothing is known against it). python3 is a dependency: without it the draft isn't queued and
+ * the reply says what to install; a parse that couldn't start (run's 127, python3 being here) isn't queued either, and the
+ * reply says to file it again */
 async function pythonProblem($: any, rel: string, text: string): Promise<string | null> {
   if (!/\.py$/i.test(rel)) return null
   if (!(await python3Ready($))) return PYTHON3_NEED
   const r = await run($, ['python3', '-I', '-W', 'error', '-c', 'import ast, sys; ast.parse(sys.stdin.read())'], { stdin: text })
   if (r.exitCode === 0 || r.exitCode === 124) return null
+  if (r.exitCode === 127) return PYTHON3_HICCUP
   const lines = r.stderr.trim().split('\n')
   const at = [...r.stderr.matchAll(/line (\d+)/g)].pop()?.[1]
   return `${at ? `line ${at}: ` : ''}${cut(lines[lines.length - 1]?.trim() || `python3 exited ${r.exitCode}`, 200)}`
@@ -8815,7 +8827,7 @@ async function fileChange($: any, e: any) {
   const bad = configProblemOf(rel, result)
   if (bad) return { deny: `the draft of ${rel} isn't usable: ${bad}. Nothing was queued.` }
   const py = await pythonProblem($, rel, result)
-  if (py === PYTHON3_NEED) return { deny: `the draft of ${rel} can't be checked: ${PYTHON3_NEED}. Nothing was queued.` }
+  if (py === PYTHON3_NEED || py === PYTHON3_HICCUP) return { deny: `the draft of ${rel} can't be checked: ${py}. Nothing was queued.` }
   if (py) return { deny: `the draft of ${rel} doesn't parse as Python (${py}): fix it and file it again. Nothing was queued.` }
   const diff = lineDiff(cur, result, rel)
   const asker = await askerNow($)
@@ -9885,7 +9897,7 @@ async function rosterTick($: any) {
       // roster.json's pin: sessions pins its session (the background service doesn't retire a pinned one), once per ref;
       // one the roster no longer pins that fleet pinned is unpinned (sessions leaves a pin the person made)
       await loadPinned($)
-      if (fresh && inst.pin !== pinnedRefs.has(running.ref) && (await sessionsReady($))) {
+      if (fresh && inst.pin !== pinnedRefs.has(running.ref)) {
         const pinned = inst.pin
         const r = await race<Result>($, () => $.sessions.pin!({ ref: running.ref, pinned, reason: pinned ? 'fleet: roster.json pins it' : 'fleet: roster.json no longer pins it' }))
         if (r?.ok) {
@@ -9918,7 +9930,6 @@ async function rosterTick($: any) {
         }
         continue
       }
-      if (!(await sessionsReady($))) continue
       const reason = why === 'memory' ? 'fleet: closed for lack of memory, memory is back' : 'fleet: a restart stopped it'
       const r = await race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: retired.ref, reason }))
       if (r?.ok) {
@@ -9980,10 +9991,6 @@ async function rosterTick($: any) {
     const asPoll = pollDue && (!some || verdict !== 'ok')
     if (verdict !== 'ok' && !asPoll) {
       notWoken(verdict === 'cap' ? `wakes ${(had && had.day === day ? had.count : 0) + others}/${perDayText(wakes.perDay)} today` : `wakes: one every ${wakes.everyMin} min`)
-      continue
-    }
-    if (!(await sessionsReady($))) {
-      notWoken(sessionsNeed())
       continue
     }
     if (asPoll) {
@@ -10198,10 +10205,6 @@ async function freshRoster($: any): Promise<string | null> {
   await loadRoster($)
   if (roster) return null
   return rosterProblem ? `${rosterProblem}.` : 'No roster.json in .claude/fleet/: /fleet init <template> writes one (solo, software or proposal), or write your own.'
-}
-
-function startLine(i: Instance): string {
-  return `cd "${root}" && claude --bg --agent ${i.agent} --settings "${settingsPath(i.slug)}" -n "${i.name}"`
 }
 
 /** The settings an instance gets besides its own (its --settings file): managed policy, the project's local and shared
@@ -10944,7 +10947,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (hb.restartWait) parts.push(`restart pending (${hb.restartWait})`)
         if (inst.poll) parts.push(`last poll ${hb.lastPoll ? `${ago(now - hb.lastPoll)} ago` : 'none yet'} (every ${inst.poll.everyMin} min)${pollOverdue(inst, hb, now) ? ': overdue' : ''}`)
         await loadPinned($)
-        if (inst.pin) parts.push(pinnedRefs.has(running.ref) ? 'pinned' : (await sessionsReady($)) ? 'to pin' : `pin: ${sessionsNeed()}`)
+        if (inst.pin) parts.push(pinnedRefs.has(running.ref) ? 'pinned' : 'to pin')
         else if (pinnedRefs.has(running.ref)) parts.push('pinned by fleet before: to unpin (roster.json no longer pins it)')
         const t = await readText($, settingsPath(inst.slug))
         if (hb.settingsHash !== null && t !== null && hb.settingsHash !== settingsCoreHash(t)) parts.push('its settings changed since it started: u restarts it with them')

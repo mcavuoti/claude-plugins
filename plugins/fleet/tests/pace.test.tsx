@@ -412,7 +412,7 @@ test('roster.json’s pin with a sessions older than fleet needs: /fleet status 
   await tick(w, 30000)
   expect(calls(w, 'pin')).toEqual([])
   const status = await fleet($, 'status')
-  // Without the sessions fleet needs, status lists no instance rows: the one line says what to update
+  // Without the sessions fleet needs, an instance has no running row: the one line says what to update
   expect(status).toContain('✗ fleet needs sessions 0.17.0 or later (0.16.3 here)')
 })
 

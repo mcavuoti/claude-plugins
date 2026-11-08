@@ -91,7 +91,7 @@ test('a .py draft that Python won’t parse (a warning counts) is refused before
   const w = world(on, { files: { [`${FLEET}/world.json`]: JSON.stringify({ worldFormat: 1, paths: ['notes/**'], checks }), [`${ROOT}/checks/lint.py`]: 'print(1)\n' } })
   const parsed: string[] = []
   w.exec.value = (argv, _cwd, stdin) => {
-    if (argv[0] !== 'python3' || !argv.includes('-c') || argv[2] === 'pass') return undefined
+    if (argv[0] !== 'python3' || !argv.includes('-c') || argv.includes('pass')) return undefined
     parsed.push(argv.join(' '))
     return stdin?.includes('def f(:') ? { exitCode: 1, stderr: '  File "<unknown>", line 2\n    def f(:\n          ^\nSyntaxError: invalid syntax\n' } : { exitCode: 0 }
   }
