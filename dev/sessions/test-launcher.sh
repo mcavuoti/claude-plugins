@@ -750,7 +750,7 @@ pass "membership: the project a session started in, for ccc's pick, ccc <name> a
 #     last frame (no clear, the alternate screen kept) with no "Hangup" report. While a viewer runs, the window says
 #     what it shows (.showing, with its three processes); a file with no end (a restart's reopen, a panel that closes
 #     the viewer itself) waits for the viewer to end; .showing and the watcher go with the launcher. Without python3
-#     the window says it's needed and opens nothing
+#     the window and ccc say it's needed and open nothing
 reset
 export SESSIONS_PLUGIN_VERSION=0.16.0 SESSIONS_PLUGIN_SINCE=0
 touch "$fix/attach-wait"
@@ -894,6 +894,12 @@ code=0
 expect "$code" 1 "without python3, the window's launcher fails"
 grep -q 'needs python3' "$work/out.txt" || fail "no python3" "it didn't say python3 is needed: $(cat -v "$work/out.txt")"
 [ ! -s "$fix/calls.log" ] || fail "no python3" "it ran claude anyway: $(cat "$fix/calls.log")"
+# Nor does ccc look the plugin up, or open anything
+code=0
+(cd "$proj" && PATH="$nopy" /bin/bash "$work/ccc" < /dev/null > "$work/out.txt" 2>&1) || code=$?
+expect "$code" 1 "without python3, ccc fails"
+grep -q 'ccc needs python3' "$work/out.txt" || fail "no python3" "ccc didn't say python3 is needed: $(cat -v "$work/out.txt")"
+[ ! -s "$fix/calls.log" ] || fail "no python3" "ccc ran claude anyway: $(cat "$fix/calls.log")"
 rm -f "$fix/attach-wait"
 unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
 pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; python3 required"

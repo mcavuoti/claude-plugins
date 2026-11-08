@@ -1041,9 +1041,9 @@ export function windowTargetText(t: WindowTarget): string {
 // What a window opened with ccc shows: <data>/windows/<tty as a file name>.showing, written by its launcher
 // (hooks/visor.sh) as each viewer starts there and removed when the launcher ends. Its terminal, what it shows (a
 // session by its short id, or the agent view: id empty), and three processes: the viewer, the launcher (bash
-// visor.sh) and its watcher (launcher.py watch), which ends the viewer when the window's file asks for it (end=1). Only
-// a launcher whose watcher runs publishes one (without python3 there's none): with none, the panel finds the window
-// with ps and closes its viewer itself. Whole only once it ends with a line break
+// visor.sh) and its watcher (launcher.py watch), which ends the viewer when the window's file asks for it (end=1). A
+// window with none (not opened with ccc) is found with ps, and the panel closes its viewer itself. Whole only once it
+// ends with a line break
 export const SHOWING = '.showing'
 export type Showing = { tty: string; command: 'attach' | 'agents'; id: string; viewer: string; launcher: string; watcher: string }
 export function showingText(s: Showing): string {

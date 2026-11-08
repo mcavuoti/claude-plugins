@@ -1894,7 +1894,8 @@ async function readUsage($: any, maxAge = USAGE_SHARED_MS, always = false) {
     const shared = await sharedUsage($, maxAge)
     const py = shared ? null : await usablePython($)
     if (shared) next = { summary: shared, note: '' }
-    else if (!py) next = { summary: null, note: 'Token usage needs python3' }
+    // python3 is a requirement: /sessions status names it when it's missing
+    else if (!py) return
     else {
       const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`, `${dataDir}/alive`], { timeoutMs: 120000 })
       let summary: UsageSummary | null = null
