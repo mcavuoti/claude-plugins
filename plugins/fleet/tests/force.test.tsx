@@ -31,7 +31,7 @@ function wakes(w: World): any[] {
 }
 
 // Every instance stopped, by the person unless said otherwise; version: what the stand-in sessions says it is
-function setup(on: any, stopped: Record<string, string | undefined> = {}, version = '0.17.0'): World {
+function setup(on: any, stopped: Record<string, string | undefined> = {}, version = '0.18.0'): World {
   const w = world(on, { background: false, files: { [`${FLEET}/roster.json`]: roster(), [`${ROOT}/.claude/agents/owner.md`]: OWNER } })
   const stop = (ref: string, name: string, why: string | undefined) => ({ ...row(ref, name, 'stopped'), ...(why ? { stopped: why } : {}) })
   const rows = {
@@ -105,7 +105,7 @@ test('a sessions older than the one fleet needs: /fleet up starts and wakes noth
   const w = setup(on, {}, '0.16.3')
   await startSession($, w)
   const plan = await fleet($, 'up --force --dry-run')
-  expect(plan).toContain('✗ fleet needs sessions 0.17.0 or later (0.16.3 here): update it (claude plugin update sessions@mcavuoti) and restart (u)')
+  expect(plan).toContain('✗ fleet needs sessions 0.18.0 or later (0.16.3 here): update it (claude plugin update sessions@mcavuoti) and restart (u)')
   const up = await fleet($, 'up --force')
   expect(up).toContain('Nothing was started or woken: update sessions, restart this session (u), then /fleet up again.')
   await w.clock.advance(10000)
