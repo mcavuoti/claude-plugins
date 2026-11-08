@@ -52,7 +52,6 @@ import unicodedata
 FORMAT = 3
 SECTIONS_FORMAT = 1
 TELL_MAX_BYTES = 4096
-HEARTBEAT_VERSION = (0, 10, 0)
 HEARTBEAT_FRESH_MS = 45000
 # The panels rewrite the order file when it changes and at least once a pass (a minute, each from its own offset)
 ORDER_FRESH_MS = 150000
@@ -107,11 +106,6 @@ def write_key_lines(path, entries):
 
 def file_key(path):
     return path.replace('/', '_')
-
-
-def parse_version(text):
-    m = re.match(r'^(\d+)\.(\d+)\.(\d+)', str(text or ''))
-    return tuple(int(x) for x in m.groups()) if m else None
 
 
 # The project root, as the mod computes it (rootFrom in state.ts): the nearest folder upwards with AGENTS.md or
@@ -233,13 +227,9 @@ def heartbeat_status(h, pid, now):
     return 'ok'
 
 
-# expectsHeartbeat in state.ts: a running session started (more than 30 s ago) after a mod version with heartbeats was
-# installed
+# expectsHeartbeat in state.ts: a running session started (more than 30 s ago) after the installed version was installed
 def expects_heartbeat(s, plugin, now):
     if not s.get('pid') or not s.get('status') or not plugin:
-        return False
-    v = parse_version(plugin.get('version'))
-    if not v or v < HEARTBEAT_VERSION:
         return False
     started = int(s.get('startedAt') or 0)
     return started > plugin.get('since', 0) + 2000 and now - started > 30000
@@ -534,11 +524,6 @@ def debug_file(name):
     return os.path.join(DATA, 'debug', clean + '.log')
 
 
-def expects_new_heartbeat(ctx):
-    v = parse_version((ctx['plugin'] or {}).get('version'))
-    return bool(v) and v >= HEARTBEAT_VERSION
-
-
 # Creates a background session in the project folder and waits for its mod. None if it couldn't
 def create(ctx, name):
     argv = [CLAUDE, '--bg', '-n', name]
@@ -567,7 +552,7 @@ def create(ctx, name):
     if not session or not session.get('id'):
         say('Created “%s” but can\'t find it in the list: run ccc again.' % name)
         return None
-    if expects_new_heartbeat(ctx):
+    if ctx['plugin']:
         say('%sStarting “%s”…%s' % (DIM, name, RESET))
         if not wait_for_heartbeat(session, START_WAIT):
             # A session that was just created has no conversation to lose: restart it once, without asking
@@ -1723,8 +1708,8 @@ WATCHES = {'kqueue': KqueueWatch, 'inotify': InotifyWatch, 'poll': PollWatch}
 # soon as a panel asks for a switch, so the panel neither looks for the viewer nor closes it: the panel writes the next
 # session to FILE (the window's file) with end=1 as its last line, the watcher sends the viewer FILE.showing names (the
 # launcher writes it as each viewer starts) a SIGHUP, and the loop opens the next one; what's typed meanwhile is
-# dropped (drop_typed). A file with no end=1 (claude respawn's reopen, ccc switching another window, a panel of an older
-# version, which closes the viewer itself) is left to the loop, which reads it once the viewer ends.
+# dropped (drop_typed). A file with no end=1 (claude respawn's reopen, ccc switching another window, a panel closing the
+# viewer itself: the usual way) is left to the loop, which reads it once the viewer ends.
 #
 # It watches FILE's folder (FILE appears or goes) and FILE itself while it's there, and besides looks every
 # WATCH_PASS_S, in case. --how picks the watch (tests); by default the first one this system has

@@ -25,7 +25,7 @@
 // A path that's missing when the list goes is watched only in the simplest case. The engine (chokidar) then waits on
 // its parent folder for that name, and the waits on one parent share one read of it: when the parent changes, only one
 // of them reads it. So one missing name under a folder that exists is watched once it's made; of several missing under
-// one parent only one ever is (in 0.14.0 a new data folder's bell, inbox and tell: the first session there never heard
+// one parent only one ever is (a new data folder's bell, inbox and tell: the first session there would never hear
 // of its inbox); and one whose parent is missing too waits for the wrong name and never is. A SessionStart that hands
 // the same list again (a /clear, a compaction) leaves the watch as it is: what was missed stays missed until the session
 // restarts. So the mod's own folders (ownWatchedFolders) are made before the list goes, and the pass looks for an
@@ -42,7 +42,7 @@ import { parseKeyLines, keyLines, FORMAT } from './state'
 
 // The version of the set of paths a session watches: raised whenever a version of the mod watches a new kind of path
 // (a reload into it would leave the new kind unwatched until the next SessionStart). A copy's own number is read from
-// this line of its file (watchSetOf), so an older copy without this file is set 0
+// this line of its file (watchSetOf)
 export const WATCH_SET = 1
 
 // The watch set of a copy of the mod, from its hooks/watch.ts (this file): 0 when it has none

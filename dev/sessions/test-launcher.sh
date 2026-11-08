@@ -202,7 +202,6 @@ expect "$(field "$(pick)" restart)" True "a heartbeat from another process"
 beat aaaaaaaa 1000 1
 expect "$(field "$(pick)" restart)" False "another format isn't a missing mod"
 SESSIONS_PLUGIN_SINCE="$(now_ms)" expect "$(field "$(SESSIONS_PLUGIN_SINCE="$(now_ms)" pick)" restart)" False "started before the install"
-SESSIONS_PLUGIN_VERSION=0.9.2 expect "$(field "$(SESSIONS_PLUGIN_VERSION=0.9.2 pick)" restart)" False "installed version has no heartbeats"
 pass "heartbeat expectations"
 
 # 5. The whole launcher, with the Name prompt: a new session whose mod never comes up gets exactly one restart, then
@@ -750,7 +749,7 @@ pass "membership: the project a session started in, for ccc's pick, ccc <name> a
 #     last frame (no clear, the alternate screen kept) with no "Hangup" report. While a viewer runs, the window says
 #     what it shows (.showing, with its three processes); a file with no end (a restart's reopen, a panel that closes
 #     the viewer itself) waits for the viewer to end; .showing and the watcher go with the launcher. Without python3
-#     the window says it's needed and opens nothing
+#     the window and ccc say it's needed and open nothing
 reset
 export SESSIONS_PLUGIN_VERSION=0.16.0 SESSIONS_PLUGIN_SINCE=0
 touch "$fix/attach-wait"
@@ -802,21 +801,13 @@ sleep 1.3
 alive "$v2" || fail "no end" "a file with no end=1 ended the viewer"
 kill -HUP "$v2"
 until_true 150 showing_is cccccccc || fail "no end" "not opened once the viewer ended"
-# A watcher that stopped: the next viewer's window says nothing (no switch would come of it), and switches the old way
-kill -9 "$watcher"
-sleep 0.2
-printf 'format=3\ncommand=attach\nid=dddddddd\ntitle=delta\n' > "$win"
 kill -HUP "$(key_of viewer "$win.showing")"
-until_true 150 grep -q '^attach dddddddd' "$fix/calls.log" || fail "watcher gone" "the next viewer didn't open"
-until_true 150 test -s "$fix/viewer-dddddddd" || fail "watcher gone" "the next viewer didn't start"
-[ ! -e "$win.showing" ] || fail "watcher gone" "a .showing with no watcher: $(cat "$win.showing")"
-kill -HUP "$(cat "$fix/viewer-dddddddd")"
 wait "$launcher" || true
 [ ! -e "$win.showing" ] || fail "cleanup" ".showing outlived the launcher"
 [ ! -e "$win" ] || fail "cleanup" "the window's file, read and left empty, outlived the launcher"
 watcher_gone() { ! alive "$watcher"; }
 until_true 50 watcher_gone || fail "cleanup" "the watcher outlived the launcher"
-expect "$(grep -c '^attach' "$fix/calls.log")" 4 "four viewers"
+expect "$(grep -c '^attach' "$fix/calls.log")" 3 "three viewers"
 grep -q Hangup "$work/out.txt" && fail "report" "bash reported the ended viewer: $(cat -v "$work/out.txt")"
 expect "$(grep -o $'\e\\[?1049l' "$work/out.txt" | wc -l | tr -d ' ')" 2 "the alternate screen is left only before the first viewer and at the end"
 expect "$(grep -o $'\e\\[2J' "$work/out.txt" | wc -l | tr -d ' ')" 1 "the screen is cleared only before the first viewer"
@@ -894,6 +885,12 @@ code=0
 expect "$code" 1 "without python3, the window's launcher fails"
 grep -q 'needs python3' "$work/out.txt" || fail "no python3" "it didn't say python3 is needed: $(cat -v "$work/out.txt")"
 [ ! -s "$fix/calls.log" ] || fail "no python3" "it ran claude anyway: $(cat "$fix/calls.log")"
+# Nor does ccc look the plugin up, or open anything
+code=0
+(cd "$proj" && PATH="$nopy" /bin/bash "$work/ccc" < /dev/null > "$work/out.txt" 2>&1) || code=$?
+expect "$code" 1 "without python3, ccc fails"
+grep -q 'ccc needs python3' "$work/out.txt" || fail "no python3" "ccc didn't say python3 is needed: $(cat -v "$work/out.txt")"
+[ ! -s "$fix/calls.log" ] || fail "no python3" "ccc ran claude anyway: $(cat "$fix/calls.log")"
 rm -f "$fix/attach-wait"
 unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
 pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; python3 required"

@@ -14,7 +14,8 @@
 # found with `claude plugin list --json`, so the launcher always matches the installed version; it passes that version
 # and since when it's installed on to the launcher. That answer takes claude most of a second, so it's kept per folder
 # (cached_lookup) and asked again only once something it comes from changed. SESSIONS_PLUGIN_DIR names another copy
-# (tests); without an installed plugin (a folder copy), it uses the copy the setup was run from.
+# (tests); without an installed plugin (a folder copy), it uses the copy the setup was run from. python3 is required:
+# without a usable one it says so and opens nothing.
 SETUP_ROOT=''
 # The format of the files the mod and its launcher share (FORMAT in hooks/state.ts): here, the lookup it keeps
 FORMAT=3
@@ -63,7 +64,11 @@ main() {
   if [ -z "$dir" ]; then
     cache="${SESSIONS_DATA_DIR:-$HOME/.claude/mods/sessions-data}/lookup/${PWD//\//_}"
     info=$(cached_lookup "$cache" "$claude") || info=''
-    if [ -z "$info" ] && py=$(command -v python3) && ! { [ "$py" = /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; }; then
+    if [ -z "$info" ]; then
+      if ! py=$(command -v python3) || { [ "$py" = /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; }; then
+        echo "ccc needs python3, and there's no usable one here (on a Mac: xcode-select --install)"
+        return 1
+      fi
       info=$("$claude" plugin list --json 2>/dev/null | "$py" -c '
 import json, sys
 from datetime import datetime

@@ -201,7 +201,7 @@ import {
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
 import { bellFrom, bellOfKey, bellText, checkWatchPaths, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchPathsArgv, watchSetOf, type Locations, type RegistryEntry, type RegistryNews } from './watch'
-import { electLeader, LEADER_STALE_MS, leaderText, leads, parseLeader, PASS_MS, type Candidate } from './leader'
+import { electLeader, LEADER_STALE_MS, leaderText, parseLeader, PASS_MS, type Candidate } from './leader'
 
 const PANE = 'sessions'
 
@@ -359,7 +359,7 @@ const startProblems: string[] = []
 // watches this session's paths (its classic.SessionStart of this WATCH_SET came, in this module or in one before it in
 // this session: the watching state), else the panel reads them on a short timer (the poll); reloadedInto: this module
 // came in by a reload (another module had drawn in this session before), so a missing SessionStart means the paths
-// watched are an older version's and only a restart (u) or /clear brings it, unless this machine's starts find none at
+// watched are another set's and only a restart (u) or /clear brings it, unless this machine's starts find none at
 // all (startSkipped: a plugin before this one sends it on past it); slowList: the files can't stand for
 // `claude agents` (see SessionFiles.usable), which is then run as before, at most every 3.5 s
 let locations: Locations = { registry: '', data: '', jobs: '' }
@@ -560,8 +560,7 @@ async function apartText($: any): Promise<string> {
   if (await isTestSession($)) {
     return `This session keeps its panel data apart, as a test session: ${locations.join(', ')} ${locations.length === 1 ? 'is' : 'are'} set in its environment${launcherOnly.length ? ` (with ${launcherOnly.join(', ')})` : ''}, so the other sessions' panels don't see what it records (seen, done, its state), nor it theirs`
   }
-  if (!launcherOnly.length) return ''
-  return `${launcherOnly.join(', ')}: set in this session's environment and ignored (they count only beside a location override, in a test session). ccc sets them for its launcher; a background service that a launcher before sessions 0.13.6 brought up hands them on to every session it starts. Harmless now: nothing to do`
+  return ''
 }
 
 // Each store read reads and parses Claude's whole store file (and touches it). So a refresh reads the store's keys once
@@ -1332,8 +1331,8 @@ async function chores($: any) {
   await updateInPlace($)
 }
 
-// The short timer, while nothing watches this session's paths (no SessionStart of this WATCH_SET came: updated in place
-// from an older version, or a host that never sends it), until the mod's own watch is up (startHelper) and while it's
+// The short timer, while nothing watches this session's paths (no SessionStart of this WATCH_SET came: a reload from
+// another set, or a host that never sends it), until the mod's own watch is up (startHelper) and while it's
 // down, as the panel ran before: requests every 0.5 s, the list every 3 s, the seen check every 2 s, the chores every
 // 15 s, the leader's turn every 20 s, the token usage every minute. Watched with a list that can't be read from Claude's
 // files (slowList), only the list every 3 s
@@ -1576,15 +1575,14 @@ async function scheduleSeen($: any) {
 
 // ---- The leader (leader.ts) ----
 
-// Who can lead: the sessions Claude's registry has running whose heartbeat here is fresh, of this format and process,
-// and from a version that leads
+// Who can lead: the sessions Claude's registry has running whose heartbeat here is fresh, of this format and process
 async function leaderCandidates($: any, now: number): Promise<Candidate[]> {
   const running = (sessionFiles && !slowList ? sessionFiles.list() : lastList).filter(s => typeof s.sessionId === 'string' && typeof s.pid === 'number' && s.pid > 0)
   const beats = await readHeartbeats($, running.map(s => s.sessionId))
   return running
     .filter(s => {
       const h = beats[s.sessionId]
-      return !!h && heartbeatStatus(h, s.pid, now) === 'ok' && leads(h.version)
+      return !!h && heartbeatStatus(h, s.pid, now) === 'ok'
     })
     .map(s => ({ pid: s.pid, sessionId: s.sessionId }))
 }
@@ -1894,7 +1892,8 @@ async function readUsage($: any, maxAge = USAGE_SHARED_MS, always = false) {
     const shared = await sharedUsage($, maxAge)
     const py = shared ? null : await usablePython($)
     if (shared) next = { summary: shared, note: '' }
-    else if (!py) next = { summary: null, note: 'Token usage needs python3' }
+    // python3 is a requirement: /sessions status names it when it's missing
+    else if (!py) return
     else {
       const r = await runSafe($, [py, USAGE_READER, `${home}/.claude/projects`, `${dataDir}/usage`, `${dataDir}/alive`], { timeoutMs: 120000 })
       let summary: UsageSummary | null = null
@@ -2449,7 +2448,7 @@ async function stillEnded($: any, s: EndedSession): Promise<string> {
 // the service restarted under it: on the log's evidence), and one it closed for lack of memory once memory is normal
 // again. Never a regular session (it lives in its own window), nor one closed for lack of memory while memory is short;
 // one the person stopped, or one with no evidence of why it stopped, only when the caller acts on the person's own
-// command (force: wake's input, 0.15.1)
+// command (force: wake's input)
 type WakeVerdict = { state: 'running' } | { state: 'refused'; detail: string } | { state: 'wake'; id: string; name: string; why: string }
 async function wakeVerdict($: any, ref: string, force = false): Promise<WakeVerdict> {
   const s = lastList.find(x => refOf(x) === ref)
@@ -2656,7 +2655,7 @@ async function offerTools($: any, cwd: string) {
   if (role === null) {
     await Promise.race([idCame, $.clock.sleep(ROLE_WAIT_MS)])
     if (reloadedInto) {
-      toolsOffered = 'not offered: no SessionStart reached the mod in this session (updated in place from an older version); a restart (u) offers them'
+      toolsOffered = 'not offered: no SessionStart reached the mod in this session (it came in by a reload); a restart (u) offers them'
       bg(offerAfterReload($, cwd))
       return
     }
@@ -2691,9 +2690,9 @@ async function offerTools($: any, cwd: string) {
   debugLine($, `tools for Claude: ${toolsOffered}${done ? '' : `, still registering after ${plan.waitMs} ms`}`)
 }
 
-// A module that came in by an update in place where none before it recorded the agent (0.15.1 and before: no
-// SessionStart in this module's life, no agentRole) learns it from Claude's files (roleFromFiles), else from the
-// session's transcript (readAgent, a few beats at most), in the background: session.start isn't held. With no agent the
+// A module that came in by a reload where none before it recorded the agent (no SessionStart in this module's life, no
+// agentRole: a host where none reaches the mod and Claude's files didn't say in time) learns it from Claude's files
+// (roleFromFiles), in the background: session.start isn't held. With no agent the
 // tools are registered then, which a plain session sees from its next request, and that's recorded (agentRole) for
 // later reloads; an agent session gets none until it restarts (a registration not awaited at session.start never shows
 // in one, and one it doesn't list would hold its starts 8 s), and nothing is recorded: each reload decides the same
@@ -2704,23 +2703,16 @@ async function offerAfterReload($: any, cwd: string) {
     debugLine($, `tools for Claude: ${toolsOffered}`)
     return
   }
-  let found = await within($, roleFromFiles($), 5000)
-  if (!found) {
-    for (let i = 0; i < 5 && agentFor !== myId; i++) {
-      await readAgent($)
-      if (agentFor !== myId) await $.clock.sleep(1000)
-    }
-    if (agentFor === myId) found = { role: { agent: myAgent }, from: 'its transcript' }
-  }
+  const found = await within($, roleFromFiles($), 5000)
   if (!found || roleSeen) {
-    debugLine($, `tools for Claude: ${toolsOffered} (neither Claude's files nor the transcript could say which agent it runs as)`)
+    debugLine($, `tools for Claude: ${toolsOffered} (Claude's files couldn't say which agent it runs as)`)
     return
   }
   const agent = found.role.agent
   if (agent) {
     const plan = roleTools(await agentFile($, agent, cwd))
     toolsOffered = plan.tools.length
-      ? `not offered: agent ${agent}, and this session was updated in place from a version without them; a restart (u) offers them`
+      ? `not offered: agent ${agent}, and no SessionStart reached the mod in this session; a restart (u) offers them`
       : `not offered: agent ${agent}, ${plan.why}`
     debugLine($, `tools for Claude: ${toolsOffered}`)
     return
@@ -5129,7 +5121,7 @@ function sessionsApi($: any): Sessions {
       const ref = input?.ref
       if (!isRef(ref)) return { ok: false, reason: 'invalid', detail: 'ref is a short id or sid:<sessionId>' }
       if (!ready()) return { ok: false, reason: 'not-ready', detail: "sessions hasn't read the session list in this session yet: try again in a few seconds" }
-      // force (0.15.1): the caller acts on the person's own command, so a stop of the person's (or one nothing explains)
+      // force: the caller acts on the person's own command, so a stop of the person's (or one nothing explains)
       // doesn't keep the session away
       const force = input?.force === true
       const v = await wakeVerdict($, ref, force)

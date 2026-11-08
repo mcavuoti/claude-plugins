@@ -16,7 +16,7 @@
 # format=, command= (attach or agents), id=, title=, folder= and end= lines (windowTargetText in state.ts). A file in
 # another format (a session running another version of the mod wrote it) isn't followed: the launcher says so and ends.
 # The window's watcher (launcher.py watch) runs beside the loop: it ends the viewer as soon as the file asks for it
-# (end=1, written by a panel switching this window), and while it runs the launcher publishes what the window shows in
+# (end=1, written by a panel switching this window), and the launcher publishes what the window shows in
 # <file>.showing (Showing in state.ts), so the panel finds this window with no ps and no question to the terminal.
 # python3 is required: without a usable one, the launcher says so and opens nothing.
 # SESSIONS_CLAUDE is the claude command (tests), SESSIONS_TTY this window's terminal (tests without one).
@@ -63,8 +63,8 @@ cleanup() {
 # execs it), without what ccc hands the launcher (SESSIONS_PLUGIN_VERSION/SINCE: a viewer that brings up the background
 # service would pass them on to it, and from it to every session it starts: launcher.py's CHILD_ENV), with its own
 # stderr (fd 3), while bash's report of a viewer the watcher ended ("Hangup: 1 …", over the last frame) goes nowhere.
-# While the watcher runs, the window's .showing is written first, with the viewer's own pid: by /bin/sh, whose $$ is
-# the process that then becomes the viewer (bash 3.2 has no BASHPID). $$ in the subshell is the launcher's.
+# The window's .showing is written first, with the viewer's own pid: by /bin/sh, whose $$ is the process that then
+# becomes the viewer (bash 3.2 has no BASHPID). $$ in the subshell is the launcher's.
 # Usage: viewer <claude> <tty> <attach|agents> <id or ''> <args...>
 viewer() {
   local claude="$1" window="$2" what="$3" id="$4"
@@ -72,12 +72,9 @@ viewer() {
   { (
     exec 2>&3 3>&-
     unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
-    if [ -n "$SHOWING" ]; then
-      # shellcheck disable=SC2016 # a script for sh, which expands it
-      exec /bin/sh -c '{ printf "format=%s\ntty=%s\ncommand=%s\nid=%s\nviewer=%s\nlauncher=%s\nwatcher=%s\n" "$1" "$2" "$3" "$4" "$$" "$5" "$6" > "$7"; } 2>/dev/null; shift 7; exec "$@"' \
-        sh "$FORMAT" "$window" "$what" "$id" "$$" "$WATCHER" "$SHOWING" "$claude" "$@"
-    fi
-    exec "$claude" "$@"
+    # shellcheck disable=SC2016 # a script for sh, which expands it
+    exec /bin/sh -c '{ printf "format=%s\ntty=%s\ncommand=%s\nid=%s\nviewer=%s\nlauncher=%s\nwatcher=%s\n" "$1" "$2" "$3" "$4" "$$" "$5" "$6" > "$7"; } 2>/dev/null; shift 7; exec "$@"' \
+      sh "$FORMAT" "$window" "$what" "$id" "$$" "$WATCHER" "$SHOWING" "$claude" "$@"
   ); } 3>&2 2>/dev/null
 }
 
@@ -166,12 +163,6 @@ main() {
     if [ -n "$title" ] && [ "$system" != Darwin ]; then printf '\033]0;%s\007' "$title"; fi
     # The agent view opens in its folder; if that folder is gone, in the current one
     if [ -n "$folder" ]; then cd "$folder" 2>/dev/null || true; fi
-    # A watcher that stopped can't end a viewer: the window stops saying what it shows, and switches the old way
-    if [ -n "$WATCHER" ] && ! kill -0 "$WATCHER" 2>/dev/null; then
-      WATCHER=''
-      rm -f "$SHOWING"
-      SHOWING=''
-    fi
     began=$SECONDS
     code=0
     case "$cmd" in

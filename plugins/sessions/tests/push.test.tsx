@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { heartbeatText, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
 import { bellOfKey, classify, directList, jobIds, listDrift, parseRegistry, SessionFiles, WATCH_SET, watchPaths, watchSetOf } from '../hooks/watch'
-import { electLeader, LEADER_STALE_MS, leaderText, leads, parseLeader, PASS_MS } from '../hooks/leader'
+import { electLeader, LEADER_STALE_MS, leaderText, parseLeader, PASS_MS } from '../hooks/leader'
 import { DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel learns by watching files (watch.ts): the paths it hands the engine at SessionStart, a row that changes
@@ -207,9 +207,6 @@ test('the leader: the record while it runs, else the lowest pid; a crashed or st
   // This session's own record late (a pass after a sleep): it keeps leading
   expect(electLeader(alpha, [alpha, me], rec(4242, now - LEADER_STALE_MS - PASS_MS), now).lead).toBe(true)
   expect(parseLeader('nothing')).toBeNull()
-  expect(leads('0.14.0')).toBe(true)
-  expect(leads('0.13.7')).toBe(false)
-  expect(leads('')).toBe(false)
 })
 
 test("the rows' next time change: the next minute under an hour, the next hour under a day, the minute ⧗ comes", () => {

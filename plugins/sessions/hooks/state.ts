@@ -13,8 +13,7 @@ export const FORMAT = 3
 // first four values, in that order), so test sessions never read nor write theirs: the session list they cache from a
 // stand-in claude, the pins they record, the notifications they count, their marks and the choices made in their
 // panels, nor the prune of keys of sessions missing from their list. SESSIONS_PLUGIN_VERSION and SESSIONS_PLUGIN_SINCE
-// (the fifth and sixth) count only beside a location: ccc sets them for its launcher, and a background service a
-// launcher before 0.13.6 brought up hands them on to every session it starts, which isn't a test session.
+// (the fifth and sixth) count only beside a location: ccc sets them for its launcher, which isn't a test session.
 // SESSIONS_REGISTRY_DIR (the seventh, Claude's registry of running sessions) is a location too. The hash is FNV-1a of
 // the values, one per line
 export function storeNamespace(values: readonly (string | undefined)[]): string {
@@ -147,10 +146,6 @@ export function afterTick(t: { last: number; quietUntil: number }, now: number, 
 export function wakeStagger(id: string, span = 10000): number {
   return span > 0 ? fnv1a(id) % span : 0
 }
-
-// The first version of the mod that writes heartbeats: sessions started after this version was installed are
-// expected to have one
-export const HEARTBEAT_VERSION = '0.10.0'
 
 // What each session's mod writes to the shared store under `state:<sessionId>`.
 // created: when the session's mod first started; turnStarted: when the current turn started; finished: when the last
@@ -492,8 +487,8 @@ export function rootCandidates(start: string): string[] {
 // - recorded: the project root its own mod recorded at its first start, from the folder it started in, and kept across
 //   restarts, /clear and /resume (the store's project:<sessionId>), published as its heartbeat's root (Heartbeat);
 // - first: the cwd of the first row of its transcript that has one (where it started: the rows after a move carry the
-//   new folder, and the file itself moves, but the first row stays), for a session whose mod doesn't run (stopped, or
-//   an older mod);
+//   new folder, and the file itself moves, but the first row stays), for a session whose mod doesn't run (stopped,
+//   for one);
 // - cwd: the folder Claude lists it in now, the last resort.
 // inProject takes any of them, a project root or a folder in it. hooks/launcher.py (session_home) and hooks/usage.py
 // (home_of) go by the same rule
@@ -897,8 +892,7 @@ export function fileKey(path: string): string {
 // launcher and the other panels tell a session whose mod is running from one whose mod never started (a pre-started
 // process that was claimed with stale state, for one). pid: the session's process as the official list shows it;
 // via: what started the mod (session.start, or the first draw, turn or prompt when that didn't come); root: the project
-// the session belongs to (sessionHome's recorded: where it started, whatever folder it's in now; 0.15.0, absent from
-// older mods, whose readers ignore it)
+// the session belongs to (sessionHome's recorded: where it started, whatever folder it's in now)
 export type Heartbeat = { format: number; pid: number; at: number; version: string; via: string; root: string }
 export function heartbeatText(h: Omit<Heartbeat, 'format' | 'root'> & { root?: string }): string {
   return keyLines({ format: FORMAT, pid: h.pid || '', at: h.at, version: h.version, via: h.via, root: h.root || undefined })
@@ -940,11 +934,10 @@ export function parsePluginList(text: string): InstalledPlugin | null {
 }
 
 // Whether a session should have a heartbeat: it runs (it has a process), it started more than 30 s ago (time for its
-// mod to start), and it started after a version of the mod that writes heartbeats was installed. A session started
-// before that runs an older mod, which a restart would fix but which isn't broken: it isn't flagged
-export function expectsHeartbeat(s: { pid?: number; status?: string; startedAt?: number }, plugin: { version: string; since: number } | null, now: number): boolean {
+// mod to start), and it started after the installed version was installed. A session started before that runs an older
+// mod, which a restart would fix but which isn't broken: it isn't flagged
+export function expectsHeartbeat(s: { pid?: number; status?: string; startedAt?: number }, plugin: { since: number } | null, now: number): boolean {
   if (!s.pid || !s.status || !plugin) return false
-  if (compareVersions(plugin.version, HEARTBEAT_VERSION) < 0 || !parseVersion(plugin.version)) return false
   const started = Number(s.startedAt) || 0
   return started > plugin.since + 2000 && now - started > 30000
 }
@@ -1041,9 +1034,9 @@ export function windowTargetText(t: WindowTarget): string {
 // What a window opened with ccc shows: <data>/windows/<tty as a file name>.showing, written by its launcher
 // (hooks/visor.sh) as each viewer starts there and removed when the launcher ends. Its terminal, what it shows (a
 // session by its short id, or the agent view: id empty), and three processes: the viewer, the launcher (bash
-// visor.sh) and its watcher (launcher.py watch), which ends the viewer when the window's file asks for it (end=1). Only
-// a launcher whose watcher runs publishes one (without python3 there's none): with none, the panel finds the window
-// with ps and closes its viewer itself. Whole only once it ends with a line break
+// visor.sh) and its watcher (launcher.py watch), which ends the viewer when the window's file asks for it (end=1). A
+// window with none (not opened with ccc) is found with ps, and the panel closes its viewer itself. Whole only once it
+// ends with a line break
 export const SHOWING = '.showing'
 export type Showing = { tty: string; command: 'attach' | 'agents'; id: string; viewer: string; launcher: string; watcher: string }
 export function showingText(s: Showing): string {
@@ -1082,7 +1075,7 @@ export function showingRuns(s: Showing, ps: string): boolean {
 // that isn't certain: no launcher window shows this session, or several do; an agent view is open, in a launcher
 // window or in any window the last listing saw (it may show the target, which only the usual way reads); or the last
 // windows listing any session took (listed: the store's windowsList, of any age) has a viewer of this session or of
-// the target in a window that publishes nothing (one not opened with ccc, or opened with an older launcher)
+// the target in a window that publishes nothing (one not opened with ccc)
 export type SwitchPlan = { kind: 'switch'; from: Showing } | { kind: 'bring'; from: Showing; to: Showing }
 export function planSwitch(shown: Showing[], me: string, target: string, listed: Windows | null): SwitchPlan | null {
   if (shown.some(s => s.command === 'agents')) return null
@@ -1158,8 +1151,8 @@ export type ReloadCheck = {
   status: string | null | undefined
   tasks: number | null
   fieldOpen: boolean
-  // The set of paths this copy watches (WATCH_SET in watch.ts) and the installed copy's (0: one from before the set had
-  // a number). Left out, not compared
+  // The set of paths this copy watches (WATCH_SET in watch.ts) and the installed copy's (0: its file couldn't be read).
+  // Left out, not compared
   watchSet?: number
   installedWatchSet?: number
 }
