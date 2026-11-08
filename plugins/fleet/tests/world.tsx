@@ -21,7 +21,7 @@ export const BAND = { plugin: 'fleet', component: 'AbovePrompt', requestId: 'ban
 export const COMPOSER = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
 
 // The golden list of what sessions api 1 serves (plugins/sessions/tests/contract.test.tsx has the same one)
-export const GOLDEN = ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart']
+export const GOLDEN = ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'watchCommand']
 // Where the tests' templates are (FLEET_TEMPLATES_DIR), and the blank one every test has
 export const TEMPLATES = '/fake/templates'
 export const BLANK = {

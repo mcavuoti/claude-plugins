@@ -184,3 +184,140 @@ test("a SessionStart that isn't proved within 10 s: the own watch runs; a later 
   await w.clock.settle()
   expect(w.runs.some((r: string[]) => r[0] === 'kill' && r[1] === '4242')).toBe(true)
 })
+
+// A session Claude proved it watches: what's left of the own watch ends, whichever came first
+const PROVED = 'live updates: on (questions, answers and overrules reach this session by their files, in under a second)'
+const probe = ($: any) => $.classic.FileChanged({ file_path: `${FLEET}/bell/probe`, event: 'change' } as any)
+const killedPid = (w: any, pid: string) => w.runs.some((r: string[]) => r[0] === 'kill' && r[1] === pid)
+async function ahead($: any, on: any, opts: any = {}) {
+  const all = watchers(on)
+  on('classic.SessionStart', () => ({}))
+  on('classic.FileChanged', () => ({}))
+  const w = world(on, { background: true, ...opts })
+  sessionsSay(w, { watch: 'kqueue' } as any)
+  return { all, w }
+}
+const otherLeases = (w: any) => w.touch(`${FLEET}/state/sweeper.json`, JSON.stringify({ format: 1, sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', ref: 'bbbbbbbb', name: 'Owner B', at: w.clock.now(), remote: null }))
+
+test("Claude's proof after the own watch went live ends it, and a reload remembers the proof", WITH_SESSIONS, async ($, on) => {
+  const written: unknown[] = []
+  on('state.set', (_: any, e: any, next: any) => {
+    if (e.key === 'watching') written.push(e.value)
+    return next(e)
+  })
+  const { all, w } = await ahead($, on)
+  await startSession($, w)
+  await $.classic.SessionStart({ source: 'startup' } as any)
+  await settle(w, 11 * SECOND)
+  all[0]!.say('ready\tkqueue\t4242\t5')
+  await settle(w, SECOND)
+  expect(await liveLine($)).toContain("fleet's own watch: kqueue")
+  await probe($)
+  await settle(w, SECOND)
+  expect(killedPid(w, '4242')).toBe(true)
+  expect(await liveLine($)).toBe(PROVED)
+  expect(written).toEqual([1])
+  all[0]!.end(null, '', 'SIGTERM')
+  await settle(w, 2 * MIN)
+  expect(await liveLine($)).toBe(PROVED)
+  expect(all.length).toBe(1)
+})
+
+test("Claude's proof while the own watch is starting: its ready ends it instead of taking over", WITH_SESSIONS, async ($, on) => {
+  const { all, w } = await ahead($, on)
+  await startSession($, w)
+  await $.classic.SessionStart({ source: 'startup' } as any)
+  await settle(w, 11 * SECOND)
+  expect(all.length).toBe(1)
+  await probe($)
+  await settle(w, SECOND)
+  expect(await liveLine($)).toBe(PROVED)
+  all[0]!.say('ready\tkqueue\t4242\t5')
+  await settle(w, SECOND)
+  expect(killedPid(w, '4242')).toBe(true)
+  expect(await liveLine($)).toBe(PROVED)
+})
+
+test('proved, and then the helper ends: live stays on, with Claude watching', WITH_SESSIONS, async ($, on) => {
+  const { all, w } = await ahead($, on)
+  await startSession($, w)
+  await $.classic.SessionStart({ source: 'startup' } as any)
+  await settle(w, 11 * SECOND)
+  await probe($)
+  await settle(w, SECOND)
+  all[0]!.say('ready\tkqueue\t4242\t5')
+  await settle(w, SECOND)
+  all[0]!.end(1, 'gone\n')
+  await settle(w, SECOND)
+  expect(await liveLine($)).toBe(PROVED)
+})
+
+test('a SessionStart inside ready: the stop holds, and live stays off with no helper', WITH_SESSIONS, async ($, on) => {
+  // Holds the one await inside ready (the first clock read after the line comes)
+  let hold = false
+  let reached = false
+  let release = () => {}
+  const held = new Promise<void>(resolve => (release = resolve))
+  // The world's clock is the test's only clock.now hook: its answer waits behind this one
+  const gated = (...args: any[]) => {
+    if (args[0] !== 'clock.now') return (on as any)(...args)
+    return on('clock.now' as any, async (...call: any[]) => {
+      if (hold) {
+        hold = false
+        reached = true
+        await held
+      }
+      return args[1](...call)
+    })
+  }
+  const { all, w } = await ahead($, gated)
+  await startSession($, w)
+  await $.classic.SessionStart({ source: 'startup' } as any)
+  await settle(w, 11 * SECOND)
+  expect(all.length).toBe(1)
+  hold = true
+  all[0]!.say('ready\tkqueue\t4242\t5')
+  for (let i = 0; i < 2000000 && !reached; i++) await Promise.resolve()
+  expect(reached).toBe(true)
+  await $.classic.SessionStart({ source: 'clear' } as any)
+  release()
+  await settle(w, 100)
+  expect(killedPid(w, '4242')).toBe(true)
+  all[0]!.end(null, '', 'SIGTERM')
+  await settle(w, 5 * SECOND)
+  expect(await liveLine($)).toContain('live updates off')
+})
+
+test("two landings Claude's proved watch missed: the own watch takes over", WITH_SESSIONS, async ($, on) => {
+  const { all, w } = await ahead($, on, { background: false, worldPaths: ['notes/**'] })
+  otherLeases(w)
+  await startSession($, w)
+  await $.classic.SessionStart({ source: 'startup' } as any)
+  await settle(w, 1500)
+  await probe($)
+  await settle(w, 30 * SECOND)
+  expect(all).toEqual([])
+  for (let i = 0; i < 2; i++) {
+    otherLeases(w)
+    w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: `x-${i}` }))
+    await settle(w, 30 * SECOND)
+  }
+  expect(w.logs.join('\n')).toContain("didn't bring two landings")
+  await settle(w, 2 * SECOND)
+  expect(all.length).toBe(1)
+})
+
+test("/fleet status doesn't say every 2 s while the own watch has the world on its 10 s tick", WITH_SESSIONS, async ($, on) => {
+  const OWNER = '---\nname: owner\ndescription: x\ntools: Read\n---\nOwner.\n'
+  const ROSTER = { rosterFormat: 1, sections: [{ id: 'owners', title: 'Owners' }], roles: { owner: { agent: 'owner', model: 'haiku', budget: { usdDay: 1 } } }, instances: [{ name: 'Owner A', role: 'owner', section: 'owners', brief: 'x' }], budget: { usdDay: 5 } }
+  const { all, w } = await ahead($, on, { background: false, worldPaths: ['notes/**'], files: { [`${FLEET}/roster.json`]: JSON.stringify(ROSTER), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${FLEET}/seeds/owner.md`]: 'Seed.' } })
+  otherLeases(w)
+  await startSession($, w)
+  await settle(w, 11 * SECOND)
+  const classic = async () => (await fleet($, 'status')).split('\n').find((l: string) => l.startsWith('classic hooks')) ?? ''
+  expect(await classic()).toContain('watches the world every 2 s')
+  all[0]!.say('ready\tkqueue\t4242\t5')
+  await settle(w, 5 * SECOND)
+  expect(await classic()).not.toContain('every 2 s')
+  expect(await classic()).toContain('every 10 s')
+})

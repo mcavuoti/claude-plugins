@@ -491,8 +491,8 @@ async function processNow($: any): Promise<string> {
 // of the mod until the next SessionStart (a start, /clear, a compaction, a resume) replaces it. A reload never raises
 // SessionStart, so the set of paths has a version (FLEET_WATCH_SET), which SessionStart writes in $.state (`watching`):
 // a module that finds its own set there is watched (live); one that doesn't (a reload into a version that watches
-// more, sessions' update in place, a managed plugin that sends SessionStart on past fleet) reads on today's timers and
-// /fleet status says "live updates off". Live comes only once the engine proved it: SessionStart rings bell/probe a
+// more, sessions' update in place, a managed plugin that sends SessionStart on past fleet) reads on today's timers until
+// its own watch starts (below), and /fleet status says "live updates off" until then. Live comes only once the engine proved it: SessionStart rings bell/probe a
 // second after it hands the list, and the first FileChanged under bell/ turns live updates on (and writes the set in
 // $.state, for a reload). Live, the timers are a safety pass (a lost event costs latency, never
 // correctness): answers every 60 s instead of 2 s, the band and the rest of the beat every 60 s instead of 10 s (10 s
@@ -568,8 +568,8 @@ async function beatOnce($: any) {
 // past it, or the session went on from before the project had fleet's folders), a child process does: the command
 // sessions' watchCommand builds, which sleeps in the kernel's file watch over the paths SessionStart would hand Claude.
 // Each of its lines runs what classic.FileChanged runs (fileChanged); its `ready` makes the session live. It starts
-// OWN_WATCH_WAIT_MS after the timers, or after a SessionStart, if live hasn't come by then; a session whose SessionStart
-// was proved never runs it. When it ends, the session is back on its timers and it starts again after a back-off; a
+// OWN_WATCH_WAIT_MS after the timers, or after a SessionStart, if live hasn't come by then; Claude's proof, whenever it
+// comes, ends it, and two landings a proved watch missed start it (until a new SessionStart). When it ends, the session is back on its timers and it starts again after a back-off; a
 // SessionStart ends it (Claude watches from then on), and a reload ends it with the module (the new module starts its own)
 const OWN_WATCH_WAIT_MS = 10000
 const OWN_WATCH_BACKOFF_MS = [60000, 300000, 1800000]
@@ -650,12 +650,15 @@ async function startOwnWatch($: any) {
 async function ownWatchReady($: any, h: OwnWatch, pid: string, how: string) {
   h.pid = /^\d+$/.test(pid) ? pid : ''
   if (how) h.how = how
-  // Stopped while it was starting: ended now that its process is known
+  // The time first: from the check on there's no await, so no stop can come between the check and what it allows
+  const now = await $.clock.now()
+  // Stopped while it was starting, or Claude's watch was proved meanwhile: ended now that its process is known
+  if (live && !ownWatchLive) h.stopping = true
   if (h.stopping) {
     if (h.pid) bg(run($, ['kill', h.pid]))
     return
   }
-  h.readyAt = await $.clock.now()
+  h.readyAt = now
   ownWatchLive = true
   ownWatchWhy = ''
   log($, `own watch: ${h.how}, process ${h.pid}: live updates on`)
@@ -717,11 +720,13 @@ function fileChanged($: any, path: string, engine: boolean) {
   // and the sweeper's marks now (and an answer to a retired asker wakes it now); a bell says what else moved
   // The engine brought a bell (this session's probe or anyone's ring under bell/): it watches fleet's paths here.
   // What was on disk before the watch began raises no event (an answer waiting for a woken or restarted asker):
-  // one pass of everything now
-  if (root && !live && engine && handedSet && path.includes('/.claude/fleet/bell/')) {
+  // one pass of everything now. A proof that comes once the own watch started ends that watch: Claude's does the job
+  if (root && engine && handedSet && path.includes('/.claude/fleet/bell/') && (!live || ownWatchLive || ownWatch)) {
+    const off = !live
     live = true
     bg(update($, watching, () => FLEET_WATCH_SET))
-    ringHere($, ['deliver', 'beat', 'sweep'])
+    stopOwnWatch($)
+    if (off) ringHere($, ['deliver', 'beat', 'sweep'])
   }
   if (root && live) {
     const p = path
@@ -8338,10 +8343,10 @@ const RESTART_QUEUED_MS = 5 * 60000
 
 /** /fleet status's line on the classic hooks that reached fleet in this session. classic.SessionStart comes before any
  * prompt: missing, a managed plugin sends it on past the plugins a person installed (next.to beneath their tier) */
-export function classicLine(seen: Record<string, number>): string {
+export function classicLine(seen: Record<string, number>, ownWatching = false): string {
   const got = Object.keys(seen).sort()
   if (seen.SessionStart) return `classic hooks reaching fleet here: ${got.join(', ')}`
-  return `classic hooks: SessionStart didn't reach fleet in this session (a managed plugin may send it on past the plugins you installed${got.length ? `; seen: ${got.join(', ')}` : ''}): fleet tells an instance who it is in its prompts and after a compaction, watches the world every 2 s, and finds a permission prompt by the verdict (tool.check)`
+  return `classic hooks: SessionStart didn't reach fleet in this session (a managed plugin may send it on past the plugins you installed${got.length ? `; seen: ${got.join(', ')}` : ''}): fleet tells an instance who it is in its prompts and after a compaction, ${ownWatching ? 'hears of a landing through its own watch and looks at the world every 10 s' : 'watches the world every 2 s'}, and finds a permission prompt by the verdict (tool.check)`
 }
 
 /** A classic hook reached fleet: when, by event. A managed plugin can send one on past the plugins a person installed
@@ -11172,7 +11177,7 @@ async function rosterStatus($: any): Promise<string[]> {
     if (blocks) lines.push(...blocksLines(inst.name, blocks, -new Date(now).getTimezoneOffset()).map((l, i) => `${i ? '      ' : '    '}${l}`))
   }
   if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
-  lines.push(classicLine(await read($, classicSeen)))
+  lines.push(classicLine(await read($, classicSeen), ownWatchLive))
   const loose = await unstamped($)
   if (loose.length) lines.push(`changed outside fleet (not through a change you applied): ${loose.join(', ')}: /fleet accept <path> stamps your own edit as yours`)
   return lines
