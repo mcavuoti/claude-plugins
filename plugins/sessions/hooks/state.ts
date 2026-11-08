@@ -1082,7 +1082,7 @@ export function showingRuns(s: Showing, ps: string): boolean {
 // that isn't certain: no launcher window shows this session, or several do; an agent view is open, in a launcher
 // window or in any window the last listing saw (it may show the target, which only the usual way reads); or the last
 // windows listing any session took (listed: the store's windowsList, of any age) has a viewer of this session or of
-// the target in a window that publishes nothing (one not opened with ccc, or opened with an older launcher)
+// the target in a window that publishes nothing (one not opened with ccc)
 export type SwitchPlan = { kind: 'switch'; from: Showing } | { kind: 'bring'; from: Showing; to: Showing }
 export function planSwitch(shown: Showing[], me: string, target: string, listed: Windows | null): SwitchPlan | null {
   if (shown.some(s => s.command === 'agents')) return null

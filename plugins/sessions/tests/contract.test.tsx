@@ -927,7 +927,7 @@ test("restart of the caller's own session: refused while a window not opened wit
 })
 
 // A session shown in two windows opened with ccc: one whose launcher says what it shows (.showing, with its watcher),
-// one of an older launcher that says nothing
+// one that says nothing
 const SHOWN_THREE = [
   '  100 ttys002  bash /Users/x/p/hooks/visor.sh start',
   '  101 ttys002  claude attach dddddddd',
@@ -937,7 +937,7 @@ const SHOWN_THREE = [
 ].join('\n')
 const SHOWING_THREE = `${DATA}/windows/_dev_ttys002.showing`
 
-test("restart with ccc windows showing the session: each is told to reopen it once the viewer ends (no end=1: the restart ends it), the new launcher's and the old one's, and its .showing stays", WITH_PROBE, async ($, on) => {
+test("restart with ccc windows showing the session: each is told to reopen it once the viewer ends (no end=1: the restart ends it), the one that says what it shows and the one that doesn't, and its .showing stays", WITH_PROBE, async ($, on) => {
   const w = world(on, { list: moreSessions() })
   w.files.set('/Users/x/jobs/dddddddd/state.json', NO_TASKS)
   const showing = showingText({ tty: '/dev/ttys002', command: 'attach', id: 'dddddddd', viewer: '101', launcher: '100', watcher: '102' })

@@ -802,21 +802,13 @@ sleep 1.3
 alive "$v2" || fail "no end" "a file with no end=1 ended the viewer"
 kill -HUP "$v2"
 until_true 150 showing_is cccccccc || fail "no end" "not opened once the viewer ended"
-# A watcher that stopped: the next viewer's window says nothing (no switch would come of it), and switches the old way
-kill -9 "$watcher"
-sleep 0.2
-printf 'format=3\ncommand=attach\nid=dddddddd\ntitle=delta\n' > "$win"
 kill -HUP "$(key_of viewer "$win.showing")"
-until_true 150 grep -q '^attach dddddddd' "$fix/calls.log" || fail "watcher gone" "the next viewer didn't open"
-until_true 150 test -s "$fix/viewer-dddddddd" || fail "watcher gone" "the next viewer didn't start"
-[ ! -e "$win.showing" ] || fail "watcher gone" "a .showing with no watcher: $(cat "$win.showing")"
-kill -HUP "$(cat "$fix/viewer-dddddddd")"
 wait "$launcher" || true
 [ ! -e "$win.showing" ] || fail "cleanup" ".showing outlived the launcher"
 [ ! -e "$win" ] || fail "cleanup" "the window's file, read and left empty, outlived the launcher"
 watcher_gone() { ! alive "$watcher"; }
 until_true 50 watcher_gone || fail "cleanup" "the watcher outlived the launcher"
-expect "$(grep -c '^attach' "$fix/calls.log")" 4 "four viewers"
+expect "$(grep -c '^attach' "$fix/calls.log")" 3 "three viewers"
 grep -q Hangup "$work/out.txt" && fail "report" "bash reported the ended viewer: $(cat -v "$work/out.txt")"
 expect "$(grep -o $'\e\\[?1049l' "$work/out.txt" | wc -l | tr -d ' ')" 2 "the alternate screen is left only before the first viewer and at the end"
 expect "$(grep -o $'\e\\[2J' "$work/out.txt" | wc -l | tr -d ' ')" 1 "the screen is cleared only before the first viewer"

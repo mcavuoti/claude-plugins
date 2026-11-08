@@ -1723,8 +1723,8 @@ WATCHES = {'kqueue': KqueueWatch, 'inotify': InotifyWatch, 'poll': PollWatch}
 # soon as a panel asks for a switch, so the panel neither looks for the viewer nor closes it: the panel writes the next
 # session to FILE (the window's file) with end=1 as its last line, the watcher sends the viewer FILE.showing names (the
 # launcher writes it as each viewer starts) a SIGHUP, and the loop opens the next one; what's typed meanwhile is
-# dropped (drop_typed). A file with no end=1 (claude respawn's reopen, ccc switching another window, a panel of an older
-# version, which closes the viewer itself) is left to the loop, which reads it once the viewer ends.
+# dropped (drop_typed). A file with no end=1 (claude respawn's reopen, ccc switching another window, a panel closing the
+# viewer itself: the usual way) is left to the loop, which reads it once the viewer ends.
 #
 # It watches FILE's folder (FILE appears or goes) and FILE itself while it's there, and besides looks every
 # WATCH_PASS_S, in case. --how picks the watch (tests); by default the first one this system has
