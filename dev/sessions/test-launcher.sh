@@ -801,6 +801,8 @@ sleep 1.3
 alive "$v2" || fail "no end" "a file with no end=1 ended the viewer"
 kill -HUP "$v2"
 until_true 150 showing_is cccccccc || fail "no end" "not opened once the viewer ended"
+# .showing is written just before the viewer starts: ended before it has, it wouldn't be in the calls counted below
+until_true 150 test -s "$fix/viewer-cccccccc" || fail "no end" "the third viewer didn't start"
 kill -HUP "$(key_of viewer "$win.showing")"
 wait "$launcher" || true
 [ ! -e "$win.showing" ] || fail "cleanup" ".showing outlived the launcher"
