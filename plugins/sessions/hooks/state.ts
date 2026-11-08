@@ -332,14 +332,19 @@ export function compareVersions(a: string, b: string): number {
 }
 
 // Notices between the mod's sessions: a fixed marker, a space and the data as JSON, with the format and the kind.
-// focus: you arrived here from the panel; ask: ask here whether to stop or restart this session (from: who asks,
-// topic, detail, and the asker's id, title and background, to go back to it when the panel there doesn't show it);
-// answer: the answer to that (sessionId: who answers, action: stop, stop-rm, restart, cancel, or unshown when the
-// question couldn't be shown there and the asker asks in its own window; cameBack: whether the window came back; a
-// session that can't send notices leaves the same in the store, answer:<asker's id>); rename: rename yourself (name). The receiver consumes every notice with the marker (none reaches the model) and acts
-// only on its own format. Senders only send to sessions whose heartbeat says they run the same format
+// focus: you arrived here from the panel with its keyboard (Enter); seen: you arrived here from the panel without it
+// (a click on the row), so what this session answered is seen and the keyboard stays where it is; ask: ask here
+// whether to stop or restart this session (from: who asks, topic, detail, and the asker's id, title and background, to
+// go back to it when the panel there doesn't show it); answer: the answer to that (sessionId: who answers, action:
+// stop, stop-rm, restart, cancel, or unshown when the question couldn't be shown there and the asker asks in its own
+// window; cameBack: whether the window came back; a session that can't send notices leaves the same in the store,
+// answer:<asker's id>); rename: rename yourself (name). The receiver consumes every notice with the marker (none
+// reaches the model) and acts only on its own format. Senders only send to sessions whose heartbeat says they run the
+// same format. A new kind needs no new format: a receiver consumes a kind it doesn't know and does nothing with it
+// (every version on format 3 does), so a session on an older version only misses what the new kind does (seen: its row
+// stays yellow until it's seen another way)
 export const NOTICE_MARKER = 'sessions-notice:7f3a'
-export type NoticeKind = 'focus' | 'ask' | 'answer' | 'rename'
+export type NoticeKind = 'focus' | 'seen' | 'ask' | 'answer' | 'rename'
 export function buildNotice(kind: NoticeKind, data: Record<string, unknown> = {}): string {
   return `${NOTICE_MARKER} ${JSON.stringify({ format: FORMAT, kind, ...data })}`
 }
