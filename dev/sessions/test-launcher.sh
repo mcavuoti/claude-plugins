@@ -932,7 +932,14 @@ if pid == 0:
     os.environ['TERM'] = 'xterm-256color'
     os.execvp('bash', ['bash', visor, 'attach', 'aaaaaaaa'])
 # What the window shows is read and thrown away, so the terminal never blocks
-threading.Thread(target=lambda: [os.read(master, 65536) for _ in iter(int, 1)], daemon=True).start()
+def drain():
+    # Until the terminal closes: on Linux a read once the child is gone raises (EIO), which ends this, quietly
+    try:
+        while os.read(master, 65536):
+            pass
+    except OSError:
+        pass
+threading.Thread(target=drain, daemon=True).start()
 os.write(master, b'first')
 until(lambda: text('read-aaaaaaaa') is not None)
 print('first viewer read: %r' % text('read-aaaaaaaa'))
