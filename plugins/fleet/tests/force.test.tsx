@@ -31,7 +31,7 @@ function wakes(w: World): any[] {
 }
 
 // Every instance stopped, by the person unless said otherwise; version: what the stand-in sessions says it is
-function setup(on: any, stopped: Record<string, string | undefined> = {}, version = '0.15.1'): World {
+function setup(on: any, stopped: Record<string, string | undefined> = {}, version = '0.17.0'): World {
   const w = world(on, { background: false, files: { [`${FLEET}/roster.json`]: roster(), [`${ROOT}/.claude/agents/owner.md`]: OWNER } })
   const stop = (ref: string, name: string, why: string | undefined) => ({ ...row(ref, name, 'stopped'), ...(why ? { stopped: why } : {}) })
   const rows = {
@@ -101,13 +101,13 @@ test('--force: a restart stopped one is woken as always (no force); the person\'
   ])
 })
 
-test('--force with a sessions older than 0.15.1: nothing of the person\'s is woken, and it says to update', WITH_SESSIONS, async ($, on) => {
-  const w = setup(on, {}, '0.15.0')
+test('a sessions older than the one fleet needs: /fleet up starts and wakes nothing, and says to update it', WITH_SESSIONS, async ($, on) => {
+  const w = setup(on, {}, '0.16.3')
   await startSession($, w)
   const plan = await fleet($, 'up --force --dry-run')
-  expect(plan).toContain('--force needs sessions 0.15.1 or later to wake the ones you stopped (this one is 0.15.0): update it, or Enter or u in the panel restarts them.')
+  expect(plan).toContain('✗ fleet needs sessions 0.17.0 or later (0.16.3 here): update it (claude plugin update sessions@mcavuoti) and restart (u)')
   const up = await fleet($, 'up --force')
-  expect(up).toContain('Owner A: stopped by you, not woken: --force needs sessions 0.15.1 or later (this one is 0.15.0): update it, or Enter or u in the panel restarts it')
+  expect(up).toContain('Nothing was started or woken: update sessions, restart this session (u), then /fleet up again.')
   await w.clock.advance(10000)
   expect(wakes(w)).toEqual([])
 })

@@ -632,6 +632,13 @@ const bgCommands = atom({ plugin: 'fleet', key: 'bgCommands' } as const, {} as R
 const handoff = atom({ plugin: 'fleet', key: 'handoff' } as const, null as { text: string; at: number } | null)
 // What the band says besides its counts: nobody sweeps, the world too big to scan ('' for nothing)
 const bandNote = atom({ plugin: 'fleet', key: 'bandNote' } as const, '')
+// What fleet needs and this session lacks (sessions, python3, Claude Code), for the band ('' when all are here)
+const needs = atom({ plugin: 'fleet', key: 'needs' } as const, '')
+async function refreshNeeds($: any) {
+  const lines = await dependencyLines($)
+  const text = lines.length ? lines.map(l => l.replace(/^fleet needs /, '')).join('; ') : ''
+  if ((await read($, needs)) !== text) await update($, needs, () => text)
+}
 const classicSeen = atom({ plugin: 'fleet', key: 'classicSeen' } as const, {} as Record<string, number>)
 const identityTold = atom({ plugin: 'fleet', key: 'identityTold' } as const, false)
 // What this instance was told of the work around it (an item offered, a run finished, its budget raised, what it had in
@@ -695,10 +702,13 @@ type Contract = Awaited<ReturnType<Api['contract']>>
 type Current = Awaited<ReturnType<Api['current']>>
 type Status = Awaited<ReturnType<Api['status']>>
 type Result = Awaited<ReturnType<Api['assignSection']>>
-type Method = keyof Api
+
 const SESSIONS_API = 1
-// wake's force (a caller acting on the person's own command wakes the ones he stopped) came in sessions 0.15.1
-const FORCE_SINCE = '0.15.1'
+// What fleet needs (CONTRIBUTING.md, "Dependencies, not fallbacks"): sessions at this version or later, python3 (a .py
+// draft's parse check, the proposal template's proofs check), and Claude Code at this version or later. A missing one
+// is said once, in the band, /fleet status and the commands that need it; there's no second way to do without it
+const SESSIONS_MIN = '0.17.0'
+const CLAUDE_MIN = '2.1.319'
 // /fleet up's wakes, one this far apart (sessions' own bring-back after its service died paces its respawns 3 s apart)
 const WAKE_GAP_MS = 3000
 function versionAtLeast(v: unknown, min: string): boolean {
@@ -707,9 +717,11 @@ function versionAtLeast(v: unknown, min: string): boolean {
 let found: Contract | null | undefined
 let foundAt = 0
 
-async function has($: any, method: Method): Promise<boolean> {
+/** Whether sessions is here at the version fleet needs: loaded, its contract api 1, and SESSIONS_MIN or later. One that
+ * didn't answer is asked again a minute later (it may have been starting); not here, not ready and too old are one
+ * state, said by sessionsNeed() */
+async function sessionsReady($: any): Promise<boolean> {
   const now = await $.clock.now()
-  // A copy that didn't answer is asked again a minute later (it may have been starting)
   if (found === undefined || (found === null && now - foundAt > 60000)) {
     foundAt = now
     try {
@@ -718,7 +730,45 @@ async function has($: any, method: Method): Promise<boolean> {
       found = null
     }
   }
-  return !!found && found.api === SESSIONS_API && found.methods.includes(method)
+  return !!found && found.api === SESSIONS_API && versionAtLeast(found.version, SESSIONS_MIN)
+}
+
+/** What's missing of sessions, in one line the person can act on */
+function sessionsNeed(): string {
+  const here = !found ? 'not answering in this session' : found.api !== SESSIONS_API ? `api ${found.api}, and fleet calls api ${SESSIONS_API}` : `${found.version || 'an older version'} here`
+  return `fleet needs sessions ${SESSIONS_MIN} or later (${here}): update it (claude plugin update sessions@mcavuoti) and restart (u)`
+}
+
+// python3 and Claude Code, each looked at once per process (a dependency doesn't come and go)
+let python3Here: boolean | undefined
+async function python3Ready($: any): Promise<boolean> {
+  if (python3Here === undefined) python3Here = (await run($, ['python3', '-c', 'pass'], { timeoutMs: 10000 })).exitCode === 0
+  return python3Here
+}
+const PYTHON3_NEED = 'fleet needs python3 (a .py draft is parsed with it, and the proofs check runs with it): install it, then restart (u)'
+let claudeVersionHere: string | undefined
+async function claudeReady($: any): Promise<boolean> {
+  if (claudeVersionHere === undefined) {
+    try {
+      const v = await $.session.version()
+      claudeVersionHere = String(v?.base || v?.version || '').replace(/-dev.*$/, '')
+    } catch {
+      claudeVersionHere = ''
+    }
+  }
+  return !claudeVersionHere || versionAtLeast(claudeVersionHere, CLAUDE_MIN)
+}
+function claudeNeed(): string {
+  return `fleet needs Claude Code ${CLAUDE_MIN} or later (${claudeVersionHere} here): update it (claude update) and restart (u)`
+}
+
+/** Every missing dependency, one line each (none: all here) */
+async function dependencyLines($: any): Promise<string[]> {
+  const out: string[] = []
+  if (!(await sessionsReady($))) out.push(sessionsNeed())
+  if (!(await python3Ready($))) out.push(PYTHON3_NEED)
+  if (!(await claudeReady($))) out.push(claudeNeed())
+  return out
 }
 
 // A $.sessions call, raced against 500 ms: null when it lost or threw
@@ -1054,6 +1104,9 @@ function timers($: any) {
   }
   $.clock.after(0, () => bg(startWorld($)))
   $.clock.after(0, () => bg(restoreMark($)))
+  // What fleet needs and doesn't find, for the band: looked at now and each minute (sessions may still be starting)
+  $.clock.after(0, () => bg(refreshNeeds($)))
+  $.clock.every(60000, () => bg(refreshNeeds($)))
   $.clock.every(2000, () => bg(worldTick($)))
   $.clock.every(10000, () => {
     if (live && !sweep.holding && !sweep.takenAt && ++beatTicks % 6 !== 0) return
@@ -1181,7 +1234,7 @@ async function allocate($: any, make: (id: string) => QueueRecord): Promise<Queu
 }
 
 async function sessionName($: any): Promise<string> {
-  if (await has($, 'current')) {
+  if (await sessionsReady($)) {
     const c = await race<Current>($, () => $.sessions.current())
     if (c?.ready && c.name) return c.name
   }
@@ -1190,7 +1243,7 @@ async function sessionName($: any): Promise<string> {
 
 async function askerNow($: any): Promise<Asker> {
   let name: string | null = null
-  if (await has($, 'current')) {
+  if (await sessionsReady($)) {
     const c = await race<Current>($, () => $.sessions.current())
     if (c?.ready) name = c.name || null
   }
@@ -1496,7 +1549,7 @@ async function beat($: any) {
   if (roster) {
     const over = (await budgets($)).filter(b => b.state === 'over')
     if (over.length) {
-      const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: over.map(b => b.inst.name) })) : null
+      const st = (await sessionsReady($)) ? await race<Status>($, () => $.sessions.status({ names: over.map(b => b.inst.name) })) : null
       const now = await $.clock.now()
       for (const b of over) {
         if (st?.ready) {
@@ -1549,7 +1602,7 @@ async function keepSection($: any, records: QueueRecord[], present: ReadonlySet<
   const want = waiting ? ASKING_SECTION : placed ? `fleet:${placed.id}` : 'none'
   const key = parent ? `${want}|${parent}` : want
   if ((await read($, section)) === key) return
-  if (!(await has($, 'assignSection')) || !(await has($, 'defineSection'))) return
+  if (!(await sessionsReady($))) return
   if (waiting || placed) {
     const spec = waiting ? { id: ASKING_SECTION, title: 'Asking you' } : { id: want, title: (placed as { title: string }).title, order: (placed as { order: number }).order }
     const d = await race<Result>($, () => $.sessions.defineSection({ source: 'fleet', spec }))
@@ -1567,7 +1620,7 @@ async function maybePrune($: any, records: QueueRecord[]) {
   lastPruneCheck = now
   const marker = dec(`prune/${dayOf(now)}`)
   if (await exists($, marker)) return
-  if (!(await has($, 'status'))) return
+  if (!(await sessionsReady($))) return
   const refs = [...new Set(records.filter(r => r.asker.ref && now - r.at > HOUR).map(r => r.asker.ref as string))]
   const st = refs.length ? await race<Status>($, () => $.sessions.status({ refs })) : { ready: true, rows: [] }
   if (!st?.ready) {
@@ -2018,7 +2071,7 @@ function threadOf(e: any): string {
  * while it isn't known */
 let nameAt = 0
 async function refreshName($: any) {
-  if (!(await has($, 'current'))) return
+  if (!(await sessionsReady($))) return
   nameAt = await $.clock.now()
   const c = await race<Current>($, () => $.sessions.current())
   if (c?.ready) {
@@ -5461,7 +5514,7 @@ async function grantWaiters($: any, spec: SlotSpec, prune = false): Promise<numb
   let waiters = await waitersOf($, spec.name)
   if (prune && waiters.length) {
     const refs = [...new Set(waiters.map(w => w.waiter.holder.ref).filter((r): r is string => !!r && !r.startsWith('sid:')))]
-    const st = refs.length && (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ refs })) : null
+    const st = refs.length && (await sessionsReady($)) ? await race<Status>($, () => $.sessions.status({ refs })) : null
     const kept: typeof waiters = []
     for (const w of waiters) {
       const state = st?.ready ? (st.rows.find((r: any) => r.ref === w.waiter.holder.ref)?.state ?? null) : null
@@ -6433,7 +6486,7 @@ async function bind($: any) {
   await loadRoster($)
   let name = envInstance
   let current: Current | null = null
-  if (!name || agentType === null) current = (await has($, 'current')) ? await race<Current>($, () => $.sessions.current()) : null
+  if (!name || agentType === null) current = (await sessionsReady($)) ? await race<Current>($, () => $.sessions.current()) : null
   if (!name && current?.ready) name = current.name
   const inst = name ? instanceNamed(name) : null
   if (!inst) {
@@ -7419,8 +7472,8 @@ async function setInFlight($: any, how: 'restarted' | 'compacted', commands: rea
   log($, `in flight after ${how === 'restarted' ? 'a restart' : 'a compaction'} for ${inst.name}: ${commands.length} command(s), ${runs.length} run(s)${quiet ? ' (said at its next step)' : ''}`)
 }
 
-/** Why sessions says a stopped session is stopped (sessions 0.13.4's status field; absent in an older one): the person,
- * idle (the background service retired it), memory, or ended (a restart, a crash: nobody stopped it) */
+/** Why sessions says a stopped session is stopped (its status's `stopped`): the person, idle (the background service
+ * retired it), memory, or ended (a restart, a crash: nobody stopped it); null when nothing says why */
 function stopReason(row: any): 'person' | 'idle' | 'memory' | 'ended' | null {
   const r = row?.stopped
   return r === 'person' || r === 'idle' || r === 'memory' || r === 'ended' ? r : null
@@ -7445,7 +7498,7 @@ function stopEpisode(hb: Heartbeat): string {
  * RESTART_WAKES_PER_DAY times today (capped: a crash loop), and the ones fleet woke in the last RESTART_SHOWN_MS */
 async function restartView($: any, given?: Status): Promise<{ stopped: Instance[]; capped: Instance[]; woke: Instance[] }> {
   const none = { stopped: [], capped: [], woke: [] }
-  if (!roster?.instances.length || (!given && !(await has($, 'status')))) return none
+  if (!roster?.instances.length || (!given && !(await sessionsReady($)))) return none
   const st = given ?? (await race<Status>($, () => $.sessions.status({ names: (roster as { instances: Instance[] }).instances.map(i => i.name) })))
   if (!st?.ready) return none
   const down = await downSet($)
@@ -7525,7 +7578,7 @@ const stoppedSizes = new Set<string>()
 // heartbeat, after a lift, by the sweeper's alerts, and before a helper is refused.
 // The other instances' spends come from the sweeper's summary (state/spends.json: one file, where every instance reading
 // every instance's spend made N² reads a minute a project); this session's own spend as it is now. exact (the sweeper,
-// a helper's refusal, a summary missing, stale or a 0.12.1 sweeper's, and near or past the project's cap, where the
+// a helper's refusal, a summary missing or stale (no sweeper yet, or one that died), and near or past the project's cap, where the
 // summary may lag a sweep) reads every spend.json
 const BUDGET_CACHE_MS = 60000
 /** The sweeper's summary of today's spends, by slug (state/spends.json, the sweeper's, replaced with mv) */
@@ -7868,7 +7921,7 @@ async function nudgeTick($: any) {
     else if (idleMs < 60000) {
       restartWait = 'waits for it to be idle a minute'
       kickNudge($, 60000 - idleMs + 500)
-    } else if (!(await has($, 'restart'))) restartWait = "this session's sessions can't restart it: u in the panel restarts it"
+    } else if (!(await sessionsReady($))) restartWait = sessionsNeed()
     else {
       await update($, restartAsked, () => restartFor)
       const reason = toRestart?.named ? 'fleet: restart asked (/fleet up --restart-when-idle)' : 'fleet: its settings changed (restart when idle)'
@@ -8718,12 +8771,13 @@ async function newsLines($: any, withApplied = true): Promise<{ lines: string[];
   }
 }
 
-/** A .py draft that Python won't parse (a warning counts: -W error): where and why; null when it parses, isn't Python,
- * or no python3 could look at it (a check fleet can't run holds nothing) */
+/** A .py draft that Python won't parse (a warning counts: -W error): where and why; null when it parses or isn't Python.
+ * python3 is a dependency: without it the draft isn't queued, and the reply says what to install */
 async function pythonProblem($: any, rel: string, text: string): Promise<string | null> {
   if (!/\.py$/i.test(rel)) return null
+  if (!(await python3Ready($))) return PYTHON3_NEED
   const r = await run($, ['python3', '-I', '-W', 'error', '-c', 'import ast, sys; ast.parse(sys.stdin.read())'], { stdin: text })
-  if (r.exitCode === 0 || r.exitCode === 124 || r.exitCode === 127) return null
+  if (r.exitCode === 0 || r.exitCode === 124) return null
   const lines = r.stderr.trim().split('\n')
   const at = [...r.stderr.matchAll(/line (\d+)/g)].pop()?.[1]
   return `${at ? `line ${at}: ` : ''}${cut(lines[lines.length - 1]?.trim() || `python3 exited ${r.exitCode}`, 200)}`
@@ -8761,6 +8815,7 @@ async function fileChange($: any, e: any) {
   const bad = configProblemOf(rel, result)
   if (bad) return { deny: `the draft of ${rel} isn't usable: ${bad}. Nothing was queued.` }
   const py = await pythonProblem($, rel, result)
+  if (py === PYTHON3_NEED) return { deny: `the draft of ${rel} can't be checked: ${PYTHON3_NEED}. Nothing was queued.` }
   if (py) return { deny: `the draft of ${rel} doesn't parse as Python (${py}): fix it and file it again. Nothing was queued.` }
   const diff = lineDiff(cur, result, rel)
   const asker = await askerNow($)
@@ -9576,7 +9631,7 @@ async function rosterTakesEffect($: any): Promise<string[]> {
   const down = await downSet($)
   const level = await commandLevelNow($)
   const deny = [...new Set([...denyRules(root as string, level), ...(realRoot && realRoot !== root ? denyRules(realRoot, level) : [])])]
-  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
+  const st = (await sessionsReady($)) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
   const at = await $.clock.now()
   const out: string[] = []
   let wrote = false
@@ -9743,7 +9798,7 @@ async function rosterTick($: any) {
   const asking = new Map<string, number>()
   for (const r of records) if (r.asker.ref && knownKind(r) && !progress(r.id, slots(r), present).complete) asking.set(r.asker.ref, (asking.get(r.asker.ref) ?? 0) + 1)
   const marks: Record<string, RowMark> = Object.fromEntries([...asking].map(([ref, n]) => [ref, askMark(n)]))
-  if (!roster || !roster.instances.length || !(await has($, 'status'))) return setFleetMarks($, marks, now)
+  if (!roster || !roster.instances.length || !(await sessionsReady($))) return setFleetMarks($, marks, now)
   const st = await race<Status>($, () => $.sessions.status({ names: (roster as { instances: Instance[] }).instances.map(i => i.name) }))
   if (!st?.ready) return
   const day = today(now)
@@ -9830,7 +9885,7 @@ async function rosterTick($: any) {
       // roster.json's pin: sessions pins its session (the background service doesn't retire a pinned one), once per ref;
       // one the roster no longer pins that fleet pinned is unpinned (sessions leaves a pin the person made)
       await loadPinned($)
-      if (fresh && inst.pin !== pinnedRefs.has(running.ref) && (await has($, 'pin'))) {
+      if (fresh && inst.pin !== pinnedRefs.has(running.ref) && (await sessionsReady($))) {
         const pinned = inst.pin
         const r = await race<Result>($, () => $.sessions.pin!({ ref: running.ref, pinned, reason: pinned ? 'fleet: roster.json pins it' : 'fleet: roster.json no longer pins it' }))
         if (r?.ok) {
@@ -9843,7 +9898,7 @@ async function rosterTick($: any) {
       continue
     }
     if (!retired || isDown || b?.state === 'over' || !hb?.ref || hb.ref !== retired.ref) continue
-    // One the person stopped stays stopped. One whose reason sessions doesn't give (an older sessions, or nothing says why)
+    // One the person stopped stays stopped. One whose reason nothing gives
     // goes the usual way: woken when something is for it, sessions refusing what it must
     const why = stopReason(retired)
     if (why === 'person') continue
@@ -9863,7 +9918,7 @@ async function rosterTick($: any) {
         }
         continue
       }
-      if (!(await has($, 'wake'))) continue
+      if (!(await sessionsReady($))) continue
       const reason = why === 'memory' ? 'fleet: closed for lack of memory, memory is back' : 'fleet: a restart stopped it'
       const r = await race<Result & { state?: string }>($, () => $.sessions.wake!({ ref: retired.ref, reason }))
       if (r?.ok) {
@@ -9927,8 +9982,8 @@ async function rosterTick($: any) {
       notWoken(verdict === 'cap' ? `wakes ${(had && had.day === day ? had.count : 0) + others}/${perDayText(wakes.perDay)} today` : `wakes: one every ${wakes.everyMin} min`)
       continue
     }
-    if (!(await has($, 'wake'))) {
-      notWoken("this session's sessions can't wake (restart it, u)")
+    if (!(await sessionsReady($))) {
+      notWoken(sessionsNeed())
       continue
     }
     if (asPoll) {
@@ -10057,7 +10112,7 @@ async function setFleetMarks($: any, given: Record<string, RowMark>, now: number
   // store and rings every panel on the machine, so identical ones aren't sent every sweep. A sweeper that stops leaves
   // them at most MARKS_TTL_MS
   if (key === marksSet.key && now - marksSet.at < MARKS_RENEW_MS) return
-  if (!(await has($, 'setMarks'))) return
+  if (!(await sessionsReady($))) return
   const r = await race<Result>($, () => $.sessions.setMarks!({ source: 'fleet', rows, ttlMs: MARKS_TTL_MS }))
   if (r?.ok) {
     if (key !== marksSet.key) log($, `marks: ${empty ? 'none' : Object.keys(rows).join(', ')}`)
@@ -10371,7 +10426,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   lint.warnings.push(...callsLint(oc), ...callsToolLint(oc, all.map(i => ({ name: i.name, agent: i.agent, tools: roleFiles.get(i.agent) ? parseRoleFile(roleFiles.get(i.agent) as string).tools : null }))))
   lint.warnings.push(...(await planBLines($, root as string)))
   const down = await downSet($)
-  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: chosen.map(i => i.name) })) : null
+  const st = (await sessionsReady($)) ? await race<Status>($, () => $.sessions.status({ names: chosen.map(i => i.name) })) : null
   const plan = chosen.map(inst => {
     const { running, stopped: retired } = st?.ready ? rowsOf(inst, st.rows) : { running: null, stopped: null }
     // --stopped (the band's line after a restart): wake the stopped ones, start none that was never started.
@@ -10447,8 +10502,10 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (isolated.length) {
     lint.warnings.push(`${isolated.join(', ')}: the project is in a git repository and ${isolated.length === 1 ? 'this instance edits' : 'these instances edit'} files with no worktree.bgIsolation, so a background session may move into a worktree copy before its first edit, and its shared files land in the copy (the README's Worktrees section; roster.json's settings can say "worktree": { "bgIsolation": "none" })`)
   }
-  // --force wakes the ones the person stopped through wake's force, which sessions serves from 0.15.1
-  const forceServed = c.force && (await has($, 'wake')) && versionAtLeast(found?.version, FORCE_SINCE)
+  // --force wakes the ones the person stopped through sessions' wake with force; without the sessions fleet needs,
+  // /fleet up starts and wakes nothing and says what to update
+  const ready = await sessionsReady($)
+  const forceServed = c.force
   const out: string[] = [`${c.dryRun ? 'The plan' : '/fleet up'} for ${chosen.length} of the roster's ${all.length} instance(s)${c.wave !== null && !c.names.length ? ` (waves 1 to ${c.wave})` : ''}${c.restartWhenIdle ? ' (--restart-when-idle: restarts running ones once idle; starts and wakes none)' : ''}${c.force ? ' (--force: wakes the ones you stopped too)' : ''}:`]
   for (const p of plan) {
     const i = p.inst
@@ -10497,8 +10554,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (c.force && c.dryRun) {
     const person = plan.filter(p => p.action === 'wake' && p.why === 'person').map(p => p.inst.name)
     const unknown = plan.filter(p => p.action === 'wake' && p.why === null).map(p => p.inst.name)
-    if (!forceServed && person.length) out.push(`--force needs sessions ${FORCE_SINCE} or later to wake the ones you stopped (this one is ${found?.version || 'older'}): update it, or Enter or u in the panel restarts them.`)
-    else if (person.length || unknown.length) out.push(`${forceLine(person, forceServed ? unknown : [])}.`)
+    if (person.length || unknown.length) out.push(`${forceLine(person, unknown)}.`)
     else out.push('--force: none of them is stopped by you.')
   }
   out.push(
@@ -10510,8 +10566,10 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   // The config files edited since fleet wrote them (/fleet init) or the person last stamped them: his own edits, mostly
   if (loose.length) out.push(`Your edits since /fleet init or your last /fleet accept: ${loose.join(', ')}. If they're yours, /fleet accept ${loose.map(acceptName).join(' ')} stamps them (till then fleet flags them as changed outside fleet; one you didn't make, read first).`)
   for (const n of await worldNotes($)) out.push(`Note: ${n}`)
+  if (!ready) out.push(`✗ ${sessionsNeed()}`)
   if (c.dryRun) return [...out, 'Nothing was started (--dry-run).'].join('\n')
   if (lint.errors.length) return [...out, 'Nothing was started: fix the errors, then /fleet up again.'].join('\n')
+  if (!ready) return [...out, 'Nothing was started or woken: update sessions, restart this session (u), then /fleet up again.'].join('\n')
   await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
   for (const p of plan) if (p.action !== 'down' && p.action !== 'unstarted') await $.fs.write(settingsPath(p.inst.slug), settingsText(settingsFor(p.inst, root as string, deny)))
   if (c.names.length) await setDown($, plan.map(p => p.inst.slug), false)
@@ -10530,11 +10588,8 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
       restarts.push(`  ${p.inst.name}: ${named ? 'restarts once idle, as asked' : 'restarts with its settings once idle'} (nothing in flight); /fleet status shows what it waits for`)
     }
   }
-  const canStart = await has($, 'start')
-  const canWake = await has($, 'wake')
-  // --force wakes the ones the person stopped (and one nothing says why stopped) through wake's force, which sessions
-  // serves from 0.15.1: an older one would refuse them as before, so then only his stops are held back
-  const canForce = forceServed && canWake
+  // --force wakes the ones the person stopped (and one nothing says why stopped) through wake's force
+  const canForce = forceServed
   const results: string[] = [...restarts]
   // Wakes go one every WAKE_GAP_MS (the first at once, so its answer is in this reply), as sessions' own bring-back
   // after its service died paces its respawns: sixteen sessions starting together load the machine
@@ -10544,27 +10599,18 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   const ownRow = async (p: { inst: Instance; ref: string | null; root: string | null }) => sameProject(p.root) || (!!p.ref && (await heartbeatOf($, p.inst.slug))?.ref === p.ref)
   for (const p of plan) {
     if (p.action === 'start') {
-      if (!canStart) {
-        results.push(`  ${p.inst.name}: the sessions plugin in this session can't start sessions (restart this session, u); by hand: ${startLine(p.inst)}`)
-        continue
-      }
-      const s = await race<Result>($, () => $.sessions.start!({ name: p.inst.name, cwd: root as string, agent: p.inst.agent, settings: settingsPath(p.inst.slug) }))
+      const s = await race<Result>($, () => $.sessions.start({ name: p.inst.name, cwd: root as string, agent: p.inst.agent, settings: settingsPath(p.inst.slug) }))
       results.push(s?.ok ? `  ${p.inst.name}: starting` : `  ${p.inst.name}: not started: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions didn't answer"}`)
       log($, `start ${p.inst.name}: ${s?.ok ? 'queued' : s && !s.ok ? s.reason : 'no answer'}`)
     } else if (p.action === 'wake' && p.ref && p.why === 'person' && !canForce) {
-      // Left alone: the person stopped it (Enter or u restarts it), or --force asked of a sessions that can't
-      results.push(
-        c.force && canWake
-          ? `  ${p.inst.name}: stopped by you, not woken: --force needs sessions ${FORCE_SINCE} or later (this one is ${found?.version || 'older'}): update it, or Enter or u in the panel restarts it`
-          : `  ${p.inst.name}: stopped by you, left alone (Enter or u in the panel restarts it, or /fleet up --force wakes it)`,
-      )
+      // Left alone: the person stopped it (Enter or u restarts it)
+      results.push(`  ${p.inst.name}: stopped by you, left alone (Enter or u in the panel restarts it, or /fleet up --force wakes it)`)
     } else if (p.action === 'wake' && p.ref && canForce && (p.why === 'person' || p.why === null) && !(await ownRow(p))) {
       results.push(`  ${p.inst.name}: ${p.why === 'person' ? 'stopped by you' : 'stopped'}, not woken: the stopped session of that name isn't known to be this project's (Enter or u in the panel restarts it)`)
     } else if (p.action === 'wake' && p.ref) {
       // A restart's, a crash's, an idle retire's, or a memory closure's (sessions refuses that one while memory is still
       // short, and says so); with --force also the person's own stop and one nothing explains
-      if (!canWake) results.push(`  ${p.inst.name}: not woken: sessions can't wake it (u in the panel restarts it)`)
-      else queue.push({ inst: p.inst, ref: p.ref, force: canForce && (p.why === 'person' || p.why === null), person: p.why === 'person' })
+      queue.push({ inst: p.inst, ref: p.ref, force: canForce && (p.why === 'person' || p.why === null), person: p.why === 'person' })
     }
   }
   const forced = queue.filter(q => q.force && q.person).map(q => q.inst.name)
@@ -10692,7 +10738,7 @@ async function downCommand($: any, names: string[], origin: string): Promise<str
   await setDown($, p.picked.map(i => i.slug), true)
   // A wake /fleet up still had to send for one of them isn't sent
   await update($, pendingWakes, ws => ws.filter(w => !p.picked.some(i => i.slug === w.slug)))
-  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: p.picked.map(i => i.name) })) : null
+  const st = (await sessionsReady($)) ? await race<Status>($, () => $.sessions.status({ names: p.picked.map(i => i.name) })) : null
   const running = st?.ready ? p.picked.filter(i => rowsOf(i, st.rows).running) : []
   return [
     `Down: ${p.picked.map(i => i.name).join(', ')}. fleet won't wake or nudge them, and /fleet up skips them (/fleet up <name> brings one back).`,
@@ -10706,7 +10752,7 @@ async function removeCommand($: any, names: string[], yes: boolean, origin: stri
   if (none) return none
   const p = pickInstances(names, (roster as { instances: Instance[] }).instances)
   if (p.unknown.length) return `Not in roster.json: ${p.unknown.join(', ')}`
-  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: p.picked.map(i => i.name) })) : null
+  const st = (await sessionsReady($)) ? await race<Status>($, () => $.sessions.status({ names: p.picked.map(i => i.name) })) : null
   const out: string[] = []
   const ready: { inst: Instance; paths: string[]; dirs: string[] }[] = []
   const now = await $.clock.now()
@@ -10833,7 +10879,7 @@ async function rosterStatus($: any): Promise<string[]> {
   const wakes = wakesOf(roster.r)
   const f = forecastOf(all, wakes, await contextSizes($, all))
   lines.push(`budget today: ${usdOf(p.usd, p.cap)}${p.cap !== null ? " (the project's cap)" : ' (no project cap)'}; wakes forecast ~${usd(f.wakesUsd)} a day (each running instance at its own context, ~40k tokens for the others, ${effectivePerDay(wakes)} wakes a day at most)${f.polls ? `; routine polls ~${usd(f.pollsUsd)} a day (${f.polls} turns a day, apart from the wakes' caps)` : ''}; ${Number.isFinite(wakes.perDay) ? `at most ${wakes.perDay} wakes a day each` : 'no daily wake cap'}, one every ${wakes.everyMin} min`)
-  const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
+  const st = (await sessionsReady($)) ? await race<Status>($, () => $.sessions.status({ names: all.map(i => i.name) })) : null
   const down = await downSet($)
   const now = await $.clock.now()
   const day = today(now)
@@ -10898,7 +10944,7 @@ async function rosterStatus($: any): Promise<string[]> {
         if (hb.restartWait) parts.push(`restart pending (${hb.restartWait})`)
         if (inst.poll) parts.push(`last poll ${hb.lastPoll ? `${ago(now - hb.lastPoll)} ago` : 'none yet'} (every ${inst.poll.everyMin} min)${pollOverdue(inst, hb, now) ? ': overdue' : ''}`)
         await loadPinned($)
-        if (inst.pin) parts.push(pinnedRefs.has(running.ref) ? 'pinned' : (await has($, 'pin')) ? 'to pin' : "pin: the sessions here can't pin (an older sessions): it may be retired when idle")
+        if (inst.pin) parts.push(pinnedRefs.has(running.ref) ? 'pinned' : (await sessionsReady($)) ? 'to pin' : `pin: ${sessionsNeed()}`)
         else if (pinnedRefs.has(running.ref)) parts.push('pinned by fleet before: to unpin (roster.json no longer pins it)')
         const t = await readText($, settingsPath(inst.slug))
         if (hb.settingsHash !== null && t !== null && hb.settingsHash !== settingsCoreHash(t)) parts.push('its settings changed since it started: u restarts it with them')
@@ -11891,7 +11937,7 @@ async function reviewLines($: any): Promise<{ lines: string[]; told: () => Promi
 async function askerViews($: any, records: QueueRecord[]): Promise<(r: QueueRecord) => AskerView> {
   const refs = [...new Set(records.map(r => r.asker.ref).filter((x): x is string => !!x))]
   const rows = new Map<string, any>()
-  if (refs.length && (await has($, 'status'))) {
+  if (refs.length && (await sessionsReady($))) {
     const st = await race<Status>($, () => $.sessions.status({ refs }))
     for (const row of st?.ready ? st.rows : []) rows.set(row.ref, row)
   }
@@ -11906,7 +11952,7 @@ async function askerViews($: any, records: QueueRecord[]): Promise<(r: QueueReco
 async function notRunningRefs($: any, refsIn: readonly (string | null)[]): Promise<Set<string>> {
   const refs = [...new Set(refsIn.filter((x): x is string => !!x))]
   const out = new Set<string>()
-  if (!refs.length || !(await has($, 'status'))) return out
+  if (!refs.length || !(await sessionsReady($))) return out
   const st = await race<Status>($, () => $.sessions.status({ refs }))
   for (const row of st?.ready ? st.rows : []) if (row.state === 'stopped' || row.state === 'gone') out.add(row.ref)
   return out
@@ -12504,7 +12550,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
   if (instances.length) {
     const down = await downSet($)
     downNames = instances.filter(i => down.has(i.slug)).map(i => i.name)
-    const st = (await has($, 'status')) ? await race<Status>($, () => $.sessions.status({ names: instances.map(i => i.name) })) : null
+    const st = (await sessionsReady($)) ? await race<Status>($, () => $.sessions.status({ names: instances.map(i => i.name) })) : null
     const swept = await readWire<WakesFile>($, stateDir('wakes.json'))
     for (const inst of instances) {
       // Not running though nobody took it down: a restart stopped it, or the background service retired it
@@ -12679,14 +12725,11 @@ async function statusCommand($: any, all = false): Promise<string> {
   const lines = [`version ${version || '?'}${root ? ` · project ${root}` : ' · this project has no .claude/fleet/ (/fleet init sets it up)'}`]
   if (configProblem) lines.push(configProblem)
   lines.push(offered ? `decide: offered here (background session ${jobRef})` : `decide: not offered here: ${whyNot}`)
-  const c = (await has($, 'contract')) ? found : null
-  lines.push(
-    c
-      ? `sessions: api ${c.api}, version ${c.version}: names, states and the "Asking you" section`
-      : found && found.api !== SESSIONS_API
-        ? `sessions: api ${found.api}, and this fleet calls api ${SESSIONS_API}: update both and restart (u)`
-        : "sessions: not answering: no names, states or sections (it's needed: restart, u)",
-  )
+  const c = (await sessionsReady($)) ? found : null
+  lines.push(c ? `sessions: api ${c.api}, version ${c.version}: names, states and the "Asking you" section` : `✗ ${sessionsNeed()}`)
+  // What else fleet needs, said here whatever else this status shows
+  if (!(await python3Ready($))) lines.push(`✗ ${PYTHON3_NEED}`)
+  if (!(await claudeReady($))) lines.push(`✗ ${claudeNeed()}`)
   if (root) {
     const oc = await outboundConfig($)
     const allowed = [oc.hosts.length ? `hosts ${oc.hosts.join(', ')}` : '', oc.remotes.length ? `remotes ${oc.remotes.join(', ')}` : '', oc.recipients.length ? `recipients ${oc.recipients.join(', ')}` : ''].filter(Boolean)
@@ -12811,8 +12854,11 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   if (!jobRef) whyNot = "this isn't a background session: here the model asks with AskUserQuestion, and fleet records the answers"
   log($, `init ${dir} (${name})`)
   const next = (Array.isArray(tpl.meta.next) ? tpl.meta.next : []).filter((x: unknown): x is string => typeof x === 'string')
+  // What fleet needs and this machine lacks, said at once (the README's Requirements)
+  const lacking = await dependencyLines($)
   return [
     `${fresh ? 'Set up' : 'Up to date'} in ${dir}/ (template ${name}${typeof tpl.meta.description === 'string' ? `: ${tpl.meta.description}` : ''}).`,
+    ...lacking.map(l => `✗ ${l}.`),
     written.length ? `Written: ${written.join(', ')}.` : '',
     kept.length ? `Kept as they were (yours): ${kept.join(', ')}.` : '',
     "Background sessions of this project get mcp__fleet__decide: they ask you without stopping, and the answer reaches them at their next step, while they work or once they're idle.",
@@ -13664,19 +13710,21 @@ export const register: Register = on => {
     const o = await read($, overBudget)
     const note = await read($, bandNote)
     const behind = await read($, behindBand)
-    if (n <= 0 && f <= 0 && o <= 0 && !note && !behind) return beneath
+    const lacking = await read($, needs)
+    if (n <= 0 && f <= 0 && o <= 0 && !note && !behind && !lacking) return beneath
     const parts = [
+      ...(lacking ? [`✗ fleet needs ${lacking}`] : []),
       ...(n > 0 ? [`? ${n} for you`] : []),
       ...(f > 0 ? [`!! ${f} flagged`] : []),
       ...(behind ? [behind] : []),
       ...(o > 0 ? [`$ ${o} over budget`] : []),
       ...(note ? [`! ${note}`] : []),
-      n > 0 ? '/fleet' : f > 0 || note || behind ? '/fleet status' : '/fleet budget',
+      n > 0 ? '/fleet' : f > 0 || note || behind || lacking ? '/fleet status' : '/fleet budget',
     ]
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">
-        <Text color={note.includes('idle with queued work') || note.includes(' for nobody: ') ? 'error' : 'warning'}>{parts.join(' · ')}</Text>
+        <Text color={lacking || note.includes('idle with queued work') || note.includes(' for nobody: ') ? 'error' : 'warning'}>{parts.join(' · ')}</Text>
         {beneath}
       </Box>
     )
