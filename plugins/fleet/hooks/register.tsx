@@ -491,8 +491,8 @@ async function processNow($: any): Promise<string> {
 // of the mod until the next SessionStart (a start, /clear, a compaction, a resume) replaces it. A reload never raises
 // SessionStart, so the set of paths has a version (FLEET_WATCH_SET), which SessionStart writes in $.state (`watching`):
 // a module that finds its own set there is watched (live); one that doesn't (a reload into a version that watches
-// more, sessions' update in place, a managed plugin that sends SessionStart on past fleet) reads on today's timers and
-// /fleet status says "live updates off". Live comes only once the engine proved it: SessionStart rings bell/probe a
+// more, sessions' update in place, a managed plugin that sends SessionStart on past fleet) reads on today's timers until
+// its own watch starts (below), and /fleet status says "live updates off" until then. Live comes only once the engine proved it: SessionStart rings bell/probe a
 // second after it hands the list, and the first FileChanged under bell/ turns live updates on (and writes the set in
 // $.state, for a reload). Live, the timers are a safety pass (a lost event costs latency, never
 // correctness): answers every 60 s instead of 2 s, the band and the rest of the beat every 60 s instead of 10 s (10 s
@@ -564,13 +564,196 @@ async function beatOnce($: any) {
     beating = false
   }
 }
+// Fleet's own watch (0.14.0). Where Claude watches nothing for this session (a plugin ahead of fleet sends SessionStart on
+// past it, or the session went on from before the project had fleet's folders), a child process does: the command
+// sessions' watchCommand builds, which sleeps in the kernel's file watch over the paths SessionStart would hand Claude.
+// Each of its lines runs what classic.FileChanged runs (fileChanged); its `ready` makes the session live. It starts
+// OWN_WATCH_WAIT_MS after the timers, or after a SessionStart, if live hasn't come by then; Claude's proof, whenever it
+// comes, ends it, and two landings a proved watch missed start it (until a new SessionStart). When it ends, the session is back on its timers and it starts again after a back-off; a
+// SessionStart ends it (Claude watches from then on), and a reload ends it with the module (the new module starts its own)
+const OWN_WATCH_WAIT_MS = 10000
+const OWN_WATCH_BACKOFF_MS = [60000, 300000, 1800000]
+const OWN_WATCH_STEADY_MS = 600000
+type OwnWatch = { how: string; pid: string; readyAt: number; stopping: boolean }
+let ownWatch: OwnWatch | null = null
+let ownWatchLive = false
+let ownWatchFailures = 0
+let ownWatchRetry: { cancel: () => void } | null = null
+let ownWatchRetryAt = 0
+let ownWatchWhy = ''
+
+/** The paths Claude or fleet's own watch follows: the two triggers and the folders that carry what the timers looked for */
+function watchedPaths(): { files: string[]; folders: string[] } {
+  return {
+    files: [`${eventsDir()}/latest`, ...(intakeCfg ? [`${inboxDir()}/latest`] : [])],
+    folders: [dec('queue'), dec('answers'), dec('overrules'), bellDir()],
+  }
+}
+/** Makes what's watched: a path whose folder is missing is never watched (the inbox's folder is made only once intake is
+ * set up), and of several missing under one parent only one ever is, so each exists before the list goes */
+async function makeWatched($: any, w: { files: string[]; folders: string[] }) {
+  const missing: string[] = []
+  for (const d of w.folders) if (await gone($, d)) missing.push(d)
+  if (missing.length) await run($, ['mkdir', '-p', ...missing])
+  for (const p of w.files) {
+    if (await gone($, p)) await $.fs.write(p, json({ format: FORMAT, last: '' })).catch(() => {})
+  }
+}
+function scheduleOwnWatch($: any, ms: number) {
+  ownWatchRetry?.cancel()
+  ownWatchRetry = $.clock.after(ms, () => {
+    ownWatchRetry = null
+    bg(startOwnWatch($))
+  })
+}
+async function startOwnWatch($: any) {
+  if (ownWatch || live || !timersOn || !root) return
+  const h: OwnWatch = { how: '', pid: '', readyAt: 0, stopping: false }
+  ownWatch = h
+  let why = ''
+  let said = ''
+  try {
+    if (!(await sessionsReady($))) throw new Error(sessionsNeed())
+    await ensureWorld($)
+    if (!root) throw new Error('no fleet in this project')
+    const w = watchedPaths()
+    const c: any = await race($, () => $.sessions.watchCommand!({ paths: [...w.files, ...w.folders] }))
+    if (!c) throw new Error('sessions did not answer')
+    if (!c.ok) throw new Error(c.detail || c.reason || 'sessions could not build it')
+    await makeWatched($, w)
+    h.how = String(c.how)
+    if (h.stopping) return
+    let buf = ''
+    const stream = $.process.spawn({ argv: c.argv, cwd: '/' })
+    for await (const chunk of stream as AsyncIterable<{ stream: string; text: string }>) {
+      if (chunk.stream === 'stderr') {
+        said = (said + chunk.text).slice(-400)
+        continue
+      }
+      buf += chunk.text
+      for (let i = buf.indexOf('\n'); i >= 0; i = buf.indexOf('\n')) {
+        const [kind = '', a = '', b = ''] = buf.slice(0, i).split('\t')
+        buf = buf.slice(i + 1)
+        if (kind === 'ready') await ownWatchReady($, h, b, a)
+        else if ((kind === 'add' || kind === 'change' || kind === 'unlink') && a && ownWatch === h) fileChanged($, a, false)
+      }
+    }
+    const end: any = await Promise.resolve((stream as any).result).catch(() => null)
+    why = end?.signal ? `ended by ${end.signal}` : end ? `exited with code ${end.code}` : 'ended'
+  } catch (err) {
+    why = err instanceof Error ? err.message : String(err)
+  } finally {
+    const last = said.trim().split('\n').at(-1) ?? ''
+    await ownWatchGone($, h, cut(last ? `${why}: ${last}` : why, 200))
+  }
+}
+async function ownWatchReady($: any, h: OwnWatch, pid: string, how: string) {
+  h.pid = /^\d+$/.test(pid) ? pid : ''
+  if (how) h.how = how
+  // The time first: from the check on there's no await, so no stop can come between the check and what it allows
+  const now = await $.clock.now()
+  // Stopped while it was starting, or Claude's watch was proved meanwhile: ended now that its process is known
+  if (live && !ownWatchLive) h.stopping = true
+  if (h.stopping) {
+    if (h.pid) bg(run($, ['kill', h.pid]))
+    return
+  }
+  h.readyAt = now
+  ownWatchLive = true
+  ownWatchWhy = ''
+  log($, `own watch: ${h.how}, process ${h.pid}: live updates on`)
+  live = true
+  watchingLatest = true
+  watchMisses = 0
+  // What changed before it was ready is in no line: one pass of everything now
+  ringHere($, ['deliver', 'beat', 'sweep'])
+}
+async function ownWatchGone($: any, h: OwnWatch, why: string) {
+  if (ownWatch !== h) return
+  ownWatch = null
+  const wasLive = ownWatchLive
+  ownWatchLive = false
+  if (h.stopping) return
+  const now = await $.clock.now()
+  if (wasLive && now - h.readyAt >= OWN_WATCH_STEADY_MS) ownWatchFailures = 0
+  const wait = OWN_WATCH_BACKOFF_MS[Math.min(ownWatchFailures, OWN_WATCH_BACKOFF_MS.length - 1)] as number
+  ownWatchFailures++
+  ownWatchWhy = why
+  ownWatchRetryAt = now + wait
+  log($, `own watch ended (${why}): timers, and it starts again in ${wait / 60000} min`)
+  if (wasLive) {
+    live = false
+    watchingLatest = false
+  }
+  scheduleOwnWatch($, wait)
+}
+/** A SessionStart came: Claude watches the paths from now on (its probe proves it), so the own watch ends */
+function stopOwnWatch($: any) {
+  ownWatchRetry?.cancel()
+  ownWatchRetry = null
+  ownWatchFailures = 0
+  ownWatchWhy = ''
+  ownWatchLive = false
+  const h = ownWatch
+  if (!h) return
+  h.stopping = true
+  if (h.pid) bg(run($, ['kill', h.pid]))
+}
+/** A watched path changed: Claude said so (engine) or fleet's own watch did. The same code the timers run */
+function fileChanged($: any, path: string, engine: boolean) {
+  if (root && path.endsWith('/.claude/fleet/events/latest')) {
+    bg(
+      (async () => {
+        fileChangedAt = await $.clock.now()
+        await eventsTick($)
+        // The sweeper's suspects follow a landing at once (live: its own tick comes only every 10 s)
+        if (live && sweep.holding) ringHere($, ['sweep'])
+      })(),
+    )
+  }
+  // A poller dropped an item: the sweeper reads it at its next tick (live: now)
+  if (root && path.endsWith('/.claude/fleet/inbox/latest')) {
+    sweep.intakeDirty = true
+    if (live && sweep.holding) ringHere($, ['sweep'])
+  }
+  // Live updates: an answer, an overrule or a note reaches its asker now; a question asked or closed reaches the band
+  // and the sweeper's marks now (and an answer to a retired asker wakes it now); a bell says what else moved
+  // The engine brought a bell (this session's probe or anyone's ring under bell/): it watches fleet's paths here.
+  // What was on disk before the watch began raises no event (an answer waiting for a woken or restarted asker):
+  // one pass of everything now. A proof that comes once the own watch started ends that watch: Claude's does the job
+  if (root && engine && handedSet && path.includes('/.claude/fleet/bell/') && (!live || ownWatchLive || ownWatch)) {
+    const off = !live
+    live = true
+    bg(update($, watching, () => FLEET_WATCH_SET))
+    stopOwnWatch($)
+    if (off) ringHere($, ['deliver', 'beat', 'sweep'])
+  }
+  if (root && live) {
+    const p = path
+    // What another session wrote in a folder this one may have listed a moment ago: listed again, not from memory
+    if (p.includes('/.claude/fleet/decisions/overrules/')) folderNamesCache.delete(dec('overrules'))
+    if (p.includes('/.claude/fleet/decisions/answers/') || p.includes('/.claude/fleet/decisions/overrules/')) {
+      sweep.wakeDirty = true
+      ringHere($, ['deliver', 'beat', 'sweep'])
+    } else if (p.includes('/.claude/fleet/decisions/queue/')) ringHere($, ['beat', 'sweep'])
+    else if (p.includes('/.claude/fleet/bell/')) {
+      // A budget raised or an instance taken down: its budgets are read again, not from the minute's cache
+      if (p.endsWith('/bell/budget')) budgetCache.at = 0
+      // A run finished: its folder is listed again, not from memory
+      if (p.endsWith('/bell/runs')) folderNamesCache.delete(runsDir())
+      ringHere($, ['beat'])
+    }
+  }
+}
+
 /** /fleet status's line on live updates; sessionStart: whether classic.SessionStart reached fleet in this session */
-function liveLine(sessionStart = true): string {
+function liveLine(sessionStart: boolean, now: number): string {
+  if (live && ownWatchLive) return `live updates: on (fleet's own watch: ${ownWatch?.how || 'running'}; questions, answers and overrules reach this session by their files, in under a second)`
+  if (live) return 'live updates: on (questions, answers and overrules reach this session by their files, in under a second)'
+  const own = ownWatchWhy ? `; fleet's own watch isn't running (${ownWatchWhy}), and it tries again in ${Math.max(1, Math.ceil((ownWatchRetryAt - now) / 60000))} min` : ''
   // With no SessionStart reaching fleet here (a managed plugin may send it on past fleet), neither u nor /clear helps
-  if (!live && !sessionStart) return "live updates off: SessionStart hasn't reached fleet in this session (a managed plugin may send it on past fleet), so here fleet reads its files on timers: answers every 2 s, the band every 10 s"
-  return live
-    ? 'live updates: on (questions, answers and overrules reach this session by their files, in under a second)'
-    : 'live updates off: u or /clear turns them on (here fleet reads its files on timers: answers every 2 s, the band every 10 s)'
+  if (!sessionStart) return `live updates off: SessionStart hasn't reached fleet in this session (a managed plugin may send it on past fleet), so here fleet reads its files on timers: answers every 2 s, the band every 10 s${own}`
+  return `live updates off: u or /clear turns them on (here fleet reads its files on timers: answers every 2 s, the band every 10 s)${own}`
 }
 const section = atom({ plugin: 'fleet', key: 'section' } as const, '')
 const reads = atom({ plugin: 'fleet', key: 'reads' } as const, {} as Record<string, Record<string, FleetRead>>)
@@ -707,7 +890,7 @@ const SESSIONS_API = 1
 // What fleet needs (CONTRIBUTING.md, "Dependencies, not fallbacks"): sessions at this version or later, python3 (a .py
 // draft's parse check, the proposal template's proofs check), and Claude Code at this version or later. A missing one
 // is said once, in the band, /fleet status and the commands that need it; there's no second way to do without it
-const SESSIONS_MIN = '0.17.0'
+const SESSIONS_MIN = '0.18.0'
 const CLAUDE_MIN = '2.1.319'
 // /fleet up's wakes, one this far apart (sessions' own bring-back after its service died paces its respawns 3 s apart)
 const WAKE_GAP_MS = 3000
@@ -1093,6 +1276,8 @@ function timers($: any) {
       })(),
     ),
   )
+  // No live updates by then: fleet's own watch
+  scheduleOwnWatch($, OWN_WATCH_WAIT_MS)
   // Live, the timers below are the safety pass: their ticks in between end at once, with nothing read
   let deliverTicks = 0
   let beatTicks = 0
@@ -2250,6 +2435,9 @@ async function eventsTick($: any, fromPoll = false) {
         handedSet = false
         bg(update($, watching, () => 0))
         log($, "events/latest: the engine's watcher didn't bring two landings; the world is looked at every 2 s, and live updates are off")
+        // The own watch missed them: it ends and starts again after its back-off. Claude's watch did: the own watch takes over
+        if (ownWatch?.pid) bg(run($, ['kill', ownWatch.pid]))
+        else if (!ownWatch) scheduleOwnWatch($, 1000)
       }
       unwatched = 0
     }
@@ -8155,10 +8343,10 @@ const RESTART_QUEUED_MS = 5 * 60000
 
 /** /fleet status's line on the classic hooks that reached fleet in this session. classic.SessionStart comes before any
  * prompt: missing, a managed plugin sends it on past the plugins a person installed (next.to beneath their tier) */
-export function classicLine(seen: Record<string, number>): string {
+export function classicLine(seen: Record<string, number>, ownWatching = false): string {
   const got = Object.keys(seen).sort()
   if (seen.SessionStart) return `classic hooks reaching fleet here: ${got.join(', ')}`
-  return `classic hooks: SessionStart didn't reach fleet in this session (a managed plugin may send it on past the plugins you installed${got.length ? `; seen: ${got.join(', ')}` : ''}): fleet tells an instance who it is in its prompts and after a compaction, watches the world every 2 s, and finds a permission prompt by the verdict (tool.check)`
+  return `classic hooks: SessionStart didn't reach fleet in this session (a managed plugin may send it on past the plugins you installed${got.length ? `; seen: ${got.join(', ')}` : ''}): fleet tells an instance who it is in its prompts and after a compaction, ${ownWatching ? 'hears of a landing through its own watch and looks at the world every 10 s' : 'watches the world every 2 s'}, and finds a permission prompt by the verdict (tool.check)`
 }
 
 /** A classic hook reached fleet: when, by event. A managed plugin can send one on past the plugins a person installed
@@ -10989,7 +11177,7 @@ async function rosterStatus($: any): Promise<string[]> {
     if (blocks) lines.push(...blocksLines(inst.name, blocks, -new Date(now).getTimezoneOffset()).map((l, i) => `${i ? '      ' : '    '}${l}`))
   }
   if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
-  lines.push(classicLine(await read($, classicSeen)))
+  lines.push(classicLine(await read($, classicSeen), ownWatchLive))
   const loose = await unstamped($)
   if (loose.length) lines.push(`changed outside fleet (not through a change you applied): ${loose.join(', ')}: /fleet accept <path> stamps your own edit as yours`)
   return lines
@@ -12752,7 +12940,7 @@ async function statusCommand($: any, all = false): Promise<string> {
     const waiting = records.filter(r => knownKind(r) && progress(r.id, slots(r), present).complete).length
     lines.push(`project: ${heldCount(records, present, alikeQuestion)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
     lines.push((await sweeperState($)).line)
-    lines.push(liveLine(!!(await read($, classicSeen)).SessionStart))
+    lines.push(liveLine(!!(await read($, classicSeen)).SessionStart, await $.clock.now()))
     await ensureWorld($)
     const spent = await judgeLedger($, await $.clock.now())
     const liveAreas = Object.keys((await judgesStateNow($)).live).sort()
@@ -12875,8 +13063,6 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
     ...next,
     isolation,
     'Sessions already running join within a minute; one that was running before fleet was enabled needs a restart (u).',
-    // Claude watches only what SessionStart named, and this project's folders didn't exist then
-    fresh && !live ? "This session reads fleet's files on timers until /clear (or u): then the band and answers come live, in about a second." : '',
     dropped,
     ...uninstalled.lines,
     ...planB,
@@ -13085,26 +13271,19 @@ export const register: Register = on => {
     try {
       await ensureWorld($)
       if (!root) return r
-      // The files it watches exist before it says so: a path whose folder is missing then is never watched in this
-      // session (the inbox's folder is made only once intake is set up)
-      const files = [`${eventsDir()}/latest`, ...(intakeCfg ? [`${inboxDir()}/latest`] : [])]
-      // And the folders that carry what fleet's timers looked for (0.11.0: live updates). A missing one is watched only
-      // in the simplest case (several missing under one parent: only one ever is), so each is made before the list goes
-      const folders = [dec('queue'), dec('answers'), dec('overrules'), bellDir()]
-      const missing: string[] = []
-      for (const d of folders) if (await gone($, d)) missing.push(d)
-      if (missing.length) await run($, ['mkdir', '-p', ...missing])
-      for (const p of files) {
-        if (await gone($, p)) await $.fs.write(p, json({ format: FORMAT, last: '' })).catch(() => {})
-      }
+      const w = watchedPaths()
+      await makeWatched($, w)
       watchingLatest = true
       watchMisses = 0
-      const watched = [...files, ...folders]
+      const watched = [...w.files, ...w.folders]
       // Live once the engine brings a ring under bell/ back (the list is set once this hook returns; it replaces the one
       // before, so live waits for that proof again)
       live = false
       handedSet = true
       $.clock.after(1000, () => bg(ringBell($, 'probe')))
+      // Claude watches from now on: the own watch ends, and comes back only if the probe doesn't prove that
+      stopOwnWatch($)
+      scheduleOwnWatch($, OWN_WATCH_WAIT_MS)
       const out = { ...r, watchPaths: [...(r?.watchPaths ?? []), ...watched] }
       if (!envInstance || !jobRef) return out
       await loadRoster($)
@@ -13168,47 +13347,7 @@ export const register: Register = on => {
 
   on('classic.FileChanged', async ($, e, next) => {
     sawClassic($, 'FileChanged')
-    if (root && String(e.file_path).endsWith('/.claude/fleet/events/latest')) {
-      bg(
-        (async () => {
-          fileChangedAt = await $.clock.now()
-          await eventsTick($)
-          // The sweeper's suspects follow a landing at once (live: its own tick comes only every 10 s)
-          if (live && sweep.holding) ringHere($, ['sweep'])
-        })(),
-      )
-    }
-    // A poller dropped an item: the sweeper reads it at its next tick (live: now)
-    if (root && String(e.file_path).endsWith('/.claude/fleet/inbox/latest')) {
-      sweep.intakeDirty = true
-      if (live && sweep.holding) ringHere($, ['sweep'])
-    }
-    // Live updates: an answer, an overrule or a note reaches its asker now; a question asked or closed reaches the band
-    // and the sweeper's marks now (and an answer to a retired asker wakes it now); a bell says what else moved
-    // The engine brought a bell (this session's probe or anyone's ring under bell/): it watches fleet's paths here.
-    // What was on disk before the watch began raises no event (an answer waiting for a woken or restarted asker):
-    // one pass of everything now
-    if (root && !live && handedSet && String(e.file_path).includes('/.claude/fleet/bell/')) {
-      live = true
-      bg(update($, watching, () => FLEET_WATCH_SET))
-      ringHere($, ['deliver', 'beat', 'sweep'])
-    }
-    if (root && live) {
-      const p = String(e.file_path)
-      // What another session wrote in a folder this one may have listed a moment ago: listed again, not from memory
-      if (p.includes('/.claude/fleet/decisions/overrules/')) folderNamesCache.delete(dec('overrules'))
-      if (p.includes('/.claude/fleet/decisions/answers/') || p.includes('/.claude/fleet/decisions/overrules/')) {
-        sweep.wakeDirty = true
-        ringHere($, ['deliver', 'beat', 'sweep'])
-      } else if (p.includes('/.claude/fleet/decisions/queue/')) ringHere($, ['beat', 'sweep'])
-      else if (p.includes('/.claude/fleet/bell/')) {
-        // A budget raised or an instance taken down: its budgets are read again, not from the minute's cache
-        if (p.endsWith('/bell/budget')) budgetCache.at = 0
-        // A run finished: its folder is listed again, not from memory
-        if (p.endsWith('/bell/runs')) folderNamesCache.delete(runsDir())
-        ringHere($, ['beat'])
-      }
-    }
+    fileChanged($, String(e.file_path), true)
     return next(e)
   }).catch(($, e, next) => next(e))
 

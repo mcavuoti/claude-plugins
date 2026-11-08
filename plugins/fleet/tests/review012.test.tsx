@@ -37,7 +37,7 @@ function setup(on: any, opts: { n?: number; why?: string | undefined; version?: 
       const why = 'why' in opts ? opts.why : 'person'
       rows[ref(i)] = { ...row(ref(i), `Owner ${String.fromCharCode(65 + i)}`, 'stopped'), ...(why ? { stopped: why } : {}) }
     }
-  sessionsSay(w, { rows, version: opts.version ?? '0.17.0' } as any)
+  sessionsSay(w, { rows, version: opts.version ?? '0.18.0' } as any)
   return w
 }
 
@@ -183,7 +183,7 @@ test('a sessions that gives no version, or an older one, gets the one dependency
   const w = setup(on, { version: '' })
   await startSession($, w)
   const up = await fleet($, 'up --force')
-  expect(up).toContain('fleet needs sessions 0.17.0 or later (an older version here)')
+  expect(up).toContain('fleet needs sessions 0.18.0 or later (an older version here)')
   expect(up).toContain('Nothing was started or woken')
   expect(up).not.toContain('stopped by you: to wake (--force)')
   await after(w, 7000)
@@ -192,7 +192,7 @@ test('a sessions that gives no version, or an older one, gets the one dependency
 
 test('/fleet status for a down instance the person stopped names it in the --force it needs', WITH_SESSIONS, async ($, on) => {
   const w = setup(on, { why: 'unknown' })
-  sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'person' }, bbbbbbb1: { ...row('bbbbbbb1', 'Owner B', 'stopped'), stopped: 'unknown' } }, version: '0.17.0' } as any)
+  sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'person' }, bbbbbbb1: { ...row('bbbbbbb1', 'Owner B', 'stopped'), stopped: 'unknown' } }, version: '0.18.0' } as any)
   await startSession($, w)
   await fleet($, 'down "Owner A"')
   const status = await fleet($, 'status')

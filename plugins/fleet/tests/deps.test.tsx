@@ -8,7 +8,7 @@ test('everything here: /fleet status names nothing missing', WITH_SESSIONS, asyn
   const w = world(on)
   await startSession($, w)
   const status = await fleet($, 'status')
-  expect(status).toContain('sessions: api 1, version 0.17.0')
+  expect(status).toContain('sessions: api 1, version 0.18.0')
   expect(status).not.toContain('fleet needs')
 })
 
@@ -16,18 +16,18 @@ test('sessions not loaded: one line says what to update, in /fleet status and th
   const w = world(on)
   sessionsSay(w, { gone: true })
   await startSession($, w)
-  expect(await fleet($, 'status')).toContain('✗ fleet needs sessions 0.17.0 or later (not answering in this session): update it (claude plugin update sessions@mcavuoti) and restart (u)')
+  expect(await fleet($, 'status')).toContain('✗ fleet needs sessions 0.18.0 or later (not answering in this session): update it (claude plugin update sessions@mcavuoti) and restart (u)')
   await w.clock.advance(61000)
   await w.clock.settle()
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(JSON.stringify(await ui.drawn())).toContain('✗ fleet needs sessions 0.17.0 or later (not answering in this session)')
+  expect(JSON.stringify(await ui.drawn())).toContain('✗ fleet needs sessions 0.18.0 or later (not answering in this session)')
 })
 
 test('an older sessions: the same line, naming the version there', WITH_SESSIONS, async ($, on) => {
   const w = world(on)
   sessionsSay(w, { version: '0.16.3' })
   await startSession($, w)
-  expect(await fleet($, 'status')).toContain('✗ fleet needs sessions 0.17.0 or later (0.16.3 here)')
+  expect(await fleet($, 'status')).toContain('✗ fleet needs sessions 0.18.0 or later (0.16.3 here)')
 })
 
 test('python3 missing: /fleet status says so, and a .py draft is refused with it, never let through unchecked', WITH_SESSIONS, async ($, on) => {
@@ -148,11 +148,11 @@ test('sessions answers well after a minute: fleet recovers by itself, with no re
   await startSession($, w)
   await pass(w, 90000)
   expect(await band($)).toContain('fleet needs sessions')
-  expect(await fleet($, 'status')).toContain('✗ fleet needs sessions 0.17.0 or later (not answering in this session)')
+  expect(await fleet($, 'status')).toContain('✗ fleet needs sessions 0.18.0 or later (not answering in this session)')
   sessionsSay(w, {})
   const cleared = await bandClears($, w, 65)
   expect(cleared).toBeGreaterThan(0)
-  expect(await fleet($, 'status')).toContain('sessions: api 1, version 0.17.0')
+  expect(await fleet($, 'status')).toContain('sessions: api 1, version 0.18.0')
 })
 
 test('a contract answered with an empty version is asked again, like one that didn’t answer', { ...WITH_SESSIONS, timeoutMs: 120000 }, async ($, on) => {
@@ -160,7 +160,7 @@ test('a contract answered with an empty version is asked again, like one that di
   sessionsSay(w, { version: '' })
   await startSession($, w)
   await pass(w, 2000, 1000)
-  expect(await fleet($, 'status')).toContain('✗ fleet needs sessions 0.17.0 or later (an older version here)')
+  expect(await fleet($, 'status')).toContain('✗ fleet needs sessions 0.18.0 or later (an older version here)')
   sessionsSay(w, {})
   await pass(w, 2 * 60000)
   expect(await fleet($, 'status')).not.toContain('fleet needs sessions')
