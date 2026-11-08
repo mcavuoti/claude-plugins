@@ -146,7 +146,7 @@ Claude in each session can list the project's other sessions and bring back a st
 - **Closing the panel**: close it yourself (its ✕ or close key, or `/sessions` while it has the keyboard) and it stays closed, in this session and in every session that starts afterwards, until you open it again with `/sessions` or the button on the line above the prompt (`shift+→` then Enter, or a click). What you chose wins: arriving with `ccc` or Enter then lands on the prompt instead of the panel.
 - **More sessions than the panel's height**: a line at the top says how many don't fit (`↓ 4 more below`, and the keys that scroll), and while the list doesn't fit, only the rows that wait for you, or that a plugin marked as needing you, keep their status lines (their badges stay), so more sessions fit.
 - **Live: what changed shows within a second, with nothing asked.** Another session turning busy, done or waiting for you, starting, ending or renamed shows in about 0.6 s (one that ends, in about 0.2 s), and your own row at once: Claude tells each panel when one of a few files changes ([Watching files](#how-it-works)). An idle panel runs no command, is drawn about once a minute (for a row's time) and reads everything again once a minute in case an event was missed; one session does the machine-wide work for all of them ([The leader](#how-it-works)).
-- **Updated in place, it says so.** A version that watches other files than the running one is never loaded in place: the `↑` stays and `u` restarts. A session that came in by a reload from 0.13 or older says `Live updates off: this session was updated in place; u restarts it, or /clear` and reads the files every 3 s until it restarts, is cleared or compacts. Where a plugin ahead of sessions keeps `SessionStart` from it, the panel reads the files every 3 s in every session, and says nothing about `u`, which wouldn't help ([When SessionStart doesn't reach sessions](#when-sessionstart-doesnt-reach-sessions)).
+- **Updated in place, it says so.** A version that watches other files than the running one is never loaded in place: the `↑` stays and `u` restarts. A session that came in by a reload from 0.13 or older, or one a plugin ahead of sessions keeps `SessionStart` from, watches the files itself and stays live ([When SessionStart doesn't reach sessions](#when-sessionstart-doesnt-reach-sessions)); while that watch is down, the first says `Live updates off: this session was updated in place; u restarts it, or /clear` and reads the files every 3 s until it restarts, is cleared or compacts, and the second reads them every 3 s and says nothing about `u`, which wouldn't help.
 - Above each session's prompt, one line (and after it whatever other mods draw there): how many sessions are waiting for you (red) or have something unseen (yellow), the account's windows on a subscription, and when the panel isn't shown, why: `panel closed · /sessions to open`, or `panel hidden: window too narrow · /sessions to show` (Claude draws a panel the mod opened on its own only from 144 columns, 110 once you've opened it yourself; one you open with `/sessions` shows at any width).
 
 ## Notifications
@@ -227,6 +227,7 @@ On macOS the panel drives Terminal.app (which window is in front, bring one forw
 | Bring forward a window showing another session | X11 with `wmctrl` or `xdotool`; otherwise it opens in the current window |
 | A window opened without the launcher (`claude attach` typed by hand) | can't be switched in place (there's no way to type into it): open it with `ccc` |
 | ↑ for an outdated version, token usage, pinning (◆), reopening after a memory shortage | works (version and folders read from `/proc`, memory from `/proc/meminfo`) |
+| Live updates where `SessionStart` doesn't reach sessions | the mod's own watch with inotify: one instance per session (`fs.inotify.max_user_instances`, 128 on many systems); past that limit a session reads on the short timer, and `/sessions status` says why |
 | Automatic "seen" (yellow → green) | X11 with `xprop`: the window in front, by its title (a session with a name of its own, not inside an agent view); otherwise it stays yellow until you type in that session, use its panel or arrive there |
 | Closing the windows of a stopped session | not needed: the viewer ends with the session and the launcher leaves the shell |
 
@@ -317,10 +318,10 @@ plugins/sessions/
 │   ├── state.ts                  pure logic: colors, versions, pins, bars, sums, windows from ps (tested)
 │   ├── watch.ts                  what the engine watches for each session, and the session list from Claude's files
 │   ├── leader.ts                 which session does the machine-wide work
-│   ├── platform/                 what differs by system: windows, processes, memory
+│   ├── platform/                 what differs by system: windows, processes, memory, the file watch
 │   │   ├── types.ts              the contract each system provides
-│   │   ├── macos.ts              Terminal.app (AppleScript), ioreg, lsof, sysctl
-│   │   ├── linux.ts              processes + launcher, xprop, wmctrl/xdotool, terminal emulators, /proc
+│   │   ├── macos.ts              Terminal.app (AppleScript), ioreg, lsof, sysctl, kqueue
+│   │   ├── linux.ts              processes + launcher, xprop, wmctrl/xdotool, terminal emulators, /proc, inotify
 │   │   └── index.ts              picks one when a session starts
 │   ├── visor.sh                  the launcher that runs in each window
 │   ├── launcher.py               what ccc opens: the top session, one window per project, the Name prompt; ccc tell, ccc section, ccc tidy; the window's watcher, and the mod's own file watch (watch-paths)

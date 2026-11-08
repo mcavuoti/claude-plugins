@@ -1,4 +1,5 @@
-// What each operating system provides so the shared panel (register.tsx) can work with windows, processes and memory.
+// What each operating system provides so the shared panel (register.tsx) can work with windows, processes, memory and
+// the kernel's file watch.
 // One implementation per system: macos.ts drives Terminal.app through AppleScript; linux.ts uses processes and the
 // launcher only, which every terminal has. Each can only be tested on its own system, so edit macos.ts from a Mac and
 // linux.ts from Linux; a change to this contract updates both in the same commit (see CONTRIBUTING.md at the repo root).

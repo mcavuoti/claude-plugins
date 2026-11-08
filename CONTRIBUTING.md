@@ -13,7 +13,7 @@ In `plugins/sessions`:
 |---|---|---|
 | `hooks/register.tsx`, `hooks/state.ts`, `hooks/watch.ts`, `hooks/leader.ts`, `hooks/visor.sh`, `hooks/launcher.py`, `hooks/usage.py`, `statusline/`, `setup/` | shared: the panel, its data and actions, what it watches and who leads, the launcher (`ccc`), token usage, the status line, the setup | either |
 | `types/index.d.ts`, `docs/plugin-contract.md`, `tests/contract.test.tsx` | the API other plugins call (`$.sessions`): its types, how it evolves, its golden method list | either |
-| `hooks/platform/types.ts` | the contract: what each system has to provide (windows, processes, memory) | either, together with both implementations |
+| `hooks/platform/types.ts` | the contract: what each system has to provide (windows, processes, memory, the kernel's file watch) | either, together with both implementations |
 | `hooks/platform/macos.ts` | macOS: Terminal.app through AppleScript, `ioreg`, `lsof`, `sysctl` | a Mac |
 | `hooks/platform/linux.ts` | Linux: windows found by process and switched through the launcher, the window in front by its title (`xprop`), `wmctrl`/`xdotool`, terminal emulators, `/proc` | Linux |
 | `extras/macos/` | macOS only extras | a Mac |
