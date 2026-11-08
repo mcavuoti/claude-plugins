@@ -58,7 +58,14 @@ export const FAKE_SESSIONS = {
         contract: async () => {
           const w = await world()
           if (w.gone) throw new Error('sessions is not loaded')
-          return { api: w.api ?? 1, version: w.version ?? '0.17.0', format: 3, methods: ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart'] }
+          return { api: w.api ?? 1, version: w.version ?? '0.18.0', format: 3, methods: ['watchCommand', 'contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart'] }
+        },
+        // fleet's own watch: no watcher unless a test says which kernel watch it has (world.watch)
+        watchCommand: async input => {
+          const w = await world()
+          if (!w.watch) return { ok: false, reason: 'no-python', detail: 'no python3 here' }
+          await note({ watchCommand: input })
+          return { ok: true, argv: ['python3', '/fake/launcher.py', 'watch-paths', ...input.paths], how: w.watch }
         },
         current: async () => (await world()).current ?? { ready: false, ref: null, sessionId: '', name: '', root: '', background: false, agent: null },
         status: async input => {
@@ -484,7 +491,7 @@ export function under(w: World, dir: string): string[] {
 }
 
 // The fake sessions' answers: this session as current, and the others by ref
-export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; refuseRestart?: string; version?: string; api?: number; gone?: boolean }) {
+export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; refuseRestart?: string; version?: string; api?: number; gone?: boolean; watch?: string }) {
   w.files.set(FAKE, JSON.stringify(say))
 }
 

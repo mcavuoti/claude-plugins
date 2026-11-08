@@ -32,6 +32,13 @@ if [ "$count" -ne 1 ]; then
   status=1
 fi
 
+# And one long-lived child: fleet's own file watch
+count=$(cat "$hooks"/* | grep -c '\$\.process\.spawn' || true)
+if [ "$count" -ne 1 ]; then
+  echo "\$.process.spawn appears $count times in plugins/fleet/hooks: only fleet's own watch runs one" >&2
+  status=1
+fi
+
 [ "$status" -eq 0 ] && echo "fleet: calls only, no sessions files, one way to run commands"
 
 # The templates /fleet init copies: whole and consistent (roles with their files and fleet's tools, seeds, sections)

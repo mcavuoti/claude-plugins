@@ -313,7 +313,7 @@ test('a restart once idle with a sessions older than fleet needs: its heartbeat 
   await turn($, w)
   w.touch(`${HB}/restart.json`, JSON.stringify({ format: 1, at: w.clock.now() }))
   await tick(w, 2 * MIN)
-  expect(json(w, `${HB}/state.json`).restartWait).toBe('fleet needs sessions 0.17.0 or later (0.16.3 here): update it (claude plugin update sessions@mcavuoti) and restart (u)')
+  expect(json(w, `${HB}/state.json`).restartWait).toBe('fleet needs sessions 0.18.0 or later (0.16.3 here): update it (claude plugin update sessions@mcavuoti) and restart (u)')
   expect(calls(w, 'restart')).toEqual([])
   // A restart.json older than this process: carried out already
   w.touch(`${HB}/restart.json`, JSON.stringify({ format: 1, at: 1 }))
@@ -413,7 +413,7 @@ test('roster.json’s pin with a sessions older than fleet needs: /fleet status 
   expect(calls(w, 'pin')).toEqual([])
   const status = await fleet($, 'status')
   // Without the sessions fleet needs, an instance has no running row: the one line says what to update
-  expect(status).toContain('✗ fleet needs sessions 0.17.0 or later (0.16.3 here)')
+  expect(status).toContain('✗ fleet needs sessions 0.18.0 or later (0.16.3 here)')
 })
 
 test('/fleet status: the wake cap reached on a running instance, and no daily cap with perDay null (G14)', WITH_SESSIONS, async ($, on) => {

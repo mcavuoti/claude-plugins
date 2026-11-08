@@ -17,7 +17,7 @@ const ROSTER = JSON.stringify({
 
 function setup(on: any, background = false): World {
   const w = world(on, { background, files: { [`${FLEET}/roster.json`]: ROSTER, [`${ROOT}/.claude/agents/owner.md`]: OWNER } })
-  sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'person' } }, version: '0.17.0' } as any)
+  sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'person' } }, version: '0.18.0' } as any)
   return w
 }
 
