@@ -268,7 +268,7 @@ test('quotes: a finding whose quoted source lands is checked again with it; one 
   })
   const ran: string[][] = []
   w.exec.value = argv => {
-    if (argv[0] !== 'python3') return undefined
+    if (argv[0] !== 'python3' || argv.includes('pass')) return undefined
     ran.push(argv.slice(2))
     const bad = argv.slice(2).filter(p => p === 'findings/F-1.md' && !w.files.get(SHEET)?.includes('42 per second'))
     return bad.length ? { exitCode: 1, stdout: bad.map(p => `${p}: quote no longer in notes/sheet.md (it changed after this file)`).join('\n') } : { exitCode: 0 }

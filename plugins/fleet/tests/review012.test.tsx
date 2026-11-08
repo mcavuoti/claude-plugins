@@ -37,7 +37,7 @@ function setup(on: any, opts: { n?: number; why?: string | undefined; version?: 
       const why = 'why' in opts ? opts.why : 'person'
       rows[ref(i)] = { ...row(ref(i), `Owner ${String.fromCharCode(65 + i)}`, 'stopped'), ...(why ? { stopped: why } : {}) }
     }
-  sessionsSay(w, { rows, version: opts.version ?? '0.15.1' } as any)
+  sessionsSay(w, { rows, version: opts.version ?? '0.17.0' } as any)
   return w
 }
 
@@ -155,25 +155,6 @@ test('pacing: 16 stopped by the person, the last wake 45 s after the first', WIT
   expect(new Set(wakes(w).map(x => x.ref)).size).toBe(16)
 })
 
-// ---- F4: an older sessions holds back only the person's stops ----
-
-test('--force with a sessions that gives no stop reason wakes what plain /fleet up wakes', WITH_SESSIONS, async ($, on) => {
-  const w = setup(on, { why: undefined, version: '0.13.0' })
-  await startSession($, w)
-  await fleet($, 'up')
-  await after(w, 7000)
-  const byPlain = wakes(w).map(x => x.ref)
-  expect(byPlain).toEqual(['aaaaaaa1', 'bbbbbbb1', 'ccccccc1'])
-  const forced = await fleet($, 'up --force')
-  await after(w, 7000)
-  expect(forced).not.toContain('not woken')
-  expect(wakes(w).slice(byPlain.length)).toEqual([
-    { ref: 'aaaaaaa1', reason: 'fleet up' },
-    { ref: 'bbbbbbb1', reason: 'fleet up' },
-    { ref: 'ccccccc1', reason: 'fleet up' },
-  ])
-})
-
 // ---- F5: a forced wake only for this project's own session ----
 
 test('--force never force-wakes a stopped session with no folder of the same name (it may be another project\'s)', WITH_SESSIONS, async ($, on) => {
@@ -198,25 +179,20 @@ test('--force wakes a session with no folder when the instance\'s heartbeat name
 
 // ---- F6: the texts ----
 
-test('with a sessions older than 0.15.1 the plan line and the run agree, and an empty version reads as older', WITH_SESSIONS, async ($, on) => {
-  const w = setup(on, { version: '0.15.0' })
-  await startSession($, w)
-  const up = await fleet($, 'up --force')
-  expect(up).toContain('Owner A: stopped by you, not woken: --force needs sessions 0.15.1')
-  expect(up).not.toContain('stopped by you: to wake (--force)')
-})
-
-test('an empty version from contract() reads as older in the hint', WITH_SESSIONS, async ($, on) => {
+test('a sessions that gives no version, or an older one, gets the one dependency line, and /fleet up wakes nothing', WITH_SESSIONS, async ($, on) => {
   const w = setup(on, { version: '' })
   await startSession($, w)
   const up = await fleet($, 'up --force')
-  expect(up).not.toContain('(this one is )')
-  expect(up).toContain('(this one is older)')
+  expect(up).toContain('fleet needs sessions 0.17.0 or later (an older version here)')
+  expect(up).toContain('Nothing was started or woken')
+  expect(up).not.toContain('stopped by you: to wake (--force)')
+  await after(w, 7000)
+  expect(wakes(w)).toEqual([])
 })
 
 test('/fleet status for a down instance the person stopped names it in the --force it needs', WITH_SESSIONS, async ($, on) => {
   const w = setup(on, { why: 'unknown' })
-  sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'person' }, bbbbbbb1: { ...row('bbbbbbb1', 'Owner B', 'stopped'), stopped: 'unknown' } }, version: '0.15.1' } as any)
+  sessionsSay(w, { rows: { aaaaaaa1: { ...row('aaaaaaa1', 'Owner A', 'stopped'), stopped: 'person' }, bbbbbbb1: { ...row('bbbbbbb1', 'Owner B', 'stopped'), stopped: 'unknown' } }, version: '0.17.0' } as any)
   await startSession($, w)
   await fleet($, 'down "Owner A"')
   const status = await fleet($, 'status')

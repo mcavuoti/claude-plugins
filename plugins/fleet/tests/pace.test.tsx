@@ -55,7 +55,9 @@ async function instance($: any, on: any, role: Record<string, unknown>, extra: R
   })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1000000, ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}) }, rateLimits: [], cost: { usd: 0.1 } } }))
   on('classic.SessionStart', () => ({}))
-  sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') }, extra: more })
+  // more: a sessions version to say (an older one than fleet needs), when a test gives one
+  const version = more.find(m => /^\d/.test(m))
+  sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') }, ...(version ? { version } : {}) })
   await startSession($, w)
   await $.classic.SessionStart({ source: 'startup', agent_type: 'owner' } as any)
   return w
@@ -285,7 +287,7 @@ test('a restart once idle (G15): it waits for a minute idle, then asks sessions 
 
 test('a restart sessions refuses (a window not opened with ccc) is asked again after 2 min, once the cause may be gone; status says why it waits, once', { ...WITH_SESSIONS, timeoutMs: 60000 }, async ($, on) => {
   const w = await instance($, on, { context: 'long' }, {}, {}, ['restart'])
-  sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') }, extra: ['restart'], refuseRestart: 'a window that wasn’t opened with ccc shows "Owner A": it wouldn’t come back by itself after the restart; u in the panel restarts it' })
+  sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') }, refuseRestart: 'a window that wasn’t opened with ccc shows "Owner A": it wouldn’t come back by itself after the restart; u in the panel restarts it' })
   await tick(w)
   await turn($, w)
   w.touch(`${HB}/restart.json`, JSON.stringify({ format: 1, at: w.clock.now() }))
@@ -296,7 +298,7 @@ test('a restart sessions refuses (a window not opened with ccc) is asked again a
   expect(wait).toBe('sessions: a window that wasn’t opened with ccc shows "Owner A": it wouldn’t come back by itself after the restart; fleet asks again in 2 min (u in the panel restarts it now)')
   expect(await fleet($, 'status')).toContain(`restart pending (${wait})`)
   // The window closed: the next ask, 2 min after the refusal, goes through
-  sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') }, extra: ['restart'] })
+  sessionsSay(w, { current: CURRENT, rows: { [REF]: row(REF, 'Owner A', 'idle') } })
   await tick(w, 30000)
   expect(calls(w, 'restart').length).toBe(1)
   await tick(w, 70000)
@@ -305,14 +307,14 @@ test('a restart sessions refuses (a window not opened with ccc) is asked again a
   expect(json(w, `${HB}/state.json`).restartWait).toBe(undefined)
 })
 
-test('a restart once idle with a sessions that can’t restart: its heartbeat says why it waits, and nothing is asked', WITH_SESSIONS, async ($, on) => {
-  const w = await instance($, on, { context: 'long' })
+test('a restart once idle with a sessions older than fleet needs: its heartbeat says what to update, and nothing is asked', WITH_SESSIONS, async ($, on) => {
+  const w = await instance($, on, { context: 'long' }, {}, {}, ['0.16.3'])
   await tick(w)
   await turn($, w)
   w.touch(`${HB}/restart.json`, JSON.stringify({ format: 1, at: w.clock.now() }))
   await tick(w, 2 * MIN)
-  expect(json(w, `${HB}/state.json`).restartWait).toBe("this session's sessions can't restart it: u in the panel restarts it")
-  expect(await fleet($, 'status')).toContain("restart pending (this session's sessions can't restart it: u in the panel restarts it)")
+  expect(json(w, `${HB}/state.json`).restartWait).toBe('fleet needs sessions 0.17.0 or later (0.16.3 here): update it (claude plugin update sessions@mcavuoti) and restart (u)')
+  expect(calls(w, 'restart')).toEqual([])
   // A restart.json older than this process: carried out already
   w.touch(`${HB}/restart.json`, JSON.stringify({ format: 1, at: 1 }))
   await tick(w, MIN)
@@ -373,7 +375,7 @@ test('roster.json’s pin (5a): the sweeper asks sessions to pin a running insta
       [`${FLEET}/instances/owner-a/state.json`]: beat('Owner A', 'owner-a', 'aaaaaaa1'),
     },
   })
-  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'idle') }, extra: ['pin'] })
+  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'idle') } })
   await startSession($, w)
   for (let k = 0; k < 3; k++) {
     w.touch(`${FLEET}/instances/owner-a/state.json`, beat('Owner A', 'owner-a', 'aaaaaaa1', { at: w.clock.now() }))
@@ -395,7 +397,7 @@ test('roster.json’s pin (5a): the sweeper asks sessions to pin a running insta
   expect(json(w, `${FLEET}/state/pinned.json`)).toEqual({ format: 1, refs: [] })
 })
 
-test('roster.json’s pin with a sessions that can’t pin: /fleet status says it may be retired', WITH_SESSIONS, async ($, on) => {
+test('roster.json’s pin with a sessions older than fleet needs: /fleet status says what to update', WITH_SESSIONS, async ($, on) => {
   const w = world(on, {
     background: false,
     files: {
@@ -404,12 +406,14 @@ test('roster.json’s pin with a sessions that can’t pin: /fleet status says i
       [`${FLEET}/instances/owner-a/state.json`]: beat('Owner A', 'owner-a', 'aaaaaaa1'),
     },
   })
-  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'idle') } })
+  sessionsSay(w, { rows: { aaaaaaa1: row('aaaaaaa1', 'Owner A', 'idle') }, version: '0.16.3' })
   await startSession($, w)
   w.touch(`${FLEET}/instances/owner-a/state.json`, beat('Owner A', 'owner-a', 'aaaaaaa1', { at: w.clock.now() }))
   await tick(w, 30000)
   expect(calls(w, 'pin')).toEqual([])
-  expect(await fleet($, 'status')).toContain("pin: the sessions here can't pin (an older sessions): it may be retired when idle")
+  const status = await fleet($, 'status')
+  // Without the sessions fleet needs, an instance has no running row: the one line says what to update
+  expect(status).toContain('✗ fleet needs sessions 0.17.0 or later (0.16.3 here)')
 })
 
 test('/fleet status: the wake cap reached on a running instance, and no daily cap with perDay null (G14)', WITH_SESSIONS, async ($, on) => {
