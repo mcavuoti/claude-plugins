@@ -149,6 +149,8 @@ export const macos: Platform = {
     return path !== '/usr/bin/python3' || (await run(['xcode-select', '-p'])).exitCode === 0
   },
 
+  fileWatch: 'kqueue',
+
   text: {
     switchNeedsWindow: 'To switch, use the panel from the Terminal window showing this session',
     agentsNeedsWindow: 'To open the agent view, use the panel from the Terminal window showing this session',

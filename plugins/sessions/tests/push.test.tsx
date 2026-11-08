@@ -7,8 +7,8 @@ import { DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel learns by watching files (watch.ts): the paths it hands the engine at SessionStart, a row that changes
 // within a file event with no command run, the bells other sessions ring, its own row from its own turns, the one
-// session that leads the machine-wide work (leader.ts), and a session that came in by a reload reading on its short
-// timer and saying so
+// session that leads the machine-wide work (leader.ts), a session that came in by a reload reading on its short
+// timer and saying so, and the mod's own watch where no SessionStart reaches it (launcher.py watch-paths)
 
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
 const BRAVO = 'bbbbbbbb-0000-0000-0000-000000000000'
@@ -586,4 +586,172 @@ test('an answer nobody saw, in a session no window shows: the seen check looks a
   expect(runsOf(w, 'ps') - ps).toBeLessThanOrEqual(5)
   expect(runsOf(w, 'ps') - ps).toBeGreaterThanOrEqual(3)
   expect(runsOf(w, 'osascript')).toBe(0)
+})
+
+// ---- The mod's own watch, where Claude watches nothing for the session ----
+
+// The mod's own watch (launcher.py watch-paths) as a process the test drives: what each one was started with, the lines
+// it prints (say), how it ends (end); a kill of the pid its ready line gave, as the mod stops it, ends it by SIGTERM
+type OwnWatch = { argv: string[]; pid: string; ended: boolean; say: (line: string) => void; end: (code: number | null, stderr?: string, signal?: string | null) => void }
+function ownWatches(on: any) {
+  const all: OwnWatch[] = []
+  on('process.spawn', async function* (_: any, e: any) {
+    const queue: { stream: 'stdout' | 'stderr'; text: string }[] = []
+    let result = null as { code: number | null; signal: string | null } | null
+    let wake = () => {}
+    const me: OwnWatch = {
+      argv: [...e.argv],
+      pid: '',
+      ended: false,
+      say: line => {
+        if (line.startsWith('ready\t')) me.pid = line.split('\t')[2] ?? ''
+        queue.push({ stream: 'stdout', text: `${line}\n` })
+        wake()
+      },
+      end: (code, stderr = '', signal = null) => {
+        if (stderr) queue.push({ stream: 'stderr', text: stderr })
+        result = { code, signal }
+        wake()
+      },
+    }
+    all.push(me)
+    for (;;) {
+      while (queue.length) yield queue.shift()!
+      if (result) break
+      await new Promise<void>(resolve => (wake = resolve))
+    }
+    me.ended = true
+    return { value: result! }
+  })
+  const onRun = (argv: readonly string[]) => {
+    if (argv[0] === 'kill') all.find(x => !x.ended && x.pid === argv[1])?.end(null, '', 'SIGTERM')
+  }
+  return { all, onRun }
+}
+
+const PYTHON = '/opt/x/bin/python3'
+// What SessionStart hands Claude for this session (a background one: its own job's state too)
+const PATHS = [REGISTRY, `${DATA}/bell`, `${DATA}/inbox`, `${DATA}/tell`, `${JOBS}/pins.json`, `${JOBS}/aaaaaaaa/state.json`]
+async function statusOf($: any): Promise<string> {
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as any)
+  return String(r.text)
+}
+const liveLine = async ($: any) => (await statusOf($)).split('\n').find(l => l.startsWith('Live') || l.startsWith('Not live')) ?? ''
+
+// A session no SessionStart reached, with python3: updated in place (an older module drew here) unless fresh
+async function unwatched($: any, on: any, options: { fresh?: boolean; store?: Record<string, unknown>; python?: string | null } = {}) {
+  const watches = ownWatches(on)
+  const w = world(on, { list: listed(SESSIONS), python: options.python === null ? undefined : (options.python ?? PYTHON), onRun: watches.onRun, store: options.store })
+  for (const s of SESSIONS) registryFile(w, s)
+  const writes = stateWrites(on, options.fresh ? {} : { shortId: 'aaaaaaaa' })
+  await startSession($, w)
+  await w.clock.advance(100)
+  return { w, writes, watches: watches.all }
+}
+
+test('not live: the mod watches the paths itself, its ready makes the session live (the short timer stops), and its lines are file events', SLOW, async ($, on) => {
+  const { w, writes, watches } = await unwatched($, on)
+  // Updated in place: no SessionStart is coming, so it starts at once, over the paths SessionStart would hand Claude
+  expect(watches.length).toBe(1)
+  expect(watches[0]!.argv).toEqual([PYTHON, expect.stringMatching(/\/hooks\/launcher\.py$/), 'watch-paths', '--how', 'kqueue', ...PATHS])
+  expect(await liveLine($)).toContain('its own watch is starting')
+  watches[0]!.say('ready\tkqueue\t7777\t12')
+  await w.clock.advance(100)
+  expect(await liveLine($)).toMatch(/^Live through the mod's own watch \(no SessionStart came: this session was updated in place\): kqueue on 6 paths \(12 watched\), process 7777, since \d+ s ago · /)
+  expect(String(writes.last.notice ?? '')).not.toContain('Live updates off')
+  // The short timer is gone: after the first pass (at this session's offset), a change no line announced waits
+  await w.clock.advance(11000)
+  registryFile(w, { ...SESSIONS[1]!, status: 'busy' })
+  await w.clock.advance(10000)
+  expect(colorOf(writes, BRAVO)).toBe('green')
+  // Its line is the file event: drawn 30 ms later
+  watches[0]!.say(`change\t${REGISTRY}/4243.json`)
+  await w.clock.advance(50)
+  expect(colorOf(writes, BRAVO)).toBe('blue')
+  // A ccc request in the inbox, on its line
+  w.write(`${DATA}/inbox/${SID}`, `format=3\naction=focus\nat=${w.clock.now()}\ntty=/dev/ttys001\ntitle=alpha\nreply=${DATA}/replies/r1\n`)
+  watches[0]!.say(`add\t${DATA}/inbox/${SID}`)
+  await w.clock.advance(50)
+  expect(w.files.has(`${DATA}/inbox/${SID}`)).toBe(false)
+  watches[0]!.end(null, '', 'SIGTERM')
+  await w.clock.advance(10)
+})
+
+test("not live: when the mod's own watch ends, the short timer is back and it starts again 30 s later, 5 times in a row at most", SLOW, async ($, on) => {
+  const { w, writes, watches } = await unwatched($, on)
+  watches[0]!.say('ready\tkqueue\t7777\t12')
+  await w.clock.advance(100)
+  watches[0]!.end(1, "launcher.py watch-paths: can't watch with kqueue: [Errno 24] Too many open files\n")
+  await w.clock.advance(100)
+  expect(await liveLine($)).toContain("; its own watch ended (exited with code 1: launcher.py watch-paths: can't watch with kqueue: [Errno 24] Too many open files) and starts again in 30 s")
+  // The short timer reads the files again, every 3 s
+  registryFile(w, { ...SESSIONS[1]!, status: 'busy' })
+  await w.clock.advance(3500)
+  expect(colorOf(writes, BRAVO)).toBe('blue')
+  expect(watches.length).toBe(1)
+  await w.clock.advance(27000)
+  expect(watches.length).toBe(2)
+  // It fails again and again (now before its ready): after the fifth, no more
+  for (let i = 1; i < 5; i++) {
+    watches[i]!.end(1, 'no\n')
+    await w.clock.advance(31000)
+  }
+  expect(watches.length).toBe(5)
+  await w.clock.advance(5 * MIN)
+  expect(watches.length).toBe(5)
+  expect(await liveLine($)).toContain('; its own watch ended 5 times in a row (last: exited with code 1: no), so it stays on the short timer until the session restarts')
+})
+
+test("a SessionStart ends the mod's own watch: Claude watches the paths from then on", SLOW, async ($, on) => {
+  const { w, watches } = await unwatched($, on)
+  watches[0]!.say('ready\tkqueue\t7777\t12')
+  await w.clock.advance(100)
+  const start: any = await $.classic.SessionStart({ source: 'clear', session_id: SID } as any)
+  await w.clock.advance(100)
+  expect(start.watchPaths).toEqual(PATHS)
+  expect(w.runs.some(a => a[0] === 'kill' && a[1] === '7777')).toBe(true)
+  expect(watches[0]!.ended).toBe(true)
+  expect(await liveLine($)).toMatch(/^Live: the engine watches/)
+  await w.clock.advance(2 * MIN)
+  expect(watches.length).toBe(1)
+})
+
+test("a fresh start that no SessionStart reaches: the mod's own watch waits 10 s for one", SLOW, async ($, on) => {
+  const { w, watches } = await unwatched($, on, { fresh: true })
+  await w.clock.advance(5000)
+  expect(watches.length).toBe(0)
+  await w.clock.advance(6000)
+  expect(watches.length).toBe(1)
+  watches[0]!.say('ready\tkqueue\t7777\t12')
+  await w.clock.advance(100)
+  expect(await liveLine($)).toContain("Live through the mod's own watch (no SessionStart came: a plugin that runs before sessions sends it on past it)")
+  watches[0]!.end(null, '', 'SIGTERM')
+  await w.clock.advance(10)
+})
+
+test("where this machine's starts get no SessionStart (startSkipped), the mod's own watch starts at once", SLOW, async ($, on) => {
+  const { w, watches } = await unwatched($, on, { fresh: true, store: { startSkipped: { at: 1 } } })
+  await w.clock.advance(1000)
+  expect(watches.length).toBe(1)
+  watches[0]!.end(null, '', 'SIGTERM')
+  await w.clock.advance(10)
+})
+
+test("live (its SessionStart came): no watch of the mod's own, ever", SLOW, async ($, on) => {
+  const watches = ownWatches(on)
+  const w = world(on, { list: listed(SESSIONS), python: PYTHON, onRun: watches.onRun })
+  for (const s of SESSIONS) registryFile(w, s)
+  await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
+  await startSession($, w)
+  await w.clock.advance(2 * MIN)
+  expect(watches.all.length).toBe(0)
+})
+
+test("without a usable python3 there's no watch of the mod's own, and /sessions status names the problem", SLOW, async ($, on) => {
+  const { w, watches } = await unwatched($, on, { python: null })
+  await w.clock.advance(MIN)
+  expect(watches.length).toBe(0)
+  const status = await statusOf($)
+  expect(status).toContain("Problem: python3 isn't usable here, and the plugin needs it")
+  expect(status).toContain('Not live: this session was updated in place')
 })
