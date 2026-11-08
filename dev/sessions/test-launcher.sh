@@ -945,6 +945,210 @@ if [ -n "$how" ]; then
   pass "the mod's own watch ($how): ready, a write, a new file, a removal, a folder made since, a file renamed over; it ends with its parent"
 fi
 
+# 16c. The same watcher as another plugin runs it ($.sessions.watchCommand: --depth 0, read by the plugin's own loop):
+#      a watched file rewritten in place ($.fs.write: the same file, the same size, then emptied) is a change each time,
+#      a folder is watched one level deep; and it never outlives its reader or its parent: it ends when its output's
+#      reader goes with nothing to write (a pipe, a socket), when its parent is killed outright while its reader is
+#      still there, when it's handed to another parent with no kernel event of it (its own look), and on a write to a
+#      reader that's gone with no kernel event of that (the kernel's word taken away in a copy of the launcher loaded here)
+if [ -n "$how" ]; then
+  mkdir -p "$work/own"
+  python3 - "$hooks/launcher.py" "$how" "$work/own" > "$work/own.txt" 2> "$work/own.err" <<'PY' || fail "watchCommand's watcher ($how)" "$(cat "$work/own.err")"
+import importlib.util, os, select, signal, socket, subprocess, sys, time
+launcher, how, work = sys.argv[1:4]
+TAB = '\t'
+
+
+def bad(what):
+    sys.stderr.write(what + '\n')
+    sys.exit(1)
+
+
+# The lines read from fd (added to lines) until want(lines) or the time is up; None once the writer's end closed (every
+# process holding it ended)
+def read_until(fd, want, seconds=3.0, lines=None):
+    lines = [] if lines is None else lines
+    buf = b''
+    end = time.time() + seconds
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], max(0.0, end - time.time()))
+        if not r:
+            break
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+        while b'\n' in buf:
+            line, buf = buf.split(b'\n', 1)
+            lines.append(line.decode())
+        if want(lines):
+            break
+    return lines
+
+
+def closed_within(fd, seconds=3.0):
+    return read_until(fd, lambda _: False, seconds) is None
+
+
+def ready(lines):
+    return bool(lines) and lines[0].startswith('ready' + TAB + how + TAB)
+
+
+folder = os.path.join(work, 'q')
+latest = os.path.join(work, 'latest')
+os.makedirs(os.path.join(folder, 'sub'))
+with open(latest, 'w') as f:
+    f.write('aaaa')
+argv = [sys.executable, launcher, 'watch-paths', '--how', how, '--depth', '0', latest, folder]
+
+p = subprocess.Popen(argv, stdout=subprocess.PIPE)
+out = p.stdout.fileno()
+lines = read_until(out, ready)
+if not ready(lines) or lines[0].split(TAB)[2] != str(p.pid):
+    bad('no ready: %r' % lines)
+inode = os.stat(latest).st_ino
+for text in ['bbbb', 'cccc', '']:
+    # What a write before this one still had to say is read first
+    read_until(out, lambda _: False, 0.2, lines)
+    before = len(lines)
+    with open(latest, 'w') as f:
+        f.write(text)
+    read_until(out, lambda ls: len(ls) > before, lines=lines)
+    if lines[before:before + 1] != ['change' + TAB + latest]:
+        bad('no change for a rewrite in place to %r: %r' % (text, lines))
+if os.stat(latest).st_ino != inode:
+    bad('the file was replaced, not rewritten in place')
+read_until(out, lambda _: False, 0.2, lines)
+before = len(lines)
+with open(os.path.join(folder, 'sub', 'deep'), 'w') as f:
+    f.write('x')
+with open(os.path.join(folder, 'one'), 'w') as f:
+    f.write('x')
+read_until(out, lambda ls: 'add' + TAB + os.path.join(folder, 'one') in ls[before:], lines=lines)
+read_until(out, lambda _: False, 0.2, lines)
+if lines[before:] != ['add' + TAB + os.path.join(folder, 'one')]:
+    bad("expected the folder's own new file alone: %r" % lines[before:])
+print('rewritten in place: a change each time; one level deep')
+
+# Its output's reader goes, with nothing to write (nothing changes, and its parent is still there)
+p.stdout.close()
+try:
+    p.wait(timeout=3)
+except subprocess.TimeoutExpired:
+    p.kill()
+    bad('it outlived the reader of its pipe')
+a, b = socket.socketpair()
+p = subprocess.Popen(argv, stdout=b.fileno())
+b.close()
+if not ready(read_until(a.fileno(), ready)):
+    p.kill()
+    bad('no ready on a socket')
+a.close()
+try:
+    p.wait(timeout=3)
+except subprocess.TimeoutExpired:
+    p.kill()
+    bad('it outlived the reader of its socket')
+print('reader gone: ended (a pipe, a socket)')
+
+# Its parent killed outright, while its reader (here) is still there: its end of the pipe closes once it has ended
+r, w = os.pipe()
+parent = subprocess.Popen(['/bin/sh', '-c', '"$@" & wait', 'sh'] + argv, stdout=w)
+os.close(w)
+lines = read_until(r, ready)
+if not ready(lines):
+    parent.kill()
+    bad('no ready under a parent: %r' % lines)
+parent.kill()
+parent.wait()
+if not closed_within(r):
+    os.kill(int(lines[0].split(TAB)[2]), signal.SIGKILL)
+    bad('it outlived its parent, killed outright')
+os.close(r)
+print('parent killed outright: ended')
+
+
+# A watcher run here from a copy of the launcher whose watch has no kernel word of its parent (follow_output: nor of its
+# output), looking at its parent every 0.2 s, writing to out_fd
+def watcher_here(out_fd, follow_output):
+    spec = importlib.util.spec_from_file_location('launcher_under_test', launcher)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.PARENT_CHECK_S = 0.2
+    base = m.WATCHES[how]
+
+    class Unfollowed(base):
+        def __init__(self, parent=None, output=None):
+            super().__init__(None, output if follow_output else None)
+
+    m.KqueueWatch = m.InotifyWatch = Unfollowed
+    os.dup2(out_fd, 1)
+    try:
+        code = m.watch_paths(['--how', how, '--depth', '0', folder])
+    except BaseException:
+        code = 3
+    os._exit(code)
+
+
+# Handed to another parent (its own ended): its look finds it, with its reader still there
+r, w = os.pipe()
+sys.stdout.flush()
+middle = os.fork()
+if middle == 0:
+    os.close(r)
+    if os.fork() == 0:
+        watcher_here(w, True)
+    os.close(w)
+    time.sleep(60)
+    os._exit(0)
+os.close(w)
+lines = read_until(r, ready)
+if not ready(lines):
+    os.kill(middle, signal.SIGKILL)
+    bad('no ready from the copy: %r' % lines)
+os.kill(middle, signal.SIGKILL)
+os.waitpid(middle, 0)
+if not closed_within(r):
+    os.kill(int(lines[0].split(TAB)[2]), signal.SIGKILL)
+    bad('it outlived its parent with no kernel event of it')
+os.close(r)
+print('handed to another parent: ended by its own look')
+
+# A write to a reader that's gone, with no kernel word of that: the failed write ends it
+r, w = os.pipe()
+sys.stdout.flush()
+child = os.fork()
+if child == 0:
+    os.close(r)
+    watcher_here(w, False)
+os.close(w)
+if not ready(read_until(r, ready)):
+    os.kill(child, signal.SIGKILL)
+    bad('no ready from the copy')
+os.close(r)
+time.sleep(0.3)
+done, status = os.waitpid(child, os.WNOHANG)
+if done:
+    bad('it ended before it had anything to write')
+with open(os.path.join(folder, 'two'), 'w') as f:
+    f.write('x')
+end = time.time() + 3
+while not done and time.time() < end:
+    time.sleep(0.02)
+    done, status = os.waitpid(child, os.WNOHANG)
+if not done:
+    os.kill(child, signal.SIGKILL)
+    bad('it outlived a write that failed')
+if os.waitstatus_to_exitcode(status) != 0:
+    bad('a write that failed ended it with code %d' % os.waitstatus_to_exitcode(status))
+print('a write that failed: ended')
+PY
+  pass "watchCommand's watcher ($how): a file rewritten in place, one level deep; it ends with its reader (a pipe, a socket, a failed write) and its parent (killed outright, or handed to another)"
+fi
+
 # 17. What's typed during a switch is dropped, on a real terminal (a pty): what was pending when the switch was asked
 #     and what's typed while the next viewer starts never reach it (an Enter neither: the next viewer reads from its
 #     start, and a whole line would reach it first), what's typed once it has the terminal does, and what was typed
