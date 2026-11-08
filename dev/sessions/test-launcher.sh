@@ -750,7 +750,7 @@ pass "membership: the project a session started in, for ccc's pick, ccc <name> a
 #     last frame (no clear, the alternate screen kept) with no "Hangup" report. While a viewer runs, the window says
 #     what it shows (.showing, with its three processes); a file with no end (a restart's reopen, a panel that closes
 #     the viewer itself) waits for the viewer to end; .showing and the watcher go with the launcher. Without python3
-#     neither runs, and the window switches the old way
+#     the window says it's needed and opens nothing
 reset
 export SESSIONS_PLUGIN_VERSION=0.16.0 SESSIONS_PLUGIN_SINCE=0
 touch "$fix/attach-wait"
@@ -884,24 +884,20 @@ if ! until_true 100 gone_pid "$w"; then
   kill "$w" 2>/dev/null || true
   fail "orphan" "the watcher outlived a launcher killed outright"
 fi
-# Without python3: no watcher and no .showing; a file and the viewer closed by whoever switches, as before
+# python3 is required: without it, a window says so and opens nothing
 nopy="$work/nopy"
 mkdir -p "$nopy"
 for t in bash dirname uname mkdir rm stty clear sleep cat; do p=$(command -v "$t") && ln -sf "$p" "$nopy/$t"; done
 : > "$fix/calls.log"
-(cd "$proj" && PATH="$nopy" /bin/bash "$hooks/visor.sh" attach aaaaaaaa < /dev/null > "$work/out.txt" 2>&1) &
-launcher=$!
-until_true 150 grep -q '^attach aaaaaaaa' "$fix/calls.log" || fail "no python3" "the viewer didn't open: $(cat -v "$work/out.txt")"
-sleep 0.3
-[ ! -e "$win.showing" ] || fail "no python3" "a .showing with no watcher"
-printf 'format=3\ncommand=attach\nid=bbbbbbbb\ntitle=beta\n' > "$win"
-kill -HUP "$(cat "$fix/viewer-aaaaaaaa")"
-until_true 150 grep -q '^attach bbbbbbbb' "$fix/calls.log" || fail "no python3" "the switch didn't open the next one"
-kill -HUP "$(cat "$fix/viewer-bbbbbbbb")"
-wait "$launcher" || true
+code=0
+(cd "$proj" && PATH="$nopy" /bin/bash "$hooks/visor.sh" attach aaaaaaaa < /dev/null > "$work/out.txt" 2>&1) || code=$?
+expect "$code" 1 "without python3, the window's launcher fails"
+grep -q 'needs python3' "$work/out.txt" || fail "no python3" "it didn't say python3 is needed: $(cat -v "$work/out.txt")"
+[ ! -s "$fix/calls.log" ] || fail "no python3" "it ran claude anyway: $(cat "$fix/calls.log")"
 rm -f "$fix/attach-wait"
 unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
-pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; without python3"
+pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; python3 required"
+
 
 # 17. What's typed during a switch is dropped, on a real terminal (a pty): what was pending when the switch was asked
 #     and what's typed while the next viewer starts never reach it (an Enter neither: the next viewer reads from its

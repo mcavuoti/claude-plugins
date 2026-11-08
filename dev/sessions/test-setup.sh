@@ -119,4 +119,16 @@ RC
   grep -Fxq "$line" "$rc" || fail "$label" "no ccc in $rc"
   rm -rf "$home"
 done
+
+# python3 is required: with none on the PATH, the setup says so and changes nothing
+label="no python3"
+home="$(mktemp -d)"
+mkdir -p "$home/bin" "$home/.claude"
+for tool in dirname date uname; do ln -s "$(command -v "$tool")" "$home/bin/$tool"; done
+code=0
+out=$(env -u CLAUDE_CODE_PLUGIN_DIRS -u SESSIONS_DATA_DIR HOME="$home" PATH="$home/bin" "$(command -v bash)" "$setup" 2>&1) || code=$?
+[ "$code" = 1 ] || fail "$label" "exit code $code: $out"
+echo "$out" | grep -q "^sessions needs python3, and there's no usable one here" || fail "$label" "it didn't say python3 is needed: $out"
+if [ -e "$home/.claude/settings.json" ] || [ -e "$home/.claude/mods" ]; then fail "$label" "it changed something"; fi
+rm -rf "$home"
 echo "setup: ok"

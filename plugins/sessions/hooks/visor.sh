@@ -15,10 +15,10 @@
 # The window's file is <data>/windows/<tty with / as _> (<data>: ~/.claude/mods/sessions-data, or SESSIONS_DATA_DIR):
 # format=, command= (attach or agents), id=, title=, folder= and end= lines (windowTargetText in state.ts). A file in
 # another format (a session running another version of the mod wrote it) isn't followed: the launcher says so and ends.
-# With python3, the window's watcher (launcher.py watch) runs beside the loop: it ends the viewer as soon as the file
-# asks for it (end=1, written by a panel switching this window), and while it runs the launcher publishes what the
-# window shows in <file>.showing (Showing in state.ts), so the panel finds this window with no ps and no question to the
-# terminal. Without python3 neither runs: the panel then finds the window with ps and closes the viewer itself.
+# The window's watcher (launcher.py watch) runs beside the loop: it ends the viewer as soon as the file asks for it
+# (end=1, written by a panel switching this window), and while it runs the launcher publishes what the window shows in
+# <file>.showing (Showing in state.ts), so the panel finds this window with no ps and no question to the terminal.
+# python3 is required: without a usable one, the launcher says so and opens nothing.
 # SESSIONS_CLAUDE is the claude command (tests), SESSIONS_TTY this window's terminal (tests without one).
 #
 # Everything lives inside a function and the last line calls it and exits: bash reads the function whole before
@@ -86,13 +86,13 @@ main() {
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   data="${SESSIONS_DATA_DIR:-$HOME/.claude/mods/sessions-data}"
   claude="${SESSIONS_CLAUDE:-claude}"
+  py=$(usable_python) || { echo "ccc needs python3, and there's no usable one here (on a Mac: xcode-select --install)"; return 1; }
   # ccc tell runs from scripts, cron or launchd, with no terminal: the launcher hands the text to the session's mod.
   # ccc section and ccc tidy need no window file either: one writes the person's sections.json, the other asks in this
   # terminal and runs claude stop and claude rm
   if [ "${1:-}" = start ] && { [ "${2:-}" = tell ] || [ "${2:-}" = section ] || [ "${2:-}" = tidy ]; }; then
     local what="$2"
     shift 2
-    py=$(usable_python) || { echo "ccc $what needs python3 (on a Mac: xcode-select --install)"; return 1; }
     "$py" "$here/launcher.py" "$what" "$@"
     return
   fi
@@ -109,24 +109,18 @@ main() {
       printf 'format=%s\ncommand=agents\nfolder=%s\n' "$FORMAT" "$PWD" > "$file" ;;
     start)
       shift
-      if ! py=$(usable_python); then
-        echo "ccc needs python3 (on a Mac: xcode-select --install). Opening the agent view instead."
-        printf 'format=%s\ncommand=agents\nfolder=%s\n' "$FORMAT" "$PWD" > "$file"
-      else
-        rm -f "$file"
-        "$py" "$here/launcher.py" start --tty "$window" --file "$file" "$@" || return 0
-      fi ;;
+      rm -f "$file"
+      "$py" "$here/launcher.py" start --tty "$window" --file "$file" "$@" || return 0 ;;
     *) echo "usage: visor.sh start [--new | --agents | <name> | tell <name|id> <text> | section <title> | tidy] | attach <id> | agents"; return 2 ;;
   esac
 
   # The window's watcher, for as long as the launcher runs (it ends by itself once its parent is gone, too)
-  if [ "$mode" != start ]; then py=$(usable_python) || py=''; fi
   WINDOW_FILE=$file
   trap cleanup EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  if [ -s "$file" ] && [ -n "$py" ]; then
+  if [ -s "$file" ]; then
     "$py" "$here/launcher.py" watch --file "$file" --launcher "$$" < /dev/null > /dev/null 2>&1 &
     WATCHER=$!
     SHOWING="$file.showing"
@@ -186,7 +180,7 @@ main() {
     esac
     # A viewer that ends at once on the first open of ccc failed to attach (the session went away meanwhile): pick
     # again, once, without it. Unless something was written down for this window: then the panel is switching it
-    if [ "$mode" = start ] && [ "$first" = 1 ] && [ "$cmd" = attach ] && [ "$code" -ne 0 ] && [ $((SECONDS - began)) -lt 3 ] && [ ! -s "$file" ] && [ -n "${py:-}" ]; then
+    if [ "$mode" = start ] && [ "$first" = 1 ] && [ "$cmd" = attach ] && [ "$code" -ne 0 ] && [ $((SECONDS - began)) -lt 3 ] && [ ! -s "$file" ]; then
       reset_terminal
       echo "Couldn't open that session; picking another."
       "$py" "$here/launcher.py" start --tty "$window" --file "$file" --new --exclude "$id"

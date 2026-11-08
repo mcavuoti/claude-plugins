@@ -49,7 +49,14 @@ for arg in "$@"; do
 done
 if [ $((do_statusline + do_keys + do_alias)) -eq 0 ]; then do_statusline=1 do_keys=1 do_alias=1; fi
 
-command -v python3 >/dev/null || { echo "setup needs python3 (to edit JSON settings safely)" >&2; exit 1; }
+# python3 is a requirement: the plugin's own file watch where no SessionStart reaches it, ccc and token usage run on it,
+# and so does this setup (it edits the JSON settings with it). On a Mac without the developer tools, /usr/bin/python3
+# is a stub that asks to install them instead of running
+py="$(command -v python3 || true)"
+if [ -z "$py" ] || { [ "$py" = /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; }; then
+  echo "sessions needs python3, and there's no usable one here: install it (on a Mac, the developer tools: xcode-select --install), then run the setup again" >&2
+  exit 1
+fi
 
 say() { printf '%s\n' "$*"; }
 # $1 file, $2 what for (the backup is <file>.bak-antes-<what>-<date-time>)
