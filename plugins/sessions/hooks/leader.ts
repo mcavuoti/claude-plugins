@@ -5,22 +5,20 @@
 //
 // Who leads (electLeader): the session the leader file (<data>/leader.json: format, pid, sessionId, at) names, while it
 // rewrites it every pass and runs; else the lowest pid among the sessions that can lead. A session can lead when
-// Claude's registry has it running and its heartbeat (alive/<sessionId>, every 15 s) is fresh, of this format, from the
-// same process, and from a version of the mod that leads (LEADER_VERSION): older ones keep doing all of it themselves.
+// Claude's registry has it running and its heartbeat (alive/<sessionId>, every 15 s) is fresh, of this format and from
+// the same process.
 // A leader that ended cleanly leaves the registry at once (its file is removed: about 0.15 s later every session
 // knows); one that crashed keeps its registry file until a listing sweeps it, but its heartbeat goes stale within 45 s,
 // and its record two passes after its last one: then the next one takes over and lists at once, which sweeps the dead
 // one's file. Two sessions leading for a moment (each read the other's state an instant late) do no harm: every duty is
 // idempotent, under the same locks as before.
 
-import { compareVersions, FORMAT, keyLines, parseKeyLines } from './state'
+import { FORMAT, keyLines, parseKeyLines } from './state'
 
 // Every session's own pass (the safety pass: everything read again, whatever the file events said), and the leader's
 export const PASS_MS = 60000
 // A leader record this old is a leader that stopped working (two passes missed)
 export const LEADER_STALE_MS = 2 * PASS_MS
-// The first version of the mod that elects a leader
-export const LEADER_VERSION = '0.14.0'
 
 export type LeaderRecord = { format: number; pid: number; sessionId: string; at: number }
 export function leaderText(r: Omit<LeaderRecord, 'format'>): string {
@@ -33,11 +31,6 @@ export function parseLeader(text: string | null): LeaderRecord | null {
   const at = Number(k.at)
   if (!k.format || !(pid > 0) || !(at > 0)) return null
   return { format: Number(k.format) || 0, pid, sessionId: k.sessionId ?? '', at }
-}
-
-// Whether a heartbeat's version leads
-export function leads(version: string): boolean {
-  return !!version && compareVersions(version, LEADER_VERSION) >= 0
 }
 
 export type Candidate = { pid: number; sessionId: string }

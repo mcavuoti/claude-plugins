@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Runs plugins/sessions/setup/setup.sh in throwaway home folders and checks what it changed: once per shell (bash, zsh,
-# and the account's own login shell), then again, when it must change nothing; and once over an earlier setup (its ccc
-# opened the agent view from ~/.claude/mods/sessions-bin), which it must move over with a backup. The CI runs it on
-# macOS and Linux; it's safe to run anywhere (it never touches your real home folder).
+# and the account's own login shell), then again, when it must change nothing. The CI runs it on macOS and Linux; it's
+# safe to run anywhere (it never touches your real home folder).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -58,26 +57,6 @@ for shell in bash zsh ""; do
   unchanged "$label" "$second"
   rm -rf "$home"
 done
-
-# Over an earlier setup: its block's ccc and its status line move to the new command, with backups; a second run
-# changes nothing
-label="earlier setup"
-home="$(mktemp -d)"
-mkdir -p "$home/.claude/mods/sessions-bin"
-printf '{"statusLine": {"type": "command", "command": "%s/.claude/mods/sessions-bin/statusline.sh", "padding": 0}}\n' "$home" > "$home/.claude/settings.json"
-printf "export FOO=1\n\n# >>> sessions plugin >>>\n# Open this folder's Claude sessions in the agents view, without starting a new one\nalias ccc='bash ~/.claude/mods/sessions-bin/visor.sh agents'\n# <<< sessions plugin <<<\n" > "$home/.bashrc"
-printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > "$home/.bash_profile"
-first=$(run_setup "$home" --shell=bash)
-# shellcheck disable=SC2001 # a prefix on every line of a multi-line output
-echo "$first" | sed "s/^/[$label] /"
-check "$label" "$home" "$home/.bashrc"
-grep -q "sessions-bin" "$home/.bashrc" && fail "$label" "the old ccc is still there"
-grep -q "^export FOO=1$" "$home/.bashrc" || fail "$label" "the rest of .bashrc changed"
-[ "$(grep -c '^# >>> sessions plugin >>>' "$home/.bashrc")" = 1 ] || fail "$label" "the block was duplicated"
-ls "$home"/.bashrc.bak-antes-ccc-start-* >/dev/null 2>&1 || fail "$label" "no backup of .bashrc"
-ls "$home"/.claude/settings.json.bak-antes-statusline-* >/dev/null 2>&1 || fail "$label" "no backup of settings.json"
-unchanged "$label" "$(run_setup "$home" --shell=bash)"
-rm -rf "$home"
 
 # ccc already defined in a file the startup file loads (like Debian's ~/.bash_aliases): already set, nothing added or
 # backed up, in a dry run and a real one; a loaded file with no ccc doesn't count, and then ccc is added once

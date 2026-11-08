@@ -46,7 +46,6 @@ import {
   heartbeatStatus,
   type Heartbeat,
   expectsHeartbeat,
-  HEARTBEAT_VERSION,
   parsePluginList,
   rootFrom,
   rootCandidates,
@@ -602,7 +601,7 @@ test('heartbeat: fresh, same format and same process is ok; old, missing or anot
   const now = 1_000_000
   const h = parseHeartbeat(heartbeatText({ pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start' }))
   expect(h).toEqual({ format: 3, pid: 42, at: now - 10000, version: '0.10.0', via: 'session.start', root: '' })
-  // The project the session belongs to (0.15.0): a line of its own, which an older reader ignores
+  // The project the session belongs to: a line of its own
   const text = heartbeatText({ pid: 42, at: now, version: '0.15.0', via: 'session.start', root: '/Users/x/myapp' })
   expect(text).toContain('root=/Users/x/myapp\n')
   expect(parseHeartbeat(text)?.root).toBe('/Users/x/myapp')
@@ -617,22 +616,18 @@ test('heartbeat: fresh, same format and same process is ok; old, missing or anot
   expect(parseHeartbeat('pid=1\n')).toBe(null)
 })
 
-test('heartbeat expected: a running session started after a version with heartbeats was installed, after 30 s', () => {
+test('heartbeat expected: a running session started after the installed version was installed, after 30 s', () => {
   const now = 10_000_000
   const plugin = { version: '0.10.0', since: 5_000_000 }
   const s = { pid: 1, status: 'idle', startedAt: 6_000_000 }
   expect(expectsHeartbeat(s, plugin, now)).toBe(true)
   // Started before that version was installed: it runs an older mod, which a restart would fix but isn't broken
   expect(expectsHeartbeat({ ...s, startedAt: 4_000_000 }, plugin, now)).toBe(false)
-  // The installed version doesn't write heartbeats (development: a test session with the repo's copy)
-  expect(expectsHeartbeat(s, { ...plugin, version: '0.9.2' }, now)).toBe(false)
-  expect(expectsHeartbeat(s, { ...plugin, version: 'x' }, now)).toBe(false)
   expect(expectsHeartbeat(s, null, now)).toBe(false)
   // Just started: its mod has 30 s to come up
   expect(expectsHeartbeat({ ...s, startedAt: now - 10000 }, plugin, now)).toBe(false)
   // Stopped
   expect(expectsHeartbeat({ startedAt: 6_000_000 }, plugin, now)).toBe(false)
-  expect(HEARTBEAT_VERSION).toBe('0.10.0')
 })
 
 test('installed plugin: the enabled sessions entry of claude plugin list --json', () => {

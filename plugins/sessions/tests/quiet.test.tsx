@@ -278,7 +278,7 @@ test("seen: another session's answer about an agent view in front serves this on
   await w.clock.advance(2000)
   expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
   expect(asked(w).length).toBe(before)
-  // A new answer of its own, and one from an older version with no tags: this session asks, and reads the view itself
+  // A new answer of its own, and one with no tags: this session asks, and reads the view itself
   w.store.set(`state:${SID}`, { finished: w.clock.now() + 1 })
   w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : args[0] === 'leer' ? 'nothing here' : '')
   await w.clock.advance(100)
@@ -567,7 +567,7 @@ for (const system of ['Darwin', 'Linux']) {
 test('a .showing its launcher left behind (its processes gone): checked, both files go, and the usual way switches the window (ps, the window in front, kill)', async ($, on) => {
   const w = world(on, { list: list() })
   launched(w, shows('/dev/ttys001', 'aaaaaaaa', 300))
-  // That terminal now runs an older launcher, which says nothing
+  // That terminal's launcher now publishes nothing
   w.ps.value = '  100 ttys001  bash /Users/x/old/hooks/visor.sh start\n  201 ttys001  claude attach aaaaaaaa'
   w.terminal.value = (args: string[]) => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
   const { from } = await enterOnBravo($, w, on)

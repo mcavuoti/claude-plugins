@@ -48,7 +48,7 @@ got="$(totals "$(python3 "$usage" "$logs" "$work/cache" "$alive")")"
 [ "$got" = "$proj=321101 $other=50000000 $outside=4000000" ] || fail "a new response" "got $got"
 pass "usage: each response in the project its session started in (heartbeat, first row, a subagent's session), wherever it worked"
 
-# Without the heartbeats folder (an older caller): the first rows alone
+# Without the heartbeats folder (its third argument is optional): the first rows alone
 got="$(totals "$(python3 "$usage" "$logs" "$work/cache2")")"
 [ "$got" = "$proj=21101 $other=50000000 $outside=4300000" ] || fail "no heartbeats" "got $got"
 pass "usage: with no heartbeats folder, each session's first row"
