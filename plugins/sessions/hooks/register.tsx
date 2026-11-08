@@ -24,6 +24,7 @@ import type {
 import {
   abbreviate,
   AGENT_ROW,
+  agentFromFlags,
   agentFromTranscript,
   assignChange,
   formatUsd,
@@ -199,7 +200,7 @@ import {
   sessionHome,
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
-import { bellFrom, bellOfKey, bellText, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchSetOf, type Locations, type RegistryNews } from './watch'
+import { bellFrom, bellOfKey, bellText, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchSetOf, type Locations, type RegistryEntry, type RegistryNews } from './watch'
 import { electLeader, LEADER_STALE_MS, leaderText, leads, parseLeader, PASS_MS, type Candidate } from './leader'
 
 const PANE = 'sessions'
@@ -247,8 +248,9 @@ const watching = atom({ plugin: 'sessions', key: 'watching' } as const, null as 
 const ended = atom({ plugin: 'sessions', key: 'ended' } as const, null as EndedNote)
 // The folder this session works in when that's outside its project (followHere), or '': its panel says so in one line
 const away = atom({ plugin: 'sessions', key: 'away' } as const, '')
-// The agent this session runs as, from its last classic.SessionStart (agent_type): in $.state, which a reload keeps, so
-// a reload decides the same about the tools for Claude (offerTools); null when no SessionStart came in this session
+// The agent this session runs as, from its last classic.SessionStart (agent_type), or where none came from Claude's files
+// (roleFromFiles): in $.state, which a reload keeps, so a reload decides the same about the tools for Claude
+// (offerTools); null when nothing said it in this session
 const agentRole = atom({ plugin: 'sessions', key: 'agentRole' } as const, null as AgentRole)
 
 // Every write of a value the panel or the band reads draws them again, equal or not (the engine compares nothing): so
@@ -348,7 +350,8 @@ const startProblems: string[] = []
 // watches this session's paths (its classic.SessionStart of this WATCH_SET came, in this module or in one before it in
 // this session: the watching state), else the panel reads them on a short timer (the poll); reloadedInto: this module
 // came in by a reload (another module had drawn in this session before), so a missing SessionStart means the paths
-// watched are an older version's and only a restart (u) or /clear brings it; slowList: the files can't stand for
+// watched are an older version's and only a restart (u) or /clear brings it, unless this machine's starts find none at
+// all (startSkipped: a plugin before this one sends it on past it); slowList: the files can't stand for
 // `claude agents` (see SessionFiles.usable), which is then run as before, at most every 3.5 s
 let locations: Locations = { registry: '', data: '', jobs: '' }
 let sessionFiles: SessionFiles | null = null
@@ -508,7 +511,8 @@ function debugLine($: any, text: string) {
 // mcp__sessions__wake, by sessionId: since when, for two minutes, so two panels or callers never respawn the same one),
 // modelWakes (the wakes Claude asked for with mcp__sessions__wake in the last hour, for its limits: ModelWake in
 // state.ts; with broughtBack under the <data>/bringback.lock folder), marks:sessions:<sessionId> (the line "woken by
-// “<caller>”" on a woken session's row, a MarkSlot of the panel's own, for 15 minutes).
+// “<caller>”" on a woken session's row, a MarkSlot of the panel's own, for 15 minutes), startSkipped (a start on this
+// machine found that no classic.SessionStart reaches the mod: at; deleted by the next one that reaches it).
 // When a stored value changes meaning, it gets a new key: sessions on another version never misread it.
 // A session started with any SESSIONS_* override (a test session) keeps every key under @<hash of the overrides>/
 // (storeNamespace in state.ts): it never reads nor writes the keys of the sessions you use, nor they its
@@ -2373,13 +2377,28 @@ const WAKE_WAIT_MS = 5000
 let toolsOffered = ''
 // classic.SessionStart, which says the agent, is raised beside session.start, not inside it (checked on 2.1.319: it
 // settled after session.start's whole chain): its hook notes the agent here at once (roleSeen), and session.start
-// waits for it while the mod's own start runs (startDone), ROLE_WAIT_MS at most: where none comes (a reload from a
-// version that didn't record it, a host with no classic hooks) that start ends the wait, a moment later
+// waits for it while the mod's own start runs (startDone), ROLE_WAIT_MS at most. Where none comes, that start ends the
+// wait, a moment later: a reload (which raises none; offerAfterReload), or a host where a plugin that runs before this
+// one sends SessionStart on past it (a managed or built-in one: nothing this mod can change). There the role comes from
+// Claude's files instead (roleFromFiles), and the machine remembers, once ROLE_SKIP_CHECK_MS on, that no SessionStart
+// came (the store's startSkipped): its next starts take the files at once, with no wait. The next SessionStart that
+// reaches the mod forgets it
 const ROLE_WAIT_MS = 1000
+// How long Claude's files may take to say the role before the start goes on without it (taken as no agent)
+const ROLE_FILES_MS = 500
+const ROLE_SKIP_CHECK_MS = 10000
+const START_SKIPPED = 'startSkipped'
 let roleSeen: AgentRole = null
 let roleKnown: () => void = () => {}
 const roleCame = new Promise<void>(resolve => (roleKnown = resolve))
 let startDone = false
+// The start's first step is done: this session's id, and whether this module came in by a reload (reloadedInto)
+let idKnown: () => void = () => {}
+const idCame = new Promise<void>(resolve => (idKnown = resolve))
+// This machine's starts find no SessionStart (START_SKIPPED, as read at this start or noted by it)
+let startSkipped = false
+// Where the role came from when no SessionStart said it ('' when one did, or a reload found it in $.state)
+let roleFrom = ''
 
 // A promise raced against the clock: its value, or null when it fails or takes longer than ms
 function within<T>($: any, work: Promise<T>, ms: number): Promise<T | null> {
@@ -2402,57 +2421,155 @@ async function agentFile($: any, agent: string, cwd: string): Promise<string | n
   return null
 }
 
-// At session.start, after the plugins beneath, once the agent is known (classic.SessionStart, waited for a moment; a
-// reload finds it in $.state): the tools this session's agent can see, registered before the first request and awaited
-// for a moment only. An agent whose tools: line doesn't name them gets none (registering them would hold each start and
-// restart 8 s); one whose file isn't found, a short wait. A reload registers them again, which changes nothing
+// Why the panel isn't live and the role came from Claude's files, in a session that started with no SessionStart
+const SKIPPED_START =
+  "no SessionStart reached the mod in this session: a plugin that runs before sessions (such as a managed or built-in one) sent it on past it, which a restart doesn't change (Claude names that plugin in a line as the session starts)"
+const toolNames = (tools: readonly SessionTool[]) => tools.map(t => `mcp__sessions__${t}`).join(', ')
+
+// Registers the tools; true once they all are, false when that took longer than ms (they still come)
+async function registerTools($: any, tools: readonly SessionTool[], ms: number): Promise<boolean> {
+  return (await within($, Promise.all(tools.map(t => $.tool.register(TOOL_SPECS[t]))), ms)) !== null
+}
+
+// The agent this session runs as where no classic.SessionStart said it, from what Claude keeps on disk: this session's
+// entry in Claude's registry of running sessions (its `agent`, there from the start, absent with none: checked on
+// 2.1.319), and a background session's job record (`--agent <name>` among the respawnFlags its restarts replay). An
+// agent either one names wins: taking an agent session for a plain one is what could hold its start 8 s. null: neither
+// was found
+async function roleFromFiles($: any): Promise<{ role: { agent: string | null }; from: string } | null> {
+  const sessionId = String(await $.session.id())
+  const l = await locationsOf($)
+  let entry: RegistryEntry | undefined
+  if (l.registry && sessionId) {
+    const files = new SessionFiles(l)
+    await syncRegistry($, files)
+    entry = files.entries().find(e => e.sessionId === sessionId)
+  }
+  // The job's folder: the one Claude names in CLAUDE_JOB_DIR when it's this session's (a session started from another
+  // one's shell inherits that one's), else the registry's job id in the service's folder
+  const named = String((await $.env.get('CLAUDE_JOB_DIR')) ?? '').replace(/\/+$/, '')
+  const short = entry?.kind === 'bg' && entry.jobId ? entry.jobId.slice(0, 8) : ''
+  const jobDir = !entry ? named : !short ? '' : named.split('/').pop() === short ? named : l.jobs ? `${l.jobs}/${short}` : ''
+  let flags: unknown[] | null = null
+  if (jobDir.startsWith('/')) {
+    try {
+      const f = JSON.parse(String(await $.fs.read(`${jobDir}/state.json`)))?.respawnFlags
+      if (Array.isArray(f)) flags = f
+    } catch {}
+  }
+  const jobAgent = flags ? agentFromFlags(flags) : null
+  if (jobAgent) return { role: { agent: jobAgent }, from: "its background job's flags" }
+  if (entry) return { role: { agent: entry.agent ?? null }, from: "Claude's registry of sessions" }
+  if (flags) return { role: { agent: null }, from: "its background job's flags" }
+  return null
+}
+
+// A start that no SessionStart reached: once it's clear none is coming (ROLE_SKIP_CHECK_MS), this machine remembers
+// (START_SKIPPED), so its next starts don't wait for one
+async function noteSkippedStart($: any) {
+  if (startSkipped) return
+  await $.clock.sleep(ROLE_SKIP_CHECK_MS)
+  if (roleSeen || startSkipped) return
+  if (await storeSet($, START_SKIPPED, { at: await $.clock.now() })) startSkipped = true
+  debugLine($, `no SessionStart came in ${ROLE_SKIP_CHECK_MS / 1000} s: this machine's next starts don't wait for one`)
+}
+
+// A SessionStart of a process's start reached the mod: this machine's starts wait for one again
+async function forgetSkippedStart($: any) {
+  if ((await storeGet($, START_SKIPPED)) != null) {
+    await storeDelete($, START_SKIPPED)
+    debugLine($, 'a SessionStart came: the next starts wait for one again')
+  }
+  startSkipped = false
+}
+
+// At session.start, after the plugins beneath, once the agent is known (classic.SessionStart, waited for a moment, or
+// at once where it never comes, Claude's files; a reload finds it in $.state): the tools this session's agent can see,
+// registered before the first request and awaited for a moment only. An agent whose tools: line doesn't name them gets
+// none (registering them would hold each start and restart 8 s); one whose file isn't found, a short wait. Where
+// nothing says the agent in time, they're registered without holding the start: a plain session sees them from its
+// next request, and an agent session never shows them, which holds nothing either. A reload registers them again,
+// which changes nothing
 async function offerTools($: any, cwd: string) {
   if (!sessionTools) {
     toolsOffered = 'off (the sessionTools option)'
     return
   }
   let role = roleSeen ?? (await read($, agentRole))
+  if (role === null) startSkipped ||= (await storeGet($, START_SKIPPED)) != null
   if (role === null && starting && !startDone) {
-    await Promise.race([roleCame, $.clock.sleep(ROLE_WAIT_MS), starting].map(w => w.catch(() => {})))
+    await Promise.race([roleCame, startSkipped ? idCame : $.clock.sleep(ROLE_WAIT_MS), starting].map(w => w.catch(() => {})))
     role = roleSeen ?? (await read($, agentRole))
   }
   if (role === null) {
-    toolsOffered = 'not offered: no SessionStart reached the mod in this session (updated in place from an older version); a restart (u) offers them'
-    bg(offerAfterReload($))
-    return
+    await Promise.race([idCame, $.clock.sleep(ROLE_WAIT_MS)])
+    if (reloadedInto) {
+      toolsOffered = 'not offered: no SessionStart reached the mod in this session (updated in place from an older version); a restart (u) offers them'
+      bg(offerAfterReload($, cwd))
+      return
+    }
+    // A fresh start that no SessionStart reached (yet): the role from Claude's files, recorded for a reload as one from
+    // SessionStart is
+    bg(noteSkippedStart($))
+    const found = await within($, roleFromFiles($), ROLE_FILES_MS)
+    debugLine($, `no SessionStart at the start: ${found ? `${found.role.agent ? `agent ${found.role.agent}` : 'no agent'}, from ${found.from}` : "Claude's files didn't say the agent in time"}`)
+    role = roleSeen ?? found?.role ?? null
+    if (!roleSeen && found) {
+      roleFrom = found.from
+      try {
+        if (!sameData(await read($, agentRole), found.role)) await update($, agentRole, () => found.role)
+      } catch {}
+    }
+    if (role === null) {
+      toolsOffered = `${toolNames(SESSION_TOOLS)} (taken as no agent, since no SessionStart reached the mod and Claude's files didn't say in time: from the next request on)`
+      bg(registerTools($, SESSION_TOOLS, 10000).then(done => debugLine($, `tools for Claude: ${toolsOffered}${done ? '' : ', still registering after 10 s'}`)))
+      return
+    }
   }
   const plan = role.agent ? roleTools(await agentFile($, role.agent, cwd)) : { tools: [...SESSION_TOOLS], waitMs: TOOLS_WAIT_MS, why: 'no agent' }
-  toolsOffered = plan.tools.length ? `${plan.tools.map(t => `mcp__sessions__${t}`).join(', ')} (${role.agent ? `agent ${role.agent}: ` : ''}${plan.why})` : `not offered: agent ${role.agent}, ${plan.why}`
+  const from = roleFrom ? `from ${roleFrom}, since no SessionStart reached the mod` : ''
+  toolsOffered = plan.tools.length
+    ? `${toolNames(plan.tools)} (${role.agent ? `agent ${role.agent}: ` : ''}${plan.why}${from ? `; ${from}` : ''})`
+    : `not offered: agent ${role.agent}, ${plan.why}${from ? ` (${from})` : ''}`
   if (!plan.tools.length) {
     debugLine($, `tools for Claude: ${toolsOffered}`)
     return
   }
-  const done = await within($, Promise.all(plan.tools.map(t => $.tool.register(TOOL_SPECS[t]))), plan.waitMs)
+  const done = await registerTools($, plan.tools, plan.waitMs)
   debugLine($, `tools for Claude: ${toolsOffered}${done ? '' : `, still registering after ${plan.waitMs} ms`}`)
 }
 
-// A module that came in by an update in place from a version that didn't record the agent (0.15.1 and before: no
-// SessionStart in this module's life, no agentRole) learns it from the session's transcript instead (readAgent, a few
-// beats at most), in the background: session.start isn't held. With no agent the tools are registered then, which a
-// plain session sees from its next request, and that's recorded (agentRole) for later reloads; an agent session gets
-// none until it restarts (a registration not awaited at session.start never shows in one, and one it doesn't list
-// would hold its starts 8 s), and nothing is recorded: each reload decides the same until then
-async function offerAfterReload($: any) {
+// A module that came in by an update in place where none before it recorded the agent (0.15.1 and before: no
+// SessionStart in this module's life, no agentRole) learns it from Claude's files (roleFromFiles), else from the
+// session's transcript (readAgent, a few beats at most), in the background: session.start isn't held. With no agent the
+// tools are registered then, which a plain session sees from its next request, and that's recorded (agentRole) for
+// later reloads; an agent session gets none until it restarts (a registration not awaited at session.start never shows
+// in one, and one it doesn't list would hold its starts 8 s), and nothing is recorded: each reload decides the same
+// until then
+async function offerAfterReload($: any, cwd: string) {
   await (starting ?? Promise.resolve()).catch(() => {})
   if (!reloadedInto || !sessionTools || roleSeen) {
     debugLine($, `tools for Claude: ${toolsOffered}`)
     return
   }
-  for (let i = 0; i < 5 && agentFor !== myId; i++) {
-    await readAgent($)
-    if (agentFor !== myId) await $.clock.sleep(1000)
+  let found = await within($, roleFromFiles($), 5000)
+  if (!found) {
+    for (let i = 0; i < 5 && agentFor !== myId; i++) {
+      await readAgent($)
+      if (agentFor !== myId) await $.clock.sleep(1000)
+    }
+    if (agentFor === myId) found = { role: { agent: myAgent }, from: 'its transcript' }
   }
-  if (agentFor !== myId || roleSeen) {
-    debugLine($, `tools for Claude: ${toolsOffered} (the transcript couldn't say which agent it runs as)`)
+  if (!found || roleSeen) {
+    debugLine($, `tools for Claude: ${toolsOffered} (neither Claude's files nor the transcript could say which agent it runs as)`)
     return
   }
-  if (myAgent) {
-    toolsOffered = `not offered: agent ${myAgent}, and this session was updated in place from a version without them; a restart (u) offers them`
+  const agent = found.role.agent
+  if (agent) {
+    const plan = roleTools(await agentFile($, agent, cwd))
+    toolsOffered = plan.tools.length
+      ? `not offered: agent ${agent}, and this session was updated in place from a version without them; a restart (u) offers them`
+      : `not offered: agent ${agent}, ${plan.why}`
     debugLine($, `tools for Claude: ${toolsOffered}`)
     return
   }
@@ -2460,8 +2577,8 @@ async function offerAfterReload($: any) {
   try {
     if (!sameData(await read($, agentRole), role)) await update($, agentRole, () => role)
   } catch {}
-  toolsOffered = `${SESSION_TOOLS.map(t => `mcp__sessions__${t}`).join(', ')} (no agent, as its transcript says; offered after an update in place, from the next request on)`
-  const done = await within($, Promise.all(SESSION_TOOLS.map(t => $.tool.register(TOOL_SPECS[t]))), 10000)
+  toolsOffered = `${toolNames(SESSION_TOOLS)} (no agent, as ${found.from} says; offered after an update in place, from the next request on)`
+  const done = await registerTools($, SESSION_TOOLS, 10000)
   debugLine($, `tools for Claude: ${toolsOffered}${done ? '' : ', still registering after 10 s'}`)
 }
 
@@ -3124,7 +3241,8 @@ async function refresh($: any) {
 // that can't be read
 function noticeText(): string {
   const parts: string[] = []
-  if (!live && reloadedInto) parts.push('Live updates off: this session was updated in place; u restarts it, or /clear')
+  // Not where no SessionStart reaches the mod at all: there neither helps, and /sessions status says why
+  if (!live && reloadedInto && !startSkipped) parts.push('Live updates off: this session was updated in place; u restarts it, or /clear')
   if (slowList && sessionFiles?.problem) parts.push("List read the slow way: Claude's registry changed format")
   if (sectionsProblem) parts.push(sectionsProblem)
   return parts.join(' · ')
@@ -4660,9 +4778,11 @@ async function liveText($: any, now: number): Promise<string> {
   const w = await read($, watching)
   const how = live
     ? `Live: the engine watches Claude's registry and the panel's files (set ${WATCH_SET}${w ? `, since ${Math.max(0, Math.round((now - w.at) / 1000))} s ago` : ''})${inboxTimer ? ', but not the inbox (a request came with no file event): read every 0.5 s' : ''}`
-    : reloadedInto
-      ? 'Not live: this session was updated in place from a version that watched other files; it reads them every 3 s until it restarts (u) or is cleared (/clear)'
-      : 'Not live: no SessionStart reached the panel in this session; it reads the files every 3 s'
+    : roleSeen
+      ? "Not live: its SessionStart came but had no folders to hand Claude to watch (no home folder?); it reads the files every 3 s"
+      : reloadedInto && !startSkipped
+        ? 'Not live: this session was updated in place from a version that watched other files; it reads them every 3 s until it restarts (u) or is cleared (/clear)'
+        : `Not live: ${SKIPPED_START}. Claude watches files for a mod only when its SessionStart asks, so the panel reads them every 3 s`
   const list = slowList ? `the list from claude agents (${sessionFiles?.problem || "this session isn't in Claude's registry"})` : "the list from Claude's files"
   let record: ReturnType<typeof parseLeader> = null
   try {
@@ -4997,6 +5117,10 @@ async function start($: any) {
     if (startedVia === 'first draw') await afterDraw($, () => $.state.set({ plugin: 'sessions', key: 'shortId' }, next))
     else if (!sameData(before, next)) await update($, shortId, () => next)
   })
+  idKnown()
+  // Came in by a reload with nothing watched: whether this machine's starts find no SessionStart at all (then neither a
+  // restart nor /clear makes it live), for what /sessions status and the panel say
+  if (reloadedInto && !live) startSkipped = (await storeGet($, START_SKIPPED)) != null
   await step('folders', async () => {
     home = (await $.env.get('HOME')) ?? ''
     dataDir = (await $.env.get('SESSIONS_DATA_DIR')) || (home ? `${home}/.claude/mods/sessions-data` : '')
@@ -5193,11 +5317,16 @@ export const register: Register = (on, options) => {
     // The agent this session runs as, for the tools for Claude (offerTools, at session.start), noted at once and kept in
     // $.state for a reload
     const role: AgentRole = { agent: typeof e.agent_type === 'string' && e.agent_type ? e.agent_type : null }
+    const first = roleSeen === null
     roleSeen = role
     roleKnown()
+    if (roleFrom && first && role.agent !== (await read($, agentRole))?.agent) debugLine($, `SessionStart came late, with ${role.agent ? `agent ${role.agent}` : 'no agent'}: the tools went by ${roleFrom}`)
+    roleFrom = ''
     try {
       if (!sameData(await read($, agentRole), role)) await update($, agentRole, () => role)
     } catch {}
+    // A process's own start: this machine's starts wait for SessionStart again (START_SKIPPED), once per module
+    if (first && (e.source === 'startup' || e.source === 'resume')) bg(forgetSkippedStart($))
     const r = await next(e)
     try {
       const paths = await watchFor($, String(e.session_id ?? ''), String(e.source ?? ''))

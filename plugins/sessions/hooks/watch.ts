@@ -129,6 +129,9 @@ export type RegistryEntry = {
   jobId?: string
   startedAt?: number
   bridgeSessionId?: string | null
+  // The agent the session runs as (claude --agent <name>, or the agent setting): there from its start (checked on
+  // 2.1.319), absent with none
+  agent?: string
 }
 
 // The statuses Claude writes there. shell: the turn ended with a background shell command still running (claude agents
@@ -158,6 +161,7 @@ export function parseRegistry(text: string): { entry: RegistryEntry } | { skip: 
   if (typeof d.jobId === 'string' && d.jobId) entry.jobId = d.jobId
   if (typeof d.startedAt === 'number') entry.startedAt = d.startedAt
   if (typeof d.bridgeSessionId === 'string' || d.bridgeSessionId === null) entry.bridgeSessionId = d.bridgeSessionId
+  if (typeof d.agent === 'string' && d.agent) entry.agent = d.agent
   return { entry }
 }
 

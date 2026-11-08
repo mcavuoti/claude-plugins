@@ -78,9 +78,9 @@ export type TellInFlight = { id: string; at: number } | null
 // What this session's classic.SessionStart had the engine watch: the set of paths (WATCH_SET in hooks/watch.ts), for
 // which session id, and when; null when none came in this session (the panel then reads on a short timer)
 export type Watching = { set: number; sessionId: string; at: number } | null
-// The agent this session runs as (claude --agent), as its last classic.SessionStart said (agent_type; null: none), which
-// decides whether mcp__sessions__list and mcp__sessions__wake are registered; null when no SessionStart came in this
-// session (then they aren't)
+// The agent this session runs as (claude --agent), as its last classic.SessionStart said (agent_type; null: none), or
+// where none came, Claude's registry of sessions or the background job's flags, which decides whether
+// mcp__sessions__list and mcp__sessions__wake are registered; null when nothing said it in this session
 export type AgentRole = { agent: string | null } | null
 
 // ---- The API for other plugins: $.sessions, contract api 1 ----

@@ -1199,6 +1199,23 @@ export function agentFromTranscript(rows: string): string | null {
   return agent
 }
 
+// The agent a background session runs as, from its job record's respawnFlags (the flags its restarts replay:
+// `--agent <name>` or `--agent=<name>`, checked on 2.1.319): null when they name none. The text after a flag that takes
+// any text (a name, settings, a prompt) is never read as a flag
+const FLAGS_WITH_TEXT = new Set(['-n', '--name', '--settings', '--agents', '--system-prompt', '--append-system-prompt'])
+export function agentFromFlags(flags: readonly unknown[]): string | null {
+  for (let i = 0; i < flags.length; i++) {
+    const f = String(flags[i])
+    if (f === '--agent') {
+      const v = flags[i + 1]
+      return typeof v === 'string' && v ? v : null
+    }
+    if (f.startsWith('--agent=')) return f.slice('--agent='.length) || null
+    if (FLAGS_WITH_TEXT.has(f)) i++
+  }
+  return null
+}
+
 // Sections: <data>/sections.json, the person's data (what they chose, kept for good), so it has its own version,
 // sectionsFormat, apart from the wire FORMAT. It changes only by adding fields, and a write keeps the fields it doesn't
 // know. A file from a newer sessions (a higher sectionsFormat) is never read as if it were this one, nor rewritten: the
