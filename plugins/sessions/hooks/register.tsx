@@ -876,7 +876,8 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
 // none, and ask Terminal nothing, which a quit Terminal would also take as a reason to start. Where the front window
 // can't be known (Linux without X11), a session counts as seen only when you type in it, use its panel or arrive there
 // A session no window shows (no viewer of it, no agent view) past the first minute after its answer is checked again a
-// minute later (seenQuietUntil), with a listing up to a minute old: arriving there with ccc or Enter marks it seen anyway
+// minute later (seenQuietUntil), with a listing up to a minute old: arriving there with ccc, or from another panel
+// (Enter or a click), marks it seen anyway
 let seenCheckedAt = 0
 let seenQuietUntil = 0
 async function markSeenIfLooking($: any) {
@@ -900,8 +901,8 @@ async function markSeenIfLooking($: any) {
   if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
 
-// The person is at this session right now (arrived from another panel or with ccc, or pressing keys in its panel):
-// what it last answered is seen, with no check
+// The person is at this session right now (arrived from another panel, by Enter or a click, or with ccc, or pressing
+// keys in its panel): what it last answered is seen, with no check
 async function seenNow($: any) {
   if (!myId) return
   const { finished, seen } = await ownSeenState($)
@@ -3376,22 +3377,24 @@ function peerRow(sessionId: string, carried: Record<string, unknown> = {}): Row 
   }
 }
 
-// Switches the front window to another session. With notifyFocus set to false, the target doesn't take the keyboard
-// with its panel (when it's about to show a question, or when it'll do so itself afterwards). From a window opened with
+// Switches the front window to another session. With notifyFocus set to false, the target isn't told you arrived
+// (when it's about to show a question, or when it'll take the keyboard itself afterwards). From a window opened with
 // ccc, by what its launcher publishes (switchByLaunchers: one file, no ps of every process, no question to Terminal);
 // else one ps serves the whole switch (which window is this one, which shows the target, the viewer to close). Nothing
-// waits before the viewer is told to end or closed: the notice that gives the target's panel the keyboard and this
-// panel's release of it go once the window went (the target takes the keyboard with no window attached too, and gets
-// it when the window attaches)
+// waits before the viewer is told to end or closed: the notice that tells the target you arrived and this panel's
+// release of the keyboard go once the window went (the target takes the keyboard with no window attached too, and
+// gets it when the window attaches)
 async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
   if (f.current) return false
-  // If the jump was made with the keyboard in the panel, the target session receives you with the focus on its panel.
-  // When leaving, this session's panel releases the keyboard
+  // If the jump was made with the keyboard in the panel (Enter), the target session receives you with the focus on its
+  // panel ('focus'); made without it (a click on the row), the keyboard stays where it is and the target only marks
+  // what it answered seen ('seen'). Either way you're looking at it now. When leaving, this session's panel releases
+  // the keyboard
   const fromKeyboard = notifyFocus && !!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused
   const gone = (): true => {
     bg(
       (async () => {
-        if (fromKeyboard) await sendNotice($, f, 'focus')
+        if (notifyFocus) await sendNotice($, f, fromKeyboard ? 'focus' : 'seen')
         await releaseFocus($)
       })(),
     )
@@ -5258,6 +5261,11 @@ export const register: Register = (on, options) => {
       if (n.kind === 'focus') {
         if (active) bg(focusPanel($))
         return { consumed: 'sessions: focus the panel after a switch' }
+      }
+      // You arrived by a click in another session's panel: you're looking at this one; the keyboard stays where it is
+      if (n.kind === 'seen') {
+        if (active) bg(seenNow($))
+        return { consumed: 'sessions: seen after a switch by click' }
       }
       if (n.kind === 'ask') {
         if (active && d.from) bg(answerQuestion($, d))

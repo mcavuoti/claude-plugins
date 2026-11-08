@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { heartbeatText, labelMinute, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, parseShowing, parseWindows, planSwitch, sameData, sessionTags, showingRuns, showingText, usageSummaryOf, windowTargetText, type Showing } from '../hooks/state'
+import { buildNotice, heartbeatText, labelMinute, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, parseShowing, parseWindows, planSwitch, sameData, sessionTags, showingRuns, showingText, usageSummaryOf, windowTargetText, type Showing } from '../hooks/state'
 import { COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel costs while nothing happens: it draws only what changed, reads the session list again only when
@@ -473,9 +473,9 @@ const showingFile = (tty: string) => `${DATA}/windows/${tty.replace(/\//g, '_')}
 const launched = (w: World, s: Showing) => w.files.set(showingFile(s.tty), showingText(s))
 const ME = shows('/dev/ttys001', 'aaaaaaaa', 100)
 
-// Enter on bravo's row with the keyboard in the panel; where the key's commands start, and the notices sent (with the
-// number of commands that had run by then)
-async function enterOnBravo($: any, w: World, on: any) {
+// Enter on bravo's row with the keyboard in the panel (keyboard false: a click on it, the panel without the keyboard);
+// where the press's commands start, and the notices sent (with the number of commands that had run by then)
+async function enterOnBravo($: any, w: World, on: any, keyboard = true) {
   w.files.set(`${DATA}/alive/${BRAVO}`, heartbeatText({ pid: 4243, at: w.clock.now() + 600000, version: '0.13.2', via: 'session.start' }))
   const notices: { kind: string; at: number }[] = []
   on('session.send', (_: any, e: any) => {
@@ -485,13 +485,65 @@ async function enterOnBravo($: any, w: World, on: any) {
   })
   await startSession($, w)
   await w.clock.advance(4000)
-  w.panes.find((p: any) => p.id === 'sessions').isFocused = true
-  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  w.panes.find((p: any) => p.id === 'sessions').isFocused = keyboard
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: keyboard } })
   const from = w.runs.length
   await ui.press({ key: `s:${BRAVO}` })
   await w.clock.settle()
   await ui.unmount()
   return { from, notices }
+}
+
+// Arriving by a click marks the target seen, with the keyboard left where it is: the switch sends 'seen' where Enter
+// sends 'focus', whichever way the window goes there (a launcher window's file, the usual ps and kill, a regular
+// session's own window brought forward)
+for (const way of ['launcher', 'usual', 'regular'] as const) {
+  for (const keyboard of [true, false]) {
+    test(`${keyboard ? 'Enter' : 'a click'} on a row (${way === 'launcher' ? 'a window whose launcher says what it shows' : way === 'usual' ? 'the usual way' : "a regular session's own window"}): the target is told ${keyboard ? "you came with the keyboard (focus), and nothing else" : 'you arrived (seen), and not to take the keyboard'}`, async ($, on) => {
+      const regular = way === 'regular'
+      const w = world(on, { list: list().map(s => (regular && s.sessionId === BRAVO ? { ...s, kind: 'interactive' } : s)) })
+      if (way === 'launcher') {
+        w.ps.value = psOf(ME)
+        launched(w, ME)
+      } else w.ps.value = `  100 ttys001  bash /Users/x/p/hooks/visor.sh start\n  101 ttys001  claude attach aaaaaaaa${regular ? '\n  4243 ttys005  claude' : ''}`
+      w.terminal.value = (args: string[]) => (args[0] === 'traer' ? 'ok' : args[0] === 'frente' ? 'true /dev/ttys001' : '')
+      const { from, notices } = await enterOnBravo($, w, on, keyboard)
+      const after = w.runs.slice(from)
+      // The window went there, the way this test names
+      if (way === 'launcher') expect(after.some(a => a[0] === 'ps' && a[1] === '-A')).toBe(false)
+      if (way === 'usual') expect(after.filter(a => a[0] === 'kill')).toEqual([['kill', '-HUP', '101']])
+      if (regular) expect(after.filter(a => a[0] === 'osascript').map(a => a.slice(2))).toEqual([['traer', '/dev/ttys005']])
+      else expect(w.files.get(`${DATA}/windows/_dev_ttys001`)).toContain('id=bbbbbbbb\n')
+      expect(notices.map(n => n.kind)).toEqual([keyboard ? 'focus' : 'seen'])
+    })
+  }
+}
+
+// The target's side: 'seen' marks what it answered seen and leaves the keyboard alone (no panel opened with it);
+// 'focus' still does both; a kind it doesn't know is consumed and does nothing, as in every version on this format
+// (which is what a session on an older version does with 'seen')
+for (const kind of ['seen', 'focus'] as const) {
+  test(`arriving ${kind === 'seen' ? 'by a click (seen): what this session answered is seen at once, and its panel does not take the keyboard' : 'with Enter (focus): seen at once, and its panel takes the keyboard, as before'}`, async ($, on) => {
+    const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 1_000_000_000 - 20 * MIN } } })
+    const PEER = { kind: 'peer', plugin: 'sessions' }
+    await startSession($, w)
+    await w.clock.advance(1000)
+    const opens = w.opens.length
+    const toasts = w.toasts.length
+    const r: any = await $.session.receive({ text: buildNotice(kind), origin: PEER } as any)
+    await w.clock.settle()
+    expect(r.consumed).toBeDefined()
+    expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+    expect(w.opens.slice(opens).filter(o => o.focus)).toHaveLength(kind === 'focus' ? 1 : 0)
+    expect(w.panes.find((p: any) => p.id === 'sessions')?.isFocused).toBe(kind === 'focus')
+    expect(w.toasts.slice(toasts)).toEqual([])
+    // A kind this version doesn't know: consumed, never handed on, nothing done
+    const before = w.opens.length
+    const u: any = await $.session.receive({ text: buildNotice('later' as any), origin: PEER } as any)
+    await w.clock.settle()
+    expect(u.consumed).toBeDefined()
+    expect(w.opens.length).toBe(before)
+  })
 }
 
 for (const system of ['Darwin', 'Linux']) {
