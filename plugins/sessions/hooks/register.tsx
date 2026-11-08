@@ -200,7 +200,7 @@ import {
   sessionHome,
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
-import { bellFrom, bellOfKey, bellText, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchSetOf, type Locations, type RegistryEntry, type RegistryNews } from './watch'
+import { bellFrom, bellOfKey, bellText, checkWatchPaths, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchPathsArgv, watchSetOf, type Locations, type RegistryEntry, type RegistryNews } from './watch'
 import { electLeader, LEADER_STALE_MS, leaderText, leads, parseLeader, PASS_MS, type Candidate } from './leader'
 
 const PANE = 'sessions'
@@ -310,8 +310,17 @@ let pendingAsk: { sessionId: string; at: number; fallback?: string; topic: Topic
 let personMoves = 0
 // The installed Claude version (the newest one known): sessions with an older one get marked with ↑
 let installedVersion = ''
-// How this system's windows, processes and memory are handled: hooks/platform/macos.ts or linux.ts
+// How this system's windows, processes and memory are handled: hooks/platform/macos.ts or linux.ts. Chosen at the start
+// (platformChosen); a $.sessions method called before it chooses it then (ownPlatform), the same way
 let platform: Platform = macos
+let platformChosen = false
+async function ownPlatform($: any): Promise<Platform> {
+  if (!platformChosen) {
+    platform = await choosePlatform(sys($))
+    platformChosen = true
+  }
+  return platform
+}
 
 // Starting the mod in this session. It's started once, by whichever comes first: session.start, the first draw of the
 // line above the prompt (a session draws even with no window attached), a prompt you type, or a notice from another
@@ -1440,7 +1449,7 @@ async function startHelper($: any) {
     const paths = watchPaths(locations, ownJob)
     h.paths = paths.length
     if (h.stopping) return
-    h.stream = $.process.spawn({ argv: [py, WATCHER, 'watch-paths', '--how', h.how, ...paths], cwd: workDir, env: LAUNCHER_ONLY })
+    h.stream = $.process.spawn({ argv: watchPathsArgv(py, WATCHER, h.how, paths), cwd: workDir, env: LAUNCHER_ONLY })
     let buf = ''
     for await (const chunk of h.stream) {
       if (chunk.stream === 'stderr') {
@@ -1841,14 +1850,15 @@ async function processVersion($: any, pid: number): Promise<string> {
 // Tokens spent: usage.py (next to this file) reads them from the conversation logs; it reads only what's new since the
 // previous run (its cache is in <data>/usage) and several sessions can run it at once.
 // It needs a python3 that runs without bothering the person (platform.pythonUsable: on a Mac without the developer
-// tools, /usr/bin/python3 pops up a prompt to install them)
+// tools, /usr/bin/python3 pops up a prompt to install them), by its absolute path. Looked for once per module, with the
+// platform chosen (a $.sessions method may ask before the start)
 const USAGE_READER = `${(import.meta as any).dir}/usage.py`
 let python: string | null | undefined
 async function usablePython($: any): Promise<string | null> {
   if (python !== undefined) return python
   const r = await runSafe($, ['/bin/sh', '-lc', 'command -v python3'])
   const path = r.exitCode === 0 ? r.stdout.trim() : ''
-  if (!path || !(await platform.pythonUsable(sys($), path))) return (python = null)
+  if (!path.startsWith('/') || !(await (await ownPlatform($)).pythonUsable(sys($), path))) return (python = null)
   return (python = path)
 }
 
@@ -4997,7 +5007,7 @@ async function sectionsList($: any): Promise<string> {
 // here: current and status answer ready: false, and the section methods find the data folder from the environment
 const SESSIONS_API: SessionsApi = 1
 // The methods this copy serves: a key missing from Sessions, or one too many, fails the type check
-const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1, setMarks: 1, pin: 1, restart: 1 } satisfies Record<SessionsMethod, 1>
+const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1, setMarks: 1, pin: 1, restart: 1, watchCommand: 1 } satisfies Record<SessionsMethod, 1>
 // How long another plugin's call waits for the sections lock before answering busy (6 × 50 ms)
 const CALL_LOCK_TRIES = 6
 
@@ -5218,6 +5228,16 @@ function sessionsApi($: any): Sessions {
       kickQueue()
       return { ok: true, state: 'queued' as const }
     },
+    // The command for a watcher of the caller's own (launcher.py watch-paths, as the mod's own watch runs it), which the
+    // caller runs and reads itself: nothing is run or kept here
+    watchCommand: async input => {
+      const v = checkWatchPaths(input?.paths)
+      if (!v.ok) return v
+      const how = (await ownPlatform($)).fileWatch
+      const py = await usablePython($)
+      if (!py) return { ok: false, reason: 'no-python', detail: "no usable python3 here, which sessions needs: install it (on a Mac, the developer tools: xcode-select --install)" }
+      return { ok: true, argv: watchPathsArgv(py, WATCHER, how, v.paths, 0), how }
+    },
   }
 }
 
@@ -5308,6 +5328,7 @@ async function start($: any) {
     const which = fixed ? { exitCode: 0, stdout: fixed } : await runSafe($, ['/bin/sh', '-lc', 'command -v claude'])
     if (which.exitCode === 0 && which.stdout.trim()) claude = which.stdout.trim()
     platform = await choosePlatform(sys($))
+    platformChosen = true
     try {
       modVersion = String(JSON.parse(await $.fs.read(`${PLUGIN_DIR}/.claude-plugin/plugin.json`))?.version ?? '')
     } catch {}

@@ -210,7 +210,18 @@ export type Sessions = {
    * them) or they can't be read, it waits, up to 5 minutes after the last call for it, then it's dropped. Each drop is
    * said in the debug log, never to the caller: a caller that still wants it asks again. `reason` goes to the debug log */
   restart?: (input: { ref: SessionsRef; reason: string }) => Promise<SessionsResult & { state?: 'queued' | 'refused' }>
+  /** 0.18.0. The command for a file watch of the caller's own: sessions' watcher (`hooks/launcher.py watch-paths`, with
+   * the kernel watch this system has, `how`, and a usable python3), over `paths`: 1 to 64 absolute paths, each a file or
+   * a folder (its own files, not its subfolders'), in their plain form (no `.` or `..` part, no `//`, no `/` at the end)
+   * and on one line. It runs nothing and keeps nothing: the caller runs `argv` with `$.process.spawn` and reads its
+   * lines (docs/plugin-contract.md says what they are and how the watcher ends) */
+  watchCommand?: (input: { paths: string[] }) => Promise<SessionsWatchCommand>
 }
+/** What watchCommand answers: the command and the kernel watch it uses; or invalid (bad `paths`, with why) and no-python
+ * (no usable python3 here, which sessions requires) */
+export type SessionsWatchCommand =
+  | { ok: true; argv: string[]; how: 'kqueue' | 'inotify' }
+  | { ok: false; reason: 'invalid' | 'no-python'; detail: string }
 export type SessionsMethod = keyof Sessions
 
 declare module 'claude-code' {
