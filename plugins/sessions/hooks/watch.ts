@@ -66,6 +66,28 @@ export function watchPaths(l: Locations, ownJob: string | null): string[] {
   return out
 }
 
+// The command for launcher.py watch-paths over paths, with the kernel watch `how` (platform.fileWatch): the mod's own
+// watch (startHelper: its folders to the watcher's default depth) and other plugins' ($.sessions.watchCommand: depth 0,
+// a folder's own files)
+export function watchPathsArgv(python: string, launcher: string, how: string, paths: readonly string[], depth?: number): string[] {
+  return [python, launcher, 'watch-paths', '--how', how, ...(depth === undefined ? [] : ['--depth', String(depth)]), ...paths]
+}
+
+// The paths $.sessions.watchCommand takes: 1 to WATCH_COMMAND_PATHS, each absolute and already in its plain form (no
+// `.` or `..` part, no `//`, no `/` at the end: the watcher's lines name a path, and the files in a folder, as given),
+// up to 4096 characters, with no control character (a tab or a line break would break the watcher's lines)
+export const WATCH_COMMAND_PATHS = 64
+export function checkWatchPaths(paths: unknown): { ok: true; paths: string[] } | { ok: false; reason: 'invalid'; detail: string } {
+  const invalid = (detail: string) => ({ ok: false as const, reason: 'invalid' as const, detail })
+  if (!Array.isArray(paths) || paths.length < 1 || paths.length > WATCH_COMMAND_PATHS) return invalid(`paths is 1 to ${WATCH_COMMAND_PATHS} absolute paths`)
+  for (const p of paths) {
+    const shown = JSON.stringify(p)?.slice(0, 200) ?? String(p)
+    if (typeof p !== 'string' || !p.startsWith('/') || p.length > 4096 || /\p{Cc}/u.test(p)) return invalid(`not an absolute path on one line: ${shown}`)
+    if (p !== '/' && p.slice(1).split('/').some(part => part === '' || part === '.' || part === '..')) return invalid(`not a plain absolute path (no . or .. part, no //, no / at the end): ${shown}`)
+  }
+  return { ok: true, paths: [...paths] }
+}
+
 // What a changed path means. null: none of the panel's
 export type Change =
   | { kind: 'registry'; file: string }

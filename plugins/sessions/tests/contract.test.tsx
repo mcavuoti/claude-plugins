@@ -25,6 +25,7 @@ const PROBE = {
         else if (m === 'setMarks') out = await $.sessions.setMarks(input)
         else if (m === 'pin') out = await $.sessions.pin(input)
         else if (m === 'restart') out = await $.sessions.restart(input)
+        else if (m === 'watchCommand') out = await $.sessions.watchCommand(input)
         return { text: JSON.stringify({ out }) }
       } catch (err) {
         return { text: JSON.stringify({ threw: String(err) }) }
@@ -60,7 +61,72 @@ test('contract: api 1 and its methods, also before the mod has started here', WI
   expect(c.api).toBe(1)
   expect(c.format).toBe(3)
   expect(typeof c.version).toBe('string')
-  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart'])
+  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'watchCommand'])
+})
+
+// watchCommand only builds the command for sessions' watcher (launcher.py watch-paths): the caller runs it and reads it
+const PYTHON = '/opt/x/bin/python3'
+const WATCHED = ['/Users/x/myapp/.claude/fleet/events/latest', '/Users/x/myapp/.claude/fleet/bell', '/']
+function spawns(on: any): string[][] {
+  const argvs: string[][] = []
+  on('process.spawn', async function* (_: any, e: any) {
+    argvs.push([...e.argv])
+    return { value: { code: 0, signal: null } }
+  })
+  return argvs
+}
+
+test("watchCommand: the watcher's command over absolute paths, with kqueue on macOS, before the start and after; it runs nothing", WITH_PROBE, async ($, on) => {
+  const spawned = spawns(on)
+  const w = world(on, { python: PYTHON })
+  const r = await call($, 'watchCommand', { paths: WATCHED })
+  expect(r).toEqual({ ok: true, argv: [PYTHON, expect.stringMatching(/^\/.*\/hooks\/launcher\.py$/), 'watch-paths', '--how', 'kqueue', '--depth', '0', ...WATCHED], how: 'kqueue' })
+  // Only its lookups ran (the system, python3), from a folder that exists; nothing was started
+  expect(w.runs.length).toBe(2)
+  expect(w.runs.every(a => a[0] === '/bin/sh')).toBe(true)
+  expect(w.cwds.every(c => c !== undefined && w.dirs.has(c))).toBe(true)
+  expect(await call($, 'watchCommand', { paths: [WATCHED[0]] })).toMatchObject({ ok: true, argv: [PYTHON, r.argv[1], 'watch-paths', '--how', 'kqueue', '--depth', '0', WATCHED[0]] })
+  expect(w.runs.length).toBe(2)
+  await startSession($, w)
+  expect(await call($, 'watchCommand', { paths: WATCHED })).toEqual(r)
+  expect(spawned).toEqual([])
+  // 64 paths at most
+  const many = Array.from({ length: 64 }, (_, i) => `/Users/x/w/${i}`)
+  expect((await call($, 'watchCommand', { paths: many })).argv.slice(7)).toEqual(many)
+  // Refused, with why: none, too many, not absolute, not in their plain form, not on one line, not strings
+  const refused = async (input: unknown) => {
+    const x = await call($, 'watchCommand', input)
+    expect(x.ok).toBe(false)
+    expect(x.reason).toBe('invalid')
+    return String(x.detail)
+  }
+  expect(await refused({ paths: [] })).toContain('1 to 64')
+  expect(await refused({})).toContain('1 to 64')
+  expect(await refused({ paths: [...many, '/Users/x/w/64'] })).toContain('1 to 64')
+  expect(await refused({ paths: ['/Users/x/w', 'w/latest'] })).toContain('"w/latest"')
+  for (const p of ['/Users/x/w/', '/Users/x//w', '/Users/x/./w', '/Users/x/../w', '/Users/x/w/..']) expect(await refused({ paths: [p] })).toContain('plain')
+  for (const p of ['/Users/x/w\nlatest', '/Users/x/w\tlatest', 42, null]) expect(await refused({ paths: [p] })).toContain('absolute path on one line')
+  expect(spawned).toEqual([])
+})
+
+test('watchCommand: inotify on Linux', WITH_PROBE, async ($, on) => {
+  world(on, { system: 'Linux', python: PYTHON })
+  expect(await call($, 'watchCommand', { paths: WATCHED })).toEqual({ ok: true, argv: [PYTHON, expect.stringMatching(/\/hooks\/launcher\.py$/), 'watch-paths', '--how', 'inotify', '--depth', '0', ...WATCHED], how: 'inotify' })
+})
+
+test('watchCommand: without a usable python3, no-python', WITH_PROBE, async ($, on) => {
+  world(on)
+  const r = await call($, 'watchCommand', { paths: WATCHED })
+  expect(r.ok).toBe(false)
+  expect(r.reason).toBe('no-python')
+  expect(r.detail).toContain('python3')
+  // Bad paths are said first
+  expect((await call($, 'watchCommand', { paths: ['w'] })).reason).toBe('invalid')
+})
+
+test('watchCommand: a python3 the PATH names by a relative path is none', WITH_PROBE, async ($, on) => {
+  world(on, { python: 'bin/python3' })
+  expect((await call($, 'watchCommand', { paths: WATCHED })).reason).toBe('no-python')
 })
 
 test('current and status: not ready before the start, then this session and the others from the official list', WITH_PROBE, async ($, on) => {
