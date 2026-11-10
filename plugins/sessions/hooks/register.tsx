@@ -296,6 +296,9 @@ let waitingSnapshot: Set<string> | null = null
 // The row selected with the arrows (the session button's key, "s:<sessionId>") and the element that has the focus now
 let selectedRow: string | undefined
 let currentFocus: string | undefined
+// What the arrows go through in the panel as the terminal last drew it (ringKeys of what its render hook drew), for
+// focusElement to wait for the frame it means to focus in; null until it's drawn
+let drawnRing: string[] | null = null
 // Panel width: what the content needs, capped at the width Claude gives it on its own ("the default one").
 // That cap is measured by opening the panel without asking for a width, and measured again if the window size changes.
 let requestedWidth = 0
@@ -3813,7 +3816,12 @@ async function focusSession($: any, sessionId: string | undefined) {
 // meanwhile, the focus isn't fought over.
 // A field that appears with autoFocus does NOT take the focus if the panel already had the keyboard: the focus goes by
 // position and lands on whatever is in that spot now (a row, and what you were typing went somewhere else). That's
-// why it's moved here
+// why it's moved here.
+// Claude places the focus in the frame it has drawn and keeps that position: asked right after the rows were written,
+// before the frame that shows them is drawn, it lands where the element was in the frame before, and the new frame moves
+// the highlight off it (the row above the focus left: one past it, where a row that arrives next is drawn). So it waits
+// for the frame that shows the rows as they are now (drawnRing, a few ms after they're written), and asks anyway at the
+// end of the wait
 async function focusElement($: any, key: string) {
   const moves = personMoves
   for (let i = 0; i < 30; i++) {
@@ -3824,7 +3832,8 @@ async function focusElement($: any, key: string) {
     } catch {
       return
     }
-    if (panes.find((p: any) => p.id === PANE)?.isFocused) {
+    const undrawn = i < 29 && drawnRing !== null && !sameData(drawnRing, ringKeys(await rowsNow($)))
+    if (!undrawn && panes.find((p: any) => p.id === PANE)?.isFocused) {
       let r: any
       try {
         r = await $.ui.focus({ requestId: PANE, key })
@@ -5995,7 +6004,9 @@ export const register: Register = (on, options) => {
       // field that closed and shifted the positions), the arrows bring it back instead of getting stuck
       else return next({ ...e, element: currentFocus })
     }
-    if (target === currentFocus) return {}
+    // Taken even when it's the element the mod thinks has the focus: Claude offers it from where the highlight is, so
+    // the highlight is elsewhere (what's drawn moved under it, and the panel's own move back didn't land). Kept where it
+    // was, the arrows would be stuck there
     const r = target === e.element ? await next(e) : await next({ ...e, element: target })
     if (!r.deny && target) {
       currentFocus = target
@@ -6101,6 +6112,8 @@ export const register: Register = (on, options) => {
     // above them, as Text too
     const plan = drawPlan(list)
     const shownRows = list.filter(f => !f.folded)
+    // What the arrows go through in this frame, for a move of the focus to wait for (focusElement)
+    if (inTerminal) drawnRing = ringKeys(list)
     // The line about the sessions of every folder that ended with the background service, under the legend: one line,
     // more where the panel is narrower than it (it wraps between words)
     const endedNote = await read($, ended)

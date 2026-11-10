@@ -94,6 +94,8 @@ export type World = {
   notifies: string[]
   pushAnswer: { value: any }
   notifyAnswer: { value: any }
+  // The element the last move of the panel's focus that reached Claude landed on (panelRing)
+  focusLanded: { value: string | undefined }
 }
 
 export type WorldOptions = {
@@ -365,7 +367,13 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: undefined }
   })
   on('ui.panes', () => ({ value: panes.map(p => ({ ...p })) }))
-  on('ui.focus', () => ({}))
+  // A move of the focus that reaches Claude lands where the chain left it (panelRing reads it). The mod's own $.ui.focus
+  // never gets here: the kit skips the mod's own hook on it, and with it what's beneath, so it's denied
+  const focusLanded: { value: string | undefined } = { value: undefined }
+  on('ui.focus', (_, e) => {
+    focusLanded.value = e.element
+    return {}
+  })
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
     return { value: undefined }
@@ -383,7 +391,42 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer, focusLanded }
+}
+
+// The panel's focus ring as Claude keeps it, for a test that presses the arrows in a mounted panel: by position, not by
+// element. The ring is a place among the panel's elements (its Buttons and fields, in the order drawn), so a frame that
+// moves what's at that place moves the highlight onto another element. An arrow offers the element before or after it
+// (ui.focus, from the person, wrapping around), and the ring goes where the chain lands; a hook that answers without
+// next keeps it where it is
+export type PanelRing = {
+  // The element the ring is on in the frame drawn now
+  on: () => Promise<string | undefined>
+  // The person puts it on an element (a click), or moves it with an arrow; each answers where it is after
+  put: (key: string) => Promise<string | undefined>
+  arrow: (way: 'up' | 'down') => Promise<string | undefined>
+}
+
+export function panelRing($: any, w: World, ui: { findAll: (q: object) => Promise<{ type: string; key: string | undefined }[]> }): PanelRing {
+  let at = -1
+  const frame = async () => (await ui.findAll({})).filter(x => x.type === 'Button' || x.type === 'Input' || x.type === 'Select').map(x => String(x.key))
+  const offer = async (element: string) => {
+    const keys = await frame()
+    w.focusLanded.value = undefined
+    await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element, origin: { kind: 'person' } })
+    await w.clock.settle()
+    const landed = w.focusLanded.value
+    if (landed !== undefined && keys.includes(landed)) at = keys.indexOf(landed)
+    return (await frame())[at]
+  }
+  return {
+    on: async () => (await frame())[at],
+    put: offer,
+    arrow: async way => {
+      const keys = await frame()
+      return offer(keys[(at + (way === 'down' ? 1 : -1) + keys.length) % keys.length] ?? '')
+    },
+  }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

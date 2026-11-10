@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import { buildNotice, fileKey, FORMAT, goneNamespaces, heartbeatText, showingText, isOldKey, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
 import { bellOfKey, classify, directList, jobIds, listDrift, parseRegistry, SessionFiles, WATCH_SET, watchPaths, watchSetOf } from '../hooks/watch'
 import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, processGone, processStartsArgv, provenRunning } from '../hooks/leader'
-import { COMMAND, DATA, ROOT, SID, SLOW, STARTED, startSession, world, type World } from './world'
+import { COMMAND, DATA, panelRing, ROOT, SID, SLOW, STARTED, startSession, world, type World } from './world'
 
 // What the panel learns by watching files (watch.ts): the paths it hands the engine at SessionStart, a row that changes
 // within a file event with no command run, the bells other sessions ring, its own row from its own turns, the one
@@ -1193,6 +1193,31 @@ test('nobody looking: the panel keeps the keyboard after an arrival whose window
   await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: `s:${BRAVO}`, origin: { kind: 'person' } } as any)
   await w.clock.advance(100)
   expect(colorOf(writes, BRAVO)).toBe('red')
+})
+
+test('nobody looking, with the keyboard in the panel: a session that starts is kept, then drawn at the end at the first key, and the arrows go to it and back', SLOW, async ($, on) => {
+  const { w, list } = await unseenSession($, on)
+  await $.session.receive({ text: buildNotice('focus'), origin: PEER } as any)
+  await w.clock.advance(200)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  const ring = panelRing($, w, ui)
+  expect(await ring.put(`s:${BRAVO}`)).toBe(`s:${BRAVO}`)
+  // A minute on with no key: kept, not drawn
+  await w.clock.advance(70000)
+  const CHARLIE = { pid: 4244, sessionId: 'cccccccc-0000-0000-0000-000000000000', id: 'cccccccc', status: 'idle', name: 'charlie' } as Session
+  list.push(...listed([CHARLIE]))
+  registryFile(w, CHARLIE)
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4244.json`, event: 'add' })
+  await w.clock.advance(50)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('charlie')
+  // The first key: offered what's below bravo in the frame drawn, it stays in the list, and the row is drawn at the end
+  expect(await ring.arrow('down')).toBe(`s:${BRAVO}`)
+  await w.clock.advance(100)
+  expect(JSON.stringify(await ui.drawn())).toContain('charlie')
+  expect(await ring.arrow('down')).toBe(`s:${CHARLIE.sessionId}`)
+  expect(await ring.arrow('up')).toBe(`s:${BRAVO}`)
+  expect(await ring.arrow('up')).toBe(`s:${SID}`)
+  await ui.unmount()
 })
 
 test('someone could be looking (a regular session, its own window): drawn at once', SLOW, async ($, on) => {
