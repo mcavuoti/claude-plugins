@@ -4984,6 +4984,7 @@ async function statusText($: any): Promise<string> {
     await notificationsText($, now),
     await liveText($, now),
   ]
+  if (!platform.frontKnown) lines.push("Seen: this machine can't tell which window is in front (no X11 display, or no xprop), so nothing checks for it: a session's answer counts as seen when you type in it, use its panel or arrive there (Enter or a click in another panel, ccc)")
   const apart = await apartText($)
   if (apart) lines.push(apart)
   if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)

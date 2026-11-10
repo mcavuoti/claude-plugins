@@ -108,6 +108,9 @@ export type WorldOptions = {
   onStart?: ($: any) => Promise<void>
   // The python3 on the PATH (command -v python3); none by default
   python?: string
+  // On Linux: $DISPLAY (':0' by default) and the xprop on the PATH (one by default; '': none)
+  display?: string
+  xpropPath?: string
 }
 
 // A session with an id and a root, an in-memory folder tree, a claude that lists one session
@@ -308,6 +311,7 @@ export function world(on: On, options: WorldOptions = {}): World {
       return installedLate.value > 0 ? clock.sleep(installedLate.value).then(answer) : answer()
     }
     if (argv[0] === '/bin/sh' && String(argv[2]).includes('uname')) return ok(`${options.system ?? 'Darwin'}|`)
+    if (argv[0] === '/bin/sh' && String(argv[2]).includes('command -v xprop')) return ok(`${options.display ?? ':0'}|${options.xpropPath ?? '/usr/bin/xprop'}`)
     if (argv[0] === '/bin/sh' && String(argv[2]) === 'command -v python3') return options.python ? ok(`${options.python}\n`) : failed()
     // The first row with a cwd of each session's transcript (firstCwds): the ones starts has, by session id
     if (argv[0] === '/bin/sh' && String(argv[2]).includes(`'"cwd":"'`)) {

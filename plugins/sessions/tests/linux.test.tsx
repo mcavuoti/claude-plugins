@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { activeWindowId, clientCommand, exactTitlePattern, frontShown, linux, pickWindowShowingMe, programFromCmdline, terminalCommand, titleShows, xpropText } from '../hooks/platform/linux'
+import { activeWindowId, clientCommand, exactTitlePattern, frontKnowable, frontShown, linux, linuxHere, pickWindowShowingMe, programFromCmdline, terminalCommand, titleShows, xpropText } from '../hooks/platform/linux'
 import { parseWindows } from '../hooks/state'
 
 // The Linux platform's pure parts. They run on any system (the CI runs them on macOS and Linux)
@@ -131,4 +131,29 @@ test('linux.windowInFront asks xprop only with a viewer on screen, and answers n
   expect(runs).toHaveLength(2)
   const none = async () => ({ exitCode: 1, stdout: '', stderr: 'xprop: unable to open display' })
   expect(await linux.windowInFront(none, shown)).toBe(null)
+})
+
+test('whether the window in front can be told on this machine: an X11 display and xprop, asked once with one sh', async () => {
+  expect(frontKnowable(':0', '/usr/bin/xprop')).toBe(true)
+  expect(frontKnowable('', '/usr/bin/xprop')).toBe(false)
+  expect(frontKnowable(':0', '')).toBe(false)
+  expect(frontKnowable(' ', '\n')).toBe(false)
+  const asked: string[][] = []
+  const answers = (stdout: string, exitCode = 0) => async (argv: string[]) => {
+    asked.push(argv)
+    return { exitCode, stdout, stderr: '' }
+  }
+  expect((await linuxHere(answers(':0|/usr/bin/xprop\n'))).frontKnown).toBe(true)
+  expect(asked).toHaveLength(1)
+  expect(asked[0]?.[0]).toBe('/bin/sh')
+  // No display (a host reached over ssh), or no xprop: it can't, and the rest of the platform is as it was
+  const headless = await linuxHere(answers('|/usr/bin/xprop'))
+  expect(headless.frontKnown).toBe(false)
+  expect(headless.windowInFront).toBe(linux.windowInFront)
+  expect(headless.fileWatch).toBe(linux.fileWatch)
+  expect((await linuxHere(answers(':0|'))).frontKnown).toBe(false)
+  // A question that fails changes nothing
+  expect((await linuxHere(answers('', 127))).frontKnown).toBe(true)
+  expect((await linuxHere(answers('something else'))).frontKnown).toBe(true)
+  expect(linux.frontKnown).toBe(true)
 })
