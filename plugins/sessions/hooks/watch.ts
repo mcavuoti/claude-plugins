@@ -6,7 +6,7 @@
 // replaces it. A reload never raises SessionStart: a module that came in by a reload watches what the module before it
 // asked for, so the set of paths has a version of its own (WATCH_SET), which an update in place never crosses
 // (reloadDecision). A module that finds no SessionStart of its own set behind it (or a session no SessionStart reaches)
-// watches the same paths itself (launcher.py watch-paths, register.tsx's startHelper), on a short timer until that's up.
+// watches the same paths itself (watcher.py watch-paths, register.tsx's startHelper), on a short timer until that's up.
 //
 // The paths (watchPaths):
 // - Claude's registry of running sessions (~/.claude/sessions, or SESSIONS_REGISTRY_DIR): one <pid>.json per running
@@ -66,11 +66,11 @@ export function watchPaths(l: Locations, ownJob: string | null): string[] {
   return out
 }
 
-// The command for launcher.py watch-paths over paths, with the kernel watch `how` (platform.fileWatch): the mod's own
+// The command for watcher.py watch-paths over paths, with the kernel watch `how` (platform.fileWatch): the mod's own
 // watch (startHelper: its folders to the watcher's default depth) and other plugins' ($.sessions.watchCommand: depth 0,
 // a folder's own files)
-export function watchPathsArgv(python: string, launcher: string, how: string, paths: readonly string[], depth?: number): string[] {
-  return [python, launcher, 'watch-paths', '--how', how, ...(depth === undefined ? [] : ['--depth', String(depth)]), ...paths]
+export function watchPathsArgv(python: string, watcher: string, how: string, paths: readonly string[], depth?: number): string[] {
+  return [python, watcher, 'watch-paths', '--how', how, ...(depth === undefined ? [] : ['--depth', String(depth)]), ...paths]
 }
 
 // The paths $.sessions.watchCommand takes: 1 to WATCH_COMMAND_PATHS, each absolute and already in its plain form (no

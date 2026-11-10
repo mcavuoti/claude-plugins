@@ -8,7 +8,7 @@ import { DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 // What the panel learns by watching files (watch.ts): the paths it hands the engine at SessionStart, a row that changes
 // within a file event with no command run, the bells other sessions ring, its own row from its own turns, the one
 // session that leads the machine-wide work (leader.ts), a session that came in by a reload reading on its short
-// timer and saying so, and the mod's own watch where no SessionStart reaches it (launcher.py watch-paths)
+// timer and saying so, and the mod's own watch where no SessionStart reaches it (watcher.py watch-paths)
 
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
 const BRAVO = 'bbbbbbbb-0000-0000-0000-000000000000'
@@ -587,7 +587,7 @@ test('an answer nobody saw, in a session no window shows: the seen check looks a
 
 // ---- The mod's own watch, where Claude watches nothing for the session ----
 
-// The mod's own watch (launcher.py watch-paths) as a process the test drives: what each one was started with, the lines
+// The mod's own watch (watcher.py watch-paths) as a process the test drives: what each one was started with, the lines
 // it prints (say), how it ends (end); a kill of the pid its ready line gave, as the mod stops it, ends it by SIGTERM
 type OwnWatch = { argv: string[]; pid: string; ended: boolean; say: (line: string) => void; end: (code: number | null, stderr?: string, signal?: string | null) => void }
 function ownWatches(on: any) {
@@ -650,7 +650,7 @@ test('not live: the mod watches the paths itself, its ready makes the session li
   const { w, writes, watches } = await unwatched($, on)
   // Updated in place: no SessionStart is coming, so it starts at once, over the paths SessionStart would hand Claude
   expect(watches.length).toBe(1)
-  expect(watches[0]!.argv).toEqual([PYTHON, expect.stringMatching(/\/hooks\/launcher\.py$/), 'watch-paths', '--how', 'kqueue', ...PATHS])
+  expect(watches[0]!.argv).toEqual([PYTHON, expect.stringMatching(/\/hooks\/watcher\.py$/), 'watch-paths', '--how', 'kqueue', ...PATHS])
   expect(await liveLine($)).toContain('its own watch is starting')
   watches[0]!.say('ready\tkqueue\t7777\t12')
   await w.clock.advance(100)
@@ -678,9 +678,9 @@ test("not live: when the mod's own watch ends, the short timer is back and it st
   const { w, writes, watches } = await unwatched($, on)
   watches[0]!.say('ready\tkqueue\t7777\t12')
   await w.clock.advance(100)
-  watches[0]!.end(1, "launcher.py watch-paths: can't watch with kqueue: [Errno 24] Too many open files\n")
+  watches[0]!.end(1, "watcher.py watch-paths: can't watch with kqueue: [Errno 24] Too many open files\n")
   await w.clock.advance(100)
-  expect(await liveLine($)).toContain("; its own watch ended (exited with code 1: launcher.py watch-paths: can't watch with kqueue: [Errno 24] Too many open files) and starts again in 30 s")
+  expect(await liveLine($)).toContain("; its own watch ended (exited with code 1: watcher.py watch-paths: can't watch with kqueue: [Errno 24] Too many open files) and starts again in 30 s")
   // The short timer reads the files again, every 3 s
   registryFile(w, { ...SESSIONS[1]!, status: 'busy' })
   await w.clock.advance(3500)

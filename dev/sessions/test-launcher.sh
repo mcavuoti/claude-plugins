@@ -897,7 +897,7 @@ rm -f "$fix/attach-wait"
 unset SESSIONS_PLUGIN_VERSION SESSIONS_PLUGIN_SINCE
 pass "the window's watcher: .showing, a switch at once (end=1), a reopen that waits, the last frame kept, no report, cleanup; each watch; python3 required"
 
-# 16b. The mod's own watch (launcher.py watch-paths), with the kernel watch the platform picks (kqueue on macOS, inotify
+# 16b. The mod's own watch (watcher.py watch-paths), with the kernel watch the platform picks (kqueue on macOS, inotify
 #      on Linux): ready once armed, then a line for a write, a new file, a removal, a file in a folder made after it
 #      started (a watched folder that was missing) and a watched file written beside and renamed over (how bells and
 #      pins.json are written); it ends as soon as its parent does, even one killed outright
@@ -910,7 +910,7 @@ if [ -n "$how" ]; then
   paths="$work/paths"
   mkdir -p "$paths/reg" "$paths/jobs"
   echo one > "$paths/reg/1.json"
-  bash -c 'python3 "$1" watch-paths --how "$2" "$3/reg" "$3/tell" "$3/jobs/pins.json" > "$3.out" 2> "$3.err" & echo $! > "$3.pid"; wait' sh "$hooks/launcher.py" "$how" "$paths" &
+  bash -c 'python3 "$1" watch-paths --how "$2" "$3/reg" "$3/tell" "$3/jobs/pins.json" > "$3.out" 2> "$3.err" & echo $! > "$3.pid"; wait' sh "$hooks/watcher.py" "$how" "$paths" &
   outer=$!
   has_line() { grep -qxF "$1" "$paths.out"; }
   until_true 150 test -s "$paths.out" || fail "watch-paths" "no ready: $(cat "$paths.err")"
@@ -949,12 +949,12 @@ fi
 #      a folder is watched one level deep; and it never outlives its reader or its parent: it ends when its output's
 #      reader goes with nothing to write (a pipe, a socket), when its parent is killed outright while its reader is
 #      still there, when it's handed to another parent with no kernel event of it (its own look), and on a write to a
-#      reader that's gone with no kernel event of that (the kernel's word taken away in a copy of the launcher loaded here)
+#      reader that's gone with no kernel event of that (the kernel's word taken away in a copy of the watcher loaded here)
 if [ -n "$how" ]; then
   mkdir -p "$work/own"
-  python3 - "$hooks/launcher.py" "$how" "$work/own" > "$work/own.txt" 2> "$work/own.err" <<'PY' || fail "watchCommand's watcher ($how)" "$(cat "$work/own.err")"
+  python3 - "$hooks/watcher.py" "$how" "$work/own" > "$work/own.txt" 2> "$work/own.err" <<'PY' || fail "watchCommand's watcher ($how)" "$(cat "$work/own.err")"
 import importlib.util, os, select, signal, socket, subprocess, sys, time
-launcher, how, work = sys.argv[1:4]
+watcher, how, work = sys.argv[1:4]
 TAB = '\t'
 
 
@@ -1001,7 +1001,7 @@ latest = os.path.join(work, 'latest')
 os.makedirs(os.path.join(folder, 'sub'))
 with open(latest, 'w') as f:
     f.write('aaaa')
-argv = [sys.executable, launcher, 'watch-paths', '--how', how, '--depth', '0', latest, folder]
+argv = [sys.executable, watcher, 'watch-paths', '--how', how, '--depth', '0', latest, folder]
 
 p = subprocess.Popen(argv, stdout=subprocess.PIPE)
 out = p.stdout.fileno()
@@ -1070,10 +1070,10 @@ os.close(r)
 print('parent killed outright: ended')
 
 
-# A watcher run here from a copy of the launcher whose watch has no kernel word of its parent (follow_output: nor of its
+# A watcher run here from a copy of watcher.py whose watch has no kernel word of its parent (follow_output: nor of its
 # output), looking at its parent every 0.2 s, writing to out_fd
 def watcher_here(out_fd, follow_output):
-    spec = importlib.util.spec_from_file_location('launcher_under_test', launcher)
+    spec = importlib.util.spec_from_file_location('watcher_under_test', watcher)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     m.PARENT_CHECK_S = 0.2

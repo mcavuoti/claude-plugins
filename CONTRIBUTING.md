@@ -11,7 +11,7 @@ In `plugins/sessions`:
 
 | Files | What | Edit from |
 |---|---|---|
-| `hooks/register.tsx`, `hooks/state.ts`, `hooks/watch.ts`, `hooks/leader.ts`, `hooks/visor.sh`, `hooks/launcher.py`, `hooks/usage.py`, `statusline/`, `setup/` | shared: the panel, its data and actions, what it watches and who leads, the launcher (`ccc`), token usage, the status line, the setup | either |
+| `hooks/register.tsx`, `hooks/state.ts`, `hooks/watch.ts`, `hooks/leader.ts`, `hooks/visor.sh`, `hooks/launcher.py`, `hooks/watcher.py`, `hooks/usage.py`, `statusline/`, `setup/` | shared: the panel, its data and actions, what it watches and who leads, the launcher (`ccc`), the file watcher, token usage, the status line, the setup | either |
 | `types/index.d.ts`, `docs/plugin-contract.md`, `tests/contract.test.tsx` | the API other plugins call (`$.sessions`): its types, how it evolves, its golden method list | either |
 | `hooks/platform/types.ts` | the contract: what each system has to provide (windows, processes, memory, the kernel's file watch) | either, together with both implementations |
 | `hooks/platform/macos.ts` | macOS: Terminal.app through AppleScript, `ioreg`, `lsof`, `sysctl` | a Mac |
