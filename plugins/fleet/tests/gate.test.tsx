@@ -75,8 +75,11 @@ test('a stale write is refused once with who changed it and when; the thread hea
   expect(ev.length).toBe(1)
   expect(ev[0]).toMatchObject({ format: 1, path: 'notes/plan.md', via: 'tool', tool: 'Edit', blind: false, from: hashText('plan v2 from B\n'), to: hashText('plan v2 from B, and mine\n'), by: { sessionId: SID, agentId: null, ref: REF, name: 'TEST A' } })
   expect(json(w, `${FLEET}/events/latest`).last).toMatch(/-aaaaaaaa-\d+\.json$/)
-  // What this session read is in its reads file, for /fleet status elsewhere and a restart
+  // What this session read is in its reads file, for /fleet status elsewhere and a restart: within 10 s of a plain read
+  // (0.14.1: a burst of them is one write), not a second
   await tick(w, 1100)
+  expect(json(w, `${FLEET}/reads/${SID}.json`)).toBe(undefined)
+  await tick(w, 9000)
   expect(json(w, `${FLEET}/reads/${SID}.json`)).toMatchObject({ format: 1, sessionId: SID, name: 'TEST A', threads: { main: { 'notes/plan.md': { v: hashText('plan v2 from B, and mine\n') } } } })
 })
 
@@ -104,10 +107,10 @@ test("each thread answers for itself: a helper's read doesn't count for the main
   expect((await call($, { tool: 'Write', file_path: PLAN, content: 'helper\n', agentId: 'a1' })).deny).toBe(undefined)
   const ev = mine(w)
   expect(ev[0].by).toMatchObject({ sessionId: SID, agentId: 'a1' })
-  await tick(w, 1100)
+  await tick(w, 10100)
   expect(Object.keys(json(w, `${FLEET}/reads/${SID}.json`).threads)).toEqual(['a1'])
   await $.turn.complete({ answer: 'done', durationMs: 5, isAborted: false, turnId: 't-a1', reason: 'answer', agentId: 'a1' } as any)
-  await tick(w, 1100)
+  await tick(w, 10100)
   expect(Object.keys(json(w, `${FLEET}/reads/${SID}.json`).threads)).toEqual([])
 })
 

@@ -163,6 +163,14 @@ export type World = {
   readCount: Map<string, number>
   // ... and looked at (fs.stat, fs.exists)
   statCount: Map<string, number>
+  // How many tool registrations were in flight at once, at most
+  registering: { now: number; peak: number }
+  // Every host operation on files and commands, by kind and path ('read <path>', 'absent <path>' for a read of a file
+  // that isn't there, 'stat', 'exists', 'list', 'write', 'run <command>'), for a test that counts a call's or a minute's
+  ops: Map<string, number>
+  // The timers fleet's clock ran, by kind and period ("every:2000", "after:150"): one count per period of an every (its
+  // next period is asked as the last one fires) and per after, for a test that counts what wakes an idle session
+  timerCount: Map<string, number>
 }
 
 export type WorldOptions = {
@@ -197,7 +205,20 @@ function parentsOf(path: string): string[] {
 }
 
 export function world(on: On, options: WorldOptions = {}): World {
-  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 2, 12, 0, 0) })
+  // The kit's clock answers the timers; each of its answers is counted on the way
+  const timerCount = new Map<string, number>()
+  const counted = ((event: string, ...rest: any[]) => {
+    if (event === 'clock.every' || event === 'clock.after') {
+      const hook = rest[rest.length - 1]
+      rest[rest.length - 1] = (x: any, e: any, next: any) => {
+        const key = `${event.slice('clock.'.length)}:${e?.ms}`
+        timerCount.set(key, (timerCount.get(key) ?? 0) + 1)
+        return hook(x, e, next)
+      }
+    }
+    return (on as any)(event, ...rest)
+  }) as unknown as On
+  const clock = mock.clock(counted, { now: Date.UTC(2026, 10, 2, 12, 0, 0) })
   const files = new Map<string, string>(Object.entries(options.files ?? {}))
   // When each file was last written (fs.list's mtimeMs); a folder's time is a counter that moves when an entry in it
   // comes or goes (fleet only compares a folder's times)
@@ -270,8 +291,12 @@ export function world(on: On, options: WorldOptions = {}): World {
   const unreadable = new Set<string>()
   const readCount = new Map<string, number>()
   const statCount = new Map<string, number>()
+  const ops = new Map<string, number>()
+  const op = (k: string) => ops.set(k, (ops.get(k) ?? 0) + 1)
   on('fs.read', (_, e) => {
     readCount.set(e.path, (readCount.get(e.path) ?? 0) + 1)
+    op(`read ${e.path}`)
+    if (!files.has(e.path) && !e.path.endsWith('/.claude-plugin/plugin.json')) op(`absent ${e.path}`)
     if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: '{"version": "0.1.0"}' }
     if (unreadable.has(e.path)) throw new Error(`EMFILE: too many open files, open '${e.path}'`)
     const text = files.get(e.path)
@@ -279,14 +304,17 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: text }
   })
   on('fs.write', (_, e) => {
+    op(`write ${e.path}`)
     addFile(e.path, e.text)
     return { value: undefined }
   })
   on('fs.exists', (_, e) => {
+    op(`exists ${e.path}`)
     statCount.set(e.path, (statCount.get(e.path) ?? 0) + 1)
     return { value: files.has(e.path) || dirs.has(e.path) }
   })
   on('fs.list', (_, e) => {
+    op(`list ${e.path}`)
     lists.push(e.path)
     if (!dirs.has(e.path)) throw new Error(`ENOENT: ${e.path}`)
     const prefix = e.path === '/' ? '/' : `${e.path}/`
@@ -298,6 +326,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: entries }
   })
   on('fs.stat', (_, e) => {
+    op(`stat ${e.path}`)
     statCount.set(e.path, (statCount.get(e.path) ?? 0) + 1)
     const p = real(e.path)
     if (p === undefined) throw new Error(`ENOENT: ${e.path}`)
@@ -308,6 +337,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   const exec = { value: (_argv: string[], _cwd: string, _stdin?: string): { exitCode: number; stdout?: string; stderr?: string } | undefined => undefined }
   on('process.run', (_, e) => {
     const argv = [...e.argv]
+    op(`run ${argv[0]}`)
     runs.push(argv)
     const ok = { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
@@ -371,8 +401,14 @@ export function world(on: On, options: WorldOptions = {}): World {
     }
     return failed(`unknown command ${cmd}`)
   })
-  on('tool.register', (_, e) => {
+  // A registration settles a few steps later, as the engine's waits for the tool to be visible: registrations made
+  // together overlap, so a test can tell one wait from several in a row (registering.peak)
+  const registering = { now: 0, peak: 0 }
+  on('tool.register', async (_, e) => {
     tools.push(e)
+    registering.peak = Math.max(registering.peak, ++registering.now)
+    for (let i = 0; i < 3; i++) await Promise.resolve()
+    registering.now--
     return { value: { tool: `mcp__fleet__${e.name}` } }
   })
   on('command.register', (_, e) => {
@@ -442,7 +478,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec, readCount, statCount }
+  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec, readCount, statCount, ops, registering, timerCount }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {
