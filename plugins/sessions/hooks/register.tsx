@@ -1403,7 +1403,7 @@ async function pollRefresh($: any) {
   await requestRefresh($)
 }
 
-// ---- The mod's own watch (launcher.py watch-paths), where Claude watches nothing for this session ----
+// ---- The mod's own watch (watcher.py watch-paths), where Claude watches nothing for this session ----
 // With no SessionStart of this WATCH_SET (a plugin ahead of sessions sends it on past it, or the session was updated in
 // place), Claude raises no classic.FileChanged for the mod. The mod then runs a watcher of its own, a process that
 // sleeps in the kernel's file watch the platform names (platform.fileWatch) over the same paths SessionStart would hand
@@ -1414,7 +1414,9 @@ async function pollRefresh($: any) {
 // HELPER_TRIES times in a row at most (one that ran HELPER_STEADY_MS counts as none). A SessionStart ends it, since
 // Claude watches the paths from then on (stopHelper); a reload ends it with the module, and the new module starts its
 // own. It needs python3, which the plugin requires: without a usable one there's none, and /sessions status says so
-const WATCHER = `${(import.meta as any).dir}/launcher.py`
+// A file of its own, apart from the launcher: python compiles the file it's started with at every start, and a watcher
+// lives as long as its session, so what each one holds in memory follows that file's size (watcher.py)
+const WATCHER = `${(import.meta as any).dir}/watcher.py`
 const HELPER_RETRY_MS = 30000
 const HELPER_TRIES = 5
 const HELPER_STEADY_MS = 600000
@@ -5220,7 +5222,7 @@ function sessionsApi($: any): Sessions {
       kickQueue()
       return { ok: true, state: 'queued' as const }
     },
-    // The command for a watcher of the caller's own (launcher.py watch-paths, as the mod's own watch runs it), which the
+    // The command for a watcher of the caller's own (watcher.py watch-paths, as the mod's own watch runs it), which the
     // caller runs and reads itself: nothing is run or kept here
     watchCommand: async input => {
       const v = checkWatchPaths(input?.paths)

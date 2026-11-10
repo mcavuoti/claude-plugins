@@ -54,7 +54,7 @@ export type Platform = {
   // Whether the python3 found on the PATH (its path) can run without bothering the person (a system stub that asks to
   // install something first can't)
   pythonUsable(run: Run, path: string): Promise<boolean>
-  // The kernel's file watch for the mod's own watch (launcher.py watch-paths --how), where Claude watches nothing for the
+  // The kernel's file watch for the mod's own watch (watcher.py watch-paths --how), where Claude watches nothing for the
   // session (no SessionStart reached the mod)
   fileWatch: 'kqueue' | 'inotify'
   // Notices whose advice depends on how windows work on this system
