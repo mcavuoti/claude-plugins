@@ -468,6 +468,36 @@ test("wake after a reboot or a crash: a background session that ended with no st
   expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['dddddddd', 'ffffffff', '22222222', 'eeeeeeee', '11111111', '55555555'])
 })
 
+// A service signalled down with every worker (its sessions were adopted across an earlier upgrade, so the log has no
+// line of any of them since their starts rolled out of its tail): their heartbeats say when they last ran, the
+// service's next start finds them dead, and they read as ended, so a caller wakes them. One whose mod left no
+// heartbeat has nothing to say it ran after: unknown, as always
+test('status after a service signalled down with all its workers: ended by their heartbeats alone, and woken', WITH_PROBE, async ($, on) => {
+  const beat = Date.parse('1970-01-12T13:29:50.000Z')
+  const bg = (id: string, name: string) => ({ id, sessionId: `${id}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', name })
+  const w = world(on, { list: [...list(), bg('dddddddd', 'worker d'), bg('eeeeeeee', 'worker e'), bg('ffffffff', 'no heartbeat')] })
+  for (const id of ['dddddddd', 'eeeeeeee']) w.files.set(`${DATA}/alive/${id}-0000-0000-0000-000000000000`, heartbeatText({ pid: 5000, at: beat, version: '0.16.3', via: 'session.start', root: ROOT }))
+  w.memory.value = '1'
+  w.files.set(
+    '/Users/x/daemon.log',
+    [
+      '[1970-01-12T12:00:00.000Z] [supervisor] shutting down (cause=upgrade, uptime=1000s, leases=2, live_workers=3)',
+      '[1970-01-12T12:00:01.000Z] [supervisor] ─── daemon start ─── version=2.1.300 pid=100 origin=transient',
+      '[1970-01-12T12:00:01.500Z] [bg] bg adopt: adopted=3 respawned=0 dead=0',
+      '[1970-01-12T13:30:00.000Z] [supervisor] shutting down (cause=signal, uptime=5400s, leases=0, live_workers=3)',
+      '[1970-01-12T13:31:00.000Z] [supervisor] ─── daemon start ─── version=2.1.300 pid=200 origin=transient',
+      '[1970-01-12T13:31:00.500Z] [bg] bg adopt: adopted=0 respawned=0 dead=3',
+    ].join('\n'),
+  )
+  await startSession($, w)
+  const rows = (await call($, 'status', { refs: ['dddddddd', 'eeeeeeee', 'ffffffff'] })).rows
+  expect(Object.fromEntries(rows.map((r: any) => [r.ref, r.stopped ?? null]))).toEqual({ dddddddd: 'ended', eeeeeeee: 'ended', ffffffff: 'unknown' })
+  expect(await call($, 'wake', { ref: 'dddddddd', reason: 'x' })).toEqual({ ok: true, state: 'queued' })
+  expect((await call($, 'wake', { ref: 'ffffffff', reason: 'x' })).state).toBe('refused')
+  await w.clock.advance(600)
+  expect(w.runs.filter(a => a[1] === 'respawn').map(a => a[2])).toEqual(['dddddddd'])
+})
+
 test('wake with force still refuses a regular session and a memory close while memory is short', WITH_PROBE, async ($, on) => {
   const bg = (id: string, name: string) => ({ id, sessionId: `${id}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', name, startedAt: Date.parse('2026-10-26T08:00:00.000Z') })
   const w = world(on, { list: [...list(), bg('44444444', 'memory one'), bg('eeeeeeee', 'stopped by the person')] })
