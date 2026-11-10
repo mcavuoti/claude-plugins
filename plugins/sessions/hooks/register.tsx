@@ -201,7 +201,7 @@ import {
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
 import { bellFrom, bellOfKey, bellText, checkWatchPaths, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchPathsArgv, watchSetOf, type Locations, type RegistryEntry, type RegistryNews } from './watch'
-import { electLeader, LEADER_STALE_MS, leaderText, parseLeader, PASS_MS, type Candidate } from './leader'
+import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, PROCESS_STARTS_ENV, processGone, processStartsArgv, provenRunning, type Candidate } from './leader'
 
 const PANE = 'sessions'
 
@@ -374,6 +374,11 @@ let leading = false
 // Another session leads, as this one's last turn saw it (it lists, reads the usage and runs the shared commands)
 let leaderElsewhere = false
 let reconciledAt = 0
+// When the leader last asked which registered processes run, and the ones a listing left registered though their
+// process looked like another one (pid and start, as the registry has them): Claude takes them as running, so they're
+// no reason to list again
+let processesCheckedAt = 0
+const listedAnyway = new Set<string>()
 let usageRunAt = 0
 let leaderWrittenAt = 0
 // This session's own status from its own turn hooks, ahead of the registry (which comes 0.6 s later): it stands while
@@ -398,10 +403,10 @@ const LAUNCHER_ONLY: Record<string, string> = { SESSIONS_PLUGIN_VERSION: '', SES
 async function runSafe(
   $: any,
   argv: string[],
-  init?: { stdin?: string; timeoutMs?: number; cwd?: string },
+  init?: { stdin?: string; timeoutMs?: number; cwd?: string; env?: Record<string, string> },
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   try {
-    return await $.process.run(argv, { ...init, cwd: init?.cwd || workDir, env: LAUNCHER_ONLY })
+    return await $.process.run(argv, { ...init, cwd: init?.cwd || workDir, env: { ...init?.env, ...LAUNCHER_ONLY } })
   } catch (err) {
     return { exitCode: 127, stdout: '', stderr: String(err) }
   }
@@ -1590,9 +1595,10 @@ async function leaderCandidates($: any, now: number): Promise<Candidate[]> {
 }
 
 // The leader's turn: who leads (electLeader), and, leading, the record rewritten and what's due. On the pass and the
-// short timer's tick: the listing (a pass apart), the pins, the reopen, the prune; on a file event: the listing when it
-// just took over, the pins when a Remote Control connection moved, the token usage when a turn ended (two minutes
-// apart at least, and every 10 minutes)
+// short timer's tick: the listing when a registered process is gone (looked at a pass apart) or none ran for
+// LIST_SAFETY_MS, the pins, the reopen, the prune; on a file event: the listing when it just took over, the pins when a
+// Remote Control connection moved, the token usage when a turn ended (two minutes apart at least, and every 10
+// minutes)
 async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   if (!dataDir || !myId || !myPid) return
   const now = await $.clock.now()
@@ -1616,7 +1622,10 @@ async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   const news = leaderNews
   leaderNews = { bridge: false, ended: false }
   const timed = why === 'pass' || why === 'tick' || why === 'start'
-  if (!slowList && sessionFiles && (e.takeover || first || (timed && now - reconciledAt >= PASS_MS - 5000))) await reconcile($)
+  if (!slowList && sessionFiles) {
+    if (e.takeover || first) await reconcile($)
+    else if (timed) await listIfGone($, now)
+  }
   if (timed || news.bridge) bg(pinRemoteSessions($))
   if (timed) bg(reopenRetiredSessions($))
   if (timed) bg(prune($))
@@ -1626,10 +1635,10 @@ async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   }
 }
 
-// The leader's listing (claude agents --json --all), a pass apart: Claude removes the registry files of sessions whose
-// process is gone as it lists (a crashed one's file stays until then), and what it lists is checked against the direct
-// read, any difference said in the debug log
-async function reconcile($: any) {
+// The leader's listing (claude agents --json --all): Claude removes the registry files of sessions whose process is
+// gone as it lists (a crashed one's file stays until then), and what it lists is checked against the direct read, any
+// difference said in the debug log. gone: the registered sessions whose process looked gone, which asked for it
+async function reconcile($: any, gone: readonly RegistryEntry[] = []) {
   reconciledAt = await $.clock.now()
   const r = await run($, [claude, 'agents', '--json', '--all'])
   if (r.exitCode !== 0) return
@@ -1637,8 +1646,35 @@ async function reconcile($: any) {
   if (typeof official === 'string') return
   const drift = listDrift(sessionFiles?.list() ?? [], official)
   if (drift) debugLine($, `reconcile: ${drift}`)
+  // One Claude still lists as running under that process: its start only reads another way here
+  if (listedAnyway.size > 200) listedAnyway.clear()
+  for (const e of gone) if (official.some(s => s.sessionId === e.sessionId && s.pid === e.pid)) listedAnyway.add(`${e.pid}:${e.procStart ?? ''}`)
   // The files it swept: their events come; read again in a moment all the same
   scheduleFlush($, 300, d => (d.registry = true))
+}
+
+// The listing only when it has something to sweep (leader.ts): a pass apart, the registered sessions that no fresh
+// heartbeat of their own process proves running are asked about in one ps of those processes (with this one's, which
+// must be in its answer: a ps that can't tell says nothing, and the listing runs as it did, a pass apart); one gone,
+// or none listed for LIST_SAFETY_MS, and it lists
+async function listIfGone($: any, now: number) {
+  if (now - reconciledAt >= LIST_SAFETY_MS) return reconcile($)
+  if (!sessionFiles || now - processesCheckedAt < PASS_MS - 5000) return
+  processesCheckedAt = now
+  const others = sessionFiles.entries().filter(e => e.pid !== myPid && !listedAnyway.has(`${e.pid}:${e.procStart ?? ''}`))
+  const beats = await readHeartbeats($, others.map(e => e.sessionId))
+  const unproven = others.filter(e => !provenRunning(beats[e.sessionId], e.pid, now))
+  if (unproven.length === 0) return
+  const r = await runSafe($, processStartsArgv([myPid, ...unproven.map(e => e.pid)]), { timeoutMs: 15000, env: PROCESS_STARTS_ENV })
+  const started = parseProcessStarts(r.stdout)
+  if (!started.has(myPid)) {
+    if (now - reconciledAt >= PASS_MS - 5000) await reconcile($)
+    return
+  }
+  const gone = unproven.filter(e => processGone(e, started))
+  if (gone.length === 0) return
+  debugLine($, `leader: ${gone.length === 1 ? `the process of a registered session (pid ${gone[0]?.pid}) is gone` : `the processes of ${gone.length} registered sessions are gone`}: listing, which sweeps ${gone.length === 1 ? 'its file' : 'their files'}`)
+  await reconcile($, gone)
 }
 
 // ---- What the engine watches (watch.ts) ----

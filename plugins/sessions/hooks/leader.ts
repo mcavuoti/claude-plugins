@@ -9,16 +9,29 @@
 // the same process.
 // A leader that ended cleanly leaves the registry at once (its file is removed: about 0.15 s later every session
 // knows); one that crashed keeps its registry file until a listing sweeps it, but its heartbeat goes stale within 45 s,
-// and its record two passes after its last one: then the next one takes over and lists at once, which sweeps the dead
-// one's file. Two sessions leading for a moment (each read the other's state an instant late) do no harm: every duty is
-// idempotent, under the same locks as before.
+// and its record two passes after its last one: then the next one takes over, finds its process gone and lists, which
+// sweeps the dead one's file. Two sessions leading for a moment (each read the other's state an instant late) do no
+// harm: every duty is idempotent, under the same locks as before.
+//
+// The listing gives the panel one thing Claude's files don't: as it lists, Claude removes the registry file of a
+// session whose process is gone (crashed, or killed), and until then that session's row stays as it last was. So the
+// leader lists when it starts leading, when a registered process is gone, and every LIST_SAFETY_MS whatever it found;
+// not once a pass. Whether one is gone, each pass: a session whose heartbeat is fresh and from its process runs
+// (provenRunning: nothing is asked); for the rest (no mod, a mod that stopped, another data folder), one
+// `ps -p <pids> -o pid= -o lstart=` says which run and when each started, which tells a process from another one that
+// took its number since (processGone). A crashed session's row then goes within about two minutes (its heartbeat
+// stale after 45 s, the leader's next pass, the listing, the sweep's file event) where it went within one; one with no
+// heartbeat here, within a pass as before.
 
-import { FORMAT, keyLines, parseKeyLines } from './state'
+import { FORMAT, HEARTBEAT_FRESH_MS, keyLines, parseKeyLines, type Heartbeat } from './state'
 
 // Every session's own pass (the safety pass: everything read again, whatever the file events said), and the leader's
 export const PASS_MS = 60000
 // A leader record this old is a leader that stopped working (two passes missed)
 export const LEADER_STALE_MS = 2 * PASS_MS
+// The leader's listing, when nothing asked for one sooner: what the check of the registered processes can't see (a
+// file Claude keeps for itself whose process is gone, a difference between the direct read and Claude's own list)
+export const LIST_SAFETY_MS = 10 * PASS_MS
 
 export type LeaderRecord = { format: number; pid: number; sessionId: string; at: number }
 export function leaderText(r: Omit<LeaderRecord, 'format'>): string {
@@ -54,4 +67,37 @@ export function electLeader(me: Candidate, candidates: readonly Candidate[], rec
 // machine don't all read at once
 export function passDelay(stagger: number): number {
   return PASS_MS + (stagger % 10000)
+}
+
+// A registered session whose heartbeat here is fresh and from that very process runs, with nothing asked
+export function provenRunning(h: Heartbeat | null | undefined, pid: number, now: number): boolean {
+  return !!h && h.pid === pid && now - h.at <= HEARTBEAT_FRESH_MS
+}
+
+// The command that says which of these processes run and when each started; and the environment it runs in, so the
+// start reads as the registry's procStart does (UTC, English)
+export function processStartsArgv(pids: readonly number[]): string[] {
+  return ['ps', '-p', pids.join(','), '-o', 'pid=', '-o', 'lstart=']
+}
+export const PROCESS_STARTS_ENV: Record<string, string> = { TZ: 'UTC', LC_ALL: 'C' }
+
+// Its answer: by pid, the start with single spaces ("Mon Nov 9 04:32:54 2026"). A process that isn't running has no line
+export function parseProcessStarts(ps: string): Map<number, string> {
+  const out = new Map<number, string>()
+  for (const line of ps.split('\n')) {
+    const [pid, ...rest] = line.trim().split(/\s+/)
+    if (pid && /^\d+$/.test(pid)) out.set(Number(pid), rest.join(' '))
+  }
+  return out
+}
+
+// Whether a registered session's process is gone: it isn't running, or another process runs under its number (it
+// started at another moment than the registry recorded). The second only when both are whole start times of that
+// shape: a registry or a ps that writes it another way says nothing against the process
+const LSTART = /^[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d\d:\d\d:\d\d \d{4}$/
+export function processGone(e: { pid: number; procStart?: string }, started: ReadonlyMap<number, string>): boolean {
+  const at = started.get(e.pid)
+  if (at === undefined) return true
+  const recorded = (e.procStart ?? '').trim().split(/\s+/).join(' ')
+  return LSTART.test(recorded) && LSTART.test(at) && recorded !== at
 }

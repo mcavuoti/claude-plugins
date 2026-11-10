@@ -15,6 +15,8 @@ export const COMMAND = { origin: { kind: 'composer' }, presentation: { isFullscr
 // For a test that starts the mod and moves the mocked clock through many minutes: 30 s rather than the kit's 5 s,
 // which a slow or busy machine (the CI runners) can run past
 export const SLOW = { timeoutMs: 30000 } as const
+// When a process started, as ps prints it under TZ=UTC and LC_ALL=C (and Claude's registry keeps it, procStart)
+export const STARTED = 'Mon Nov  9 04:32:54 2026'
 
 export type World = {
   files: Map<string, string>
@@ -67,6 +69,10 @@ export type World = {
   terminalLate: { value: number }
   // What xprop answers (X11 on Linux), by its arguments; null: xprop fails, as without a display (the default)
   xprop: { value: (args: string[]) => string | null }
+  // The processes that don't run, by pid (`ps -p <pids> -o pid= -o lstart=` lists every other one asked about), and
+  // when one started where that isn't STARTED
+  gone: Set<number>
+  startedAt: Map<number, string>
   // While set, `claude agents` answers only once it resolves (a slow listing)
   agentsGate: { value: Promise<void> | null }
   // While true, `claude agents` fails (exit 127, as when run's timeout cuts it), after the gate if one is set
@@ -135,6 +141,8 @@ export function world(on: On, options: WorldOptions = {}): World {
   const terminal = { value: (_args: string[]) => '' }
   const terminalLate = { value: 0 }
   const xprop = { value: (_args: string[]): string | null => null }
+  const gone = new Set<number>()
+  const startedAt = new Map<number, string>()
   const agentsGate: { value: Promise<void> | null } = { value: null }
   const agentsFail = { value: false }
   const plugins = { value: '[]' }
@@ -274,6 +282,11 @@ export function world(on: On, options: WorldOptions = {}): World {
     // As a real ps reads -o (POSIX, which procps keeps to the letter): in `name=header` the header runs to the end of
     // that -o argument, so `-o pid=,tty=,command=` is one pid column headed ",tty=,command=", and only pids are listed
     // -p <pids>: only those processes, and exit code 1 when none of them runs
+    if (argv[0] === 'ps' && argv.includes('lstart=')) {
+      const asked = String(argv[argv.indexOf('-p') + 1]).split(',').map(Number)
+      const lines = asked.filter(p => !gone.has(p)).map(p => `${String(p).padStart(5)} ${startedAt.get(p) ?? STARTED}`)
+      return lines.length ? ok(`${lines.join('\n')}\n`) : failed()
+    }
     if (argv[0] === 'ps') {
       const header = argv.find((a, i) => argv[i - 1] === '-o' && /=./.test(a))
       const pids = argv.includes('-p') ? new Set(String(argv[argv.indexOf('-p') + 1]).split(',')) : null
@@ -340,7 +353,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, xprop, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {
