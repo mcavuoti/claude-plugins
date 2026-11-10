@@ -660,8 +660,21 @@ test('live: a start another plugin queues runs at once, with no 0.5 s timer', { 
   expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === '--bg' && a.includes('helper'))).toBe(true)
 })
 
-test('an answer nobody saw, in a session no window shows: the seen check looks again a minute later, one ps a minute at most', SLOW, async ($, on) => {
+test('an answer nobody saw, in a session no window shows: the seen check looks again a minute later, with one ps of every process every five minutes once it is 10 minutes old', SLOW, async ($, on) => {
   const w = world(on, { list: listed(SESSIONS), store: { [`state:${SID}`]: { finished: 1_000_000_000 - 20 * MIN } } })
+  for (const s of SESSIONS) registryFile(w, s)
+  await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
+  await startSession($, w)
+  await w.clock.advance(MIN)
+  const ps = runsOf(w, 'ps', '-A')
+  await w.clock.advance(10 * MIN)
+  expect(runsOf(w, 'ps', '-A') - ps).toBeLessThanOrEqual(3)
+  expect(runsOf(w, 'ps', '-A') - ps).toBeGreaterThanOrEqual(2)
+  expect(runsOf(w, 'osascript')).toBe(0)
+})
+
+test('an answer under 10 minutes old, in a session no window shows: one ps of every process a minute, as before', SLOW, async ($, on) => {
+  const w = world(on, { list: listed(SESSIONS), store: { [`state:${SID}`]: { finished: 1_000_000_000 - 2 * MIN } } })
   for (const s of SESSIONS) registryFile(w, s)
   await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
   await startSession($, w)
@@ -670,7 +683,6 @@ test('an answer nobody saw, in a session no window shows: the seen check looks a
   await w.clock.advance(5 * MIN)
   expect(runsOf(w, 'ps', '-A') - ps).toBeLessThanOrEqual(5)
   expect(runsOf(w, 'ps', '-A') - ps).toBeGreaterThanOrEqual(3)
-  expect(runsOf(w, 'osascript')).toBe(0)
 })
 
 // ---- The mod's own watch, where Claude watches nothing for the session ----

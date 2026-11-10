@@ -1069,6 +1069,32 @@ export function showingRuns(s: Showing, ps: string): boolean {
   return launcher && watcher
 }
 
+// The seen check's view of the windows: a listing (ps), with what the launcher windows say they show right now (their
+// .showing files, read with no command) in place of what it had for their terminals. So a listing taken a while ago is
+// still right about the windows opened with ccc, whatever they switched to since
+export function withShowing(v: Windows, shown: readonly Showing[]): Windows {
+  const published = new Set(shown.map(s => s.tty))
+  const byId: Record<string, string[]> = {}
+  for (const [id, ttys] of Object.entries(v.byId)) {
+    const kept = ttys.filter(t => !published.has(t))
+    if (kept.length) byId[id] = kept
+  }
+  const agentsViews = v.agentsViews.filter(a => !published.has(a.tty))
+  const clients = Object.fromEntries(Object.entries(v.clients).filter(([tty]) => !published.has(tty)))
+  for (const s of shown) {
+    if (s.command === 'attach') (byId[s.id] ??= []).push(s.tty)
+    else agentsViews.push({ pid: s.viewer, tty: s.tty })
+    clients[s.tty] = s.viewer
+  }
+  return { byId, byPid: v.byPid, agentsViews, clients, launchers: v.launchers }
+}
+
+// The windows that say what they show whose launcher a listing saw running on their terminal: only those are taken at
+// their word. One no listing confirmed is a window opened since, or a file its launcher left behind
+export function listedLaunchers(v: Windows, shown: readonly Showing[]): Showing[] {
+  return shown.filter(s => v.launchers[s.tty] === s.launcher)
+}
+
 // A switch from this session's panel by what the launcher windows publish, with no ps and no question to the terminal
 // (jump in register.tsx): 'switch' the one launcher window showing this session (its watcher ends the viewer there),
 // or 'bring' forward one that shows the target. null, the usual way (ps, and on macOS the window in front), whenever

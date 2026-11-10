@@ -140,6 +140,8 @@ import {
   parseShowing,
   showingRuns,
   planSwitch,
+  withShowing,
+  listedLaunchers,
   autoName,
   bgRefusal,
   checkStart,
@@ -820,8 +822,8 @@ async function myWindows($: any): Promise<string[]> {
 
 // The windows listing and the window in front, shared by every session for the seen check: one ps then serves every
 // session for SEEN_WINDOWS_MS (5 s in the first minute after a finish; which windows are open changes rarely, and
-// arriving in a session marks it seen without it), and one question to Terminal for FRONT_SHARED_MS, a little under
-// the fastest pace of the check. Only for that
+// arriving in a session marks it seen without it; SEEN_WINDOWS_LAZY_MS where the check says the listing can be older),
+// and one question to Terminal for FRONT_SHARED_MS, a little under the fastest pace of the check. Only for that
 // check: what acts on a window (closing a viewer, a switch) reads the listing right then, and a switch the usual way
 // stores what it read (shareWindows); a switch by the launcher windows reads the stored one only to know whether a
 // window that publishes nothing shows either session (planSwitch), never to act on a window. Like the session list:
@@ -829,17 +831,22 @@ async function myWindows($: any): Promise<string[]> {
 // meanwhile; a ps that took longer than SHARED_MS pushes every session's next one back (twice its time, up to 30 s)
 const SHARED_MS = 1500
 const SEEN_WINDOWS_MS = 30000
+const SEEN_WINDOWS_LAZY_MS = 300000
 const FRONT_SHARED_MS = 1900
 const WINDOWS_PENDING_MS = 10000
 // Two questions to Terminal at most (the front window, an agent view's text), 8 s each at most
 const FRONT_PENDING_MS = 20000
 const WINDOWS_BACKOFF_MAX_MS = 30000
-async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<Windows> {
+// The stored listing as it is (null: none, or not one), then one at most maxAge old (its `at`: when its ps came back)
+function storedWindows(c: any): { windows: Windows; at: number } | null {
+  return c && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid && c.windows.launchers ? { windows: c.windows as Windows, at: Number(c.at) || 0 } : null
+}
+async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<{ windows: Windows; at: number }> {
   const now = await $.clock.now()
   const c = await storeGet($, 'windowsList')
-  const stored = c && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid ? (c.windows as Windows) : null
+  const stored = storedWindows(c)
   if (stored) {
-    if (now - Number(c.at) < maxAge) return stored
+    if (now - stored.at < maxAge) return stored
     if (typeof c.until === 'number' && now < c.until) return stored
     if (typeof c.pendingAt === 'number' && now - c.pendingAt < WINDOWS_PENDING_MS) return stored
     await storeSet($, 'windowsList', { ...c, pendingAt: now })
@@ -848,7 +855,7 @@ async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<Windows>
   const at = await $.clock.now()
   const took = at - now
   await storeSet($, 'windowsList', { at, windows: v, ...(took > SHARED_MS ? { until: at + Math.min(WINDOWS_BACKOFF_MAX_MS, 2 * took) } : {}) })
-  return v
+  return { windows: v, at }
 }
 
 // The window in front ('frontWindow': at, tty, and with an agent view in front, tags: the sessions it shows by their
@@ -895,6 +902,15 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
 // A session no window shows (no viewer of it, no agent view) past the first minute after its answer is checked again a
 // minute later (seenQuietUntil), with a listing up to a minute old: arriving there with ccc, or from another panel
 // (Enter or a click), marks it seen anyway
+// The listing (a ps of every process) is what finds the windows; the windows opened with ccc also say what they show
+// in a file (.showing), read at every check with no command and taken over the listing for their terminals
+// (withShowing), once a listing saw their launcher running there (listedLaunchers). So the listing can be older,
+// SEEN_WINDOWS_LAZY_MS, where it's only there to find a viewer opened by hand: while there are such windows and the
+// last listing saw every one of them (and, for a regular session, its own process: its own window is found there),
+// and for an answer 10 minutes old on a session no window showed last time. A viewer opened by hand is then noticed
+// up to that much later; one opened with ccc, at once (its file). Before a window
+// counts as looked at on the word of an older listing, it's asked about now: its launcher and watcher (one ps of those
+// two) when it says what it shows, else a listing taken now; never a regular session's own window
 let seenCheckedAt = 0
 let seenQuietUntil = 0
 async function markSeenIfLooking($: any) {
@@ -907,13 +923,33 @@ async function markSeenIfLooking($: any) {
   // In the first minute after a finish the person may well be opening a window on it: a listing at most 5 s old then;
   // a minute old once the answer is 10 minutes old, or when no window showed this session last time
   const age = now - finished
-  const v = await sharedWindows($, age < 60000 ? 5000 : age >= 600000 || seenQuietUntil > 0 ? 2 * SEEN_WINDOWS_MS : SEEN_WINDOWS_MS)
-  const mine = myWindowsIn(v)
+  const quiet = seenQuietUntil > 0
+  const strict = age < 60000 ? 5000 : age >= 600000 || quiet ? 2 * SEEN_WINDOWS_MS : SEEN_WINDOWS_MS
+  const shown = await launcherWindows($)
+  const before = storedWindows(await storeGet($, 'windowsList'))
+  const ownListed = !!before && (me().background || !!before.windows.byPid[String(myPid)])
+  const lazy = !!before && ownListed && listedLaunchers(before.windows, shown).length === shown.length && (shown.length > 0 || (quiet && age >= 600000))
+  let listed = await sharedWindows($, lazy ? SEEN_WINDOWS_LAZY_MS : strict)
+  const told = listedLaunchers(listed.windows, shown)
+  let v = withShowing(listed.windows, told)
+  let mine = myWindowsIn(v)
   seenQuietUntil = mine.length === 0 && v.agentsViews.length === 0 && age >= 60000 ? now + 60000 : 0
   if (mine.length === 0 && v.agentsViews.length === 0) return
   const front = await sharedFront($, v)
   const tty = front?.tty
   if (!tty) return
+  if (mine.includes(tty) && now - listed.at >= strict && tty !== v.byPid[String(myPid)]) {
+    const window = told.find(s => s.tty === tty)
+    if (window) {
+      if (!(await launcherRuns($, window))) return
+    } else {
+      listed = await sharedWindows($, 0)
+      // Another session's listing in flight, or a slow ps's back-off: not on an older one's word; the next check asks
+      if (listed.at < now) return
+      v = withShowing(listed.windows, listedLaunchers(listed.windows, shown))
+      mine = myWindowsIn(v)
+    }
+  }
   const looking = mine.includes(tty) || (v.agentsViews.some(c => c.tty === tty) && !!front.tags?.includes(myShortId()))
   if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
