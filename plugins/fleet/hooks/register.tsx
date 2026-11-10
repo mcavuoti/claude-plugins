@@ -665,6 +665,7 @@ async function ownWatchReady($: any, h: OwnWatch, pid: string, how: string) {
   live = true
   watchingLatest = true
   watchMisses = 0
+  pace($)
   // What changed before it was ready is in no line: one pass of everything now
   ringHere($, ['deliver', 'beat', 'sweep'])
 }
@@ -684,6 +685,7 @@ async function ownWatchGone($: any, h: OwnWatch, why: string) {
   if (wasLive) {
     live = false
     watchingLatest = false
+    pace($)
   }
   scheduleOwnWatch($, wait)
 }
@@ -724,6 +726,7 @@ function fileChanged($: any, path: string, engine: boolean) {
   if (root && engine && handedSet && path.includes('/.claude/fleet/bell/') && (!live || ownWatchLive || ownWatch)) {
     const off = !live
     live = true
+    pace($)
     bg(update($, watching, () => FLEET_WATCH_SET))
     stopOwnWatch($)
     if (off) ringHere($, ['deliver', 'beat', 'sweep'])
@@ -1270,6 +1273,7 @@ function timers($: any) {
         if (!live && (await read($, watching)) === FLEET_WATCH_SET) {
           live = true
           watchingLatest = true
+          pace($)
           // What came while no module ran (a reload) raises no event: one pass of everything now
           ringHere($, ['deliver', 'beat', 'sweep'])
         }
@@ -1278,17 +1282,12 @@ function timers($: any) {
   )
   // No live updates by then: fleet's own watch
   scheduleOwnWatch($, OWN_WATCH_WAIT_MS)
-  // Live, the timers below are the safety pass: their ticks in between end at once, with nothing read
-  let deliverTicks = 0
-  let beatTicks = 0
+  // Delivery, the world and the beat: the set of timers the session's state calls for (pace)
+  pace($)
   if (jobRef) {
     $.clock.after(0, () => bg(rebuild($)))
-    $.clock.every(2000, () => {
-      // A slot it waits for: its line looked at every 2 s while it waits (nothing but a state read otherwise)
-      bg(slotWatch($))
-      if (live && ++deliverTicks % 30 !== 0) return
-      bg(deliverChain($))
-    })
+    // A slot it waits for in a line it joined before a reload: watched again
+    $.clock.after(0, () => bg((async () => ((await read($, slotWait)).length ? watchSlots($) : undefined))()))
     // An instance of the roster: its binding, heartbeat and spend; its seed, and its nudges
     $.clock.after(1500, () => bg(instanceTick($)))
     $.clock.every(30000, () => bg(instanceTick($)))
@@ -1301,12 +1300,62 @@ function timers($: any) {
   // What fleet needs and doesn't find, for the band: looked at now and each minute (sessions may still be starting)
   $.clock.after(0, () => bg(refreshNeeds($)))
   $.clock.every(60000, () => bg(refreshNeeds($)))
-  $.clock.every(2000, () => bg(worldTick($)))
-  $.clock.every(10000, () => {
-    if (live && !sweep.holding && !sweep.takenAt && ++beatTicks % 6 !== 0) return
-    bg(beatOnce($))
-  })
   $.clock.after(1000, () => bg(beatOnce($)))
+}
+
+// The pace of delivery, the world and the beat (0.14.1): one set of timers at a time, the one the session's state calls
+// for, chosen again each time that state changes (live updates on or off, the lease held, lost or being taken). `timers`
+// wherever live updates are off, and while it takes the lease: delivery and the world every 2 s, the beat every 10 s
+// (live and taking the lease, delivery every 60 s). `sweeper`, the sweeping session with live updates on: the world and
+// the beat every 10 s (its outside scan), delivery every 60 s. `quiet`, a live session that neither sweeps nor takes the
+// lease: the lease looked at every 30 s, the world every 60 s, delivery and the beat every 60 s; what it acts on comes
+// by FileChanged (a landing, a question, an answer, a bell), so these are the safety pass, and nothing wakes it every 2 s.
+// A change of set cancels the old timers before the new ones start: never two sets, and a pass the new set owes runs
+// on its first timer (2 s, 10 s or 30 s)
+type PaceSet = 'timers' | 'sweeper' | 'quiet'
+const QUIET_LEASE_MS = 30000
+const QUIET_PASS_MS = 60000
+let paceSet: PaceSet | null = null
+let paceTimers: { cancel: () => void }[] = []
+function paceNow(): PaceSet {
+  if (!live || sweep.takenAt) return 'timers'
+  return sweep.holding ? 'sweeper' : 'quiet'
+}
+function pace($: any) {
+  if (!timersOn) return
+  const set = paceNow()
+  if (set === paceSet) return
+  paceSet = set
+  for (const t of paceTimers) t.cancel()
+  paceTimers = []
+  if (set === 'timers') {
+    // Live while it takes the lease, delivery's ticks in between end at once
+    let deliverTicks = 0
+    let beatTicks = 0
+    if (jobRef)
+      paceTimers.push(
+        $.clock.every(2000, () => {
+          if (live && ++deliverTicks % 30 !== 0) return
+          bg(deliverChain($))
+        }),
+      )
+    paceTimers.push($.clock.every(2000, () => bg(worldTick($))))
+    paceTimers.push(
+      $.clock.every(10000, () => {
+        if (live && !sweep.holding && !sweep.takenAt && ++beatTicks % 6 !== 0) return
+        bg(beatOnce($))
+      }),
+    )
+    return
+  }
+  if (jobRef) paceTimers.push($.clock.every(QUIET_PASS_MS, () => bg(deliverChain($))))
+  if (set === 'sweeper') {
+    paceTimers.push($.clock.every(WORLD_SLOW_MS, () => bg(worldTick($))))
+    paceTimers.push($.clock.every(10000, () => bg(beatOnce($))))
+  } else {
+    paceTimers.push($.clock.every(QUIET_LEASE_MS, () => bg(worldTick($))))
+    paceTimers.push($.clock.every(QUIET_PASS_MS, () => bg(beatOnce($))))
+  }
 }
 
 // ---- The decisions' files ----
@@ -2433,6 +2482,7 @@ async function eventsTick($: any, fromPoll = false) {
         // proves the watch again (a bell no longer does, and a reload doesn't inherit it)
         live = false
         handedSet = false
+        pace($)
         bg(update($, watching, () => 0))
         log($, "events/latest: the engine's watcher didn't bring two landings; the world is looked at every 2 s, and live updates are off")
         // The own watch missed them: it ends and starts again after its back-off. Claude's watch did: the own watch takes over
@@ -4407,8 +4457,9 @@ async function startWorld($: any) {
 
 // Every 2 s; every WORLD_SLOW_MS instead while the engine watches events/latest for this session (classic.SessionStart
 // returned it) in a session that doesn't sweep, or sweeps with live updates on (FileChanged rings its sweep), and isn't
-// taking the lease: the watcher brings landings at once, so the tick is only the fallback. A reload of the module (no
-// SessionStart of its own) starts at 2 s again, unless its SessionStart's set is in $.state (live)
+// taking the lease: the watcher brings landings at once, so the tick is only the fallback; live in a session that
+// doesn't sweep, every QUIET_PASS_MS (pace's quiet set). A reload of the module (no SessionStart of its own) starts at
+// 2 s again, unless its SessionStart's set is in $.state (live)
 const WORLD_SLOW_MS = 10000
 let watchingLatest = false
 let watchMisses = 0
@@ -4423,7 +4474,13 @@ async function worldTick($: any) {
   // at once (FileChanged), so its tick is the safety pass. Taking the lease stays at 2 s (the 2 s check of a take)
   if (watchingLatest && (!sweep.holding || live) && !sweep.takenAt) {
     const now = await $.clock.now()
-    if (now - worldTickAt < WORLD_SLOW_MS - 500) return
+    // Live in a session that doesn't sweep (pace's quiet set, a timer every 30 s): the world every 60 s, the lease at
+    // every tick, so a sweeper that stopped renewing it is replaced within LEASE_MS + 30 s (+ the taker's 2 s)
+    const quiet = live && !sweep.holding
+    if (now - worldTickAt < (quiet ? QUIET_PASS_MS : WORLD_SLOW_MS) - 500) {
+      if (quiet) await lease($)
+      return
+    }
     worldTickAt = now
   }
   if (!realRoot) {
@@ -4452,6 +4509,14 @@ const sweep = { bornAt: 0, holding: false, takenAt: 0, leaseAt: 0, lastSweep: 0,
 // (or none) is taken by writing it, and the taker sweeps once it still finds itself there 2 s later (two that took it
 // at once: the last write wins, and the other backs off). Replaced with mv, no lock: a minute of two sweepers is harmless
 async function lease($: any) {
+  try {
+    await leaseOnce($)
+  } finally {
+    // Held, lost or being taken: the timers that state calls for
+    pace($)
+  }
+}
+async function leaseOnce($: any) {
   const now = await $.clock.now()
   const due = sweep.holding ? 30000 : sweep.takenAt ? 2000 : 10000
   if (now - sweep.leaseAt < due) return
@@ -4509,6 +4574,7 @@ async function sweeperState($: any): Promise<{ line: string; nobody: boolean }> 
 async function releaseLease($: any) {
   if (!sweep.holding || !root) return
   sweep.holding = false
+  pace($)
   const l = parseLease(await readText($, stateDir('sweeper.json')))
   if (l && l.sessionId === String(await $.session.id())) await remove($, [stateDir('sweeper.json')])
   // Its marks on the instances' rows go with it (the next sweeper sets them again)
@@ -5680,6 +5746,7 @@ async function slotCall($: any, e: any): Promise<any> {
     await run($, ['mkdir', '-p', slotDir(name, 'waiting')])
     await replace($, slotDir(name, `waiting/${holderKey(holder)}.json`), json(w))
     await update($, slotWait, l => (l.includes(name) ? l : [...l, name]))
+    watchSlots($)
     log($, `slot ${name}: ${slotHolderWords(holder)} waits (number ${v.place})`)
     return {
       result: `None of ${name} is free (${slotState(spec, leases.map(x => x.lease), [], now, me.offsetMin)}). You're number ${v.place} in line: fleet gives you one as soon as it's free, and tells you then (a message from fleet). Don't wait for it: do other work, or end your turn.`,
@@ -8009,20 +8076,37 @@ function kickNudge($: any, delayMs = 0) {
 const nudgeSeen: Record<'decisions' | 'work' | 'runs' | 'budget' | 'restart', string | number | null> = { decisions: null, work: null, runs: null, budget: null, restart: null }
 
 /** Every 2 s while it waits in a slot's line: that slot's folder, where another session gives it the slot (its lease
- * runs from then), so it's told within seconds, not at the next pass. One stat a slot; nothing while it waits on none */
+ * runs from then), so it's told within seconds, not at the next pass. One stat a slot; its timer runs only while it
+ * waits (watchSlots, started as it joins a line). Whether it still waits */
 let slotTimes: string | null = null
-async function slotWatch($: any) {
-  if (!myInstance) return
+async function slotWatch($: any): Promise<boolean> {
   const waits = await read($, slotWait)
   if (!waits.length) {
     slotTimes = null
-    return
+    return false
   }
+  if (!myInstance) return true
   let times = ''
   for (const s of waits) times += `${s}:${await folderTime($, stateDir(`slots/${s}`))},`
   const before = slotTimes
   slotTimes = times
   if (before !== null && before !== times) kickNudge($)
+  return true
+}
+let slotTimer: { cancel: () => void } | null = null
+function watchSlots($: any) {
+  if (slotTimer || !jobRef || !timersOn) return
+  slotTimer = $.clock.every(2000, () =>
+    bg(
+      (async () => {
+        if (await slotWatch($)) return
+        slotTimer?.cancel()
+        slotTimer = null
+        // A line joined while this look found none: watched again
+        if ((await read($, slotWait)).length) watchSlots($)
+      })(),
+    ),
+  )
 }
 async function watchForNudge($: any, records: readonly QueueRecord[], present: ReadonlySet<string>) {
   const inst = myInstance
@@ -13280,6 +13364,7 @@ export const register: Register = on => {
       // before, so live waits for that proof again)
       live = false
       handedSet = true
+      pace($)
       $.clock.after(1000, () => bg(ringBell($, 'probe')))
       // Claude watches from now on: the own watch ends, and comes back only if the probe doesn't prove that
       stopOwnWatch($)
