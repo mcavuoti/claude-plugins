@@ -3749,6 +3749,16 @@ async function paneState($: any) {
   if (!sameData(await read($, paneNote), note)) await update($, paneNote, () => note)
 }
 
+// Enter on this session's own row: the keyboard goes to the text box, to type here. A press with the panel not holding
+// the keyboard (a click) says where you are, as before
+async function toPrompt($: any) {
+  if (!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused) {
+    $.ui.toast("You're in this session")
+    return
+  }
+  await releaseFocus($)
+}
+
 // When leaving a session, its panel releases the keyboard: when you come back, the text box receives you
 async function releaseFocus($: any) {
   const pane = (await $.ui.panes()).find((p: any) => p.id === PANE)
@@ -6203,7 +6213,7 @@ export const register: Register = (on, options) => {
             plain
             autoFocus={f.sessionId === initial && !fields ? true : undefined}
             label={name(f)}
-            onPress={() => (f.current ? $.ui.toast("You're in this session") : bg(jump($, f)))}
+            onPress={() => (f.current ? bg(toPrompt($)) : bg(jump($, f)))}
           />
         ) : (
           <Text bold={f.current ? true : undefined}>{name(f)}</Text>
