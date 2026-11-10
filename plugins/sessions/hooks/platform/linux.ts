@@ -152,13 +152,6 @@ export const linux: Platform = {
     const title = name.exitCode === 0 ? xpropText(name.stdout) : null
     return title ? frontShown(title, shown) : null
   },
-  async userPresent() {
-    return true
-  },
-
-  async readWindow() {
-    return ''
-  },
 
   // By title (the launcher titles each window with its session's name), with wmctrl, else xdotool; X11 only. The whole
   // title, never a part of it: a session named "api" mustn't bring up a browser whose title holds the word

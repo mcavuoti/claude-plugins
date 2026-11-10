@@ -62,11 +62,17 @@ export type World = {
   // macOS's memory pressure level (sysctl kern.memorystatus_vm_pressure_level): 1 normal, 4 critical
   memory: { value: string }
   // What `ps -A -o pid= -o tty= -o command=` lists (no window by default), and what Terminal's AppleScript answers, by its
-  // mode words (frente, leer, traer, cerrar, abrir: hooks/platform/macos.ts; '' by default)
+  // mode words (frente, traer, cerrar, abrir: hooks/platform/macos.ts; '' by default)
   ps: { value: string }
   terminal: { value: (args: string[]) => string }
   // How late Terminal's AppleScript answers, in ms (0: at once): a busy Terminal
   terminalLate: { value: number }
+  // macOS: the app in front, by its bundle id, as lsappinfo tells it (Terminal by default; null: lsappinfo can't tell),
+  // the seconds since the last keyboard or mouse input (ioreg's HIDIdleTime; 0 by default) and whether the screen is
+  // locked (ioreg's IOConsoleLocked)
+  frontApp: { value: string | null }
+  idle: { value: number }
+  locked: { value: boolean }
   // What xprop answers (X11 on Linux), by its arguments; null: xprop fails, as without a display (the default)
   xprop: { value: (args: string[]) => string | null }
   // The processes that don't run, by pid (`ps -p <pids> -o pid= -o lstart=` lists every other one asked about), and
@@ -88,6 +94,8 @@ export type World = {
   notifies: string[]
   pushAnswer: { value: any }
   notifyAnswer: { value: any }
+  // The element the last move of the panel's focus that reached Claude landed on (panelRing)
+  focusLanded: { value: string | undefined }
 }
 
 export type WorldOptions = {
@@ -143,6 +151,19 @@ export function world(on: On, options: WorldOptions = {}): World {
   const ps = { value: '' }
   const terminal = { value: (_args: string[]) => '' }
   const terminalLate = { value: 0 }
+  const frontApp: { value: string | null } = { value: 'com.apple.Terminal' }
+  const idle = { value: 0 }
+  const locked = { value: false }
+  // Each app's ASN, as lsappinfo names one launch of an app: one per bundle id, the same in every test (the platform
+  // keeps what it learned of an ASN)
+  const asns = new Map<string, string>()
+  const asnOf = (bundle: string) => {
+    let h = 7
+    for (const ch of bundle) h = (h * 31 + ch.charCodeAt(0)) >>> 0
+    const asn = `ASN:0x0-0x${h.toString(16)}:`
+    asns.set(bundle, asn)
+    return asn
+  }
   const xprop = { value: (_args: string[]): string | null => null }
   const gone = new Set<number>()
   const startedAt = new Map<number, string>()
@@ -301,6 +322,13 @@ export function world(on: On, options: WorldOptions = {}): World {
       const answer = () => ok(terminal.value(argv.slice(2)))
       return terminalLate.value > 0 ? clock.sleep(terminalLate.value).then(answer) : answer()
     }
+    if (argv[0] === 'lsappinfo' && argv[1] === 'front') return frontApp.value === null ? failed() : ok(`${asnOf(frontApp.value)}\n`)
+    if (argv[0] === 'lsappinfo' && argv[1] === 'info') {
+      const bundle = [...asns.entries()].find(([, asn]) => asn === argv.at(-1))?.[0]
+      return bundle ? ok(`[ NULL ]  ${argv.at(-1)} (in front) \n    bundleID="${bundle}"\n    bundle path=[ NULL ] \n`) : failed()
+    }
+    if (argv[0] === 'ioreg' && argv.includes('Root')) return ok(`+-o Root  <class IORegistryEntry>\n    "IOConsoleLocked" = ${locked.value ? 'Yes' : 'No'}\n`)
+    if (argv[0] === 'ioreg' && argv.includes('IOHIDSystem')) return ok(`    | |   "HIDIdleTime" = ${Math.round(idle.value * 1e9)}\n`)
     if (argv[0] === 'xprop') {
       const answer = xprop.value(argv.slice(1))
       return answer === null ? failed() : ok(answer)
@@ -339,7 +367,13 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: undefined }
   })
   on('ui.panes', () => ({ value: panes.map(p => ({ ...p })) }))
-  on('ui.focus', () => ({}))
+  // A move of the focus that reaches Claude lands where the chain left it (panelRing reads it). The mod's own $.ui.focus
+  // never gets here: the kit skips the mod's own hook on it, and with it what's beneath, so it's denied
+  const focusLanded: { value: string | undefined } = { value: undefined }
+  on('ui.focus', (_, e) => {
+    focusLanded.value = e.element
+    return {}
+  })
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
     return { value: undefined }
@@ -357,7 +391,42 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer, focusLanded }
+}
+
+// The panel's focus ring as Claude keeps it, for a test that presses the arrows in a mounted panel: by position, not by
+// element. The ring is a place among the panel's elements (its Buttons and fields, in the order drawn), so a frame that
+// moves what's at that place moves the highlight onto another element. An arrow offers the element before or after it
+// (ui.focus, from the person, wrapping around), and the ring goes where the chain lands; a hook that answers without
+// next keeps it where it is
+export type PanelRing = {
+  // The element the ring is on in the frame drawn now
+  on: () => Promise<string | undefined>
+  // The person puts it on an element (a click), or moves it with an arrow; each answers where it is after
+  put: (key: string) => Promise<string | undefined>
+  arrow: (way: 'up' | 'down') => Promise<string | undefined>
+}
+
+export function panelRing($: any, w: World, ui: { findAll: (q: object) => Promise<{ type: string; key: string | undefined }[]> }): PanelRing {
+  let at = -1
+  const frame = async () => (await ui.findAll({})).filter(x => x.type === 'Button' || x.type === 'Input' || x.type === 'Select').map(x => String(x.key))
+  const offer = async (element: string) => {
+    const keys = await frame()
+    w.focusLanded.value = undefined
+    await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element, origin: { kind: 'person' } })
+    await w.clock.settle()
+    const landed = w.focusLanded.value
+    if (landed !== undefined && keys.includes(landed)) at = keys.indexOf(landed)
+    return (await frame())[at]
+  }
+  return {
+    on: async () => (await frame())[at],
+    put: offer,
+    arrow: async way => {
+      const keys = await frame()
+      return offer(keys[(at + (way === 'down' ? 1 : -1) + keys.length) % keys.length] ?? '')
+    },
+  }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {

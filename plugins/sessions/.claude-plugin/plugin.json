@@ -1,6 +1,6 @@
 {
   "name": "sessions",
-  "version": "0.18.5",
+  "version": "0.19.0",
   "description": "Side panel with this folder's sessions: status colors, sections, one-window switching, stop, restart, rename, a waiting-for-you filter, auto-pin and reopen with Remote Control, a notification when a session waits too long or spends far above its usual, spend and token usage, a status line, ccc tell and ccc section for scripts, ccc tidy to end the sessions you no longer need, tools for Claude to list this project's sessions and wake a retired one, and an API for other plugins",
   "author": { "name": "mcavuoti" },
   "license": "MIT",
@@ -34,6 +34,12 @@
       "type": "boolean",
       "title": "Tools for Claude to list and wake this project's sessions",
       "description": "Claude in each session gets mcp__sessions__list (this project's other sessions) and mcp__sessions__wake (brings back a stopped background session of this project the background service retired, so SendMessage reaches it; never one you stopped). Off: neither is offered",
+      "default": true
+    },
+    "seenCheck": {
+      "type": "boolean",
+      "title": "Turn a row green when its window is in front",
+      "description": "While a session's answer is unseen and a window shows it, the panel asks which window is in front (on macOS, Terminal, and only while you're at the computer with Terminal in front). Off: nothing asks; an answer counts as seen when you arrive in that session, type there or use its panel",
       "default": true
     },
     "staleMinutes": {

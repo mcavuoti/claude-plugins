@@ -183,7 +183,6 @@ import {
   listHolds,
   LIST_MS,
   nextSeenCheck,
-  sessionTags,
   usageSummaryOf,
   type ListedFile,
   nextLabelChange,
@@ -297,6 +296,9 @@ let waitingSnapshot: Set<string> | null = null
 // The row selected with the arrows (the session button's key, "s:<sessionId>") and the element that has the focus now
 let selectedRow: string | undefined
 let currentFocus: string | undefined
+// What the arrows go through in the panel as the terminal last drew it (ringKeys of what its render hook drew), for
+// focusElement to wait for the frame it means to focus in; null until it's drawn
+let drawnRing: string[] | null = null
 // Panel width: what the content needs, capped at the width Claude gives it on its own ("the default one").
 // That cap is measured by opening the panel without asking for a width, and measured again if the window size changes.
 let requestedWidth = 0
@@ -352,6 +354,10 @@ let staleMs = 3600000
 // The plugin's option for the tools Claude gets (mcp__sessions__list and mcp__sessions__wake, "Tools for Claude" below):
 // on unless the person turned it off
 let sessionTools = true
+// The plugin's option for the seen check (markSeenIfLooking): on unless the person turned it off. Off, nothing asks
+// which window is in front (on macOS, nothing asks Terminal for it), and an answer counts as seen when the person
+// arrives, types or uses the panel there, as where the front window can't be known
+let seenCheck = true
 // The installed version this session's mod already tried to update itself to (once per version), and the one it
 // can't, since it watches another set of paths (said once in the debug log)
 let reloadTriedFor = ''
@@ -448,9 +454,33 @@ async function readIfChanged($: any, path: string): Promise<string | null> {
   return text
 }
 
-// The platform's commands run through runSafe, with this hook's $
+// The platform's commands run through runSafe, with this hook's $. What they cost in this session is counted by
+// program (how many ran, how long they took in all and the slowest, how many failed or were cut off) for /sessions
+// status, and each one is a line in the debug log
+const platformRuns = new Map<string, { count: number; ms: number; max: number; failed: number }>()
 function sys($: any): Run {
-  return (argv, init) => runSafe($, argv, init)
+  return async (argv, init) => {
+    const from = await $.clock.now()
+    const r = await runSafe($, argv, init)
+    const ms = (await $.clock.now()) - from
+    const program = argv[0] ?? ''
+    const c = platformRuns.get(program) ?? { count: 0, ms: 0, max: 0, failed: 0 }
+    platformRuns.set(program, { count: c.count + 1, ms: c.ms + ms, max: Math.max(c.max, ms), failed: c.failed + (r.exitCode === 0 ? 0 : 1) })
+    debugLine($, `platform: ${argv.slice(0, 3).join(' ')} (exit ${r.exitCode}, ${ms} ms)`)
+    return r
+  }
+}
+
+// /sessions status: the platform's commands this session ran, and whether the seen check's questions are paused
+async function platformText($: any, now: number): Promise<string> {
+  const runs = [...platformRuns.entries()].map(([p, c]) => `${p} ${c.count} (${Math.round(c.ms / Math.max(1, c.count))} ms each, slowest ${c.max} ms${c.failed ? `, ${c.failed} failed` : ''})`)
+  const lines = [`The platform's commands (windows, presence, processes) since this session started: ${runs.length ? runs.join(', ') : 'none'}`]
+  if (!seenCheck) lines.push("Seen: off (the seenCheck option): nothing asks which window is in front; a session's answer counts as seen when you type in it, use its panel or arrive there")
+  const pause = frontPauseOf(await storeGet($, 'frontWindow'))
+  if (seenCheck && pause && now < pause.pausedUntil) {
+    lines.push(`Seen: every session's questions about the window in front are paused for ${howLong(pause.pausedUntil - now)}: the last answer took ${pause.took} ms (${pause.strikes} slow in a row)`)
+  }
+  return lines.join('\n')
 }
 
 // This session's short id, the one `claude attach` takes and the agent view shows: the official list's. It stays across
@@ -518,7 +548,8 @@ function debugLine($: any, text: string) {
 // (SpendLedger in state.ts), pushCount (the notifications sent today: day, count), lastPush (the last one: at, text,
 // from, and what the phone and the notification channel answered), windowsList and frontWindow (the windows listing
 // and the window in front, shared by the seen check for SEEN_WINDOWS_MS and FRONT_SHARED_MS: at, windows / tty, and
-// frontWindow's tags, the sessions an agent view in front shows; both also pendingAt, a session asking right now, and
+// frontWindow's by, the mark of the session asking, and strikes, slowAt, took and pausedUntil, the pause after a slow
+// answer (sharedFront); both also pendingAt, a session asking right now, and
 // windowsList until, when a slow ps pushed the next one back; windowsList is also what a switch's own ps found, which
 // the next switch by the launcher windows reads for viewers in windows that publish nothing: planSwitch),
 // answer:<id> (the answer to a Stop or Restart question that session asked, when the asked session couldn't send it as
@@ -847,8 +878,17 @@ const SEEN_WINDOWS_MS = 30000
 const SEEN_WINDOWS_LAZY_MS = 300000
 const FRONT_SHARED_MS = 1900
 const WINDOWS_PENDING_MS = 10000
-// Two questions to Terminal at most (the front window, an agent view's text), 8 s each at most
+// The platform's checks and one question to Terminal, a few seconds each at most
 const FRONT_PENDING_MS = 20000
+// After marking that it asks, a session waits this long and reads the mark again: of two that marked at once, only
+// the one whose mark stayed asks
+const FRONT_CLAIM_MS = 150
+// An answer slower than FRONT_SLOW_MS (or one cut off) pauses every session's question for FRONT_PAUSE_MS, twice as
+// long for each slow answer in a row (up to FRONT_PAUSE_MAX_MS); they're forgotten FRONT_FORGIVE_MS after the last
+const FRONT_SLOW_MS = 2000
+const FRONT_PAUSE_MS = 120000
+const FRONT_PAUSE_MAX_MS = 3600000
+const FRONT_FORGIVE_MS = 3600000
 const WINDOWS_BACKOFF_MAX_MS = 30000
 // The stored listing as it is (null: none, or not one), then one at most maxAge old (its `at`: when its ps came back)
 function storedWindows(c: any): { windows: Windows; at: number } | null {
@@ -871,26 +911,44 @@ async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<{ window
   return { windows: v, at }
 }
 
-// The window in front ('frontWindow': at, tty, and with an agent view in front, tags: the sessions it shows by their
-// ⟨id⟩ tag, sessionTags), the way the windows listing is shared: `at` is when Terminal answered; a session about to ask
-// says so (`pendingAt`) and the others skip their check meanwhile (the next one is at most a pace away). The session
-// that asks also reads the text of an agent view in front, so the sessions it shows don't each read it: however many
-// sessions are unseen, one question to Terminal (two with an agent view in front) per FRONT_SHARED_MS. null: another
-// session is asking
-type Front = { tty: string | null; tags?: string[] }
-async function sharedFront($: any, v: Windows): Promise<Front | null> {
+// The window in front ('frontWindow': at, tty), the way the windows listing is shared: `at` is when the platform
+// answered; a session about to ask says so (`pendingAt`, with `by`, its own mark) and the others skip their check
+// meanwhile (the next one is at most a pace away). However many sessions are unseen, one question per FRONT_SHARED_MS
+// machine-wide, and only one at a time: a session asks only if its mark is still there FRONT_CLAIM_MS after it wrote
+// it. On macOS the question is Apple Events to Terminal only with someone at the computer and Terminal in front
+// (platform.windowInFront). A slow answer pauses every session's questions (`strikes`, `slowAt`, `took` and
+// `pausedUntil`, kept across answers): a Terminal slow to answer is left alone, longer each time. null: another session
+// is asking, or the questions are paused
+type FrontPause = { strikes: number; slowAt: number; took: number; pausedUntil: number }
+function frontPauseOf(c: any): FrontPause | null {
+  return c && typeof c === 'object' && typeof c.strikes === 'number' && typeof c.slowAt === 'number' && typeof c.pausedUntil === 'number'
+    ? { strikes: c.strikes, slowAt: c.slowAt, took: Number(c.took) || 0, pausedUntil: c.pausedUntil }
+    : null
+}
+async function sharedFront($: any, v: Windows): Promise<{ tty: string | null } | null> {
   const now = await $.clock.now()
   const c = await storeGet($, 'frontWindow')
-  const isView = (tty: unknown) => typeof tty === 'string' && v.agentsViews.some(a => a.tty === tty)
-  const answered = !!c && typeof c.at === 'number' && (typeof c.tty === 'string' || c.tty === null) && (!isView(c.tty) || Array.isArray(c.tags))
-  if (answered && now - c.at < FRONT_SHARED_MS) return { tty: c.tty, ...(Array.isArray(c.tags) ? { tags: c.tags.map(String) } : {}) }
+  const pause = frontPauseOf(c)
+  if (pause && now < pause.pausedUntil) return null
+  const answered = !!c && typeof c.at === 'number' && (typeof c.tty === 'string' || c.tty === null)
+  if (answered && now - c.at < FRONT_SHARED_MS) return { tty: c.tty }
   if (c && typeof c.pendingAt === 'number' && now >= c.pendingAt && now - c.pendingAt < FRONT_PENDING_MS) return null
-  await storeSet($, 'frontWindow', { ...(c && typeof c === 'object' ? c : {}), pendingAt: now })
+  const by = `${myId}:${now}`
+  await storeSet($, 'frontWindow', { ...(c && typeof c === 'object' ? c : {}), pendingAt: now, by })
+  await $.clock.sleep(FRONT_CLAIM_MS)
+  if ((await storeGet($, 'frontWindow'))?.by !== by) return null
+  const asked = await $.clock.now()
   const tty = await platform.windowInFront(sys($), await shownWindows($, v))
-  const tags = tty && isView(tty) ? sessionTags(await platform.readWindow(sys($), tty)) : undefined
-  const front: Front = { tty, ...(tags ? { tags } : {}) }
-  await storeSet($, 'frontWindow', { at: await $.clock.now(), ...front })
-  return front
+  const at = await $.clock.now()
+  const took = at - asked
+  let kept: FrontPause | null = pause
+  if (took > FRONT_SLOW_MS) {
+    const strikes = (pause && at - pause.slowAt < FRONT_FORGIVE_MS ? pause.strikes : 0) + 1
+    kept = { strikes, slowAt: at, took, pausedUntil: at + Math.min(FRONT_PAUSE_MAX_MS, FRONT_PAUSE_MS * 2 ** (strikes - 1)) }
+    debugLine($, `seen: the window in front took ${took} ms to tell; every session's questions pause for ${howLong(kept.pausedUntil - at)} (${strikes} slow in a row)`)
+  } else if (pause && at - pause.slowAt >= FRONT_FORGIVE_MS) kept = null
+  await storeSet($, 'frontWindow', { at, tty, ...(kept ?? {}) })
+  return { tty }
 }
 
 // The viewers' windows, each with the name of the session it shows (its viewer titles the window with it), for a
@@ -906,15 +964,17 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
   })
 }
 
-// Are you looking at me? Someone at the computer (the platform can tell on macOS: screen unlocked, recent input) and a
-// window in front with one of my viewers, or an agent view showing my tag. Only while this session's last answer is
-// unseen, at the pace nextSeenCheck sets (the 2 s timer does nothing between checks), and only a session shown in some
-// window (one of its viewers, or an agent view) asks which window is in front: most background sessions are shown in
-// none, and ask Terminal nothing, which a quit Terminal would also take as a reason to start. Where the front window
-// can't be known (Linux without X11), a session counts as seen only when you type in it, use its panel or arrive there
-// A session no window shows (no viewer of it, no agent view) past the first minute after its answer is checked again a
-// minute later (seenQuietUntil), with a listing up to a minute old: arriving there with ccc, or from another panel
-// (Enter or a click), marks it seen anyway
+// Are you looking at me? A window in front with one of my viewers (or my own window), which the platform tells only
+// while someone could be looking (on macOS: someone at the computer, Terminal the app in front). An agent view in front
+// marks nothing seen: which session it shows is on its screen only, and reading a window's text is a costly question
+// to Terminal. Only while this session's last answer is unseen, at the pace nextSeenCheck sets (the 2 s timer does
+// nothing between checks), and only a session with a window of its own asks which window is in front: most background
+// sessions are shown in none, and ask Terminal nothing, which a quit Terminal would also take as a reason to start.
+// Where the front window can't be known (Linux without X11), or the seenCheck option is off, a session counts as seen
+// only when you type in it, use its panel or arrive there.
+// A session no window shows past the first minute after its answer is checked again a minute later (seenQuietUntil),
+// with a listing up to a minute old: arriving there with ccc, or from another panel (Enter or a click), marks it seen
+// anyway
 // The listing (a ps of every process) is what finds the windows; the windows opened with ccc also say what they show
 // in a file (.showing), read at every check with no command and taken over the listing for their terminals
 // (withShowing), once a listing saw their launcher running there (listedLaunchers). So the listing can be older,
@@ -927,7 +987,7 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
 let seenCheckedAt = 0
 let seenQuietUntil = 0
 async function markSeenIfLooking($: any) {
-  if (!platform.frontKnown) return
+  if (!platform.frontKnown || !seenCheck) return
   const { finished, seen } = await ownSeenState($)
   if (finished <= seen) return
   const now = await $.clock.now()
@@ -946,8 +1006,8 @@ async function markSeenIfLooking($: any) {
   const told = listedLaunchers(listed.windows, shown)
   let v = withShowing(listed.windows, told)
   let mine = myWindowsIn(v)
-  seenQuietUntil = mine.length === 0 && v.agentsViews.length === 0 && age >= 60000 ? now + 60000 : 0
-  if (mine.length === 0 && v.agentsViews.length === 0) return
+  seenQuietUntil = mine.length === 0 && age >= 60000 ? now + 60000 : 0
+  if (mine.length === 0) return
   const front = await sharedFront($, v)
   const tty = front?.tty
   if (!tty) return
@@ -963,8 +1023,7 @@ async function markSeenIfLooking($: any) {
       mine = myWindowsIn(v)
     }
   }
-  const looking = mine.includes(tty) || (v.agentsViews.some(c => c.tty === tty) && !!front.tags?.includes(myShortId()))
-  if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
+  if (mine.includes(tty)) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
 
 // The person is at this session right now (arrived from another panel, by Enter or a click, or with ccc, or pressing
@@ -1613,7 +1672,7 @@ function scheduleLabel($: any, next: number, now: number) {
 // (nextSeenCheck): none at all once it's seen
 let seenTimer: { cancel: () => void } | null = null
 async function scheduleSeen($: any) {
-  if (!live || !platform.frontKnown || !myId) return
+  if (!live || !platform.frontKnown || !seenCheck || !myId) return
   const { finished, seen } = await ownSeenState($)
   seenTimer?.cancel()
   seenTimer = null
@@ -3757,7 +3816,12 @@ async function focusSession($: any, sessionId: string | undefined) {
 // meanwhile, the focus isn't fought over.
 // A field that appears with autoFocus does NOT take the focus if the panel already had the keyboard: the focus goes by
 // position and lands on whatever is in that spot now (a row, and what you were typing went somewhere else). That's
-// why it's moved here
+// why it's moved here.
+// Claude places the focus in the frame it has drawn and keeps that position: asked right after the rows were written,
+// before the frame that shows them is drawn, it lands where the element was in the frame before, and the new frame moves
+// the highlight off it (the row above the focus left: one past it, where a row that arrives next is drawn). So it waits
+// for the frame that shows the rows as they are now (drawnRing, a few ms after they're written), and asks anyway at the
+// end of the wait
 async function focusElement($: any, key: string) {
   const moves = personMoves
   for (let i = 0; i < 30; i++) {
@@ -3768,7 +3832,8 @@ async function focusElement($: any, key: string) {
     } catch {
       return
     }
-    if (panes.find((p: any) => p.id === PANE)?.isFocused) {
+    const undrawn = i < 29 && drawnRing !== null && !sameData(drawnRing, ringKeys(await rowsNow($)))
+    if (!undrawn && panes.find((p: any) => p.id === PANE)?.isFocused) {
       let r: any
       try {
         r = await $.ui.focus({ requestId: PANE, key })
@@ -3784,16 +3849,6 @@ async function focusElement($: any, key: string) {
     }
     await $.clock.sleep(50)
   }
-}
-
-// The window of an agent view that's showing a session right now (its ⟨id⟩ tag is on screen), except the front one
-async function agentsViewShowing($: any, v: { agentsViews: { pid: string; tty: string }[] }, f: Row, except: string): Promise<string | undefined> {
-  const tag = `⟨${f.id ?? f.sessionId.slice(0, 8)}⟩`
-  for (const c of v.agentsViews) {
-    if (c.tty === except) continue
-    if ((await platform.readWindow(sys($), c.tty)).includes(tag)) return c.tty
-  }
-  return undefined
 }
 
 // A notice to another session's mod (see buildNotice), only if it answers: its heartbeat says it runs and speaks this
@@ -3909,10 +3964,10 @@ async function jump($: any, f: Row, notifyFocus = true): Promise<boolean> {
     $.ui.toast(platform.text.switchNeedsWindow)
     return false
   }
-  // If it's already open in another window, bring that one: never the same session in two windows. Look among the
-  // viewers (claude attach <id>) and among the agent views, which don't say which session they show: read their
-  // screen looking for its tag
-  const target = (f.id ? v.byId[f.id]?.find(t => t !== front) : undefined) ?? (await agentsViewShowing($, v, f, front))
+  // If it's already open in another window, bring that one: never the same session in two windows. Among the viewers
+  // (claude attach <id>): an agent view doesn't say which session it shows but on its screen, which isn't read (a
+  // costly question to Terminal), so a session an agent view elsewhere shows opens here as well
+  const target = f.id ? v.byId[f.id]?.find(t => t !== front) : undefined
   if (target) {
     if (await platform.bringWindow(sys($), target, f.title)) return gone()
     // Where it can't be brought forward (Linux without wmctrl/xdotool, or Wayland), show it in this window too
@@ -5140,6 +5195,7 @@ async function statusText($: any): Promise<string> {
     await notificationsText($, now),
     await liveText($, now),
   ]
+  lines.push(await platformText($, now))
   if (!platform.frontKnown) lines.push("Seen: this machine can't tell which window is in front (no X11 display, or no xprop), so nothing checks for it: a session's answer counts as seen when you type in it, use its panel or arrive there (Enter or a click in another panel, ccc)")
   const apart = await apartText($)
   if (apart) lines.push(apart)
@@ -5652,6 +5708,7 @@ export const register: Register = (on, options) => {
   quietHours = parseQuietHours(quietHoursText)
   notificationsPerDay = typeof options?.notificationsPerDay === 'number' && Number.isFinite(options.notificationsPerDay) ? Math.max(0, Math.floor(options.notificationsPerDay)) : 5
   sessionTools = options?.sessionTools !== false
+  seenCheck = options?.seenCheck !== false
   // $.sessions for other plugins (sessionsApi). Nothing else happens here: a throw at this step unloads the whole mod.
   // Claude doesn't let the $ built here be handed to a function, so the methods get the few calls they make (files,
   // commands, the clock, the environment, the store) through closures over it
@@ -5947,7 +6004,9 @@ export const register: Register = (on, options) => {
       // field that closed and shifted the positions), the arrows bring it back instead of getting stuck
       else return next({ ...e, element: currentFocus })
     }
-    if (target === currentFocus) return {}
+    // Taken even when it's the element the mod thinks has the focus: Claude offers it from where the highlight is, so
+    // the highlight is elsewhere (what's drawn moved under it, and the panel's own move back didn't land). Kept where it
+    // was, the arrows would be stuck there
     const r = target === e.element ? await next(e) : await next({ ...e, element: target })
     if (!r.deny && target) {
       currentFocus = target
@@ -6053,6 +6112,8 @@ export const register: Register = (on, options) => {
     // above them, as Text too
     const plan = drawPlan(list)
     const shownRows = list.filter(f => !f.folded)
+    // What the arrows go through in this frame, for a move of the focus to wait for (focusElement)
+    if (inTerminal) drawnRing = ringKeys(list)
     // The line about the sessions of every folder that ended with the background service, under the legend: one line,
     // more where the panel is narrower than it (it wraps between words)
     const endedNote = await read($, ended)

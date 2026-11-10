@@ -131,7 +131,7 @@ export function listHolds(c: { at: number; sig?: unknown; until?: unknown } | nu
 }
 
 // The seen check's pace in a session whose last answer nobody saw (its row yellow), and only while one of its windows
-// (or an agent view) is open: the first check right after the finish, then every 2 s for a minute (the person is
+// is open: the first check right after the finish, then every 2 s for a minute (the person is
 // likely about to look), every 10 s up to 10 minutes, then every 30 s. Typing in the session, a key in its panel or
 // arriving there (Enter in another panel, or ccc) marks it seen at once, with no check. When the next check is due,
 // after one at lastCheck
@@ -139,12 +139,6 @@ export function nextSeenCheck(finished: number, lastCheck: number): number {
   if (lastCheck < finished) return finished
   const age = lastCheck - finished
   return lastCheck + (age < 60000 ? 2000 : age < 600000 ? 10000 : 30000)
-}
-
-// The sessions a window's text shows by their tag (⟨short id⟩, as each session's band ends): an agent view's, for the
-// seen check, which shares what it read as these and not the whole text
-export function sessionTags(text: string): string[] {
-  return [...new Set([...text.matchAll(/⟨([0-9A-Za-z_-]{1,64})⟩/g)].map(m => m[1]!))]
 }
 
 // How many of the panel's items don't fit: each item's lines in drawing order (a section title doesn't count, a session

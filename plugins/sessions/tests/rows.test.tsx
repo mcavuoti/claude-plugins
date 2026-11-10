@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { FORMAT, buildNotice, heartbeatText, parseNotice } from '../hooks/state'
-import { BAND, COMMAND, DATA, ROOT, SID, SLOW, startSession, world } from './world'
+import { BAND, COMMAND, DATA, panelRing, ROOT, SID, SLOW, startSession, world } from './world'
 
 // What the panel's rows show beyond each session: sections (the person's /sessions section, the headers, the freeze
 // while the panel has the keyboard, sections.json kept tidy) and what the sessions spend
@@ -284,6 +284,101 @@ test('folds made in another session apply here once the panel doesn\'t have the 
   expect(await drawnOrder($, ['charlie', '▸ Desk'])).toEqual(['▸ Desk'])
 })
 
+// The arrows while rows come, go and change under the keyboard, with Claude's ring kept by position (panelRing). The
+// mod's own moves of the focus don't land here (the kit can't answer them), as one doesn't when Claude places it in
+// the frame before the one it's meant for, or when the focus moved meanwhile: the ring stays at its place
+const row = (c: string) => `s:${c.repeat(8)}-0000-0000-0000-000000000000`
+const newSession = (c: string, name: string, pid: number) => ({ id: c.repeat(8), sessionId: `${c.repeat(8)}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', status: 'idle', pid, name })
+
+async function focusedPanel($: any, on: any, sessionsList: any[]) {
+  const w = world(on, { list: sessionsList })
+  await startSession($, w)
+  setFocused(w, true)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  return { w, ui, ring: panelRing($, w, ui) }
+}
+
+test('a session that starts while the panel has the keyboard: its row goes at the end, and the arrows go to it and back', async ($, on) => {
+  const sessionsList = list()
+  const { w, ui, ring } = await focusedPanel($, on, sessionsList)
+  expect(await ring.put(row('c'))).toBe(row('c'))
+  sessionsList.push(newSession('d', 'delta', 4245))
+  await w.clock.advance(7000)
+  expect(await ring.on()).toBe(row('c'))
+  expect(await ring.arrow('down')).toBe(row('d'))
+  // Past the last row the arrows stay in the list
+  expect(await ring.arrow('down')).toBe(row('d'))
+  expect(await ring.arrow('up')).toBe(row('c'))
+  expect(await ring.arrow('up')).toBe(row('b'))
+  await ui.unmount()
+})
+
+test('a session that starts as the one above the focus ends: the new row is drawn where the focus was, and the arrows leave it', async ($, on) => {
+  const sessionsList = list()
+  const { w, ui, ring } = await focusedPanel($, on, sessionsList)
+  expect(await ring.put(row('c'))).toBe(row('c'))
+  sessionsList.splice(1, 1)
+  sessionsList.push(newSession('d', 'delta', 4245))
+  await w.clock.advance(7000)
+  // charlie moved up one and delta, at the end, took its place: with the panel's move back to charlie not landed, the
+  // highlight is on delta while the mod still has charlie
+  expect(await ring.on()).toBe(row('d'))
+  expect(await ring.arrow('up')).toBe(row('c'))
+  expect(await ring.arrow('up')).toBe(row('a'))
+  expect(await ring.arrow('down')).toBe(row('c'))
+  expect(await ring.arrow('down')).toBe(row('d'))
+  await ui.unmount()
+})
+
+test('the session above the focus ends: the highlight is left past the list, and an arrow brings it back', async ($, on) => {
+  const sessionsList = list()
+  const { w, ui, ring } = await focusedPanel($, on, sessionsList)
+  expect(await ring.put(row('c'))).toBe(row('c'))
+  sessionsList.splice(1, 1)
+  await w.clock.advance(7000)
+  expect(await ring.on()).toBe('usage-day')
+  expect(await ring.arrow('up')).toBe(row('c'))
+  expect(await ring.arrow('up')).toBe(row('a'))
+  expect(await ring.arrow('down')).toBe(row('c'))
+  await ui.unmount()
+})
+
+test('a session renamed while the panel has the keyboard: the focus stays on its row, and the arrows go on as before', async ($, on) => {
+  const sessionsList = list()
+  const { w, ui, ring } = await focusedPanel($, on, sessionsList)
+  expect(await ring.put(row('b'))).toBe(row('b'))
+  sessionsList[1].name = 'zulu'
+  await w.clock.advance(7000)
+  expect((await ui.find({ key: row('b') }))?.text).toContain('zulu')
+  expect(await ring.on()).toBe(row('b'))
+  expect(await ring.arrow('down')).toBe(row('c'))
+  expect(await ring.arrow('up')).toBe(row('b'))
+  expect(await ring.arrow('up')).toBe(row('a'))
+  await ui.unmount()
+})
+
+test('c folds the section under the focus: the arrows go through its line, and after Enter unfolds it, through its rows', async ($, on) => {
+  const sessionsList = list()
+  const w = world(on, { list: sessionsList })
+  w.files.set(SECTIONS, DESK({ bbbbbbbb: { section: 'probe:desk', by: 'probe' }, cccccccc: { section: 'probe:desk', by: 'probe' } }))
+  await startSession($, w)
+  setFocused(w, true)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  const ring = panelRing($, w, ui)
+  expect(await ring.put(row('b'))).toBe(row('b'))
+  await ui.press({ key: 'fold' })
+  await w.clock.advance(2000)
+  expect(await ring.on()).toBe('h:probe:desk')
+  expect(await ring.arrow('up')).toBe(row('a'))
+  expect(await ring.arrow('down')).toBe('h:probe:desk')
+  await ui.press({ key: 'h:probe:desk' })
+  await w.clock.advance(2000)
+  expect(await ring.on()).toBe(row('b'))
+  expect(await ring.arrow('down')).toBe(row('c'))
+  expect(await ring.arrow('up')).toBe(row('b'))
+  await ui.unmount()
+})
+
 test('⚙n: what a running background session has going on in the background, as the service counts it', async ($, on) => {
   const w = world(on, { list: list() })
   w.files.set('/Users/x/jobs/bbbbbbbb/state.json', JSON.stringify({ inFlight: { tasks: 2, drainableMonitors: 0, kinds: ['local_agent', 'local_bash'] } }))
@@ -313,7 +408,8 @@ test('seen: a session shown in no window asks Terminal nothing; its viewer in fr
   // Its viewer, in the window in front
   w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
   w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
-  await w.clock.advance(2000)
+  // The check, and the moment it waits to know it's the one session asking
+  await w.clock.advance(2200)
   expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
   expect(w.runs.filter(a => a[0] === 'osascript')).toHaveLength(1)
 })
