@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { buildNotice, fileKey, goneNamespaces, heartbeatText, showingText, isOldKey, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
+import { buildNotice, fileKey, FORMAT, goneNamespaces, heartbeatText, showingText, isOldKey, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
 import { bellOfKey, classify, directList, jobIds, listDrift, parseRegistry, SessionFiles, WATCH_SET, watchPaths, watchSetOf } from '../hooks/watch'
 import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, processGone, processStartsArgv, provenRunning } from '../hooks/leader'
 import { COMMAND, DATA, ROOT, SID, SLOW, STARTED, startSession, world, type World } from './world'
@@ -902,6 +902,88 @@ test("where this machine's starts get no SessionStart (startSkipped), the mod's 
   expect(watches.length).toBe(1)
   watches[0]!.end(null, '', 'SIGTERM')
   await w.clock.advance(10)
+})
+
+// What an idle session costs where no SessionStart reaches the mod (startSkipped, as on a managed install), once its
+// own watch is up: every wait it asks of the clock (each period of an every, each after and sleep, by its length) and
+// every command it runs, over 10 minutes of the mocked clock. The test's on, with the clock's waits counted on the way
+// to mock.clock's hooks (a test can hook an event once: this wraps world's own)
+function countingWaits(on: any, waits: number[]) {
+  return ((name: string, ...rest: any[]) => {
+    if (name === 'clock.every' || name === 'clock.after' || name === 'clock.sleep') {
+      const hook = rest[rest.length - 1]
+      rest[rest.length - 1] = ($: any, e: any, next: any) => {
+        waits.push(Number(e.ms))
+        return hook($, e, next)
+      }
+    }
+    return on(name, ...rest)
+  }) as any
+}
+// Ten idle minutes, after two to settle: the waits (each length and how often) and the commands (program and first
+// argument, how often). The rest of the fleet stands in a second session, bravo, written each minute as its mod would:
+// its heartbeat (with its project), and without lead its leader record, the token usage summary and Claude's version
+// answers it leaves (sharedUsage, sharedAnswer). A session that leads runs usage.py, which writes the summary
+async function idleTenMinutes($: any, on: any, lead: boolean) {
+  const waits: number[] = []
+  const watches = ownWatches(on)
+  // usage.py leaves the summary every panel reads (sharedUsage)
+  const summary = () => w.write(`${DATA}/usage/summary.json`, JSON.stringify({ format: FORMAT, today: '2001-09-09', hour: '2001-09-09T01', days: {}, hours: {} }))
+  const onRun = (argv: readonly string[]) => {
+    watches.onRun(argv)
+    if (String(argv[1]).endsWith('/usage.py')) summary()
+  }
+  const w: World = world(countingWaits(on, waits), { list: listed(SESSIONS), python: PYTHON, onRun, transcript: '', store: { startSkipped: { at: 1 } } })
+  for (const s of SESSIONS) registryFile(w, s)
+  const others = () => {
+    w.write(`${DATA}/alive/${BRAVO}`, heartbeatText({ pid: 4243, at: w.clock.now(), version: '0.18.5', via: 'session.start', root: ROOT }))
+    if (lead) return
+    // bravo (pid 4243) leads, as its record says while it rewrites it every pass
+    w.write(`${DATA}/leader.json`, leaderText({ pid: 4243, sessionId: BRAVO, at: w.clock.now() }))
+    summary()
+    w.store.set('installed', { at: w.clock.now(), version: '2.1.316' })
+    w.store.set('plugin', { at: w.clock.now(), plugin: null })
+  }
+  others()
+  await startSession($, w)
+  await w.clock.advance(1000)
+  expect(watches.all.length).toBe(1)
+  watches.all[0]!.say('ready\tkqueue\t7777\t12')
+  for (let i = 0; i < 2; i++) {
+    await w.clock.advance(MIN)
+    others()
+  }
+  expect(await liveLine($)).toContain("Live through the mod's own watch")
+  const fromWait = waits.length
+  const fromRun = w.runs.length
+  for (let i = 0; i < 10; i++) {
+    await w.clock.advance(MIN)
+    others()
+  }
+  const tally = (keys: string[]) => keys.reduce<Record<string, number>>((t, k) => ((t[k] = (t[k] ?? 0) + 1), t), {})
+  const waited = tally(waits.slice(fromWait).map(ms => (ms >= 59000 && ms <= 61000 ? 'a minute' : `${ms} ms`)))
+  const ran = tally(w.runs.slice(fromRun).map(a => `${a[0]?.split('/').pop()} ${a[1]?.split('/').pop()}`))
+  watches.all[0]!.end(null, '', 'SIGTERM')
+  await w.clock.advance(10)
+  return { waited, ran, watches: watches.all.length }
+}
+
+test('idle where no SessionStart comes (startSkipped), its own watch up, not leading: 10 minutes ask the clock only for the heartbeat, the pass and the rows\' times, and run no command', SLOW, async ($, on) => {
+  const { waited, ran, watches } = await idleTenMinutes($, on, false)
+  // No short timer (0.5 s, 2 s, 3 s): the heartbeat every 15 s (40), the pass (10) and the rows' times (10), each a
+  // minute
+  expect(waited).toEqual({ '15000 ms': 40, 'a minute': 20 })
+  expect(ran).toEqual({})
+  expect(watches).toBe(1)
+})
+
+test('idle where no SessionStart comes, its own watch up, leading: the same waits, and only the machine-wide work a leader does', SLOW, async ($, on) => {
+  const { waited, ran } = await idleTenMinutes($, on, true)
+  // And the registry read again 300 ms after its listing (reconcile)
+  expect(waited).toEqual({ '15000 ms': 40, 'a minute': 20, '300 ms': 1 })
+  // For the whole machine, in this one session: the safety listing every 10 minutes, the token usage every 10
+  // minutes, Claude's version and the installed plugin every 5 (whichever session finds them old first)
+  expect(ran).toEqual({ 'claude agents': 1, 'python3 usage.py': 1, 'claude --version': 2, 'claude plugin': 2 })
 })
 
 test("live (its SessionStart came): no watch of the mod's own, ever", SLOW, async ($, on) => {
