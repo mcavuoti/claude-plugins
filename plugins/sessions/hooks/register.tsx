@@ -3560,14 +3560,15 @@ const LOOKED_MS = 60000
 let lookedAt = 0
 // The ccc windows' .showing files, read again SHOWING_MS apart at most (a burst of events reads them once)
 const SHOWING_MS = 2000
-let showingRead = { at: 0, mine: false }
+let showingRead: { at: number; shown: Showing[] } = { at: 0, shown: [] }
 
 // Whether anyone could be looking at this session's panel or band. When in doubt, yes: a regular session (its own
 // window), the panel with the keyboard, the person's last sign here under LOOKED_MS ago, a turn of its own, a remote
 // client attached ($.session.surfaces), Remote Control on (the service's record), a ccc window showing it or showing
 // the agent view (its .showing), or a viewer of it or an agent view in the last listing of the windows any session
-// took (stored for the seen check and the switches). No command runs here. A viewer opened by hand that no listing saw
-// yet is the one thing it can't tell (see held)
+// took (stored for the seen check and the switches), with what the ccc windows it saw show now in place of what they
+// showed then (withShowing, as the seen check reads it). No command runs here. A viewer opened by hand that no listing
+// saw yet is the one thing it can't tell (see held)
 async function couldBeLooking($: any, focused: boolean): Promise<boolean> {
   try {
     if (focused || !dataDir || !myId || !me().background) return true
@@ -3577,10 +3578,13 @@ async function couldBeLooking($: any, focused: boolean): Promise<boolean> {
     if ((await $.session.surfaces()).some((s: string) => s !== 'terminal')) return true
     const id = myShortId()
     if ((await hasRemoteControl($, id)) === true) return true
-    if (now - showingRead.at >= SHOWING_MS || now < showingRead.at) showingRead = { at: now, mine: (await launcherWindows($)).some(s => s.command === 'agents' || s.id === id) }
-    if (showingRead.mine) return true
+    if (now - showingRead.at >= SHOWING_MS || now < showingRead.at) showingRead = { at: now, shown: await launcherWindows($) }
+    const shown = showingRead.shown
+    if (shown.some(s => s.command === 'agents' || s.id === id)) return true
     const listed = storedWindows(await storeGet($, 'windowsList'))
-    return !!listed && ((listed.windows.byId[id]?.length ?? 0) > 0 || listed.windows.agentsViews.length > 0)
+    if (!listed) return false
+    const v = withShowing(listed.windows, listedLaunchers(listed.windows, shown))
+    return (v.byId[id]?.length ?? 0) > 0 || v.agentsViews.length > 0
   } catch {
     return true
   }

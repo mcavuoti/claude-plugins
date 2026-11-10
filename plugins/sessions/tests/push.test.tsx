@@ -297,7 +297,7 @@ test('SessionStart hands the engine its paths, after those of the plugins beneat
   const r: any = await $.command.run({ command: 'sessions', args: 'status', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as any)
   expect(r.text).toContain('Live: the engine watches')
   expect(r.text).toContain("the list from Claude's files")
-  expect([...w.store.entries()].filter(([k]) => k.includes('dbg'))).toEqual([])
+  expect(w.toasts).toEqual([])
 })
 
 test('live: another session turning busy is drawn on its file event, with no command run and no short timer', SLOW, async ($, on) => {
@@ -1070,6 +1070,25 @@ for (const [why, show] of SHOWN) {
     expect(colorOf(writes, BRAVO)).toBe('blue')
   })
 }
+
+test('nobody looking: a listing that saw it in a ccc window that shows another session now counts for nothing', SLOW, async ($, on) => {
+  const { w, writes } = await unseenSession($, on)
+  // The listing saw this session's viewer in a ccc window (its launcher, pid 100); that window shows bravo now
+  w.store.set('windowsList', { at: w.clock.now() - 10 * MIN, windows: { byId: { aaaaaaaa: [TTY] }, byPid: {}, agentsViews: [], clients: { [TTY]: '101' }, launchers: { [TTY]: '100' } } })
+  w.write(`${DATA}/windows/${fileKey(TTY)}.showing`, showingText({ tty: TTY, command: 'attach', id: 'bbbbbbbb', viewer: '103', launcher: '100', watcher: '102' }))
+  await w.clock.advance(3000)
+  const rows = writes.count.rows ?? 0
+  await bravoBusy($, w)
+  expect(writes.count.rows ?? 0).toBe(rows)
+  // A viewer of it the listing saw in a window opened another way still counts
+  w.store.set('windowsList', { at: w.clock.now() - 10 * MIN, windows: { byId: { aaaaaaaa: [TTY, '/dev/ttys002'] }, byPid: {}, agentsViews: [], clients: { [TTY]: '101' }, launchers: { [TTY]: '100' } } })
+  await w.clock.advance(3000)
+  registryFile(w, { ...SESSIONS[1]!, status: 'waiting' })
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
+  await w.clock.advance(50)
+  expect(writes.count.rows).toBe(rows + 1)
+  expect(colorOf(writes, BRAVO)).toBe('red')
+})
 
 test('someone could be looking (a regular session, its own window): drawn at once', SLOW, async ($, on) => {
   const { w, writes } = await unseenSession($, on, [{ ...SESSIONS[0]!, kind: 'interactive' }, SESSIONS[1]!])
