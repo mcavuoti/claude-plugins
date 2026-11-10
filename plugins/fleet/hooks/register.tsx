@@ -1075,6 +1075,14 @@ async function tmpFile($: any, text: string): Promise<string> {
 // answer wins, and a register record is written once
 async function publish($: any, path: string, text: string): Promise<'ok' | 'exists' | 'failed'> {
   wrote(path)
+  try {
+    return await publishOnce($, path, text)
+  } finally {
+    // A read that went out between the first wrote() and the link may have found it missing: forgotten again
+    wrote(path)
+  }
+}
+async function publishOnce($: any, path: string, text: string): Promise<'ok' | 'exists' | 'failed'> {
   const tmp = await tmpFile($, text)
   let r = await run($, ['ln', tmp, path])
   if (r.exitCode !== 0 && !(await exists($, path))) {
@@ -1127,10 +1135,15 @@ async function publishAll($: any, items: readonly { path: string; text: string }
 // The file appears whole, over any older one
 async function replace($: any, path: string, text: string): Promise<boolean> {
   wrote(path)
-  const tmp = await tmpFile($, text)
-  const r = await run($, ['mv', '-f', tmp, path])
-  if (r.exitCode !== 0) await run($, ['rm', '-f', tmp])
-  return r.exitCode === 0
+  try {
+    const tmp = await tmpFile($, text)
+    const r = await run($, ['mv', '-f', tmp, path])
+    if (r.exitCode !== 0) await run($, ['rm', '-f', tmp])
+    return r.exitCode === 0
+  } finally {
+    // A read that went out between the first wrote() and the move may have found it missing: forgotten again
+    wrote(path)
+  }
 }
 
 async function remove($: any, paths: string[]) {
@@ -2530,8 +2543,10 @@ async function eventsTick($: any, fromPoll = false) {
       }
       unwatched = 0
     }
-    if (m !== latestMark && latestMark !== 0 && Math.abs(m - ownTriggerAt) > 15000 && fileChangedAt < m) unwatched = m
   }
+  // A landing (not this session's own) the watcher hadn't brought when this look took it in, whoever looked (the poll, or
+  // a tool step's digest): the poll's next look counts it as a miss if the watcher still hasn't brought it
+  if (watchingLatest && !unwatched && m !== latestMark && latestMark !== 0 && Math.abs(m - ownTriggerAt) > 15000 && fileChangedAt < m) unwatched = m
   if (m === latestMark) return
   latestMark = m
   await pullEvents($)
@@ -4518,12 +4533,13 @@ async function startWorld($: any) {
     } catch {}
   }
   const had = await read($, reads)
-  const t = await readText($, readsPath(String(await $.session.id())))
-  const p = t === null ? null : parseReads(t)
-  if (!Object.keys(had).length) {
+  if (!Object.keys(had).length && !(await read($, outside))) {
+    const t = await readText($, readsPath(String(await $.session.id())))
+    const p = t === null ? null : parseReads(t)
     if (p && 'threads' in p && p.threads.main) await touched(update($, reads, () => ({ main: p.threads.main as Record<string, FleetRead> })))
-  } else if (!p || !('threads' in p) || JSON.stringify(p.threads) !== JSON.stringify(had)) {
-    // A reload: what the module before it hadn't written yet (a read in its last 10 s) is written now
+  } else {
+    // A reload: what the module before it hadn't written yet (a read in its last 10 s, the outside mark of its last
+    // second) is written now, once
     saveReadsSoon($, true)
   }
   await refreshName($)
@@ -6767,11 +6783,13 @@ function today(now: number): string {
   return localDay(now, -new Date(now).getTimezoneOffset())
 }
 
-async function readWire<T>($: any, path: string): Promise<T | null> {
+/** A wire file, or null. A writer that rewrites what it read (read-modify-write) asks `fresh`: what the absent-file
+ * memory says is missing is read anyway, so a file another session made meanwhile (its bell not here yet) is kept */
+async function readWire<T>($: any, path: string, fresh = false): Promise<T | null> {
   const rare = !!myInstance && RARE_FILE.test(path) && path.startsWith(`${instDir(myInstance.slug)}/`)
-  if (rare && (absentUntil.get(path) ?? 0) > (await $.clock.now())) return null
+  if (rare && !fresh && (absentUntil.get(path) ?? 0) > (await $.clock.now())) return null
   const bell = live ? belledBy(path) : null
-  if (bell) {
+  if (bell && !fresh) {
     const a = belledAbsent.get(path)
     if (a && (await $.clock.now()) - a < BELLED_ABSENT_MS) return null
   }
@@ -7247,8 +7265,8 @@ async function boardItems($: any): Promise<({ id: string; mtime: number } & Retu
   return out
 }
 
-async function readWork($: any): Promise<WorkFile | null> {
-  return readWire<WorkFile>($, stateDir('work.json'))
+async function readWork($: any, fresh = false): Promise<WorkFile | null> {
+  return readWire<WorkFile>($, stateDir('work.json'), fresh)
 }
 
 // ---- Results to reproduce (G30): world.json's reproduce rules; the one board item fleet writes itself ----
@@ -7500,7 +7518,8 @@ async function workTick($: any, rows: readonly any[], list: readonly BudgetRow[]
   await eventsTick($)
   const insts = roster.instances
   const items = await boardItems($)
-  const had = await readWork($)
+  // Rewritten below from what it holds: read whatever the absent-file memory says
+  const had = await readWork($, true)
   // Each instance: running idle, busy, retired (stopped, not by the person nor for lack of memory, with the heartbeat
   // the sweeper wakes it by), or off
   const states = new Map<string, 'idle' | 'busy' | 'retired' | 'off'>()
@@ -10120,7 +10139,7 @@ async function downSet($: any): Promise<Set<string>> {
 }
 
 async function setDown($: any, slugs: readonly string[], down: boolean) {
-  const d = (await readWire<{ format: number; instances: Record<string, number> }>($, stateDir('down.json'))) ?? { format: FORMAT, instances: {} }
+  const d = (await readWire<{ format: number; instances: Record<string, number> }>($, stateDir('down.json'), true)) ?? { format: FORMAT, instances: {} }
   const now = await $.clock.now()
   for (const s of slugs) {
     if (down) d.instances[s] = d.instances[s] ?? now
@@ -10463,7 +10482,7 @@ async function rosterTick($: any) {
     // The band's restart line says what this sweep woke at once, not at the next one
     const line = await restartLine($, st).catch(() => restart)
     if (line !== restart) {
-      const w = await readWork($)
+      const w = await readWork($, true)
       if (w) {
         await replace($, stateDir('work.json'), json({ ...w, ...(line ? { restart: line } : { restart: undefined }) }))
         await ringBell($, 'work')
@@ -11235,7 +11254,7 @@ async function budgetCommand($: any, target: string, amount: string, origin: str
   if (!a) return 'Write the amount in dollars: /fleet budget <name> 20, or +5 to raise today’s'
   const now = await $.clock.now()
   const day = today(now)
-  const had = await readWire<LiftsFile>($, stateDir('lifts.json'))
+  const had = await readWire<LiftsFile>($, stateDir('lifts.json'), true)
   const lifts: LiftsFile = had && had.day === day ? had : { format: FORMAT, day, instances: {} }
   const current = key === null ? p.cap : (b?.cap ?? null)
   const next = 'set' in a ? a.set : (current ?? 0) + a.add

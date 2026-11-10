@@ -202,6 +202,35 @@ test('F3 live updates turned off by two watcher misses stay off until a new Sess
   expect(await fleet($, 'status')).toContain('live updates off')
 })
 
+// F3b (0.14.1 review). A working session takes landings in at its tool steps (the digest) before its minute's look: the
+// misses still count, so a dead watch is found there too
+test('F3b two watcher misses taken in by tool steps first still turn live updates off', WITH_SESSIONS, async ($, on) => {
+  const w = world(on, { background: false, worldPaths: ['notes/**'], files: { [`${ROOT}/notes/a.md`]: 'a\n' } })
+  on('classic.SessionStart', () => ({}))
+  on('classic.FileChanged', () => ({}))
+  sessionsSay(w, { rows: {} })
+  const other = () => w.touch(`${FLEET}/state/sweeper.json`, JSON.stringify({ format: 1, sessionId: 'bbbbbbbb-0000-0000-0000-000000000000', ref: 'bbbbbbbb', name: 'Owner B', at: w.clock.now(), remote: null }))
+  other()
+  await startSession($, w)
+  await goLive($, w)
+  await tick(w, 30000)
+  expect(await fleet($, 'status')).toContain('live updates: on')
+  for (let i = 0; i < 2; i++) {
+    other()
+    w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: `x-${i}` }))
+    // A tool step a few seconds later takes the landing in first
+    await tick(w, 4000)
+    await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/a.md` } as any)
+    await tick(w, 26000)
+    other()
+    await tick(w, 35000)
+  }
+  other()
+  await tick(w, 60000)
+  expect(w.logs.join('\n')).toContain("the engine's watcher didn't bring two landings")
+  expect(await fleet($, 'status')).toContain('live updates off')
+})
+
 // F4 (text). A managed plugin that sends classic.SessionStart on past fleet: /fleet status says "u or /clear turns
 // them on", but neither can (no SessionStart ever reaches fleet in this session)
 const SKIPPER = {
