@@ -1,11 +1,13 @@
 // macOS: windows are Terminal.app windows, driven through AppleScript (which window is in front, bring one forward,
-// read its text, type into it, open or close one), plus ioreg (presence), lsof (a process's program and folder) and
+// open or close one), plus lsappinfo (the app in front), ioreg (presence), lsof (a process's program and folder) and
 // sysctl (memory pressure). Only testable on a Mac: edit this file from one (see CONTRIBUTING.md).
 import type { Platform, Run } from './types'
 
-// Terminal.app via AppleScript: which window is in front, bring one forward, open a new one, read a screen.
-// The script's mode words (the first argument) are Spanish: "frente" = which window is in front, "leer" = read a tab's
-// contents, "traer" = bring a tab's window forward, "cerrar" = close the window, only when that tab is its only one
+// Terminal.app via AppleScript: which window is in front, bring one forward, open a new one. Each run is an Apple Event
+// to Terminal, which Terminal serves on threads of its own: the seen check asks only with someone at the computer and
+// Terminal the app in front (windowInFront), and nothing reads a tab's text.
+// The script's mode words (the first argument) are Spanish: "frente" = which window is in front, "traer" = bring a
+// tab's window forward, "cerrar" = close the window, only when that tab is its only one
 // (answers "solapas" = it has other tabs, which stay as they are, or "ocupada" = busy, if the tab is running something),
 // "abrir" = open a new window with the same bounds. A Terminal that isn't running is never launched: every mode answers
 // "" then (a command inside the tell block would start it, and it would open a window)
@@ -18,10 +20,8 @@ export const TERMINAL = `on run argv
       return (frontmost as text) & " " & (tty of selected tab of front window)
     end if
     repeat with w in windows
-      set wid to id of w
       repeat with i from 1 to count of tabs of w
         if tty of tab i of w is (item 2 of argv) then
-          if modo is "leer" then return contents of tab i of window id wid
           if modo is "traer" then
             set selected of tab i of w to true
             set index of w to 1
@@ -52,9 +52,47 @@ export const TERMINAL = `on run argv
   return ""
 end run`
 
+// How long a question may take before osascript is cut off: which window is in front is a property read (31 ms or so),
+// bringing a window forward or closing one a little more, opening one waits for Terminal to make it. Cutting osascript
+// off doesn't end what Terminal does with the event, it only stops waiting: the seen check backs off on a slow answer
+export const TERMINAL_TIMEOUT_MS: Record<string, number> = { frente: 3000, traer: 5000, cerrar: 5000, abrir: 8000 }
+
 async function terminal(run: Run, args: string[]): Promise<string> {
-  const r = await run(['osascript', '-', ...args], { stdin: TERMINAL, timeoutMs: 8000 })
+  const r = await run(['osascript', '-', ...args], { stdin: TERMINAL, timeoutMs: TERMINAL_TIMEOUT_MS[args[0] ?? ''] ?? 5000 })
   return r.exitCode === 0 ? r.stdout.trim() : ''
+}
+
+// The app in front, from the system's list of apps, with no Apple Event: lsappinfo gives the front app's ASN, then that
+// ASN's bundle id, which is kept (an ASN names one launch of one app), so an app already met costs no second command.
+// With the screen locked the app in front is the login window. null: lsappinfo couldn't tell
+const TERMINAL_APP = 'com.apple.Terminal'
+const bundles = new Map<string, string>()
+export function parseAsn(text: string): string | null {
+  return text.match(/ASN:0x[0-9a-f]+-0x[0-9a-f]+:/i)?.[0] ?? null
+}
+export function parseBundle(text: string): string | null {
+  return text.match(/bundleID="([^"]+)"/)?.[1] ?? null
+}
+async function frontApp(run: Run): Promise<string | null> {
+  const front = await run(['lsappinfo', 'front'], { timeoutMs: 3000 })
+  const asn = front.exitCode === 0 ? parseAsn(front.stdout) : null
+  if (!asn) return null
+  const known = bundles.get(asn)
+  if (known) return known
+  const info = await run(['lsappinfo', 'info', '-only', 'bundleid', asn], { timeoutMs: 3000 })
+  const id = info.exitCode === 0 ? parseBundle(info.stdout) : null
+  if (!id) return null
+  if (bundles.size >= 100) bundles.clear()
+  bundles.set(asn, id)
+  return id
+}
+
+// Someone at the computer: keyboard or mouse used in the last 2 minutes, and the screen unlocked (asked only where the
+// app in front couldn't be told: a locked screen puts the login window there)
+async function present(run: Run, checkLock: boolean): Promise<boolean> {
+  if (checkLock && screenLocked((await run(['ioreg', '-n', 'Root', '-d1'], { timeoutMs: 3000 })).stdout)) return false
+  const idle = idleSeconds((await run(['ioreg', '-c', 'IOHIDSystem', '-d', '4', '-r'], { timeoutMs: 3000 })).stdout)
+  return idle === null || idle < 120
 }
 
 // "frente" answers "<is Terminal the frontmost app> <tty of the front window's selected tab>" ("no" without windows):
@@ -83,31 +121,24 @@ export const macos: Platform = {
   name: 'macos',
 
   // The front Terminal window, only if it's one showing this session: one of its viewers (or its own window, for a
-  // regular session), or an agent view showing its ⟨id⟩ tag on screen
+  // regular session), or an agent view: the panel was just used from the window in front, so an agent view there shows
+  // this session (its text isn't read)
   async windowShowingMe(run, v, me) {
     const front = parseFront(await terminal(run, ['frente']))
     if (!front) return null
     const mine = [...(v.byId[me.shortId] ?? []), ...(me.pid && v.byPid[String(me.pid)] ? [v.byPid[String(me.pid)]] : [])]
-    if (mine.includes(front)) return front
-    if (v.agentsViews.some(c => c.tty === front) && (await terminal(run, ['leer', front])).includes(`⟨${me.shortId}⟩`)) return front
-    return null
+    return mine.includes(front) || v.agentsViews.some(c => c.tty === front) ? front : null
   },
 
   frontKnown: true,
 
+  // Terminal is asked only when someone could be looking at it: the app in front is Terminal (or can't be told) and
+  // someone is at the computer, both found with no Apple Event. Away, or in another app, nothing is asked of Terminal
   async windowInFront(run) {
+    const app = await frontApp(run)
+    if (app !== null && app !== TERMINAL_APP) return null
+    if (!(await present(run, app === null))) return null
     return parseFront(await terminal(run, ['frente']))
-  },
-
-  // Screen unlocked and keyboard or mouse used in the last 2 minutes
-  async userPresent(run) {
-    if (screenLocked((await run(['ioreg', '-n', 'Root', '-d1'], { timeoutMs: 15000 })).stdout)) return false
-    const idle = idleSeconds((await run(['ioreg', '-c', 'IOHIDSystem', '-d', '4', '-r'], { timeoutMs: 15000 })).stdout)
-    return idle === null || idle < 120
-  },
-
-  async readWindow(run, tty) {
-    return terminal(run, ['leer', tty])
   },
 
   async bringWindow(run, tty) {

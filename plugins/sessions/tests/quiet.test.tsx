@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { buildNotice, heartbeatText, labelMinute, listedLaunchers, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, parseShowing, parseWindows, planSwitch, sameData, sessionTags, showingRuns, showingText, usageSummaryOf, windowTargetText, withShowing, type Showing } from '../hooks/state'
+import { buildNotice, heartbeatText, labelMinute, listedLaunchers, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, parseShowing, parseWindows, planSwitch, sameData, showingRuns, showingText, usageSummaryOf, windowTargetText, withShowing, type Showing } from '../hooks/state'
+import { TERMINAL } from '../hooks/platform/macos'
 import { COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel costs while nothing happens: it draws only what changed, reads the session list again only when
@@ -247,45 +248,123 @@ test('seen: arriving (ccc) or a key in the panel marks it seen at once, with no 
 })
 
 const asked = (w: World) => w.runs.filter(a => a[0] === 'osascript').map(a => a[2])
-const VIEW_TEXT = '● bravo  idle  ⟨bbbbbbbb⟩\n● alpha  done  ⟨aaaaaaaa⟩ ⟨bbbbbbbb⟩'
+// The commands the seen check's question to the platform runs (the app in front, presence, Terminal)
+const frontRuns = (w: World) => w.runs.filter(a => ['osascript', 'lsappinfo', 'ioreg'].includes(a[0] ?? '')).map(a => `${a[0]} ${a[0] === 'osascript' ? a[2] : a[1]}`)
 
-test('the sessions a window shows, by their ⟨id⟩ tags', () => {
-  expect(sessionTags(VIEW_TEXT)).toEqual(['bbbbbbbb', 'aaaaaaaa'])
-  expect(sessionTags('no tags ⟨⟩ ⟨two words⟩')).toEqual([])
-})
-
-test("seen with an agent view in front: one question to Terminal and one read of the view's text, shared as the tags it shows", async ($, on) => {
+test('seen with only an agent view open: nothing is asked of Terminal, and nothing reads a window', SLOW, async ($, on) => {
   const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
   w.ps.value = '  101 ttys001  claude agents'
-  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : args[0] === 'leer' ? VIEW_TEXT : '')
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
   await startSession($, w)
-  await w.clock.advance(3000)
-  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
-  expect(asked(w)).toEqual(['frente', 'leer'])
-  expect(w.store.get('frontWindow')).toEqual({ at: expect.any(Number), tty: '/dev/ttys001', tags: ['bbbbbbbb', 'aaaaaaaa'] })
+  await w.clock.advance(3 * MIN)
+  expect(frontRuns(w)).toEqual([])
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  expect(TERMINAL).not.toContain('contents')
+  expect(TERMINAL).not.toContain('"leer"')
 })
 
-test("seen: another session's answer about an agent view in front serves this one with no question, unless it lacks the view's tags", async ($, on) => {
+test('seen: the question to Terminal only with someone at the computer and Terminal the app in front', SLOW, async ($, on) => {
   const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
-  w.ps.value = '  101 ttys001  claude agents'
+  w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
   w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys002' : '')
+  // Another app in front: one lsappinfo a question (its bundle once), nothing for presence, no Apple Event
+  w.frontApp.value = 'com.example.Editor'
+  await startSession($, w)
+  await w.clock.advance(MIN)
+  const other = frontRuns(w)
+  expect(other.length).toBeGreaterThan(5)
+  expect(other.filter(r => r === 'lsappinfo info')).toHaveLength(1)
+  expect(other.every(r => r.startsWith('lsappinfo'))).toBe(true)
+  // The screen locked: the login window is in front
+  w.frontApp.value = 'com.apple.loginwindow'
+  await w.clock.advance(MIN)
+  expect(frontRuns(w).slice(other.length).every(r => r.startsWith('lsappinfo'))).toBe(true)
+  // Terminal in front, nobody at it for 5 minutes: lsappinfo and one ioreg a question, no Apple Event
+  w.frontApp.value = 'com.apple.Terminal'
+  w.idle.value = 300
+  const before = frontRuns(w).length
+  await w.clock.advance(MIN)
+  const away = frontRuns(w).slice(before)
+  expect(away.filter(r => r === 'ioreg -c').length).toBeGreaterThan(0)
+  expect(away.some(r => r.startsWith('osascript') || r === 'ioreg -n')).toBe(false)
+  // Back at it: Terminal is asked, and this session's viewer isn't the one in front
+  w.idle.value = 1
+  await w.clock.advance(15000)
+  expect(asked(w)).toContain('frente')
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  // Where lsappinfo can't tell, the lock is asked of ioreg as well; locked, nothing goes to Terminal
+  w.frontApp.value = null
+  w.locked.value = true
+  const n = asked(w).length
+  const k = frontRuns(w).length
+  await w.clock.advance(MIN)
+  expect(asked(w).length).toBe(n)
+  expect(frontRuns(w).slice(k)).toContain('ioreg -n')
+})
+
+test('seen: a slow answer pauses every session\'s questions, longer each time, and /sessions status says so', SLOW, async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys002' : '')
+  w.terminalLate.value = 3000
   await startSession($, w)
   await w.clock.advance(6000)
-  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
-  const before = asked(w).length
-  // An answer a moment ago, the view showing this session: seen, nothing asked
-  w.store.set('frontWindow', { at: w.clock.now() + 1000, tty: '/dev/ttys001', tags: ['aaaaaaaa'] })
-  await w.clock.advance(2000)
-  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
-  expect(asked(w).length).toBe(before)
-  // A new answer of its own, and one with no tags: this session asks, and reads the view itself
-  w.store.set(`state:${SID}`, { finished: w.clock.now() + 1 })
-  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : args[0] === 'leer' ? 'nothing here' : '')
-  await w.clock.advance(100)
+  expect(asked(w)).toEqual(['frente'])
+  const first = w.store.get('frontWindow') as any
+  expect(first).toEqual({ at: expect.any(Number), tty: '/dev/ttys002', strikes: 1, slowAt: first.at, took: 3000, pausedUntil: first.at + 2 * MIN })
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND } as any)
+  expect(r.text).toMatch(/paused for 1 min: the last answer took 3000 ms \(1 slow in a row\)/)
+  expect(r.text).toMatch(/osascript 1 \(3000 ms each/)
+  // Nothing asked while paused, from this session or any other (the pause is in the store)
+  await w.clock.advance(2 * MIN - 10000)
+  expect(asked(w)).toEqual(['frente'])
+  // Slow again: twice as long
+  await w.clock.advance(20000)
+  expect(asked(w)).toEqual(['frente', 'frente'])
+  const second = w.store.get('frontWindow') as any
+  expect(second.strikes).toBe(2)
+  expect(second.pausedUntil - second.at).toBe(4 * MIN)
+  // Quick again after the pause: the answer counts, and the strikes stay until an hour has gone without a slow one
+  w.terminalLate.value = 0
+  await w.clock.advance(4 * MIN + 5000)
+  expect(asked(w).length).toBe(3)
+  expect((w.store.get('frontWindow') as any).strikes).toBe(2)
+  for (let i = 0; i < 6; i++) await w.clock.advance(10 * MIN)
+  expect((w.store.get('frontWindow') as any).strikes).toBe(undefined)
+})
+
+test('seen: two sessions that mark at once that they ask: only the one whose mark stayed asks', async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  await startSession($, w)
+  // Another session writes its own mark right after this one's
+  for (let i = 0; i < 100 && !(w.store.get('frontWindow') as any)?.by; i++) await w.clock.advance(20)
+  const mark = w.store.get('frontWindow') as any
+  expect(mark.by).toContain(SID)
+  w.store.set('frontWindow', { ...mark, by: `${BRAVO}:${mark.pendingAt}` })
+  await w.clock.advance(1000)
+  expect(asked(w)).toEqual([])
+  // That one's answer, when it comes, serves this one
   w.store.set('frontWindow', { at: w.clock.now(), tty: '/dev/ttys001' })
   await w.clock.advance(2000)
-  expect(asked(w).slice(before)).toEqual(['frente', 'leer'])
-  expect((w.store.get('frontWindow') as any).tags).toEqual([])
+  expect(asked(w)).toEqual([])
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+})
+
+test('seen check off (seenCheck false): no ps, no question to Terminal, ever; arriving still marks it seen, and /sessions status says so', { ...SLOW, options: { seenCheck: false } }, async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+  w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  await startSession($, w)
+  await w.clock.advance(5 * MIN)
+  expect(frontRuns(w)).toEqual([])
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  const r: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND } as any)
+  expect(r.text).toContain('Seen: off (the seenCheck option)')
+  w.files.set(`${DATA}/inbox/${SID}`, `format=3\naction=focus\nat=${w.clock.now()}\n`)
+  await w.clock.advance(600)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
 })
 
 test('seen: while another session asks Terminal (pendingAt), this one asks nothing; a marker older than 20 s is ignored', SLOW, async ($, on) => {
@@ -314,8 +393,8 @@ test('seen: a slow Terminal\'s answer is stamped when it came back, and says mea
   const asking = w.store.get('frontWindow') as any
   expect(typeof asking?.pendingAt).toBe('number')
   expect(asking.at).toBe(undefined)
-  await w.clock.advance(3000)
-  expect(w.store.get('frontWindow')).toEqual({ at: asking.pendingAt + 3000, tty: '/dev/ttys002' })
+  await w.clock.advance(3200)
+  expect(w.store.get('frontWindow')).toMatchObject({ at: asking.pendingAt + 150 + 3000, tty: '/dev/ttys002' })
 })
 
 test('a failing claude --version or plugin list is tried again 5 minutes later, not at every refresh, keeping what it had', SLOW, async ($, on) => {

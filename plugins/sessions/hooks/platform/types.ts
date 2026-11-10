@@ -26,13 +26,11 @@ export type Platform = {
   // Whether windowInFront can tell at all (false: it always answers null, and a session counts as seen only when you
   // type in it): where it can't, the seen check runs no command
   frontKnown: boolean
-  // The window in front right now (its terminal), for marking a session as seen; null where that can't be known.
+  // The window in front right now (its terminal), for marking a session as seen: null where that can't be known, and
+  // where nobody could be looking at it (nobody at the computer, where the system can tell; another app in front). It's
+  // asked on a timer: the cheap checks come first, and the terminal app itself is asked last, if at all.
   // `shown` lists the viewers' windows, for a system that can only tell the front window by its title
   windowInFront(run: Run, shown: Shown[]): Promise<string | null>
-  // Whether someone is at the computer (screen unlocked, recent input); true where that can't be known
-  userPresent(run: Run): Promise<boolean>
-  // A window's visible text, used to tell which session an agent view shows; '' where windows can't be read
-  readWindow(run: Run, tty: string): Promise<string>
   // Brings a window forward: by its terminal, or by its title where only titles can be matched
   bringWindow(run: Run, tty: string, title: string): Promise<boolean>
   // When the window showing the target session can't be brought forward: show the target in the current window too

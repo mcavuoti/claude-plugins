@@ -313,7 +313,8 @@ test('seen: a session shown in no window asks Terminal nothing; its viewer in fr
   // Its viewer, in the window in front
   w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
   w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
-  await w.clock.advance(2000)
+  // The check, and the moment it waits to know it's the one session asking
+  await w.clock.advance(2200)
   expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
   expect(w.runs.filter(a => a[0] === 'osascript')).toHaveLength(1)
 })
