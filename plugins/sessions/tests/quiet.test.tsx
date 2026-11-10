@@ -880,3 +880,26 @@ test('parseShowing and showingRuns: a whole file in this format, and processes t
   expect(showingRuns(s, psOf(s).replace(/ttys001/g, 'ttys007'))).toBe(false)
   expect(showingRuns({ ...s, tty: '/dev/pts/3' }, psOf({ ...s, tty: '/dev/pts/3' }))).toBe(true)
 })
+
+test("Enter on this session's own row: the keyboard goes to the text box; a click with the panel not holding it says where you are", async ($, on) => {
+  const w = world(on)
+  await startSession($, w)
+  await w.clock.advance(4000)
+  const pane = w.panes.find((p: any) => p.id === 'sessions')
+  pane.isFocused = true
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, isFocused: true } })
+  const opens = w.opens.length
+  await ui.press({ key: `s:${SID}` })
+  await w.clock.settle()
+  // The panel opened again without the keyboard: it's the text box's
+  expect(w.panes.find((p: any) => p.id === 'sessions')?.isFocused).toBe(false)
+  expect(w.opens.slice(opens).some((o: any) => o.id === 'sessions' && !o.focus)).toBe(true)
+  expect(w.toasts).not.toContain("You're in this session")
+  // Pressed with the panel not holding the keyboard: the note, and nothing moved
+  const again = w.opens.length
+  await ui.press({ key: `s:${SID}` })
+  await w.clock.settle()
+  expect(w.toasts).toContain("You're in this session")
+  expect(w.opens.length).toBe(again)
+  await ui.unmount()
+})

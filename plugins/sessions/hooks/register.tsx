@@ -3749,6 +3749,16 @@ async function paneState($: any) {
   if (!sameData(await read($, paneNote), note)) await update($, paneNote, () => note)
 }
 
+// Enter on this session's own row: the keyboard goes to the text box, to type here. A press with the panel not holding
+// the keyboard (a click) says where you are, as before
+async function toPrompt($: any) {
+  if (!(await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused) {
+    $.ui.toast("You're in this session")
+    return
+  }
+  await releaseFocus($)
+}
+
 // When leaving a session, its panel releases the keyboard: when you come back, the text box receives you
 async function releaseFocus($: any) {
   const pane = (await $.ui.panes()).find((p: any) => p.id === PANE)
@@ -3781,19 +3791,14 @@ async function adjustWidth($: any) {
   await $.ui.open({ id: PANE, title: 'Sessions', columns: width })
 }
 
-// You arrived from another session's panel, or with ccc: the panel takes the keyboard, on the session next to this one,
-// so you can keep going through them. You're looking at this session: what it answered is seen
+// You arrived from another session's panel, or with ccc: the panel takes the keyboard, on this session's own row (the one
+// you picked), and the arrows go on from there. You're looking at this session: what it answered is seen
 async function focusPanel($: any) {
   bg(seenNow($))
   // A panel you closed stays closed: you land on the prompt, and the line above it says how to open it
   if (await closedByYou($)) return
   const list = (await rowsNow($)).filter(f => !f.folded)
-  const i = list.findIndex(f => f.current)
-  const find = (from: number, step: number) => {
-    for (let k = from; k >= 0 && k < list.length; k += step) if (!list[k]?.current) return list[k]
-    return undefined
-  }
-  await takeKeyboard($, (find(i + 1, 1) ?? find(i - 1, -1))?.sessionId)
+  await takeKeyboard($, (list.find(f => f.current) ?? list[0])?.sessionId)
 }
 
 // The panel takes the keyboard, on a session. Claude gives the panel the keyboard a moment after it's requested, on the
@@ -6208,7 +6213,7 @@ export const register: Register = (on, options) => {
             plain
             autoFocus={f.sessionId === initial && !fields ? true : undefined}
             label={name(f)}
-            onPress={() => (f.current ? $.ui.toast("You're in this session") : bg(jump($, f)))}
+            onPress={() => (f.current ? bg(toPrompt($)) : bg(jump($, f)))}
           />
         ) : (
           <Text bold={f.current ? true : undefined}>{name(f)}</Text>

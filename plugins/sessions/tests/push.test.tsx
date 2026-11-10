@@ -1107,9 +1107,12 @@ for (const [how, arrive] of ARRIVALS) {
     expect(colorOf(writes, BRAVO)).toBe('blue')
     const focus = w.opens.findIndex((o: any, i: number) => i >= opens && o.focus === true)
     if (focus >= 0) expect(rowsAt[0]).toBeLessThanOrEqual(focus)
-    // What's drawn is what was held, and what a refresh with someone looking finds: it writes nothing more
+    // What's drawn is what was held, and what a refresh with someone looking finds: it writes nothing more. Arriving
+    // with Enter or ccc puts the landing row (autoFocus) on this session's own row, where the person picked it
     const drawn = await drawnNow($)
-    expect(drawn).toBe(held)
+    const unfocused = (t: string) => t.replace(/,"autoFocus":true/g, '')
+    expect(unfocused(drawn)).toBe(unfocused(held))
+    if (how.startsWith('Enter') || how.startsWith('ccc')) expect(drawn).toMatch(new RegExp(`"key":"s:${SID}"[^}]*"autoFocus":true`))
     surfaces.value = ['terminal', 'mobile']
     await changed($, w, `${JOBS}/pins.json`, '[]')
     expect(writes.count.rows).toBe(rows + 1)
