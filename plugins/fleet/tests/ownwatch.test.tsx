@@ -297,17 +297,23 @@ test("two landings Claude's proved watch missed: the own watch takes over", WITH
   await probe($)
   await settle(w, 30 * SECOND)
   expect(all).toEqual([])
+  // Live and not sweeping, the world's pass is once a minute (0.14.1): two missed landings are taken as a dead watch
+  // within two passes of the second
   for (let i = 0; i < 2; i++) {
     otherLeases(w)
     w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: `x-${i}` }))
     await settle(w, 30 * SECOND)
+    otherLeases(w)
+    await settle(w, 35 * SECOND)
   }
+  otherLeases(w)
+  await settle(w, 60 * SECOND)
   expect(w.logs.join('\n')).toContain("didn't bring two landings")
   await settle(w, 2 * SECOND)
   expect(all.length).toBe(1)
 })
 
-test("/fleet status doesn't say every 2 s while the own watch has the world on its 10 s tick", WITH_SESSIONS, async ($, on) => {
+test("/fleet status doesn't say every 2 s while the own watch has the world on its minute's tick (it doesn't sweep)", WITH_SESSIONS, async ($, on) => {
   const OWNER = '---\nname: owner\ndescription: x\ntools: Read\n---\nOwner.\n'
   const ROSTER = { rosterFormat: 1, sections: [{ id: 'owners', title: 'Owners' }], roles: { owner: { agent: 'owner', model: 'haiku', budget: { usdDay: 1 } } }, instances: [{ name: 'Owner A', role: 'owner', section: 'owners', brief: 'x' }], budget: { usdDay: 5 } }
   const { all, w } = await ahead($, on, { background: false, worldPaths: ['notes/**'], files: { [`${FLEET}/roster.json`]: JSON.stringify(ROSTER), [`${ROOT}/.claude/agents/owner.md`]: OWNER, [`${FLEET}/seeds/owner.md`]: 'Seed.' } })
@@ -319,5 +325,5 @@ test("/fleet status doesn't say every 2 s while the own watch has the world on i
   all[0]!.say('ready\tkqueue\t4242\t5')
   await settle(w, 5 * SECOND)
   expect(await classic()).not.toContain('every 2 s')
-  expect(await classic()).toContain('every 10 s')
+  expect(await classic()).toContain('looks at the world every minute')
 })

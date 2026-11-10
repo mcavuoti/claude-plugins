@@ -180,12 +180,17 @@ test('F3 live updates turned off by two watcher misses stay off until a new Sess
   await goLive($, w)
   await tick(w, 30000)
   expect(await fleet($, 'status')).toContain('live updates: on')
-  // Two landings of another session whose events the engine never brings
+  // Two landings of another session whose events the engine never brings (live and not sweeping, the world's pass is
+  // once a minute: found within two passes of the second)
   for (let i = 0; i < 2; i++) {
     other()
     w.touch(`${FLEET}/events/latest`, JSON.stringify({ format: 1, last: `x-${i}` }))
-    await tick(w, 25000)
+    await tick(w, 30000)
+    other()
+    await tick(w, 35000)
   }
+  other()
+  await tick(w, 60000)
   expect(w.logs.join('\n')).toContain("the engine's watcher didn't bring two landings")
   const mid = await fleet($, 'status')
   expect(mid).toContain('live updates off')

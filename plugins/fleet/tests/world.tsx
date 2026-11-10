@@ -168,6 +168,9 @@ export type World = {
   // Every host operation on files and commands, by kind and path ('read <path>', 'absent <path>' for a read of a file
   // that isn't there, 'stat', 'exists', 'list', 'write', 'run <command>'), for a test that counts a call's or a minute's
   ops: Map<string, number>
+  // The timers fleet's clock ran, by kind and period ("every:2000", "after:150"): one count per period of an every (its
+  // next period is asked as the last one fires) and per after, for a test that counts what wakes an idle session
+  timerCount: Map<string, number>
 }
 
 export type WorldOptions = {
@@ -202,7 +205,20 @@ function parentsOf(path: string): string[] {
 }
 
 export function world(on: On, options: WorldOptions = {}): World {
-  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 2, 12, 0, 0) })
+  // The kit's clock answers the timers; each of its answers is counted on the way
+  const timerCount = new Map<string, number>()
+  const counted = ((event: string, ...rest: any[]) => {
+    if (event === 'clock.every' || event === 'clock.after') {
+      const hook = rest[rest.length - 1]
+      rest[rest.length - 1] = (x: any, e: any, next: any) => {
+        const key = `${event.slice('clock.'.length)}:${e?.ms}`
+        timerCount.set(key, (timerCount.get(key) ?? 0) + 1)
+        return hook(x, e, next)
+      }
+    }
+    return (on as any)(event, ...rest)
+  }) as unknown as On
+  const clock = mock.clock(counted, { now: Date.UTC(2026, 10, 2, 12, 0, 0) })
   const files = new Map<string, string>(Object.entries(options.files ?? {}))
   // When each file was last written (fs.list's mtimeMs); a folder's time is a counter that moves when an entry in it
   // comes or goes (fleet only compares a folder's times)
@@ -462,7 +478,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec, readCount, statCount, ops, registering }
+  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec, readCount, statCount, ops, registering, timerCount }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {
