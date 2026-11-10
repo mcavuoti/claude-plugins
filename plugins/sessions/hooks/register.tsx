@@ -81,6 +81,8 @@ import {
   type EndedSession,
   stopReasons,
   storeNamespace,
+  goneNamespaces,
+  isOldKey,
   wakeStagger,
   afterTick,
   rowsBelow,
@@ -662,6 +664,17 @@ async function storeKeys($: any): Promise<string[]> {
     const ns = await storeNamespaceOf($)
     const all: string[] = await $.store.keys()
     return ns ? all.filter(k => k.startsWith(ns)).map(k => k.slice(ns.length)) : all.filter(k => !k.startsWith('@'))
+  } catch {
+    return []
+  }
+}
+
+// The store as it is, every namespace's keys with their namespace: only for the leader's prune of the test namespaces
+// whose sessions are gone (pruneNamespaces), in a session that has none itself. Everything else goes through the four
+// above, and stays in its own namespace
+async function everyStoreKey($: any): Promise<string[]> {
+  try {
+    return await $.store.keys()
   } catch {
     return []
   }
@@ -1849,6 +1862,8 @@ async function prune($: any) {
     for (const k of keys.filter(k => k.endsWith(`:${id}`))) await storeDelete($, k)
     await runSafe($, ['rm', '-f', `${dataDir}/alive/${id}`, `${dataDir}/inbox/${id}`])
   }
+  await pruneOldKeys($, keys)
+  await pruneNamespaces($, now)
   // ccc tell folders of background sessions no longer in the list
   try {
     const shorts = new Set(list.map(s => String(s.id ?? '')))
@@ -1882,6 +1897,57 @@ async function prune($: any) {
     for (const id of drop) emptyBefore.delete(id)
     return { file: dropSections(pruned, drop) }
   })
+}
+
+// The keys from before the store's keys were English (isOldKey): nothing reads them
+async function pruneOldKeys($: any, keys: readonly string[]) {
+  const old = keys.filter(isOldKey)
+  if (old.length === 0) return
+  debugLine($, `prune: ${old.length === 1 ? 'a key' : `${old.length} keys`} from before the store's keys were English`)
+  for (const k of old) await storeDelete($, k)
+}
+
+// The test namespaces whose sessions are gone (goneNamespaces in state.ts): nothing else deletes a test session's
+// keys once it's removed, and every read and write of the store carries them. Only the leader of the sessions the
+// person uses does it (no namespace of its own: its list is Claude's own, every session of this machine, running or
+// stopped), and only for a namespace found so at two prunes in a row (10 minutes apart), against a list read right
+// then that has this very session, with no record there created in the last 5 minutes (a session that started since
+// the list was read). Never a namespace with a session still in the list, nor any key outside a namespace. At most
+// NAMESPACE_KEYS_A_PRUNE keys a prune (each delete rewrites the store): the rest at the next
+const NAMESPACE_KEYS_A_PRUNE = 80
+let goneBefore = new Set<string>()
+async function pruneNamespaces($: any, now: number) {
+  if ((await storeNamespaceOf($)) !== '') return
+  const all = await everyStoreKey($)
+  if (!all.some(k => k.startsWith('@'))) return
+  const list = await officialList($, 0)
+  if (typeof list === 'string' || !list.some(s => s.sessionId === myId)) return
+  const gone = goneNamespaces(all, new Set(list.map(s => String(s.sessionId))))
+  const was = goneBefore
+  goneBefore = new Set(gone.keys())
+  let left = NAMESPACE_KEYS_A_PRUNE
+  for (const [ns, keys] of gone) {
+    if (!was.has(ns) || left <= 0) continue
+    let recent = false
+    for (const k of keys.filter(k => k.startsWith('state:'))) {
+      let created = 0
+      try {
+        created = Number((await $.store.get(`${ns}${k}`))?.created) || 0
+      } catch {}
+      if (now - created < 300000) recent = true
+    }
+    if (recent) continue
+    const drop = keys.slice(0, left)
+    left -= drop.length
+    debugLine($, `prune: ${drop.length === 1 ? 'a key' : `${drop.length} keys`} of a test namespace whose sessions are gone (${ns})`)
+    for (const k of drop) {
+      try {
+        await $.store.delete(`${ns}${k}`)
+      } catch {}
+    }
+    // Cut short: found again at the next prune, which goes on
+    if (drop.length < keys.length) goneBefore.add(ns)
+  }
 }
 
 // The order files (<data>/order/<root as a file name>) of projects whose folder is gone: of the files no panel rewrote

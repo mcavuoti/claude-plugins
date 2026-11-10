@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { heartbeatText, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
+import { goneNamespaces, heartbeatText, isOldKey, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
 import { bellOfKey, classify, directList, jobIds, listDrift, parseRegistry, SessionFiles, WATCH_SET, watchPaths, watchSetOf } from '../hooks/watch'
 import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, processGone, processStartsArgv, provenRunning } from '../hooks/leader'
 import { DATA, ROOT, SID, SLOW, STARTED, startSession, world, type World } from './world'
@@ -176,6 +176,28 @@ test('the files in memory: only what moved is read, a file cut short twice is a 
   expect(files.jobsToCheck(['aaaaaaaa'], true)).toEqual(['aaaaaaaa'])
   expect(files.jobMoved('aaaaaaaa', { mtimeMs: 1, size: 2 })).toBe(false)
   expect(files.list()).toEqual([{ id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background' }])
+})
+
+test("the store's dead weight: the test namespaces none of whose keys names a listed session, and the keys from before they were English", () => {
+  const gone = 'dddddddd-0000-0000-0000-000000000000'
+  const keys = [
+    `@0000aaaa/state:${gone}`,
+    '@0000aaaa/list',
+    `@0000aaaa/marks:probe:${gone}`,
+    `@0000bbbb/state:${gone}`,
+    `@0000bbbb/marks:probe:${BRAVO}`,
+    '@0000cccc/windowsList',
+    `state:${gone}`,
+    'waitingOnly',
+    '@not-a-namespace',
+  ]
+  const found = goneNamespaces(keys, new Set([SID, BRAVO]))
+  // Not the one a listed session has a key in; one with no session-keyed key at all is gone too
+  expect([...found.keys()]).toEqual(['@0000aaaa/', '@0000cccc/'])
+  expect(found.get('@0000aaaa/')).toEqual([`state:${gone}`, 'list', `marks:probe:${gone}`])
+  expect([...goneNamespaces(keys, new Set([gone])).keys()]).toEqual(['@0000cccc/'])
+  for (const k of ['lista', 'instalada', 'vistaUso', 'fijado', 'fijadoAuto', 'reapertura', `estado:${gone}`, `visto:${gone}`, `titulo:${gone}`, `esperando:${gone}`, `reiniciada:${gone}`, `revividas:${gone}`]) expect(isOldKey(k)).toBe(true)
+  for (const k of ['list', 'installed', 'usageView', 'pinPass', 'autoPins', 'reopenPass', `state:${gone}`, `seen:${gone}`, `title:${gone}`, 'listado', 'estado']) expect(isOldKey(k)).toBe(false)
 })
 
 test('bells: which a write of the store rings', () => {
@@ -566,6 +588,53 @@ test('live: a leader that crashed (its file stays, its heartbeat stops) is repla
   expect(cleared).toBeGreaterThan(0)
   expect(cleared - killed).toBeLessThanOrEqual(3 * MIN)
   expect(parseLeader(w.files.get(`${DATA}/leader.json`) ?? '')?.pid).toBe(4242)
+})
+
+// A session the person uses: no location override, so no namespace of its own in the store
+const NO_OVERRIDES = { SESSIONS_CLAUDE: '', SESSIONS_JOBS_DIR: '', SESSIONS_DAEMON_LOG: '' }
+
+test("the leader's prune drops a test namespace whose sessions are gone at the second prune that finds it so, and the keys from before they were English; never a namespace with a listed session, one with a record just created, nor a key of the person's", SLOW, async ($, on) => {
+  const gone = 'dddddddd-0000-0000-0000-000000000000'
+  const fresh = 'eeeeeeee-0000-0000-0000-000000000000'
+  const { w } = await liveSession($, on, SESSIONS, NO_OVERRIDES)
+  expect(w.namespace).toBe('')
+  const seeded: Record<string, unknown> = {
+    [`@0000aaaa/state:${gone}`]: { created: 1 },
+    [`@0000aaaa/seen:${gone}`]: 5,
+    '@0000aaaa/list': { at: 1, sessions: [] },
+    [`@0000aaaa/marks:probe:${gone}`]: { at: 1, until: 2, rows: {} },
+    [`@0000bbbb/state:${BRAVO}`]: { created: 1 },
+    [`@0000bbbb/state:${gone}`]: { created: 1 },
+    '@0000bbbb/waitingOnly': true,
+    [`@0000cccc/state:${fresh}`]: { created: 1 },
+    lista: { en: 1, sesiones: [] },
+    [`estado:${gone}`]: { creada: 1 },
+    fijado: 1,
+    usageView: { period: 'week', scope: 'all' },
+    [`title:${BRAVO}`]: 'kept',
+  }
+  for (const [k, v] of Object.entries(seeded)) w.store.set(k, v)
+  const left = () => [...w.store.keys()].filter(k => k in seeded).sort()
+  // The first prune that sees them (10 minutes after the start's): the old keys go; the namespaces are only noted
+  await w.clock.advance(10 * MIN + 15000)
+  expect(left()).toEqual(Object.keys(seeded).filter(k => !['lista', `estado:${gone}`, 'fijado'].includes(k)).sort())
+  // A test session starts in one of them just before the next: its record is a moment old, and it isn't listed yet
+  await w.clock.advance(9 * MIN)
+  w.store.set(`@0000cccc/state:${fresh}`, { created: w.clock.now() })
+  await w.clock.advance(MIN + 15000)
+  expect(left()).toEqual([`@0000bbbb/state:${BRAVO}`, `@0000bbbb/state:${gone}`, '@0000bbbb/waitingOnly', `@0000cccc/state:${fresh}`, `title:${BRAVO}`, 'usageView'].sort())
+  expect(w.store.get('usageView')).toEqual({ period: 'week', scope: 'all' })
+})
+
+test("a test session never prunes another namespace: it can't tell which sessions run for them", SLOW, async ($, on) => {
+  const gone = 'dddddddd-0000-0000-0000-000000000000'
+  const { w } = await liveSession($, on)
+  expect(w.namespace).not.toBe('')
+  w.store.set(`@0000aaaa/state:${gone}`, { created: 1 })
+  await w.clock.advance(25 * MIN)
+  // Not a key of it asked for, read or deleted
+  expect([...w.storeKeys].filter(k => k.includes('@0000aaaa/'))).toEqual([])
+  expect(w.store.has(`@0000aaaa/state:${gone}`)).toBe(true)
 })
 
 test('updated in place from an older version: the short timer, and the panel says live updates need a restart; /clear brings them', SLOW, async ($, on) => {
