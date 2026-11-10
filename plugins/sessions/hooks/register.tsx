@@ -1365,6 +1365,7 @@ async function pass($: any) {
   storeCache.clear()
   await syncFiles($, true)
   await requestRefresh($)
+  await drawHeld($)
   await solo('leader', () => leaderTurn($, 'pass'))
   if (!live) return
   // The requests and the queues another plugin fills, as the short timer would (a missed event, or a queue whose kick
@@ -3541,6 +3542,73 @@ function withOwnHint(s: any, now: number): any {
   return s.status === h.status ? s : { ...s, status: h.status }
 }
 
+// ---- Nobody looking: no drawing for other sessions' events ----
+// Claude draws a session's panel and band whether or not a window shows it, and most background sessions are shown in
+// none. Each write of the rows or the band's counts draws them again, and that drawing (Claude's, and the mod's own
+// render functions) is most of what another session's start and turn costs this one; the reads are a small part. So
+// while nobody could be looking (couldBeLooking), a refresh reads everything as always, and what follows from the
+// reads goes on (the order file, who waits and the pushes, the marks' records, the leader's work, `$.sessions`), but
+// what the panel and the band would show is kept here (held) instead of written. Whenever Claude draws them anyway (a
+// viewer attaching at a new size, a remote client asking) they draw what's held, so that frame is current too. It's
+// written, and drawn, the moment someone could look (arrived: Enter or a click in another panel, ccc's request,
+// typing, a key in the panel, /sessions, a remote client attaching), whenever a refresh finds someone could, and at
+// the pass, so a viewer opened by hand, at the size the session was last drawn at, shows a panel a pass old at most
+// until a key is pressed there
+let held: { rows: Row[]; summary: PanelSummary } | null = null
+// The person's last sign here, for LOOKED_MS: an arrival, typing, a key in the panel, /sessions, a turn of this session
+const LOOKED_MS = 60000
+let lookedAt = 0
+// The ccc windows' .showing files, read again SHOWING_MS apart at most (a burst of events reads them once)
+const SHOWING_MS = 2000
+let showingRead = { at: 0, mine: false }
+
+// Whether anyone could be looking at this session's panel or band. When in doubt, yes: a regular session (its own
+// window), the panel with the keyboard, the person's last sign here under LOOKED_MS ago, a turn of its own, a remote
+// client attached ($.session.surfaces), Remote Control on (the service's record), a ccc window showing it or showing
+// the agent view (its .showing), or a viewer of it or an agent view in the last listing of the windows any session
+// took (stored for the seen check and the switches). No command runs here. A viewer opened by hand that no listing saw
+// yet is the one thing it can't tell (see held)
+async function couldBeLooking($: any, focused: boolean): Promise<boolean> {
+  try {
+    if (focused || !dataDir || !myId || !me().background) return true
+    const now = await $.clock.now()
+    if (now - lookedAt < LOOKED_MS) return true
+    if (ownHint?.status === 'busy' || lastList.find(s => s.sessionId === myId)?.status === 'busy') return true
+    if ((await $.session.surfaces()).some((s: string) => s !== 'terminal')) return true
+    const id = myShortId()
+    if ((await hasRemoteControl($, id)) === true) return true
+    if (now - showingRead.at >= SHOWING_MS || now < showingRead.at) showingRead = { at: now, mine: (await launcherWindows($)).some(s => s.command === 'agents' || s.id === id) }
+    if (showingRead.mine) return true
+    const listed = storedWindows(await storeGet($, 'windowsList'))
+    return !!listed && ((listed.windows.byId[id]?.length ?? 0) > 0 || listed.windows.agentsViews.length > 0)
+  } catch {
+    return true
+  }
+}
+
+// What's held, written: the panel and the band drawn as the last refresh left them
+async function drawHeld($: any) {
+  const h = held
+  if (!h) return
+  if (!sameData(await read($, rows), h.rows)) {
+    await update($, rows, () => h.rows)
+    bg(adjustWidth($))
+  }
+  if (!sameData(await read($, summary), h.summary)) await update($, summary, () => h.summary)
+  if (held === h) held = null
+}
+
+// The person is here, or may be: drawn before anything else
+async function arrived($: any) {
+  lookedAt = await $.clock.now()
+  await drawHeld($)
+}
+
+// The rows as the panel shows them now: what's held, else what was drawn
+async function rowsNow($: any): Promise<Row[]> {
+  return held?.rows ?? (await read($, rows))
+}
+
 // The rows as the panel shows them: grouped in sections, children under their parents (groupRows), only the ones
 // waiting for you with the f filter on, and the folded sections' rows hidden behind one line (foldRows). Claude tracks
 // the panel's focus by position, not by session: if rows move while you're in the panel, the highlight would jump to
@@ -3551,7 +3619,8 @@ function withOwnHint(s: any, now: number): any {
 // it goes. Otherwise, if what the arrows go through moved (a row or a fold line left the list, or shifted), the focus
 // goes back to its element (or the one next to it), since Claude keeps the position, not the element
 async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' = '') {
-  const shownBefore = await read($, rows)
+  const drawn = await read($, rows)
+  const shownBefore = held?.rows ?? drawn
   const frozen = focused && reflow !== 'filter'
   waitingSnapshot = waitingMembers(projectRows, waitingSnapshot, waitingOnly, frozen)
   const members = waitingSnapshot
@@ -3560,11 +3629,6 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
   const kept = keepPlaces(foldRows(grouped, collapsed, !!members), shownBefore, frozen)
   // A fold the person made: the rows stay put, and only the folds are taken anew, over the sections as they're drawn
   const shown = reflow === 'fold' ? foldRows(kept, collapsed, !!members) : kept
-  // The width the panel asks for follows what its rows hold (names, spend, marks): worked out again when they changed
-  if (!sameData(shownBefore, shown)) {
-    await update($, rows, () => shown)
-    bg(adjustWidth($))
-  }
   const spends = projectRows.filter(f => f.usd !== null)
   const others = projectRows.filter(f => !f.current)
   const next: PanelSummary = {
@@ -3574,7 +3638,18 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     unseen: others.filter(f => f.color === 'yellow').length,
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
+  // Nobody could be looking: kept, not drawn (held)
+  if (!reflow && !(await couldBeLooking($, focused))) {
+    held = { rows: shown, summary: next }
+    return
+  }
+  // The width the panel asks for follows what its rows hold (names, spend, marks): worked out again when they changed
+  if (!sameData(drawn, shown)) {
+    await update($, rows, () => shown)
+    bg(adjustWidth($))
+  }
   if (!sameData(await read($, summary), next)) await update($, summary, () => next)
+  held = null
   if (!focused || reflow) return
   const target = refocusTarget(ringKeys(shownBefore), ringKeys(shown), currentFocus)
   if (target) bg(focusElement($, target))
@@ -3628,7 +3703,7 @@ async function adjustWidth($: any) {
     return
   }
   if (defaultWidth === 0) return
-  const shown = await read($, rows)
+  const shown = await rowsNow($)
   const width = paneWidth(shown.map(f => f.title), defaultWidth, (shown.some(f => f.usd !== null) ? SPEND_COLUMN : 0) + markColumns(shown))
   if (width === requestedWidth) return
   requestedWidth = width
@@ -3641,7 +3716,7 @@ async function focusPanel($: any) {
   bg(seenNow($))
   // A panel you closed stays closed: you land on the prompt, and the line above it says how to open it
   if (await closedByYou($)) return
-  const list = (await read($, rows)).filter(f => !f.folded)
+  const list = (await rowsNow($)).filter(f => !f.folded)
   const i = list.findIndex(f => f.current)
   const find = (from: number, step: number) => {
     for (let k = from; k >= 0 && k < list.length; k += step) if (!list[k]?.current) return list[k]
@@ -3939,7 +4014,7 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
 // After an action from the panel, the keyboard goes back to the panel, on the same row (or the one next to it if it
 // left the list)
 async function focusRow($: any, sessionId: string, fallback: string | undefined) {
-  const ids = (await read($, rows)).filter(f => !f.folded).map(f => f.sessionId)
+  const ids = (await rowsNow($)).filter(f => !f.folded).map(f => f.sessionId)
   await takeKeyboard($, ids.includes(sessionId) ? sessionId : fallback && ids.includes(fallback) ? fallback : ids[0])
 }
 
@@ -3979,7 +4054,7 @@ async function detailFor($: any, f: Row, topic: Topic): Promise<string> {
 async function decide($: any, f: Row, topic: Topic) {
   if (!f.id) return
   const detail = await detailFor($, f, topic)
-  const ids = (await read($, rows)).filter(x => !x.current).map(x => x.sessionId)
+  const ids = (await rowsNow($)).filter(x => !x.current).map(x => x.sessionId)
   const fallback = neighbor(ids, f.sessionId)
   // If that session is already waiting for you (a permission, a question), this question would queue up behind that one
   // and on arriving you'd answer its own by mistake: so it's asked here.
@@ -4060,7 +4135,7 @@ async function receiveAnswer($: any, data: Record<string, unknown>) {
 
 // The session selected with the arrows (for s, u and r), yours too; if there isn't one or it can't be used, say so
 async function selectedSession($: any, purpose: 'stop' | 'restart'): Promise<Row | undefined> {
-  const f = (await read($, rows)).find(x => `s:${x.sessionId}` === selectedRow)
+  const f = (await rowsNow($)).find(x => `s:${x.sessionId}` === selectedRow)
   if (!f) {
     $.ui.toast('Select a session with ↑↓ first')
     return undefined
@@ -4281,7 +4356,7 @@ async function createSession($: any, name: string) {
     const s = lastList
       .filter(x => x.name === clean && x.cwd === myCwd && (x.startedAt ?? 0) >= since)
       .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))[0]
-    const f = s && (await read($, rows)).find(x => x.sessionId === s.sessionId)
+    const f = s && (await rowsNow($)).find(x => x.sessionId === s.sessionId)
     if (f) {
       await jump($, f)
       return
@@ -4333,7 +4408,7 @@ async function toggleRename($: any) {
     if (!sameData(await read($, renaming), null)) await update($, renaming, () => null)
     return
   }
-  const list = await read($, rows)
+  const list = await rowsNow($)
   const f = list.find(x => `s:${x.sessionId}` === selectedRow) ?? (list.every(x => x.current) ? list.find(x => x.current) : undefined)
   if (!f) {
     $.ui.toast('Select a session with ↑↓ first (to rename this one, use /rename)')
@@ -4372,7 +4447,7 @@ async function toggleWaiting($: any) {
   waitingSnapshot = null
   await storeSet($, 'waitingOnly', waitingOnly)
   await layout($, true, 'filter')
-  const list = await read($, rows)
+  const list = await rowsNow($)
   const keep = list.find(f => `s:${f.sessionId}` === selectedRow) ?? list.find(f => !f.current) ?? list[0]
   if (keep) bg(focusSession($, keep.sessionId))
 }
@@ -4400,7 +4475,7 @@ async function toggleFold($: any) {
     await unfold($, key.slice(2))
     return
   }
-  const list = await read($, rows)
+  const list = await rowsNow($)
   const f = list.find(x => `s:${x.sessionId}` === key)
   if (!f) {
     $.ui.toast('Select a session with ↑↓ first')
@@ -4420,7 +4495,7 @@ async function toggleFold($: any) {
 
 async function unfold($: any, section: string) {
   await setFolded($, section, false)
-  const first = (await read($, rows)).find(f => f.section === section && !f.folded)
+  const first = (await rowsNow($)).find(f => f.section === section && !f.folded)
   if (first) bg(focusSession($, first.sessionId))
 }
 
@@ -4439,7 +4514,7 @@ async function rename($: any, text: string) {
       await $.command.run({ command: 'rename', args: name })
       return
     }
-    const f = (await read($, rows)).find(x => x.sessionId === r.sessionId)
+    const f = (await rowsNow($)).find(x => x.sessionId === r.sessionId)
     const why = f ? await noticeTo($, f, 'rename', { name }) : "it isn't in the list"
     if (!why) {
       $.ui.toast(`Renaming “${r.title}” to “${name}”…`)
@@ -4602,6 +4677,8 @@ async function notifyWhenBack($: any) {
 // This session's own row, from its own turn hooks: drawn at once (the registry says the same 0.6 s later, withOwnHint)
 async function ownStatus($: any, status: 'busy' | 'idle') {
   ownHint = { status, at: await $.clock.now() }
+  // Its own turn, starting or ending: someone may be watching it (couldBeLooking)
+  lookedAt = ownHint.at
   scheduleFlush($, 0, d => (d.rows = true))
 }
 
@@ -4666,6 +4743,7 @@ async function checkInbox($: any, byPass = false) {
     }
     debugLine($, `inbox: ${r.action}`)
     if (r.action === 'focus') {
+      await arrived($)
       await focusPanel($)
     } else if (r.action === 'bring') {
       const ok = !!r.tty && (await platform.bringWindow(sys($), r.tty, r.title))
@@ -4993,10 +5071,10 @@ async function announceUpdate($: any): Promise<string | undefined> {
 // read); a panel you closed stays closed
 async function keyboardBack($: any, key: string) {
   if (await closedByYou($)) return
-  let around = ringKeys(await read($, rows))
+  let around = ringKeys(await rowsNow($))
   for (let i = 0; around.length === 0 && i < 30; i++) {
     await $.clock.sleep(100)
-    around = ringKeys(await read($, rows))
+    around = ringKeys(await rowsNow($))
   }
   const target = around.includes(key) ? key : undefined
   debugLine($, `update in place: the keyboard back to the panel${target ? `, on ${target}` : ''}`)
@@ -5033,8 +5111,8 @@ async function statusText($: any): Promise<string> {
   const dir = PLUGIN_DIR.replace(/\/hooks\/\.\.$/, '')
   const plugin = await installedPlugin($)
   const copy = plugin?.path && plugin.path === dir ? `installed (${plugin.version})` : `folder copy: ${dir}${plugin?.version ? ` (installed: ${plugin.version})` : ''}`
-  const rowsNow = await read($, rows)
-  const silent = rowsNow.filter(f => f.noPanel || f.otherFormat).map(f => `${f.title} (${f.noPanel ? 'no heartbeat' : 'another version'})`)
+  const shownNow = await rowsNow($)
+  const silent = shownNow.filter(f => f.noPanel || f.otherFormat).map(f => `${f.title} (${f.noPanel ? 'no heartbeat' : 'another version'})`)
   const lines = [
     `sessions ${modVersion || '?'} · ${copy}`,
     `Running here: started ${ago(startedAt)} by ${startedVia || 'nothing'}${startedVia !== 'session.start' ? (sawSessionStart ? ' (session.start came later)' : ' (session.start never came)') : ''}`,
@@ -5678,6 +5756,12 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // A remote client joined (the phone, the desktop app): it may show the panel, drawn as it is before anything else
+  on('session.attach', async ($, e, next) => {
+    if (active) bg(arrived($))
+    return next(e)
+  })
+
   // The main loop's turns only: a subagent's run inside a turn starts no new one (the working time and ⧗ count from
   // the main turn), and nothing here holds the run up
   on('turn.start', async ($, e, next) => {
@@ -5703,12 +5787,12 @@ export const register: Register = (on, options) => {
       }
       const d = n.data
       if (n.kind === 'focus') {
-        if (active) bg(focusPanel($))
+        if (active) bg(arrived($).then(() => focusPanel($)))
         return { consumed: 'sessions: focus the panel after a switch' }
       }
       // You arrived by a click in another session's panel: you're looking at this one; the keyboard stays where it is
       if (n.kind === 'seen') {
-        if (active) bg(seenNow($))
+        if (active) bg(arrived($).then(() => seenNow($)))
         return { consumed: 'sessions: seen after a switch by click' }
       }
       if (n.kind === 'ask') {
@@ -5768,6 +5852,7 @@ export const register: Register = (on, options) => {
     if (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') {
       bg(ensureStarted($, 'prompt'))
       if (active) {
+        bg(arrived($))
         await storeSet($, `seen:${myId}`, await $.clock.now())
         bg(rearmTells($))
       }
@@ -5776,6 +5861,7 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'sessions' }, async ($, e) => {
+    if (active) await arrived($)
     // /sessions setup: the one-time setup (setup/setup.sh) for what a plugin can't configure by itself. Only its own
     // options are passed on, as separate arguments (no shell in between)
     const words = String(e.args ?? '')
@@ -5825,19 +5911,20 @@ export const register: Register = (on, options) => {
         currentFocus = e.element
         // On entering the panel the focus lands on a session by itself: if none was selected (or the selected one is
         // gone), that one stays, so s stops it without moving the arrows
-        const selected = (await read($, rows)).some(f => `s:${f.sessionId}` === selectedRow)
+        const selected = (await rowsNow($)).some(f => `s:${f.sessionId}` === selectedRow)
         if (e.element.startsWith('s:') && !selected) selectedRow = e.element
       }
       return r
     }
     personMoves++
     // Keys in this session's panel: the person is at this session
+    bg(arrived($))
     bg(seenNow($))
     // With the New or Rename field open, Tab and the arrows stay in it (Enter or Esc get you out)
     const field = (await read($, askingName)) ? 'name' : (await read($, renaming)) ? 'rename-input' : null
     if (field) return e.element === field ? next(e) : next({ ...e, element: field })
     // The sessions and the folded sections' lines, in the order they're drawn
-    const ring = ringKeys(await read($, rows))
+    const ring = ringKeys(await rowsNow($))
     if (ring.length === 0) return next(e)
     let target = e.element
     if (!target || !ring.includes(target)) {
@@ -5873,7 +5960,9 @@ export const register: Register = (on, options) => {
     const beneath = await next(e)
     // A survey holds the band: it goes first
     if (e.props.hasSurvey) return beneath
-    const about = await read($, summary)
+    // What's held while nobody could be looking, else what was written (read either way: its next write draws this)
+    const written = await read($, summary)
+    const about = held?.summary ?? written
     const reds = about.waiting
     const yellows = about.unseen
     const id = await read($, shortId)
@@ -5920,7 +6009,9 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const Input = e.surface === 'mobile' ? undefined : $.ui.resolve(e).Input
-    const list = await read($, rows)
+    // What's held while nobody could be looking, else what was written (read either way: its next write draws this)
+    const written = await read($, rows)
+    const list = held?.rows ?? written
     const asking = await read($, askingName)
     const renamingRow = await read($, renaming)
     const note = await read($, notice)
@@ -5940,7 +6031,8 @@ export const register: Register = (on, options) => {
       }
     }
     const marks = list.some(f => f.noPanel || f.otherFormat)
-    const about = await read($, summary)
+    const writtenSummary = await read($, summary)
+    const about = held?.summary ?? writtenSummary
     // On an API account each row says what its session cost so far, and a line the project's total (list price)
     const spends = about.spent !== null
     // What's drawn, top to bottom (drawPlan): a section's title above its first row, when two or more groups have rows
