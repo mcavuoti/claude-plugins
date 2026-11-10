@@ -1310,8 +1310,9 @@ function timers($: any) {
 // the beat every 10 s (its outside scan), delivery every 60 s. `quiet`, a live session that neither sweeps nor takes the
 // lease: the lease looked at every 30 s, the world every 60 s, delivery and the beat every 60 s; what it acts on comes
 // by FileChanged (a landing, a question, an answer, a bell), so these are the safety pass, and nothing wakes it every 2 s.
-// A change of set cancels the old timers before the new ones start: never two sets, and a pass the new set owes runs
-// on its first timer (2 s, 10 s or 30 s)
+// A change of set cancels the old timers before the new ones start (never two sets), and runs delivery and the beat
+// once (the new timers start their periods over, so the safety pass never waits longer than one period of either set);
+// the world's pass follows its own last time (worldTickAt)
 type PaceSet = 'timers' | 'sweeper' | 'quiet'
 const QUIET_LEASE_MS = 30000
 const QUIET_PASS_MS = 60000
@@ -1325,9 +1326,11 @@ function pace($: any) {
   if (!timersOn) return
   const set = paceNow()
   if (set === paceSet) return
+  const switched = paceSet !== null
   paceSet = set
   for (const t of paceTimers) t.cancel()
   paceTimers = []
+  if (switched) ringHere($, ['deliver', 'beat'])
   if (set === 'timers') {
     // Live while it takes the lease, delivery's ticks in between end at once
     let deliverTicks = 0
@@ -1813,7 +1816,7 @@ async function beat($: any) {
   if (worldOn()) {
     const now = await $.clock.now()
     for (const [task, b] of Object.entries(await read($, bgCommands))) if (now - b.at > 24 * HOUR) await bgDone($, task)
-    if (((await runningHere($)).length || finishedHere.some(f => now - f.end < FINISHED_KEEP_MS)) && now - readsSavedAt > 60000) saveReadsSoon($)
+    if (((await runningHere($)).length || finishedHere.some(f => now - f.end < FINISHED_KEEP_MS)) && now - readsSavedAt > 60000) saveReadsSoon($, true)
   }
   // The outside scan is the sweeper's (claims dedupe it anyway); every session walks the world once, for its baseline
   if (sweep.holding || !baselined) await scanWorld($).catch(err => log($, `world scan: ${String(err).slice(0, 200)}`))
@@ -1967,7 +1970,8 @@ const finishedHere: Finished[] = []
 // is still flagged later if the move was a revision)
 const HONEST_MS = 15 * 60000
 let readsSavedAt = 0
-let readsTimer = false
+// When the reads file's next write is due (0: none)
+let readsDue = 0
 // This session as other sessions' digests name it, from $.sessions every 10 s
 let myName: string | null = null
 let myRef: string | null = null
@@ -2607,18 +2611,36 @@ async function noteRead($: any, thread: string, path: unknown): Promise<string[]
   return [f.text !== null && records && !changeOf(f.text, records.changeKey) ? uncitedText(id, rev, records.changeKey) : citeText(id, rev)]
 }
 
-// reads/<sessionId>.json, a second after a change (for /fleet status in other sessions, and after a restart)
-function saveReadsSoon($: any) {
-  if (readsTimer) return
-  readsTimer = true
-  $.clock.after(1000, () =>
-    bg(
-      (async () => {
-        readsTimer = false
-        await saveReads($)
-      })(),
-    ),
+// reads/<sessionId>.json: for the other sessions (the commands this one runs and those that just finished, which their
+// sweeper leaves to it; its outside mark; its reads, for /fleet status and the sweeper's wakes) and for itself after a
+// restart. What the others act on at once (urgent: a command shown, finished or ended, the outside mark) is written a
+// second after it changed; a plain read, a thread dropped or a change told, within 10 s, a burst in one write (each is
+// an mv). The cost: a restart within those 10 s forgets the last reads, so the gate may refuse a write once until the
+// file is read again. A reload writes what its predecessor hadn't (startWorld), and a session that ends what's due
+const READS_SOON_MS = 1000
+const READS_LATER_MS = 10000
+function saveReadsSoon($: any, urgent = false) {
+  bg(
+    (async () => {
+      const now = await $.clock.now()
+      const at = now + (urgent ? READS_SOON_MS : READS_LATER_MS)
+      // One due by then carries this change too
+      if (readsDue && readsDue <= at) return
+      readsDue = at
+      $.clock.after(at - now, () => {
+        if (readsDue !== at) return
+        readsDue = 0
+        bg(saveReads($))
+      })
+    })(),
   )
+}
+
+/** The write that's due, now (the session ends) */
+async function flushReads($: any) {
+  if (!readsDue) return
+  readsDue = 0
+  await saveReads($)
 }
 
 async function saveReads($: any) {
@@ -3425,7 +3447,7 @@ async function markOutside($: any, what: string) {
   const now = await $.clock.now()
   await update($, outside, () => ({ at: now, what }))
   log($, `outside content: ${what}; this conversation's changes wait for the person's apply until /clear`)
-  saveReadsSoon($)
+  saveReadsSoon($, true)
 }
 
 /** After a restart (the same conversation), the mark comes back from this session's reads file */
@@ -3958,7 +3980,7 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     const end = await $.clock.now()
     finishedHere.push({ thread, at: startedAt, end })
     finishedHere.splice(0, Math.max(finishedHere.filter(f => end - f.end >= FINISHED_KEEP_MS).length, finishedHere.length - 50))
-    saveReadsSoon($)
+    saveReadsSoon($, true)
     log($, `${unnamed} shared file(s) changed during a command that doesn't name them: left to their writer's event, else credited to it (probably)`)
   }
   // The writer named only when its event is the version there now (an older event isn't who wrote this one)
@@ -4114,13 +4136,13 @@ async function bashHook($: any, e: any, next: any) {
     const c = fgRunning.get(n)
     if (!c) return
     c.shown = true
-    saveReadsSoon($)
+    saveReadsSoon($, true)
   })
   let r: any
   try {
     r = await next(e)
   } finally {
-    if (fgRunning.get(n)?.shown) saveReadsSoon($)
+    if (fgRunning.get(n)?.shown) saveReadsSoon($, true)
     fgRunning.delete(n)
   }
   if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
@@ -4139,7 +4161,7 @@ async function bashHook($: any, e: any, next: any) {
     const b: FleetBg = { thread, at: startedAt, before: [...before].map(([p, s]) => [p, s.mtimeMs, s.size]), command: String(e.command ?? ''), ...(readOnly ? { readOnly: true } : {}) }
     await update($, bgCommands, m => ({ ...m, [task]: b }))
     beatSoon($)
-    saveReadsSoon($)
+    saveReadsSoon($, true)
     log($, `Bash in the background (${task}) by ${thread}: its landings when it completes`)
     before = undefined
   }
@@ -4211,7 +4233,7 @@ async function bgDone($: any, task: string) {
     return b ? omit(m, [task]) : m
   })
   if (b) beatSoon($)
-  saveReadsSoon($)
+  saveReadsSoon($, true)
   // A command that writes nothing took no look at the world: nothing to compare
   if (!b || !worldOn() || (b.readOnly && !b.before.length)) return
   const before: Snapshot = new Map(b.before.map(([p, mtimeMs, size]) => [p, { mtimeMs, size }]))
@@ -4428,10 +4450,14 @@ async function startWorld($: any) {
       await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: '' }))
     } catch {}
   }
-  if (!Object.keys(await read($, reads)).length) {
-    const t = await readText($, readsPath(String(await $.session.id())))
-    const p = t === null ? null : parseReads(t)
+  const had = await read($, reads)
+  const t = await readText($, readsPath(String(await $.session.id())))
+  const p = t === null ? null : parseReads(t)
+  if (!Object.keys(had).length) {
     if (p && 'threads' in p && p.threads.main) await update($, reads, () => ({ main: p.threads.main as Record<string, FleetRead> }))
+  } else if (!p || !('threads' in p) || JSON.stringify(p.threads) !== JSON.stringify(had)) {
+    // A reload: what the module before it hadn't written yet (a read in its last 10 s) is written now
+    saveReadsSoon($, true)
   }
   await refreshName($)
   await pullEvents($, 25, true)
@@ -8427,10 +8453,10 @@ const RESTART_QUEUED_MS = 5 * 60000
 
 /** /fleet status's line on the classic hooks that reached fleet in this session. classic.SessionStart comes before any
  * prompt: missing, a managed plugin sends it on past the plugins a person installed (next.to beneath their tier) */
-export function classicLine(seen: Record<string, number>, ownWatching = false): string {
+export function classicLine(seen: Record<string, number>, ownWatching = false, sweeping = false): string {
   const got = Object.keys(seen).sort()
   if (seen.SessionStart) return `classic hooks reaching fleet here: ${got.join(', ')}`
-  return `classic hooks: SessionStart didn't reach fleet in this session (a managed plugin may send it on past the plugins you installed${got.length ? `; seen: ${got.join(', ')}` : ''}): fleet tells an instance who it is in its prompts and after a compaction, ${ownWatching ? 'hears of a landing through its own watch and looks at the world every 10 s' : 'watches the world every 2 s'}, and finds a permission prompt by the verdict (tool.check)`
+  return `classic hooks: SessionStart didn't reach fleet in this session (a managed plugin may send it on past the plugins you installed${got.length ? `; seen: ${got.join(', ')}` : ''}): fleet tells an instance who it is in its prompts and after a compaction, ${ownWatching ? `hears of a landing through its own watch and looks at the world every ${sweeping ? '10 s (it sweeps)' : 'minute'}` : 'watches the world every 2 s'}, and finds a permission prompt by the verdict (tool.check)`
 }
 
 /** A classic hook reached fleet: when, by event. A managed plugin can send one on past the plugins a person installed
@@ -11261,7 +11287,7 @@ async function rosterStatus($: any): Promise<string[]> {
     if (blocks) lines.push(...blocksLines(inst.name, blocks, -new Date(now).getTimezoneOffset()).map((l, i) => `${i ? '      ' : '    '}${l}`))
   }
   if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
-  lines.push(classicLine(await read($, classicSeen), ownWatchLive))
+  lines.push(classicLine(await read($, classicSeen), ownWatchLive, sweep.holding))
   const loose = await unstamped($)
   if (loose.length) lines.push(`changed outside fleet (not through a change you applied): ${loose.join(', ')}: /fleet accept <path> stamps your own edit as yours`)
   return lines
@@ -13336,7 +13362,8 @@ export const register: Register = on => {
     }
     if (e.reason === 'clear' && timersOn && jobRef) $.clock.after(500, () => bg(rebuild($)))
     if (e.reason === 'clear') bg(clearReads($, String(e.sessionId ?? '')))
-    else await Promise.race([releaseLease($).catch(() => {}), $.clock.sleep(500)])
+    // (and its reads file gets what was due: a read in its last 10 s)
+    else await Promise.race([Promise.all([releaseLease($).catch(() => {}), flushReads($).catch(() => {})]), $.clock.sleep(500)])
     return next(e)
   })
 
