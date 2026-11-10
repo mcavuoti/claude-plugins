@@ -56,12 +56,15 @@ test("windowInFront: no Apple Event to Terminal unless it's the app in front and
   other.ran.length = 0
   expect(await macos.windowInFront(other.run, [])).toBe(null)
   expect(other.ran).toEqual(['lsappinfo front'])
-  const away = fake({ 'lsappinfo front': 'ASN:0x0-0x7a2:', 'lsappinfo info': 'bundleID="com.apple.Terminal"', 'ioreg -c': '"HIDIdleTime" = 300000000000' })
+  const away = fake({ 'lsappinfo front': 'ASN:0x0-0x7a2:', 'lsappinfo info': 'bundleID="com.apple.Terminal"', 'ioreg -c': '"HIDIdleTime" = 400000000000' })
   expect(await macos.windowInFront(away.run, [])).toBe(null)
   expect(away.ran).toEqual(['lsappinfo front', 'lsappinfo info', 'ioreg -c'])
   const here = fake({ 'lsappinfo front': 'ASN:0x0-0x7a2:', 'ioreg -c': '"HIDIdleTime" = 1000000000', 'osascript frente': 'true /dev/ttys004' })
   expect(await macos.windowInFront(here.run, [])).toBe('/dev/ttys004')
   expect(here.ran).toEqual(['lsappinfo front', 'ioreg -c', 'osascript frente'])
+  // Reading for a few minutes without a key still counts: 200 s idle is under the 5 minutes
+  const reading = fake({ 'lsappinfo front': 'ASN:0x0-0x7a2:', 'ioreg -c': '"HIDIdleTime" = 200000000000', 'osascript frente': 'true /dev/ttys004' })
+  expect(await macos.windowInFront(reading.run, [])).toBe('/dev/ttys004')
   // lsappinfo can't tell: the lock is asked too
   const locked = fake({ 'lsappinfo front': null, 'ioreg -n': '"IOConsoleLocked" = Yes', 'osascript frente': 'true /dev/ttys004' })
   expect(await macos.windowInFront(locked.run, [])).toBe(null)

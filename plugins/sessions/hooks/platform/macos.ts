@@ -87,12 +87,14 @@ async function frontApp(run: Run): Promise<string | null> {
   return id
 }
 
-// Someone at the computer: keyboard or mouse used in the last 2 minutes, and the screen unlocked (asked only where the
+// Someone at the computer: keyboard or mouse used in the last PRESENT_IDLE_S (5 minutes: reading a session without
+// touching anything for a while still counts), and the screen unlocked (asked only where the
 // app in front couldn't be told: a locked screen puts the login window there)
+const PRESENT_IDLE_S = 300
 async function present(run: Run, checkLock: boolean): Promise<boolean> {
   if (checkLock && screenLocked((await run(['ioreg', '-n', 'Root', '-d1'], { timeoutMs: 3000 })).stdout)) return false
   const idle = idleSeconds((await run(['ioreg', '-c', 'IOHIDSystem', '-d', '4', '-r'], { timeoutMs: 3000 })).stdout)
-  return idle === null || idle < 120
+  return idle === null || idle < PRESENT_IDLE_S
 }
 
 // "frente" answers "<is Terminal the frontmost app> <tty of the front window's selected tab>" ("no" without windows):
