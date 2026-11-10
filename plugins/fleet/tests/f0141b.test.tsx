@@ -423,3 +423,40 @@ test('a reload writes the reads the module before it had yet to write ($.state h
   await tick(w, 1100)
   expect(json(w, READS).threads.main['notes/a.md']).toMatchObject({ v: hashText('a\n') })
 })
+
+// Measured live (0.14.0 and 0.14.1): the sweeping session's end let the lease go, and a timer of the ending process took
+// it back 0.4 s later, so another session waited out the whole stale bound
+test('a sweeping session that ends lets the lease go for good: its timers take nothing back', WITH_SESSIONS, async ($, on) => {
+  const { w } = session(on, 'person')
+  await startSession($, w)
+  await goLive($, w)
+  await tick(w, 30 * SECOND)
+  expect(json(w, `${STATE}/sweeper.json`)?.sessionId).toBe(SID)
+  await $.session.end({ reason: 'other', sessionId: SID } as any)
+  await w.clock.settle()
+  expect(w.files.has(`${STATE}/sweeper.json`)).toBe(false)
+  await tick(w, 3 * MIN)
+  expect(w.files.has(`${STATE}/sweeper.json`)).toBe(false)
+})
+
+test('a /resume lets the lease go and the session may take it again later (the process goes on)', WITH_SESSIONS, async ($, on) => {
+  const { w } = session(on, 'person')
+  await startSession($, w)
+  await goLive($, w)
+  await tick(w, 30 * SECOND)
+  expect(json(w, `${STATE}/sweeper.json`)?.sessionId).toBe(SID)
+  await $.session.end({ reason: 'resume', sessionId: SID } as any)
+  await w.clock.settle()
+  await tick(w, 3 * MIN)
+  expect(json(w, `${STATE}/sweeper.json`)?.sessionId).toBe(SID)
+})
+
+// Measured live: an instance's beat looked at runs/ (3.75 a minute) in a project that never declared a run, a failed
+// stat each time. The session's start makes it with the other folders it keeps
+test('a session in a project with a world makes runs/ at start, so its beats find the folder', WITH_SESSIONS, async ($, on) => {
+  const { w } = session(on, 'person')
+  otherSweeps(w)
+  await startSession($, w)
+  await tick(w, 5 * SECOND)
+  expect(w.dirs.has(`${FLEET}/runs`)).toBe(true)
+})

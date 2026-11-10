@@ -4526,7 +4526,8 @@ async function startWorld($: any) {
   await ensureWorld($)
   if (!world || worldStarted) return
   worldStarted = true
-  await run($, ['mkdir', '-p', eventsDir(), `${fleetDir()}/reads`])
+  // runs/ too: an instance looks at it every beat, and a project that never declared a run would fail that look
+  await run($, ['mkdir', '-p', eventsDir(), `${fleetDir()}/reads`, runsDir()])
   if (!(await exists($, `${eventsDir()}/latest`))) {
     try {
       await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: '' }))
@@ -4625,7 +4626,11 @@ async function lease($: any) {
     pace($)
   }
 }
+/** The process is ending (a session.end that isn't a /clear or a resume): its lease was let go, and a timer still
+ * running in it takes nothing back (else another session waits out the whole stale bound) */
+let ending = false
 async function leaseOnce($: any) {
+  if (ending) return
   const now = await $.clock.now()
   const due = sweep.holding ? 30000 : sweep.takenAt ? 2000 : 10000
   if (now - sweep.leaseAt < due) return
@@ -13496,7 +13501,10 @@ export const register: Register = on => {
     if (e.reason === 'clear' && timersOn && jobRef) $.clock.after(500, () => bg(rebuild($)))
     if (e.reason === 'clear') bg(clearReads($, String(e.sessionId ?? '')))
     // (and its reads file gets what was due: a read in its last 10 s)
-    else await Promise.race([Promise.all([releaseLease($).catch(() => {}), flushReads($).catch(() => {})]), $.clock.sleep(500)])
+    else {
+      if (e.reason !== 'resume') ending = true
+      await Promise.race([Promise.all([releaseLease($).catch(() => {}), flushReads($).catch(() => {})]), $.clock.sleep(500)])
+    }
     return next(e)
   })
 
