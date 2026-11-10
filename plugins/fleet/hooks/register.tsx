@@ -496,7 +496,8 @@ async function processNow($: any): Promise<string> {
 // second after it hands the list, and the first FileChanged under bell/ turns live updates on (and writes the set in
 // $.state, for a reload). Live, the timers are a safety pass (a lost event costs latency, never
 // correctness): answers every 60 s instead of 2 s, the band and the rest of the beat every 60 s instead of 10 s (10 s
-// still in the sweeping session, whose beat scans the world for outside changes).
+// still in the sweeping session, whose beat scans the world for outside changes), the world every 60 s and the lease
+// every 30 s in a session that doesn't sweep, and no timer every 2 s (pace, 0.14.1).
 const FLEET_WATCH_SET = 1
 const watching = atom({ plugin: 'fleet', key: 'watching' } as const, 0)
 let live = false
