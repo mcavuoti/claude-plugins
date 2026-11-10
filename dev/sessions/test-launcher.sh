@@ -285,7 +285,16 @@ wait "$!" 2>/dev/null || true
 grep -q "already open in another window" "$work/out.txt" || fail "bring" "no note: $(cat "$work/out.txt")"
 grep -q "^attach" "$fix/calls.log" && fail "bring" "something opened here too"
 grep -q "^id=bbbbbbbb" "$data/windows/_dev_ttys901" || fail "show" "the other window wasn't told to show beta"
-kill -0 "$viewer" 2>/dev/null && fail "show" "the other window's viewer wasn't closed"
+# The viewer gets its HUP as the launcher returns and is reaped a moment later, and until then (a zombie) it still
+# answers kill -0: it counts as closed once ps no longer lists it or lists it as a zombie, 2 s at most
+closed=0
+for _ in $(seq 1 100); do
+  state=$(/bin/ps -o stat= -p "$viewer" 2>/dev/null) || state=''
+  state=${state// /}
+  if [ -z "$state" ] || [ "${state#Z}" != "$state" ]; then closed=1; break; fi
+  sleep 0.02
+done
+if [ "$closed" != 1 ]; then fail "show" "the other window's viewer wasn't closed"; fi
 grep -q '^action=focus' "$data/inbox/bbbbbbbb-0000-0000-0000-000000000000" || fail "show" "no focus request for beta"
 # Nobody answers: open here instead
 reset

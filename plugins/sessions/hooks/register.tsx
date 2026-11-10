@@ -81,6 +81,8 @@ import {
   type EndedSession,
   stopReasons,
   storeNamespace,
+  goneNamespaces,
+  isOldKey,
   wakeStagger,
   afterTick,
   rowsBelow,
@@ -140,6 +142,8 @@ import {
   parseShowing,
   showingRuns,
   planSwitch,
+  withShowing,
+  listedLaunchers,
   autoName,
   bgRefusal,
   checkStart,
@@ -201,7 +205,7 @@ import {
 } from './state'
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
 import { bellFrom, bellOfKey, bellText, checkWatchPaths, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchPathsArgv, watchSetOf, type Locations, type RegistryEntry, type RegistryNews } from './watch'
-import { electLeader, LEADER_STALE_MS, leaderText, parseLeader, PASS_MS, type Candidate } from './leader'
+import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, PROCESS_STARTS_ENV, processGone, processStartsArgv, provenRunning, type Candidate } from './leader'
 
 const PANE = 'sessions'
 
@@ -374,6 +378,11 @@ let leading = false
 // Another session leads, as this one's last turn saw it (it lists, reads the usage and runs the shared commands)
 let leaderElsewhere = false
 let reconciledAt = 0
+// When the leader last asked which registered processes run, and the ones a listing left registered though their
+// process looked like another one (pid and start, as the registry has them): Claude takes them as running, so they're
+// no reason to list again
+let processesCheckedAt = 0
+const listedAnyway = new Set<string>()
 let usageRunAt = 0
 let leaderWrittenAt = 0
 // This session's own status from its own turn hooks, ahead of the registry (which comes 0.6 s later): it stands while
@@ -398,10 +407,10 @@ const LAUNCHER_ONLY: Record<string, string> = { SESSIONS_PLUGIN_VERSION: '', SES
 async function runSafe(
   $: any,
   argv: string[],
-  init?: { stdin?: string; timeoutMs?: number; cwd?: string },
+  init?: { stdin?: string; timeoutMs?: number; cwd?: string; env?: Record<string, string> },
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   try {
-    return await $.process.run(argv, { ...init, cwd: init?.cwd || workDir, env: LAUNCHER_ONLY })
+    return await $.process.run(argv, { ...init, cwd: init?.cwd || workDir, env: { ...init?.env, ...LAUNCHER_ONLY } })
   } catch (err) {
     return { exitCode: 127, stdout: '', stderr: String(err) }
   }
@@ -660,6 +669,17 @@ async function storeKeys($: any): Promise<string[]> {
   }
 }
 
+// The store as it is, every namespace's keys with their namespace: only for the leader's prune of the test namespaces
+// whose sessions are gone (pruneNamespaces), in a session that has none itself. Everything else goes through the four
+// above, and stays in its own namespace
+async function everyStoreKey($: any): Promise<string[]> {
+  try {
+    return await $.store.keys()
+  } catch {
+    return []
+  }
+}
+
 async function seenAt($: any, sessionId: string): Promise<number> {
   return Number(await storeGet($, `seen:${sessionId}`)) || 0
 }
@@ -815,8 +835,8 @@ async function myWindows($: any): Promise<string[]> {
 
 // The windows listing and the window in front, shared by every session for the seen check: one ps then serves every
 // session for SEEN_WINDOWS_MS (5 s in the first minute after a finish; which windows are open changes rarely, and
-// arriving in a session marks it seen without it), and one question to Terminal for FRONT_SHARED_MS, a little under
-// the fastest pace of the check. Only for that
+// arriving in a session marks it seen without it; SEEN_WINDOWS_LAZY_MS where the check says the listing can be older),
+// and one question to Terminal for FRONT_SHARED_MS, a little under the fastest pace of the check. Only for that
 // check: what acts on a window (closing a viewer, a switch) reads the listing right then, and a switch the usual way
 // stores what it read (shareWindows); a switch by the launcher windows reads the stored one only to know whether a
 // window that publishes nothing shows either session (planSwitch), never to act on a window. Like the session list:
@@ -824,17 +844,22 @@ async function myWindows($: any): Promise<string[]> {
 // meanwhile; a ps that took longer than SHARED_MS pushes every session's next one back (twice its time, up to 30 s)
 const SHARED_MS = 1500
 const SEEN_WINDOWS_MS = 30000
+const SEEN_WINDOWS_LAZY_MS = 300000
 const FRONT_SHARED_MS = 1900
 const WINDOWS_PENDING_MS = 10000
 // Two questions to Terminal at most (the front window, an agent view's text), 8 s each at most
 const FRONT_PENDING_MS = 20000
 const WINDOWS_BACKOFF_MAX_MS = 30000
-async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<Windows> {
+// The stored listing as it is (null: none, or not one), then one at most maxAge old (its `at`: when its ps came back)
+function storedWindows(c: any): { windows: Windows; at: number } | null {
+  return c && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid && c.windows.launchers ? { windows: c.windows as Windows, at: Number(c.at) || 0 } : null
+}
+async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<{ windows: Windows; at: number }> {
   const now = await $.clock.now()
   const c = await storeGet($, 'windowsList')
-  const stored = c && Array.isArray(c.windows?.agentsViews) && c.windows.byId && c.windows.byPid ? (c.windows as Windows) : null
+  const stored = storedWindows(c)
   if (stored) {
-    if (now - Number(c.at) < maxAge) return stored
+    if (now - stored.at < maxAge) return stored
     if (typeof c.until === 'number' && now < c.until) return stored
     if (typeof c.pendingAt === 'number' && now - c.pendingAt < WINDOWS_PENDING_MS) return stored
     await storeSet($, 'windowsList', { ...c, pendingAt: now })
@@ -843,7 +868,7 @@ async function sharedWindows($: any, maxAge = SEEN_WINDOWS_MS): Promise<Windows>
   const at = await $.clock.now()
   const took = at - now
   await storeSet($, 'windowsList', { at, windows: v, ...(took > SHARED_MS ? { until: at + Math.min(WINDOWS_BACKOFF_MAX_MS, 2 * took) } : {}) })
-  return v
+  return { windows: v, at }
 }
 
 // The window in front ('frontWindow': at, tty, and with an agent view in front, tags: the sessions it shows by their
@@ -890,6 +915,15 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
 // A session no window shows (no viewer of it, no agent view) past the first minute after its answer is checked again a
 // minute later (seenQuietUntil), with a listing up to a minute old: arriving there with ccc, or from another panel
 // (Enter or a click), marks it seen anyway
+// The listing (a ps of every process) is what finds the windows; the windows opened with ccc also say what they show
+// in a file (.showing), read at every check with no command and taken over the listing for their terminals
+// (withShowing), once a listing saw their launcher running there (listedLaunchers). So the listing can be older,
+// SEEN_WINDOWS_LAZY_MS, where it's only there to find a viewer opened by hand: while there are such windows and the
+// last listing saw every one of them (and, for a regular session, its own process: its own window is found there),
+// and for an answer 10 minutes old on a session no window showed last time. A viewer opened by hand is then noticed
+// up to that much later; one opened with ccc, at once (its file). Before a window
+// counts as looked at on the word of an older listing, it's asked about now: its launcher and watcher (one ps of those
+// two) when it says what it shows, else a listing taken now; never a regular session's own window
 let seenCheckedAt = 0
 let seenQuietUntil = 0
 async function markSeenIfLooking($: any) {
@@ -902,13 +936,33 @@ async function markSeenIfLooking($: any) {
   // In the first minute after a finish the person may well be opening a window on it: a listing at most 5 s old then;
   // a minute old once the answer is 10 minutes old, or when no window showed this session last time
   const age = now - finished
-  const v = await sharedWindows($, age < 60000 ? 5000 : age >= 600000 || seenQuietUntil > 0 ? 2 * SEEN_WINDOWS_MS : SEEN_WINDOWS_MS)
-  const mine = myWindowsIn(v)
+  const quiet = seenQuietUntil > 0
+  const strict = age < 60000 ? 5000 : age >= 600000 || quiet ? 2 * SEEN_WINDOWS_MS : SEEN_WINDOWS_MS
+  const shown = await launcherWindows($)
+  const before = storedWindows(await storeGet($, 'windowsList'))
+  const ownListed = !!before && (me().background || !!before.windows.byPid[String(myPid)])
+  const lazy = !!before && ownListed && listedLaunchers(before.windows, shown).length === shown.length && (shown.length > 0 || (quiet && age >= 600000))
+  let listed = await sharedWindows($, lazy ? SEEN_WINDOWS_LAZY_MS : strict)
+  const told = listedLaunchers(listed.windows, shown)
+  let v = withShowing(listed.windows, told)
+  let mine = myWindowsIn(v)
   seenQuietUntil = mine.length === 0 && v.agentsViews.length === 0 && age >= 60000 ? now + 60000 : 0
   if (mine.length === 0 && v.agentsViews.length === 0) return
   const front = await sharedFront($, v)
   const tty = front?.tty
   if (!tty) return
+  if (mine.includes(tty) && now - listed.at >= strict && tty !== v.byPid[String(myPid)]) {
+    const window = told.find(s => s.tty === tty)
+    if (window) {
+      if (!(await launcherRuns($, window))) return
+    } else {
+      listed = await sharedWindows($, 0)
+      // Another session's listing in flight, or a slow ps's back-off: not on an older one's word; the next check asks
+      if (listed.at < now) return
+      v = withShowing(listed.windows, listedLaunchers(listed.windows, shown))
+      mine = myWindowsIn(v)
+    }
+  }
   const looking = mine.includes(tty) || (v.agentsViews.some(c => c.tty === tty) && !!front.tags?.includes(myShortId()))
   if (looking && (await platform.userPresent(sys($)))) await storeSet($, `seen:${myId}`, await $.clock.now())
 }
@@ -1590,9 +1644,10 @@ async function leaderCandidates($: any, now: number): Promise<Candidate[]> {
 }
 
 // The leader's turn: who leads (electLeader), and, leading, the record rewritten and what's due. On the pass and the
-// short timer's tick: the listing (a pass apart), the pins, the reopen, the prune; on a file event: the listing when it
-// just took over, the pins when a Remote Control connection moved, the token usage when a turn ended (two minutes
-// apart at least, and every 10 minutes)
+// short timer's tick: the listing when a registered process is gone (looked at a pass apart) or none ran for
+// LIST_SAFETY_MS, the pins, the reopen, the prune; on a file event: the listing when it just took over, the pins when a
+// Remote Control connection moved, the token usage when a turn ended (two minutes apart at least, and every 10
+// minutes)
 async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   if (!dataDir || !myId || !myPid) return
   const now = await $.clock.now()
@@ -1616,7 +1671,10 @@ async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   const news = leaderNews
   leaderNews = { bridge: false, ended: false }
   const timed = why === 'pass' || why === 'tick' || why === 'start'
-  if (!slowList && sessionFiles && (e.takeover || first || (timed && now - reconciledAt >= PASS_MS - 5000))) await reconcile($)
+  if (!slowList && sessionFiles) {
+    if (e.takeover || first) await reconcile($)
+    else if (timed) await listIfGone($, now)
+  }
   if (timed || news.bridge) bg(pinRemoteSessions($))
   if (timed) bg(reopenRetiredSessions($))
   if (timed) bg(prune($))
@@ -1626,10 +1684,10 @@ async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   }
 }
 
-// The leader's listing (claude agents --json --all), a pass apart: Claude removes the registry files of sessions whose
-// process is gone as it lists (a crashed one's file stays until then), and what it lists is checked against the direct
-// read, any difference said in the debug log
-async function reconcile($: any) {
+// The leader's listing (claude agents --json --all): Claude removes the registry files of sessions whose process is
+// gone as it lists (a crashed one's file stays until then), and what it lists is checked against the direct read, any
+// difference said in the debug log. gone: the registered sessions whose process looked gone, which asked for it
+async function reconcile($: any, gone: readonly RegistryEntry[] = []) {
   reconciledAt = await $.clock.now()
   const r = await run($, [claude, 'agents', '--json', '--all'])
   if (r.exitCode !== 0) return
@@ -1637,8 +1695,35 @@ async function reconcile($: any) {
   if (typeof official === 'string') return
   const drift = listDrift(sessionFiles?.list() ?? [], official)
   if (drift) debugLine($, `reconcile: ${drift}`)
+  // One Claude still lists as running under that process: its start only reads another way here
+  if (listedAnyway.size > 200) listedAnyway.clear()
+  for (const e of gone) if (official.some(s => s.sessionId === e.sessionId && s.pid === e.pid)) listedAnyway.add(`${e.pid}:${e.procStart ?? ''}`)
   // The files it swept: their events come; read again in a moment all the same
   scheduleFlush($, 300, d => (d.registry = true))
+}
+
+// The listing only when it has something to sweep (leader.ts): a pass apart, the registered sessions that no fresh
+// heartbeat of their own process proves running are asked about in one ps of those processes (with this one's, which
+// must be in its answer: a ps that can't tell says nothing, and the listing runs as it did, a pass apart); one gone,
+// or none listed for LIST_SAFETY_MS, and it lists
+async function listIfGone($: any, now: number) {
+  if (now - reconciledAt >= LIST_SAFETY_MS) return reconcile($)
+  if (!sessionFiles || now - processesCheckedAt < PASS_MS - 5000) return
+  processesCheckedAt = now
+  const others = sessionFiles.entries().filter(e => e.pid !== myPid && !listedAnyway.has(`${e.pid}:${e.procStart ?? ''}`))
+  const beats = await readHeartbeats($, others.map(e => e.sessionId))
+  const unproven = others.filter(e => !provenRunning(beats[e.sessionId], e.pid, now))
+  if (unproven.length === 0) return
+  const r = await runSafe($, processStartsArgv([myPid, ...unproven.map(e => e.pid)]), { timeoutMs: 15000, env: PROCESS_STARTS_ENV })
+  const started = parseProcessStarts(r.stdout)
+  if (!started.has(myPid)) {
+    if (now - reconciledAt >= PASS_MS - 5000) await reconcile($)
+    return
+  }
+  const gone = unproven.filter(e => processGone(e, started))
+  if (gone.length === 0) return
+  debugLine($, `leader: ${gone.length === 1 ? `the process of a registered session (pid ${gone[0]?.pid}) is gone` : `the processes of ${gone.length} registered sessions are gone`}: listing, which sweeps ${gone.length === 1 ? 'its file' : 'their files'}`)
+  await reconcile($, gone)
 }
 
 // ---- What the engine watches (watch.ts) ----
@@ -1777,6 +1862,8 @@ async function prune($: any) {
     for (const k of keys.filter(k => k.endsWith(`:${id}`))) await storeDelete($, k)
     await runSafe($, ['rm', '-f', `${dataDir}/alive/${id}`, `${dataDir}/inbox/${id}`])
   }
+  await pruneOldKeys($, keys)
+  await pruneNamespaces($, now)
   // ccc tell folders of background sessions no longer in the list
   try {
     const shorts = new Set(list.map(s => String(s.id ?? '')))
@@ -1810,6 +1897,57 @@ async function prune($: any) {
     for (const id of drop) emptyBefore.delete(id)
     return { file: dropSections(pruned, drop) }
   })
+}
+
+// The keys from before the store's keys were English (isOldKey): nothing reads them
+async function pruneOldKeys($: any, keys: readonly string[]) {
+  const old = keys.filter(isOldKey)
+  if (old.length === 0) return
+  debugLine($, `prune: ${old.length === 1 ? 'a key' : `${old.length} keys`} from before the store's keys were English`)
+  for (const k of old) await storeDelete($, k)
+}
+
+// The test namespaces whose sessions are gone (goneNamespaces in state.ts): nothing else deletes a test session's
+// keys once it's removed, and every read and write of the store carries them. Only the leader of the sessions the
+// person uses does it (no namespace of its own: its list is Claude's own, every session of this machine, running or
+// stopped), and only for a namespace found so at two prunes in a row (10 minutes apart), against a list read right
+// then that has this very session, with no record there created in the last 5 minutes (a session that started since
+// the list was read). Never a namespace with a session still in the list, nor any key outside a namespace. At most
+// NAMESPACE_KEYS_A_PRUNE keys a prune (each delete rewrites the store): the rest at the next
+const NAMESPACE_KEYS_A_PRUNE = 80
+let goneBefore = new Set<string>()
+async function pruneNamespaces($: any, now: number) {
+  if ((await storeNamespaceOf($)) !== '') return
+  const all = await everyStoreKey($)
+  if (!all.some(k => k.startsWith('@'))) return
+  const list = await officialList($, 0)
+  if (typeof list === 'string' || !list.some(s => s.sessionId === myId)) return
+  const gone = goneNamespaces(all, new Set(list.map(s => String(s.sessionId))))
+  const was = goneBefore
+  goneBefore = new Set(gone.keys())
+  let left = NAMESPACE_KEYS_A_PRUNE
+  for (const [ns, keys] of gone) {
+    if (!was.has(ns) || left <= 0) continue
+    let recent = false
+    for (const k of keys.filter(k => k.startsWith('state:'))) {
+      let created = 0
+      try {
+        created = Number((await $.store.get(`${ns}${k}`))?.created) || 0
+      } catch {}
+      if (now - created < 300000) recent = true
+    }
+    if (recent) continue
+    const drop = keys.slice(0, left)
+    left -= drop.length
+    debugLine($, `prune: ${drop.length === 1 ? 'a key' : `${drop.length} keys`} of a test namespace whose sessions are gone (${ns})`)
+    for (const k of drop) {
+      try {
+        await $.store.delete(`${ns}${k}`)
+      } catch {}
+    }
+    // Cut short: found again at the next prune, which goes on
+    if (drop.length < keys.length) goneBefore.add(ns)
+  }
 }
 
 // The order files (<data>/order/<root as a file name>) of projects whose folder is gone: of the files no panel rewrote
@@ -4912,6 +5050,7 @@ async function statusText($: any): Promise<string> {
     await notificationsText($, now),
     await liveText($, now),
   ]
+  if (!platform.frontKnown) lines.push("Seen: this machine can't tell which window is in front (no X11 display, or no xprop), so nothing checks for it: a session's answer counts as seen when you type in it, use its panel or arrive there (Enter or a click in another panel, ccc)")
   const apart = await apartText($)
   if (apart) lines.push(apart)
   if (startProblems.length) lines.push(`Start problems: ${startProblems.join('; ')}`)

@@ -5,7 +5,7 @@
 // from /proc/meminfo.
 // Only fully testable on Linux: edit this file from there (see CONTRIBUTING.md).
 import type { Windows } from '../state'
-import type { Platform, Shown } from './types'
+import type { Platform, Run, Shown } from './types'
 
 // Without asking the desktop which window is in front (Linux: no portable way, and none at all on Wayland), the window
 // this session is shown in, which is where its panel was just used: a viewer of this session, preferring one that runs
@@ -141,7 +141,7 @@ export const linux: Platform = {
   },
 
   // The window in front, by its title, with xprop (X11). Without X11 or xprop (Wayland, no display) it answers none,
-  // and a session counts as seen only when you type in it
+  // and a session counts as seen only when you type in it: frontKnown is false on such a machine (linuxHere)
   frontKnown: true,
   async windowInFront(run, shown) {
     if (shown.length === 0) return null
@@ -226,4 +226,21 @@ export const linux: Platform = {
     cantOpenAgents: "Couldn't open the agent view here: open a terminal and run ccc",
     cantBring: 'windows can only be brought forward on X11 with wmctrl or xdotool',
   },
+}
+
+// Whether the window in front can be told on this machine: xprop reads it from an X11 display, so both must be there.
+// With no display (a host reached over ssh, Wayland with no X11 beside it) or no xprop, windowInFront always answers
+// none: no session is ever marked seen by looking at it, and the seen check has nothing to run
+export function frontKnowable(display: string, xprop: string): boolean {
+  return display.trim() !== '' && xprop.trim() !== ''
+}
+
+// The Linux platform as this machine has it, asked once at the start (one sh, no other program): where the window in
+// front can't be told, frontKnown is false, and the seen check runs no command at all (no ps, no xprop). A question
+// that fails changes nothing
+export async function linuxHere(run: Run): Promise<Platform> {
+  const r = await run(['/bin/sh', '-c', 'printf "%s|%s" "${DISPLAY:-}" "$(command -v xprop 2>/dev/null)"'])
+  if (r.exitCode !== 0 || !r.stdout.includes('|')) return linux
+  const [display = '', xprop = ''] = r.stdout.split('|')
+  return frontKnowable(display, xprop) ? linux : { ...linux, frontKnown: false }
 }

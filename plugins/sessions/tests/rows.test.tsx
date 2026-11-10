@@ -318,6 +318,25 @@ test('seen: a session shown in no window asks Terminal nothing; its viewer in fr
   expect(w.runs.filter(a => a[0] === 'osascript')).toHaveLength(1)
 })
 
+for (const missing of ['display', 'xprop'] as const) {
+  test(`seen on Linux with no ${missing === 'display' ? 'display (a host reached over ssh)' : 'xprop'}: the window in front can't be told, so nothing is run for it, and /sessions status says so`, SLOW, async ($, on) => {
+    const w = world(on, { list: list(), system: 'Linux', ...(missing === 'display' ? { display: '' } : { xpropPath: '' }), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
+    w.ps.value = '  101 pts/1  claude attach aaaaaaaa'
+    w.xprop.value = args => (args.join(' ') === '-root _NET_ACTIVE_WINDOW' ? '_NET_ACTIVE_WINDOW(WINDOW): window id # 0x1, 0x0' : '_NET_WM_NAME(UTF8_STRING) = "Terminal - \u2733 alpha"')
+    on('prompt.submit', (_: any, e: any) => ({ text: e.text }))
+    await startSession($, w)
+    await w.clock.advance(3 * 60000)
+    expect(w.runs.filter(a => a[0] === 'ps' || a[0] === 'xprop')).toEqual([])
+    expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+    const r: any = await $.command.run({ command: 'sessions', args: 'status', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as any)
+    expect(r.text).toContain("can't tell which window is in front")
+    // Typing in it still counts
+    await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as any)
+    await w.clock.advance(100)
+    expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+  })
+}
+
 test('seen on Linux (X11): its viewer\'s window in front, its title showing the session\'s name, sees it; another one doesn\'t', async ($, on) => {
   const w = world(on, { list: list(), system: 'Linux', store: { [`state:${SID}`]: { finished: 999_999_000 } } })
   w.ps.value = ['  101 pts/1  claude attach aaaaaaaa', '  102 pts/2  claude attach bbbbbbbb'].join('\n')

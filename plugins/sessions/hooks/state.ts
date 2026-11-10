@@ -23,6 +23,31 @@ export function storeNamespace(values: readonly (string | undefined)[]): string 
   return `@${fnv1a(hashed.map(v => v ?? '').join('\n')).toString(16).padStart(8, '0')}/`
 }
 
+// What nothing else ever takes out of the store, and the leader's prune does (register.tsx): the test namespaces whose
+// sessions are gone, and the keys written before 0.10.0, when the store's keys were Spanish (nothing reads them).
+// A namespace is a test session's (@<hash>/, above), and its sessions are gone when none of its keys names a session of
+// the list (a key names one by ending with its id: state:<id>, marks:<source>:<id>). A session that runs, or is stopped
+// and not removed, is in the list and has its record there (state:<id>, written as its mod starts): its whole
+// namespace stays, whatever else it holds. By namespace, the keys (without it) of those with no such session
+export function goneNamespaces(keys: readonly string[], listed: ReadonlySet<string>): Map<string, string[]> {
+  const spaces = new Map<string, string[]>()
+  const kept = new Set<string>()
+  for (const k of keys) {
+    const m = k.match(/^(@[0-9a-f]{8}\/)(.+)$/)
+    if (!m?.[1] || !m[2]) continue
+    spaces.set(m[1], [...(spaces.get(m[1]) ?? []), m[2]])
+    if (listed.has(m[2].slice(m[2].lastIndexOf(':') + 1))) kept.add(m[1])
+  }
+  for (const ns of kept) spaces.delete(ns)
+  return spaces
+}
+
+const OLD_KEYS = ['lista', 'instalada', 'vistaUso', 'fijado', 'fijadoAuto', 'reapertura']
+const OLD_FAMILIES = ['estado', 'visto', 'titulo', 'esperando', 'reiniciada', 'revividas']
+export function isOldKey(key: string): boolean {
+  return OLD_KEYS.includes(key) || OLD_FAMILIES.some(f => key.startsWith(`${f}:`))
+}
+
 // FNV-1a (32 bits) of a text's UTF-8 bytes, from a starting basis (FNV's own by default)
 export function fnv1a(text: string, basis = 0x811c9dc5): number {
   let h = basis >>> 0
@@ -1067,6 +1092,32 @@ export function showingRuns(s: Showing, ps: string): boolean {
     if (pid === s.watcher && /\S*\/launcher\.py watch( |$)/.test(command)) watcher = true
   }
   return launcher && watcher
+}
+
+// The seen check's view of the windows: a listing (ps), with what the launcher windows say they show right now (their
+// .showing files, read with no command) in place of what it had for their terminals. So a listing taken a while ago is
+// still right about the windows opened with ccc, whatever they switched to since
+export function withShowing(v: Windows, shown: readonly Showing[]): Windows {
+  const published = new Set(shown.map(s => s.tty))
+  const byId: Record<string, string[]> = {}
+  for (const [id, ttys] of Object.entries(v.byId)) {
+    const kept = ttys.filter(t => !published.has(t))
+    if (kept.length) byId[id] = kept
+  }
+  const agentsViews = v.agentsViews.filter(a => !published.has(a.tty))
+  const clients = Object.fromEntries(Object.entries(v.clients).filter(([tty]) => !published.has(tty)))
+  for (const s of shown) {
+    if (s.command === 'attach') (byId[s.id] ??= []).push(s.tty)
+    else agentsViews.push({ pid: s.viewer, tty: s.tty })
+    clients[s.tty] = s.viewer
+  }
+  return { byId, byPid: v.byPid, agentsViews, clients, launchers: v.launchers }
+}
+
+// The windows that say what they show whose launcher a listing saw running on their terminal: only those are taken at
+// their word. One no listing confirmed is a window opened since, or a file its launcher left behind
+export function listedLaunchers(v: Windows, shown: readonly Showing[]): Showing[] {
+  return shown.filter(s => v.launchers[s.tty] === s.launcher)
 }
 
 // A switch from this session's panel by what the launcher windows publish, with no ps and no question to the terminal

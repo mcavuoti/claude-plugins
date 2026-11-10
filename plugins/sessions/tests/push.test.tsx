@@ -1,9 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
-import { heartbeatText, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
+import { goneNamespaces, heartbeatText, isOldKey, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
 import { bellOfKey, classify, directList, jobIds, listDrift, parseRegistry, SessionFiles, WATCH_SET, watchPaths, watchSetOf } from '../hooks/watch'
-import { electLeader, LEADER_STALE_MS, leaderText, parseLeader, PASS_MS } from '../hooks/leader'
-import { DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
+import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, processGone, processStartsArgv, provenRunning } from '../hooks/leader'
+import { DATA, ROOT, SID, SLOW, STARTED, startSession, world, type World } from './world'
 
 // What the panel learns by watching files (watch.ts): the paths it hands the engine at SessionStart, a row that changes
 // within a file event with no command run, the bells other sessions ring, its own row from its own turns, the one
@@ -17,7 +17,7 @@ const REGISTRY = '/Users/x/.claude/sessions'
 const JOBS = '/Users/x/jobs'
 const MIN = 60000
 
-type Session = { pid: number; sessionId: string; id?: string; status?: string; name: string; cwd?: string; kind?: string }
+type Session = { pid: number; sessionId: string; id?: string; status?: string; name: string; cwd?: string; kind?: string; procStart?: string }
 const SESSIONS: Session[] = [
   { pid: 4242, sessionId: SID, id: 'aaaaaaaa', status: 'idle', name: 'alpha' },
   { pid: 4243, sessionId: BRAVO, id: 'bbbbbbbb', status: 'idle', name: 'bravo' },
@@ -35,7 +35,7 @@ function registryFile(w: World, s: Session) {
     name: s.name,
     ...(s.id ? { jobId: `${s.id}-0000-0000-0000-000000000000` } : {}),
     startedAt: 999_000_000,
-    procStart: 'x',
+    procStart: s.procStart ?? 'x',
   })
   w.write(`${REGISTRY}/${s.pid}.json`, text)
   w.write(`${REGISTRY}/${s.pid}.0a1b.key`, 'x')
@@ -178,6 +178,28 @@ test('the files in memory: only what moved is read, a file cut short twice is a 
   expect(files.list()).toEqual([{ id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background' }])
 })
 
+test("the store's dead weight: the test namespaces none of whose keys names a listed session, and the keys from before they were English", () => {
+  const gone = 'dddddddd-0000-0000-0000-000000000000'
+  const keys = [
+    `@0000aaaa/state:${gone}`,
+    '@0000aaaa/list',
+    `@0000aaaa/marks:probe:${gone}`,
+    `@0000bbbb/state:${gone}`,
+    `@0000bbbb/marks:probe:${BRAVO}`,
+    '@0000cccc/windowsList',
+    `state:${gone}`,
+    'waitingOnly',
+    '@not-a-namespace',
+  ]
+  const found = goneNamespaces(keys, new Set([SID, BRAVO]))
+  // Not the one a listed session has a key in; one with no session-keyed key at all is gone too
+  expect([...found.keys()]).toEqual(['@0000aaaa/', '@0000cccc/'])
+  expect(found.get('@0000aaaa/')).toEqual([`state:${gone}`, 'list', `marks:probe:${gone}`])
+  expect([...goneNamespaces(keys, new Set([gone])).keys()]).toEqual(['@0000cccc/'])
+  for (const k of ['lista', 'instalada', 'vistaUso', 'fijado', 'fijadoAuto', 'reapertura', `estado:${gone}`, `visto:${gone}`, `titulo:${gone}`, `esperando:${gone}`, `reiniciada:${gone}`, `revividas:${gone}`]) expect(isOldKey(k)).toBe(true)
+  for (const k of ['list', 'installed', 'usageView', 'pinPass', 'autoPins', 'reopenPass', `state:${gone}`, `seen:${gone}`, `title:${gone}`, 'listado', 'estado']) expect(isOldKey(k)).toBe(false)
+})
+
 test('bells: which a write of the store rings', () => {
   expect(bellOfKey(`state:${SID}`)).toBe(SID)
   expect(bellOfKey(`seen:${SID}`)).toBe(SID)
@@ -242,6 +264,29 @@ test("the leader's check: what the direct read and claude agents disagree on, co
   expect(listDrift(mine, [{ ...mine[0], status: 'busy' }, mine[1], mine[2]])).toBe('1 with another process or status')
 })
 
+test("the leader's check of the registered processes: a fresh heartbeat of that process proves it; ps says which run and since when", () => {
+  const now = 10_000_000
+  const beat = (pid: number, at: number) => ({ format: 3, pid, at, version: '0.18.3', via: 'session.start', root: ROOT })
+  expect(provenRunning(beat(4243, now - 30000), 4243, now)).toBe(true)
+  // Stale, another process's, or none: asked about
+  expect(provenRunning(beat(4243, now - 46000), 4243, now)).toBe(false)
+  expect(provenRunning(beat(4999, now - 1000), 4243, now)).toBe(false)
+  expect(provenRunning(undefined, 4243, now)).toBe(false)
+  expect(processStartsArgv([4242, 4243])).toEqual(['ps', '-p', '4242,4243', '-o', 'pid=', '-o', 'lstart='])
+  const started = parseProcessStarts(` 4242 ${STARTED}\n 4243 Tue Nov 10 02:33:51 2026\n`)
+  expect(started.get(4242)).toBe('Mon Nov 9 04:32:54 2026')
+  // Running since the moment the registry recorded (whatever its spacing): not gone
+  expect(processGone({ pid: 4242, procStart: STARTED }, started)).toBe(false)
+  // Not running; and running since another moment: another process took its number
+  expect(processGone({ pid: 4300, procStart: STARTED }, started)).toBe(true)
+  expect(processGone({ pid: 4243, procStart: STARTED }, started)).toBe(true)
+  // A start the registry or ps writes another way says nothing against it
+  expect(processGone({ pid: 4243 }, started)).toBe(false)
+  expect(processGone({ pid: 4243, procStart: '1794278031873' }, started)).toBe(false)
+  expect(processGone({ pid: 4243, procStart: STARTED }, parseProcessStarts(' 4243 12345.67\n'))).toBe(false)
+  expect(LIST_SAFETY_MS).toBe(10 * PASS_MS)
+})
+
 // ---- In a session ----
 
 test('SessionStart hands the engine its paths, after those of the plugins beneath, and the session is live', async ($, on) => {
@@ -273,13 +318,17 @@ test('live: another session turning busy is drawn on its file event, with no com
   await $.classic.FileChanged({ file_path: `${REGISTRY}/5000.json`, event: 'add' })
   await w.clock.advance(50)
   expect(writes.count.rows).toBe(rows + 1)
-  // Idle, nothing happening: no ps, no store write of a listing, the leader's one listing a pass
-  const ps = runsOf(w, 'ps')
+  // Idle, nothing happening: no listing, no ps of every process, no store write of a listing. The other two have no
+  // heartbeat here, so the leader asks whether their processes run, one ps of those a pass
+  const ps = runsOf(w, 'ps', '-A')
+  const asked = runsOf(w, 'ps', '-p')
   const before = listings(w)
   await w.clock.advance(5 * MIN)
-  expect(listings(w) - before).toBeLessThanOrEqual(5)
-  expect(listings(w) - before).toBeGreaterThanOrEqual(4)
-  expect(runsOf(w, 'ps')).toBe(ps)
+  expect(listings(w)).toBe(before)
+  expect(runsOf(w, 'ps', '-A')).toBe(ps)
+  expect(runsOf(w, 'ps', '-p') - asked).toBeLessThanOrEqual(5)
+  expect(runsOf(w, 'ps', '-p') - asked).toBeGreaterThanOrEqual(4)
+  expect(w.runs.filter(a => a[0] === 'ps' && a[1] === '-p').at(-1)).toEqual(processStartsArgv([4242, 4243, 5000]))
   expect(w.store.has('list')).toBe(false)
   expect(runsOf(w, 'mkdir') - runsOf(w, 'mkdir', '-p')).toBe(runsOf(w, 'rmdir'))
 })
@@ -419,6 +468,67 @@ test('live: the lowest pid leads, writes the record and lists once a pass; the n
   expect(parseLeader(w.files.get(`${DATA}/leader.json`) ?? '')?.pid).toBe(4242)
 })
 
+test('live: the leader lists when it starts leading, then only when a registered process is gone, and every 10 minutes', SLOW, async ($, on) => {
+  const sessions: Session[] = [SESSIONS[0]!, { ...SESSIONS[1]!, procStart: STARTED }]
+  const { w, writes, list } = await liveSession($, on, sessions)
+  await w.clock.advance(1000)
+  // It starts leading: one listing
+  expect(listings(w)).toBe(1)
+  const asked = () => runsOf(w, 'ps', '-p')
+  // Bravo's heartbeat is fresh and from its process: nothing is asked, and nothing listed
+  for (let i = 0; i < 8; i++) {
+    heartbeat(w, BRAVO, 4243)
+    await w.clock.advance(30000)
+  }
+  expect(listings(w)).toBe(1)
+  expect(asked()).toBe(0)
+  // Its heartbeat stops (its mod did, or it was killed): the next pass asks whether its process runs. It does
+  await w.clock.advance(2 * MIN)
+  expect(asked()).toBeGreaterThanOrEqual(1)
+  expect(listings(w)).toBe(1)
+  expect(w.envs[w.runs.findIndex(a => a[0] === 'ps' && a[1] === '-p')]).toMatchObject({ TZ: 'UTC', LC_ALL: 'C' })
+  // Another process runs under its number (started at another moment): gone, and the listing sweeps its file
+  w.startedAt.set(4243, 'Tue Nov 10 02:33:51 2026')
+  list.splice(1, 1)
+  for (let t = 0; t < 70 && listings(w) < 2; t++) await w.clock.advance(1000)
+  expect(listings(w)).toBe(2)
+  await changed($, w, `${REGISTRY}/4243.json`, null, 'unlink')
+  expect(rowOf(writes, BRAVO)).toBe(undefined)
+  // Alone: nothing asked; the safety listing 10 minutes after the last one
+  const alone = asked()
+  await w.clock.advance(8 * MIN)
+  expect(listings(w)).toBe(2)
+  expect(asked()).toBe(alone)
+  await w.clock.advance(3 * MIN)
+  expect(listings(w)).toBe(3)
+})
+
+test('live: a registered process that is gone is listed for at the next pass; one Claude still lists as running is asked about no more', SLOW, async ($, on) => {
+  const sessions: Session[] = [SESSIONS[0]!, { ...SESSIONS[1]!, procStart: STARTED }]
+  const { w, list } = await liveSession($, on, sessions)
+  await w.clock.advance(1000)
+  expect(listings(w)).toBe(1)
+  // Killed: no process; its registry file stays until the listing
+  w.gone.add(4243)
+  await w.clock.advance(MIN + 10000)
+  expect(listings(w)).toBe(2)
+  // Claude didn't sweep it, and lists it running under that process (its start only reads another way here, or its
+  // process isn't one this machine's ps sees): no listing a pass from then on
+  expect(list.some(s => s.pid === 4243)).toBe(true)
+  await w.clock.advance(5 * MIN)
+  expect(listings(w)).toBe(2)
+})
+
+test("live: a ps that can't tell (it lists not even this session's process) says nothing: the listing a pass apart, as before", SLOW, async ($, on) => {
+  const { w } = await liveSession($, on)
+  w.gone.add(4242)
+  await w.clock.advance(1000)
+  const before = listings(w)
+  await w.clock.advance(5 * MIN)
+  expect(listings(w) - before).toBeLessThanOrEqual(5)
+  expect(listings(w) - before).toBeGreaterThanOrEqual(4)
+})
+
 test('live: while another session leads, it alone runs claude --version and plugin list; this one runs them only if it keeps them no more', SLOW, async ($, on) => {
   const sessions: Session[] = [{ pid: 4200, sessionId: CHARLIE, id: 'cccccccc', status: 'idle', name: 'charlie' }, ...SESSIONS]
   const now = 1_000_000_000
@@ -478,6 +588,53 @@ test('live: a leader that crashed (its file stays, its heartbeat stops) is repla
   expect(cleared).toBeGreaterThan(0)
   expect(cleared - killed).toBeLessThanOrEqual(3 * MIN)
   expect(parseLeader(w.files.get(`${DATA}/leader.json`) ?? '')?.pid).toBe(4242)
+})
+
+// A session the person uses: no location override, so no namespace of its own in the store
+const NO_OVERRIDES = { SESSIONS_CLAUDE: '', SESSIONS_JOBS_DIR: '', SESSIONS_DAEMON_LOG: '' }
+
+test("the leader's prune drops a test namespace whose sessions are gone at the second prune that finds it so, and the keys from before they were English; never a namespace with a listed session, one with a record just created, nor a key of the person's", SLOW, async ($, on) => {
+  const gone = 'dddddddd-0000-0000-0000-000000000000'
+  const fresh = 'eeeeeeee-0000-0000-0000-000000000000'
+  const { w } = await liveSession($, on, SESSIONS, NO_OVERRIDES)
+  expect(w.namespace).toBe('')
+  const seeded: Record<string, unknown> = {
+    [`@0000aaaa/state:${gone}`]: { created: 1 },
+    [`@0000aaaa/seen:${gone}`]: 5,
+    '@0000aaaa/list': { at: 1, sessions: [] },
+    [`@0000aaaa/marks:probe:${gone}`]: { at: 1, until: 2, rows: {} },
+    [`@0000bbbb/state:${BRAVO}`]: { created: 1 },
+    [`@0000bbbb/state:${gone}`]: { created: 1 },
+    '@0000bbbb/waitingOnly': true,
+    [`@0000cccc/state:${fresh}`]: { created: 1 },
+    lista: { en: 1, sesiones: [] },
+    [`estado:${gone}`]: { creada: 1 },
+    fijado: 1,
+    usageView: { period: 'week', scope: 'all' },
+    [`title:${BRAVO}`]: 'kept',
+  }
+  for (const [k, v] of Object.entries(seeded)) w.store.set(k, v)
+  const left = () => [...w.store.keys()].filter(k => k in seeded).sort()
+  // The first prune that sees them (10 minutes after the start's): the old keys go; the namespaces are only noted
+  await w.clock.advance(10 * MIN + 15000)
+  expect(left()).toEqual(Object.keys(seeded).filter(k => !['lista', `estado:${gone}`, 'fijado'].includes(k)).sort())
+  // A test session starts in one of them just before the next: its record is a moment old, and it isn't listed yet
+  await w.clock.advance(9 * MIN)
+  w.store.set(`@0000cccc/state:${fresh}`, { created: w.clock.now() })
+  await w.clock.advance(MIN + 15000)
+  expect(left()).toEqual([`@0000bbbb/state:${BRAVO}`, `@0000bbbb/state:${gone}`, '@0000bbbb/waitingOnly', `@0000cccc/state:${fresh}`, `title:${BRAVO}`, 'usageView'].sort())
+  expect(w.store.get('usageView')).toEqual({ period: 'week', scope: 'all' })
+})
+
+test("a test session never prunes another namespace: it can't tell which sessions run for them", SLOW, async ($, on) => {
+  const gone = 'dddddddd-0000-0000-0000-000000000000'
+  const { w } = await liveSession($, on)
+  expect(w.namespace).not.toBe('')
+  w.store.set(`@0000aaaa/state:${gone}`, { created: 1 })
+  await w.clock.advance(25 * MIN)
+  // Not a key of it asked for, read or deleted
+  expect([...w.storeKeys].filter(k => k.includes('@0000aaaa/'))).toEqual([])
+  expect(w.store.has(`@0000aaaa/state:${gone}`)).toBe(true)
 })
 
 test('updated in place from an older version: the short timer, and the panel says live updates need a restart; /clear brings them', SLOW, async ($, on) => {
@@ -572,17 +729,29 @@ test('live: a start another plugin queues runs at once, with no 0.5 s timer', { 
   expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === '--bg' && a.includes('helper'))).toBe(true)
 })
 
-test('an answer nobody saw, in a session no window shows: the seen check looks again a minute later, one ps a minute at most', SLOW, async ($, on) => {
+test('an answer nobody saw, in a session no window shows: the seen check looks again a minute later, with one ps of every process every five minutes once it is 10 minutes old', SLOW, async ($, on) => {
   const w = world(on, { list: listed(SESSIONS), store: { [`state:${SID}`]: { finished: 1_000_000_000 - 20 * MIN } } })
   for (const s of SESSIONS) registryFile(w, s)
   await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
   await startSession($, w)
   await w.clock.advance(MIN)
-  const ps = runsOf(w, 'ps')
-  await w.clock.advance(5 * MIN)
-  expect(runsOf(w, 'ps') - ps).toBeLessThanOrEqual(5)
-  expect(runsOf(w, 'ps') - ps).toBeGreaterThanOrEqual(3)
+  const ps = runsOf(w, 'ps', '-A')
+  await w.clock.advance(10 * MIN)
+  expect(runsOf(w, 'ps', '-A') - ps).toBeLessThanOrEqual(3)
+  expect(runsOf(w, 'ps', '-A') - ps).toBeGreaterThanOrEqual(2)
   expect(runsOf(w, 'osascript')).toBe(0)
+})
+
+test('an answer under 10 minutes old, in a session no window shows: one ps of every process a minute, as before', SLOW, async ($, on) => {
+  const w = world(on, { list: listed(SESSIONS), store: { [`state:${SID}`]: { finished: 1_000_000_000 - 2 * MIN } } })
+  for (const s of SESSIONS) registryFile(w, s)
+  await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
+  await startSession($, w)
+  await w.clock.advance(MIN)
+  const ps = runsOf(w, 'ps', '-A')
+  await w.clock.advance(5 * MIN)
+  expect(runsOf(w, 'ps', '-A') - ps).toBeLessThanOrEqual(5)
+  expect(runsOf(w, 'ps', '-A') - ps).toBeGreaterThanOrEqual(3)
 })
 
 // ---- The mod's own watch, where Claude watches nothing for the session ----

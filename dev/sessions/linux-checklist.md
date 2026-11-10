@@ -57,5 +57,10 @@ the desktop (X11 or Wayland) and the terminal app.
     first minute after the answer, 10 s later on, 30 s after 10 minutes. Check `xprop -id "$(xprop -root
     _NET_ACTIVE_WINDOW | grep -o '0x[0-9a-f]*' | head -1)" _NET_WM_NAME` holds the session's name. On Wayland or
     without `xprop` it stays yellow until you type in it, use its panel or arrive there.
+18. **Seen, with no display:** on a host reached over ssh (`echo "$DISPLAY"` prints nothing) or one with no `xprop`
+    (`command -v xprop`), `/sessions status` in a session started there ends with a line that says the window in front
+    can't be told. With a background session's answer unseen for a few minutes and debug logs on, its debug log has no
+    `ps` and no `xprop` run by sessions (`grep -c 'process.run.*: ps ' <log>`), and typing in it turns its row green.
+    With a display and `xprop`, the line isn't there and item 17 holds.
 
 Anything off: note what you pressed, what the window showed, the output of `ps -A -o pid= -o tty= -o command= | grep -E 'claude|visor|launcher.py'`, and `head ~/.claude/mods/sessions-data/windows/*`.

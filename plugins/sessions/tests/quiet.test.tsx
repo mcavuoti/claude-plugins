@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { buildNotice, heartbeatText, labelMinute, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, parseShowing, parseWindows, planSwitch, sameData, sessionTags, showingRuns, showingText, usageSummaryOf, windowTargetText, type Showing } from '../hooks/state'
+import { buildNotice, heartbeatText, labelMinute, listedLaunchers, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, parseShowing, parseWindows, planSwitch, sameData, sessionTags, showingRuns, showingText, usageSummaryOf, windowTargetText, withShowing, type Showing } from '../hooks/state'
 import { COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel costs while nothing happens: it draws only what changed, reads the session list again only when
@@ -655,6 +655,110 @@ test("the window in front is still asked when this session is also shown in a wi
   expect(w.files.has(`${DATA}/windows/_dev_ttys001`)).toBe(false)
   expect((w.store.get('windowsList') as any).at).toBeGreaterThan(1)
   expect((w.store.get('windowsList') as any).windows.byId.aaaaaaaa).toEqual(['/dev/ttys001', '/dev/ttys003'])
+})
+
+// ---- The seen check and the windows that say what they show ----
+
+test('the seen check takes a window opened with ccc at its word once a listing saw its launcher, over what the listing had there', () => {
+  const there = shows('/dev/ttys002', 'bbbbbbbb', 200)
+  // The listing, a while ago: this session's viewer in the launcher window, another of its viewers opened by hand
+  const listed = parseWindows(`${psOf(ME)}\n  301 ttys003  claude attach aaaaaaaa\n  4242 ttys009  claude`)
+  // Only a window whose launcher the listing saw on that terminal: not one opened since, nor a file left behind
+  expect(listedLaunchers(listed, [ME, there])).toEqual([ME])
+  expect(listedLaunchers(listed, [{ ...ME, launcher: '999' }])).toEqual([])
+  // Since then the window switched to bravo: its file says so, and the viewer opened by hand stays as listed
+  const now = withShowing(listed, [{ ...ME, id: 'bbbbbbbb' }])
+  expect(now.byId).toEqual({ aaaaaaaa: ['/dev/ttys003'], bbbbbbbb: ['/dev/ttys001'] })
+  expect(now.byPid['4242']).toBe('/dev/ttys009')
+  expect(now.launchers).toEqual(listed.launchers)
+  // One that shows the agent view now
+  const view = withShowing(listed, [{ ...ME, command: 'agents', id: '' }])
+  expect(view.byId).toEqual({ aaaaaaaa: ['/dev/ttys003'] })
+  expect(view.agentsViews).toEqual([{ pid: ME.viewer, tty: '/dev/ttys001' }])
+  expect(withShowing(listed, [])).toEqual(listed)
+})
+
+test('seen: with a window opened with ccc, what it shows is read from its file at every check, and the ps of every process is taken every five minutes', SLOW, async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 1_000_000_000 - 2 * MIN } } })
+  const other = { ...ME, id: 'bbbbbbbb' }
+  // The window shows bravo, and it's the window in front
+  w.ps.value = psOf(other)
+  launched(w, other)
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  await startSession($, w)
+  await w.clock.advance(MIN)
+  const all = () => runsOf(w, 'ps', '-A')
+  const before = all()
+  expect(before).toBeGreaterThanOrEqual(1)
+  await w.clock.advance(10 * MIN)
+  // Every minute before
+  expect(all() - before).toBeLessThanOrEqual(3)
+  expect(all() - before).toBeGreaterThanOrEqual(1)
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  // The window switches to this session: its launcher rewrites the file. Seen at the next check, with no ps of every
+  // process: only that window's launcher and watcher are asked about, since the listing is minutes old
+  launched(w, ME)
+  w.ps.value = psOf(ME)
+  const listed = all()
+  const from = w.runs.length
+  await w.clock.advance(MIN + 5000)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+  expect(all()).toBe(listed)
+  expect(w.runs.slice(from).filter(a => a[0] === 'ps')).toEqual([['ps', '-p', '100,102', '-o', 'pid=', '-o', 'tty=', '-o', 'command=']])
+})
+
+test("seen: a window whose file says it shows this session, but whose launcher is gone, doesn't count", SLOW, async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 1_000_000_000 - 20 * MIN } } })
+  w.ps.value = psOf(ME)
+  launched(w, ME)
+  w.terminal.value = args => (args[0] === 'frente' ? 'false /dev/ttys001' : '')
+  await startSession($, w)
+  await w.clock.advance(3 * MIN)
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  // The launcher was killed and left its file; the window in front is that terminal, with something else in it
+  w.ps.value = '  700 ttys001  -bash'
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  await w.clock.advance(MIN)
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+})
+
+test("seen: a regular session started since the last listing isn't waited on: its own window is found by a listing taken then", async ($, on) => {
+  const regular = [{ sessionId: SID, cwd: ROOT, kind: 'interactive', status: 'idle', pid: 4242, name: 'alpha' }, list()[1]]
+  const other = shows('/dev/ttys002', 'bbbbbbbb', 200)
+  // A window opened with ccc shows bravo, and a listing two minutes ago saw it: this session's process wasn't there yet
+  const w = world(on, { list: regular, store: { [`state:${SID}`]: { finished: 999_999_000 }, windowsList: { at: 1_000_000_000 - 2 * MIN, windows: parseWindows(psOf(other)) } } })
+  launched(w, other)
+  w.ps.value = `${psOf(other)}\n  4242 ttys005  claude`
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys005' : '')
+  await startSession($, w)
+  await w.clock.advance(6000)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
+})
+
+test('seen: a viewer opened by hand that an older listing had is asked about again before its window counts', SLOW, async ($, on) => {
+  const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 1_000_000_000 - 20 * MIN } } })
+  // A window opened with ccc showing bravo, and a viewer of this session opened by hand in another
+  const other = { ...shows('/dev/ttys002', 'bbbbbbbb', 200) }
+  const byHand = '  301 ttys001  claude attach aaaaaaaa'
+  w.ps.value = `${psOf(other)}\n${byHand}`
+  launched(w, other)
+  w.terminal.value = args => (args[0] === 'frente' ? 'false /dev/ttys001' : '')
+  await startSession($, w)
+  await w.clock.advance(2 * MIN)
+  const all = () => runsOf(w, 'ps', '-A')
+  // That viewer is closed, and its window (a plain shell now) comes to the front: the listing that had it there is
+  // over a minute old, so one taken now says it's gone
+  w.ps.value = psOf(other)
+  await w.clock.advance(90000)
+  const before = all()
+  w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys001' : '')
+  await w.clock.advance(35000)
+  expect(all()).toBe(before + 1)
+  expect(w.store.get(`seen:${SID}`)).toBe(undefined)
+  // Opened again: the next listing (five minutes apart) finds it, and looking at it is seen
+  w.ps.value = `${psOf(other)}\n${byHand}`
+  await w.clock.advance(6 * MIN)
+  expect(Number(w.store.get(`seen:${SID}`))).toBeGreaterThan(0)
 })
 
 test('planSwitch: the one launcher window showing this session switches, one showing the target is brought; anything unclear goes the usual way', () => {

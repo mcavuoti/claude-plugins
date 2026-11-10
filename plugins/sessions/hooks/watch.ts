@@ -35,8 +35,9 @@
 // its job's folder, which the service makes before the session starts.
 //
 // The list itself is read from those files (directList): the same list `claude agents --json --all` prints, as far as
-// the panel uses it. Only the elected leader (leader.ts) still runs that command, once a pass: it sweeps the files of
-// sessions that crashed, which no file event reports.
+// the panel uses it. Only the elected leader (leader.ts) still runs that command: it sweeps the files of sessions that
+// crashed, which no file event reports. So it runs when a registered process is gone (goneProcesses in leader.ts),
+// and every LIST_SAFETY_MS.
 
 import { parseKeyLines, keyLines, FORMAT } from './state'
 
@@ -155,6 +156,9 @@ export type RegistryEntry = {
   // The agent the session runs as (claude --agent <name>, or the agent setting): there from its start (checked on
   // 2.1.319), absent with none
   agent?: string
+  // When its process started, as `ps -o lstart=` prints it in UTC ("Mon Nov  9 04:32:54 2026"; checked on macOS with
+  // 2.1.319 to 2.1.322): what tells the process from another one that took its number since (leader.ts)
+  procStart?: string
 }
 
 // The statuses Claude writes there. shell: the turn ended with a background shell command still running (claude agents
@@ -185,6 +189,7 @@ export function parseRegistry(text: string): { entry: RegistryEntry } | { skip: 
   if (typeof d.startedAt === 'number') entry.startedAt = d.startedAt
   if (typeof d.bridgeSessionId === 'string' || d.bridgeSessionId === null) entry.bridgeSessionId = d.bridgeSessionId
   if (typeof d.agent === 'string' && d.agent) entry.agent = d.agent
+  if (typeof d.procStart === 'string' && d.procStart) entry.procStart = d.procStart
   return { entry }
 }
 
