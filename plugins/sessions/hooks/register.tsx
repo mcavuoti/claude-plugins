@@ -3563,15 +3563,17 @@ const SHOWING_MS = 2000
 let showingRead: { at: number; shown: Showing[] } = { at: 0, shown: [] }
 
 // Whether anyone could be looking at this session's panel or band. When in doubt, yes: a regular session (its own
-// window), the panel with the keyboard, the person's last sign here under LOOKED_MS ago, a turn of its own, a remote
+// window), the person's last sign here under LOOKED_MS ago, a turn of its own, a remote
 // client attached ($.session.surfaces), Remote Control on (the service's record), a ccc window showing it or showing
 // the agent view (its .showing), or a viewer of it or an agent view in the last listing of the windows any session
 // took (stored for the seen check and the switches), with what the ccc windows it saw show now in place of what they
 // showed then (withShowing, as the seen check reads it). No command runs here. A viewer opened by hand that no listing
-// saw yet is the one thing it can't tell (see held)
-async function couldBeLooking($: any, focused: boolean): Promise<boolean> {
+// saw yet is the one thing it can't tell (see held). Not the panel having the keyboard: a background session's panel
+// keeps it once the window that came with it closes (a ccc window closed after arriving there), so it says nothing
+// about a viewer; the keys pressed there do
+async function couldBeLooking($: any): Promise<boolean> {
   try {
-    if (focused || !dataDir || !myId || !me().background) return true
+    if (!dataDir || !myId || !me().background) return true
     const now = await $.clock.now()
     if (now - lookedAt < LOOKED_MS) return true
     if (ownHint?.status === 'busy' || lastList.find(s => s.sessionId === myId)?.status === 'busy') return true
@@ -3590,13 +3592,19 @@ async function couldBeLooking($: any, focused: boolean): Promise<boolean> {
   }
 }
 
-// What's held, written: the panel and the band drawn as the last refresh left them
+// What's held, written: the panel and the band drawn as the last refresh left them. With the keyboard in the panel,
+// the focus goes back to its element if what the arrows go through moved, as layout does
 async function drawHeld($: any) {
   const h = held
   if (!h) return
-  if (!sameData(await read($, rows), h.rows)) {
+  const before = await read($, rows)
+  if (!sameData(before, h.rows)) {
     await update($, rows, () => h.rows)
     bg(adjustWidth($))
+    if ((await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused) {
+      const target = refocusTarget(ringKeys(before), ringKeys(h.rows), currentFocus)
+      if (target) bg(focusElement($, target))
+    }
   }
   if (!sameData(await read($, summary), h.summary)) await update($, summary, () => h.summary)
   if (held === h) held = null
@@ -3643,7 +3651,7 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
   // Nobody could be looking: kept, not drawn (held)
-  if (!reflow && !(await couldBeLooking($, focused))) {
+  if (!reflow && !(await couldBeLooking($))) {
     held = { rows: shown, summary: next }
     return
   }

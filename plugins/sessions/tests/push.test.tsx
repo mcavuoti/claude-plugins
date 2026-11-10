@@ -1090,6 +1090,29 @@ test('nobody looking: a listing that saw it in a ccc window that shows another s
   expect(colorOf(writes, BRAVO)).toBe('red')
 })
 
+test('nobody looking: the panel keeps the keyboard after an arrival whose window closed; a minute on, events are kept again', SLOW, async ($, on) => {
+  const { w, writes } = await unseenSession($, on)
+  await $.session.receive({ text: buildNotice('focus'), origin: PEER } as any)
+  await w.clock.advance(200)
+  expect(w.panes.find((p: any) => p.id === 'sessions')?.isFocused).toBe(true)
+  // Drawn at once within the minute
+  const rows = writes.count.rows ?? 0
+  await bravoBusy($, w)
+  expect(writes.count.rows).toBe(rows + 1)
+  // Past it, with the keyboard still in the panel and no key pressed: kept, not drawn
+  await w.clock.advance(70000)
+  const later = writes.count.rows ?? 0
+  registryFile(w, { ...SESSIONS[1]!, status: 'waiting' })
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
+  await w.clock.advance(50)
+  expect(w.panes.find((p: any) => p.id === 'sessions')?.isFocused).toBe(true)
+  expect(writes.count.rows ?? 0).toBe(later)
+  // A key there: drawn, red
+  await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: `s:${BRAVO}`, origin: { kind: 'person' } } as any)
+  await w.clock.advance(100)
+  expect(colorOf(writes, BRAVO)).toBe('red')
+})
+
 test('someone could be looking (a regular session, its own window): drawn at once', SLOW, async ($, on) => {
   const { w, writes } = await unseenSession($, on, [{ ...SESSIONS[0]!, kind: 'interactive' }, SESSIONS[1]!])
   const rows = writes.count.rows ?? 0
