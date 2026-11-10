@@ -1,9 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
-import { goneNamespaces, heartbeatText, isOldKey, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
+import { buildNotice, fileKey, goneNamespaces, heartbeatText, showingText, isOldKey, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
 import { bellOfKey, classify, directList, jobIds, listDrift, parseRegistry, SessionFiles, WATCH_SET, watchPaths, watchSetOf } from '../hooks/watch'
 import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, processGone, processStartsArgv, provenRunning } from '../hooks/leader'
-import { DATA, ROOT, SID, SLOW, STARTED, startSession, world, type World } from './world'
+import { COMMAND, DATA, ROOT, SID, SLOW, STARTED, startSession, world, type World } from './world'
 
 // What the panel learns by watching files (watch.ts): the paths it hands the engine at SessionStart, a row that changes
 // within a file event with no command run, the bells other sessions ring, its own row from its own turns, the one
@@ -64,7 +64,7 @@ const listings = (w: World) => runsOf(w, '/bin/claude', 'agents')
 
 // The panel's values as the mod writes them: how many writes of each, and the last value. seeds: what a module before
 // this one left in the session's $.state (a reload keeps it), answered until the mod writes it
-type Writes = { count: Record<string, number>; last: Record<string, any> }
+type Writes = { count: Record<string, number>; last: Record<string, any>; onRows?: () => void }
 function stateWrites(on: any, seeds: Record<string, unknown> = {}): Writes {
   const w: Writes = { count: {}, last: {} }
   const left = new Map(Object.entries(seeds))
@@ -73,6 +73,7 @@ function stateWrites(on: any, seeds: Record<string, unknown> = {}): Writes {
       w.count[e.key] = (w.count[e.key] ?? 0) + 1
       w.last[e.key] = e.value
       left.delete(e.key)
+      if (e.key === 'rows') w.onRows?.()
     }
     return next(e)
   })
@@ -920,4 +921,219 @@ test("without a usable python3 there's no watch of the mod's own, and /sessions 
   const status = await statusOf($)
   expect(status).toContain("Problem: python3 isn't usable here, and the plugin needs it")
   expect(status).toContain('Not live: this session was updated in place')
+})
+
+// ---- Nobody looking: another session's events are read, and not drawn ----
+
+const PEER = { kind: 'peer', plugin: 'sessions' } as const
+const BUSY_BRAVO = { ...SESSIONS[1]!, status: 'busy' }
+const TTY = '/dev/ttys001'
+
+// A live background session no window shows: Claude draws on its terminal alone ($.session.surfaces), no ccc window
+// or listing shows it, no Remote Control. Five seconds in, past its first pass (which draws what's held). surfaces:
+// what $.session.surfaces answers, which a test can change. rowsAt: how many ui.open calls had been made at each write
+// of the rows from then on (to tell what came first); drawsAt(writes): the rows' writes since
+async function unseenSession($: any, on: any, sessions: Session[] = SESSIONS) {
+  const surfaces = { value: ['terminal'] as string[] }
+  on('session.surfaces', () => ({ value: surfaces.value }))
+  on('prompt.submit', (_: any, e: any) => ({ text: e.text }))
+  on('turn.complete', (_: any, e: any) => ({ text: String(e.answer ?? '') }) as any)
+  on('session.attach', (_: any, e: any) => ({ clientId: e.clientId }) as any)
+  const s = await liveSession($, on, sessions)
+  await s.w.clock.advance(5000)
+  const rowsAt: number[] = []
+  s.writes.onRows = () => rowsAt.push(s.w.opens.length)
+  return { ...s, surfaces, rowsAt }
+}
+
+// The panel as a draw shows it now (its buttons' handles aside, which every draw numbers anew), and the color of a
+// row's dot there
+async function drawnNow($: any): Promise<string> {
+  const ui = await $.ui.mount(PANEL)
+  const text = JSON.stringify(await ui.drawn()).replace(/"handle":\d+/g, '"handle":0')
+  await ui.unmount()
+  return text
+}
+function dotOf(drawn: string, sessionId: string): string | undefined {
+  const find = (n: any): any => (n?.props?.key === `row:${sessionId}` ? n : (n?.children ?? []).map(find).find(Boolean))
+  return find(JSON.parse(drawn))?.children?.[1]?.props?.color
+}
+
+// Bravo turns busy: Claude rewrites its file, and the event comes
+async function bravoBusy($: any, w: World) {
+  registryFile(w, BUSY_BRAVO)
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
+  await w.clock.advance(50)
+}
+
+test('nobody looking: another session turning busy is read and kept, not drawn; a draw of the panel shows it all the same', SLOW, async ($, on) => {
+  const { w, writes } = await unseenSession($, on)
+  const order = `${DATA}/order/${fileKey(ROOT)}`
+  const before = w.files.get(order)
+  const [rows, summary] = [writes.count.rows ?? 0, writes.count.summary ?? 0]
+  expect(dotOf(await drawnNow($), BRAVO)).toBe('success')
+  await bravoBusy($, w)
+  // Nothing written for the panel or the band, so nothing is drawn again
+  expect(writes.count.rows ?? 0).toBe(rows)
+  expect(writes.count.summary ?? 0).toBe(summary)
+  // What follows from the reads still happens: the launcher's order file has bravo working
+  expect(w.files.get(order)).not.toBe(before)
+  // And a draw Claude makes anyway (a viewer attaching at a new size) shows the panel as it is: bravo blue
+  expect(dotOf(await drawnNow($), BRAVO)).toBe('suggestion')
+  expect(writes.count.rows ?? 0).toBe(rows)
+  // Nothing more for most of a minute (the rows' times, the heartbeat), until the pass
+  await w.clock.advance(PASS_MS - 20000)
+  expect(writes.count.rows ?? 0).toBe(rows)
+})
+
+// Every way of arriving draws the panel as a refresh finds it, before anything else it does there
+const ARRIVALS: [string, ($: any, w: World, surfaces: { value: string[] }) => Promise<void>][] = [
+  ['Enter in another panel (the focus notice)', async $ => void (await $.session.receive({ text: buildNotice('focus'), origin: PEER } as any))],
+  ['a click in another panel (the seen notice)', async $ => void (await $.session.receive({ text: buildNotice('seen'), origin: PEER } as any))],
+  [
+    'ccc (its request in the inbox)',
+    async ($, w) => {
+      w.write(`${DATA}/inbox/${SID}`, `format=3\naction=focus\nat=${w.clock.now()}\n`)
+      await $.classic.FileChanged({ file_path: `${DATA}/inbox/${SID}`, event: 'add' })
+    },
+  ],
+  ['typing in the box', async $ => void (await $.prompt.submit({ text: 'go', origin: { kind: 'composer' } } as any))],
+  ['a key in the panel', async $ => void (await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: `s:${BRAVO}`, origin: { kind: 'person' } } as any))],
+  [
+    'a remote client attaching',
+    async ($, _w, surfaces) => {
+      surfaces.value = ['terminal', 'mobile']
+      await $.session.attach({ surface: 'mobile', clientId: 'mobile:default' } as any)
+    },
+  ],
+  ['/sessions', async $ => void (await $.command.run({ command: 'sessions', args: '', ...COMMAND } as any))],
+  ['the pass (a viewer opened by hand, at the size last drawn)', async (_$, w) => void (await w.clock.advance(PASS_MS))],
+]
+for (const [how, arrive] of ARRIVALS) {
+  test(`nobody looking, then ${how}: the panel is drawn as a refresh finds it, first`, SLOW, async ($, on) => {
+    const { w, writes, surfaces, rowsAt } = await unseenSession($, on)
+    const rows = writes.count.rows ?? 0
+    await bravoBusy($, w)
+    expect(writes.count.rows ?? 0).toBe(rows)
+    const held = await drawnNow($)
+    expect(dotOf(held, BRAVO)).toBe('suggestion')
+    const opens = w.opens.length
+    await arrive($, w, surfaces)
+    await w.clock.advance(200)
+    // Written, bravo blue, and before the panel took the keyboard (Enter, ccc, /sessions)
+    expect(writes.count.rows).toBe(rows + 1)
+    expect(colorOf(writes, BRAVO)).toBe('blue')
+    const focus = w.opens.findIndex((o: any, i: number) => i >= opens && o.focus === true)
+    if (focus >= 0) expect(rowsAt[0]).toBeLessThanOrEqual(focus)
+    // What's drawn is what was held, and what a refresh with someone looking finds: it writes nothing more
+    const drawn = await drawnNow($)
+    expect(drawn).toBe(held)
+    surfaces.value = ['terminal', 'mobile']
+    await changed($, w, `${JOBS}/pins.json`, '[]')
+    expect(writes.count.rows).toBe(rows + 1)
+    expect(await drawnNow($)).toBe(drawn)
+  })
+}
+
+test('nobody looking: what others count on goes on (the heartbeat, the order file, a push for a long wait)', SLOW, async ($, on) => {
+  const { w, writes } = await unseenSession($, on)
+  const alive = w.files.get(`${DATA}/alive/${SID}`)
+  registryFile(w, { ...SESSIONS[1]!, status: 'waiting' })
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
+  await w.clock.advance(50)
+  expect(w.files.get(`${DATA}/order/${fileKey(ROOT)}`)).toContain(`row=${BRAVO}\tred\t`)
+  await w.clock.advance(12 * MIN)
+  expect(w.pushes).toHaveLength(1)
+  expect(w.pushes[0]).toContain('“bravo” has been waiting for you')
+  expect(w.files.get(`${DATA}/alive/${SID}`)).not.toBe(alive)
+  // Only the passes drew: one a minute at most
+  expect(writes.count.rows ?? 0).toBeLessThanOrEqual(14)
+})
+
+// What says someone could be looking: then another session's event is drawn at once, as before
+const SHOWN: [string, (w: World, surfaces: { value: string[] }) => void][] = [
+  ['a ccc window shows it', w => w.write(`${DATA}/windows/${fileKey(TTY)}.showing`, showingText({ tty: TTY, command: 'attach', id: 'aaaaaaaa', viewer: '101', launcher: '100', watcher: '102' }))],
+  ['a ccc window shows the agent view', w => w.write(`${DATA}/windows/${fileKey(TTY)}.showing`, showingText({ tty: TTY, command: 'agents', id: '', viewer: '101', launcher: '100', watcher: '102' }))],
+  ['the last listing of the windows has a viewer of it', w => w.store.set('windowsList', { at: w.clock.now() - 10 * MIN, windows: { byId: { aaaaaaaa: [TTY] }, byPid: {}, agentsViews: [], clients: {}, launchers: {} } })],
+  ['the last listing of the windows has an agent view', w => w.store.set('windowsList', { at: w.clock.now() - 10 * MIN, windows: { byId: {}, byPid: {}, agentsViews: [{ pid: '101', tty: TTY }], clients: {}, launchers: {} } })],
+  ['Remote Control is on', w => w.write(`${JOBS}/aaaaaaaa/state.json`, JSON.stringify({ bridgeSessionId: 'session_x' }))],
+  ['a remote client is attached', (_w, surfaces) => void (surfaces.value = ['terminal', 'desktop'])],
+]
+for (const [why, show] of SHOWN) {
+  test(`someone could be looking (${why}): another session's event is drawn at once`, SLOW, async ($, on) => {
+    const { w, writes, surfaces } = await unseenSession($, on)
+    show(w, surfaces)
+    await w.clock.advance(3000)
+    const rows = writes.count.rows ?? 0
+    await bravoBusy($, w)
+    expect(writes.count.rows).toBe(rows + 1)
+    expect(colorOf(writes, BRAVO)).toBe('blue')
+  })
+}
+
+test('nobody looking: a listing that saw it in a ccc window that shows another session now counts for nothing', SLOW, async ($, on) => {
+  const { w, writes } = await unseenSession($, on)
+  // The listing saw this session's viewer in a ccc window (its launcher, pid 100); that window shows bravo now
+  w.store.set('windowsList', { at: w.clock.now() - 10 * MIN, windows: { byId: { aaaaaaaa: [TTY] }, byPid: {}, agentsViews: [], clients: { [TTY]: '101' }, launchers: { [TTY]: '100' } } })
+  w.write(`${DATA}/windows/${fileKey(TTY)}.showing`, showingText({ tty: TTY, command: 'attach', id: 'bbbbbbbb', viewer: '103', launcher: '100', watcher: '102' }))
+  await w.clock.advance(3000)
+  const rows = writes.count.rows ?? 0
+  await bravoBusy($, w)
+  expect(writes.count.rows ?? 0).toBe(rows)
+  // A viewer of it the listing saw in a window opened another way still counts
+  w.store.set('windowsList', { at: w.clock.now() - 10 * MIN, windows: { byId: { aaaaaaaa: [TTY, '/dev/ttys002'] }, byPid: {}, agentsViews: [], clients: { [TTY]: '101' }, launchers: { [TTY]: '100' } } })
+  await w.clock.advance(3000)
+  registryFile(w, { ...SESSIONS[1]!, status: 'waiting' })
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
+  await w.clock.advance(50)
+  expect(writes.count.rows).toBe(rows + 1)
+  expect(colorOf(writes, BRAVO)).toBe('red')
+})
+
+test('nobody looking: the panel keeps the keyboard after an arrival whose window closed; a minute on, events are kept again', SLOW, async ($, on) => {
+  const { w, writes } = await unseenSession($, on)
+  await $.session.receive({ text: buildNotice('focus'), origin: PEER } as any)
+  await w.clock.advance(200)
+  expect(w.panes.find((p: any) => p.id === 'sessions')?.isFocused).toBe(true)
+  // Drawn at once within the minute
+  const rows = writes.count.rows ?? 0
+  await bravoBusy($, w)
+  expect(writes.count.rows).toBe(rows + 1)
+  // Past it, with the keyboard still in the panel and no key pressed: kept, not drawn
+  await w.clock.advance(70000)
+  const later = writes.count.rows ?? 0
+  registryFile(w, { ...SESSIONS[1]!, status: 'waiting' })
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
+  await w.clock.advance(50)
+  expect(w.panes.find((p: any) => p.id === 'sessions')?.isFocused).toBe(true)
+  expect(writes.count.rows ?? 0).toBe(later)
+  // A key there: drawn, red
+  await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: `s:${BRAVO}`, origin: { kind: 'person' } } as any)
+  await w.clock.advance(100)
+  expect(colorOf(writes, BRAVO)).toBe('red')
+})
+
+test('someone could be looking (a regular session, its own window): drawn at once', SLOW, async ($, on) => {
+  const { w, writes } = await unseenSession($, on, [{ ...SESSIONS[0]!, kind: 'interactive' }, SESSIONS[1]!])
+  const rows = writes.count.rows ?? 0
+  expect(rows).toBeGreaterThan(0)
+  await bravoBusy($, w)
+  expect(writes.count.rows).toBe(rows + 1)
+})
+
+test("its own turn, and a minute after it: drawn at once; then another session's events are kept again", SLOW, async ($, on) => {
+  const { w, writes } = await unseenSession($, on)
+  await $.turn.start({ turnId: 't1', text: 'go' } as any)
+  await w.clock.advance(20)
+  expect(colorOf(writes, SID)).toBe('blue')
+  const rows = writes.count.rows ?? 0
+  await bravoBusy($, w)
+  expect(writes.count.rows).toBe(rows + 1)
+  await $.turn.complete({ turnId: 't1', answer: 'done', reason: 'end_turn' } as any)
+  await w.clock.advance(2 * MIN)
+  const after = writes.count.rows ?? 0
+  registryFile(w, { ...SESSIONS[1]!, status: 'idle' })
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
+  await w.clock.advance(50)
+  expect(writes.count.rows ?? 0).toBe(after)
 })
