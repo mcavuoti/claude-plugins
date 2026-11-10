@@ -102,6 +102,8 @@ test('a fresh focus request from ccc gives the panel the keyboard and is consume
   await w.clock.advance(600)
   expect(w.files.has(inbox)).toBe(false)
   expect(w.opens.some(o => o.id === 'sessions' && o.focus === true)).toBe(true)
+  // The arrival's own focus move ends first (it lands on this session's row, retried for 1.5 s at most)
+  await w.clock.advance(2000)
   const before = w.opens.length
   w.files.set(inbox, `format=3\naction=focus\nat=${w.clock.now() - 60000}\n`)
   await w.clock.advance(600)
