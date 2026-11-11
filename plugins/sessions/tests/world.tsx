@@ -32,6 +32,11 @@ export type World = {
   // Every store key the mod asked for, as it asked (with its namespace), and that namespace
   storeKeys: Set<string>
   namespace: string
+  // The store's lock as the engine meets it: while `until` is ahead of the mocked clock (a lock a killed session left,
+  // which the next write takes over once it's that old) or `next` writes are still to be refused (other sessions writing
+  // at once), a set or a delete answers `ms` late with a rejection, as the engine's does ("Lock file is already being
+  // held", after about two thirds of a second). refused: the keys of the writes it refused; landed: of the ones it took
+  storeLock: { until: number; next: number; ms: number; refused: string[]; landed: string[] }
   runs: string[][]
   // When each command ran, by the mocked clock
   runAt: number[]
@@ -193,14 +198,27 @@ export function world(on: On, options: WorldOptions = {}): World {
     storeKeys.add(e.key)
     return { value: store.get(plain(e.key)) as any }
   })
+  // A write the lock refuses: the hook throws, nothing beneath answers, and the mod's call rejects
+  const storeLock = { until: 0, next: 0, ms: 665, refused: [] as string[], landed: [] as string[] }
+  const refuses = () => clock.now() < storeLock.until || storeLock.next > 0
+  const refuse = async (key: string, what: string): Promise<never> => {
+    if (storeLock.next > 0) storeLock.next--
+    storeLock.refused.push(plain(key))
+    await clock.sleep(storeLock.ms)
+    throw new Error(`$.store.${what} failed: Lock file is already being held`)
+  }
   on('store.set', (_, e) => {
     storeKeys.add(e.key)
+    if (refuses()) return refuse(e.key, 'set')
     store.set(plain(e.key), e.value)
+    storeLock.landed.push(plain(e.key))
     return { value: undefined }
   })
   on('store.delete', (_, e) => {
     storeKeys.add(e.key)
+    if (refuses()) return refuse(e.key, 'delete')
     store.delete(plain(e.key))
+    storeLock.landed.push(plain(e.key))
     return { value: undefined }
   })
   on('store.keys', () => ({ value: [...store.keys()].map(k => `${namespace}${k}`) }))
@@ -391,7 +409,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer, focusLanded }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, storeLock, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer, focusLanded }
 }
 
 // The panel's focus ring as Claude keeps it, for a test that presses the arrows in a mounted panel: by position, not by

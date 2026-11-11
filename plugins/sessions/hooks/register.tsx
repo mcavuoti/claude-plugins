@@ -88,6 +88,7 @@ import {
   rowsBelow,
   shellQuote,
   isRef,
+  recordBehind,
   type StopLog,
   colorOf,
   displayWidth,
@@ -136,6 +137,7 @@ import {
   parseTranscriptStarts,
   type Whereabouts,
   sortRows,
+  startedByPerson,
   windowTargetText,
   SHOWING,
   type Showing,
@@ -241,7 +243,7 @@ const paneNote = atom({ plugin: 'sessions', key: 'paneNote' } as const, '' as Pa
 // line above the prompt
 const limits = atom({ plugin: 'sessions', key: 'limits' } as const, [] as RateLimit[])
 // About all the project's rows, whatever is shown: the f filter, how many there are, what they spent
-const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, waiting: 0, unseen: 0, spent: null } as PanelSummary)
+const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, waiting: 0, unseen: 0, unasked: 0, spent: null } as PanelSummary)
 // The ccc tell request on its way to a turn (checkTells): in $.state, which a reload of the mod's code keeps
 const tellInFlight = atom({ plugin: 'sessions', key: 'tellInFlight' } as const, null as TellInFlight)
 // What this session's classic.SessionStart had the engine watch (watch.ts): in $.state, which a reload keeps as the
@@ -617,7 +619,62 @@ function forgetStored(match: (key: string) => boolean) {
   for (const k of [...storeCache.keys()]) if (match(k)) storeCache.delete(k)
 }
 
+// A write the engine rejects is tried again. $.store.set and $.store.delete take a lock beside the store's file (a
+// folder, <store>.json.lock), read the file, write a copy and rename it. While another session holds that lock (several
+// writing at once), or a session killed in the middle of a write left it there, the write is rejected after about two
+// thirds of a second ("Lock file is already being held"), and a lock left behind rejects every writer until it's 10 s
+// old, when the next write takes it over. Measured on Claude 2.1.322 with three sessions writing at once: a write in a
+// few hundred rejected, and none lost with 5 tries 50 ms apart. So:
+// - a rejected write is tried again, STORE_TRIES times in all, STORE_RETRY_MS apart, and its caller waits for them
+//   (hold). A caller inside a hook of a prompt, of a turn's end, of a command or of another plugin's call passes hold
+//   false and waits for the one try, as it always did;
+// - one still rejected then waits in lateWrites, the newest of its key (a later set or delete of that key takes its
+//   place), and the pump tries it every STORE_LATE_MS from the mod's own start's $, awaited by nobody, until it lands or
+//   STORE_LATE_FOR_MS passed since it was asked: past the 10 s a leftover lock lasts. While any waits, a write that
+//   may wait joins them with no try of its own (nothing holds its caller); and from a write that used up its tries
+//   until the next one that lands (storeRefusing: a lock left behind, most likely) every write gets one try, so a
+//   refresh with several writes isn't held 3.5 s by each;
+// - only the keys landsLate names wait: the ones this session alone writes and the person's own choices. Any other is
+//   a value built from a read of a key several sessions write (the lists, the claims, who waits since when), which
+//   landing late would undo what another session wrote since: after its tries it's given up, and what depends on it
+//   says so or does it again (the next refresh, the next pass);
+// - a retry never lands an older value after a newer one of its key was asked (lastAsked);
+// - what waits is what this session reads meanwhile (storeGet, storeKeys, ownSeenState): its own last word on its own
+//   record, so a record built from a read (`{ ...previous, finished }`) keeps what waits. What's kept in memory of the
+//   store (storeCache, selfSeen) changes when a write lands and never before: one given up leaves them as the store is.
+// Every rejection, write that landed on a later try and write given up is counted, for /sessions status (storeText)
+// and the debug log
+const STORE_TRIES = 5
+const STORE_RETRY_MS = 50
+const STORE_LATE_MS = 500
+const STORE_LATE_FOR_MS = 12000
+type StoreWrite = { value: unknown; deleted: boolean; since: number }
+const lastAsked = new Map<string, StoreWrite>()
+const lateWrites = new Map<string, StoreWrite>()
+let latePump = false
+let storeRefusing = false
+// The pump with the mod's own start's $ (set there): one a $.sessions call lends is gone when its caller's hook returns
+let ownPump: (() => void) | null = null
+const storeCounts = { rejections: 0, landedLater: 0, givenUp: 0, restored: 0 }
+let storeLast: { at: number; key: string; why: string } | null = null
+
+function landsLate(key: string): boolean {
+  if (myId && key.endsWith(`:${myId}`)) return /^(state|seen|title|spend|project|restarted|reloaded):/.test(key)
+  return key === 'panelClosed' || key === 'waitingOnly' || key === 'collapsed' || key === 'usageView' || key === 'endedDismissed' || key.startsWith('personStop:')
+}
+
+// The store's own value of a key, whatever waits to land and whatever is kept in memory
+async function storeStored($: any, key: string): Promise<any> {
+  try {
+    return await $.store.get(`${await storeNamespaceOf($)}${key}`)
+  } catch {
+    return undefined
+  }
+}
+
 async function storeGet($: any, key: string): Promise<any> {
+  const late = lateWrites.get(key)
+  if (late) return late.deleted ? undefined : late.value
   if (cacheable(key) && storeCache.has(key)) return storeCache.get(key)
   try {
     const value = await $.store.get(`${await storeNamespaceOf($)}${key}`)
@@ -628,27 +685,144 @@ async function storeGet($: any, key: string): Promise<any> {
   }
 }
 
-async function storeSet($: any, key: string, value: unknown): Promise<boolean> {
+// One try. Landed: what's kept in memory follows, and the panels that draw it are told (its bell)
+async function storeOnce($: any, key: string, w: StoreWrite): Promise<boolean> {
   try {
-    await $.store.set(`${await storeNamespaceOf($)}${key}`, value)
-    noteOwn(key, value)
-    if (cacheable(key)) storeCache.set(key, value)
-    else storeCache.delete(key)
-    ringFor($, key)
-    return true
-  } catch {
+    const name = `${await storeNamespaceOf($)}${key}`
+    if (w.deleted) await $.store.delete(name)
+    else await $.store.set(name, w.value)
+  } catch (err) {
+    storeCounts.rejections++
+    let at = 0
+    try {
+      at = await $.clock.now()
+    } catch {}
+    storeLast = { at, key, why: String(err).replace(/^.*\bfailed: /, '').slice(0, 80) }
     return false
   }
+  const value = w.deleted ? undefined : w.value
+  noteOwn(key, value)
+  if (cacheable(key)) storeCache.set(key, value)
+  else storeCache.delete(key)
+  ringFor($, key)
+  return true
 }
 
-async function storeDelete($: any, key: string) {
+// Whether the write landed before this returns; false also for one that waits to land late (see above)
+async function storeWrite($: any, key: string, value: unknown, deleted: boolean, hold: boolean): Promise<boolean> {
+  const what = `${deleted ? 'delete' : 'set'} ${key}`
+  let since = 0
   try {
-    await $.store.delete(`${await storeNamespaceOf($)}${key}`)
-    noteOwn(key, undefined)
-    if (cacheable(key)) storeCache.set(key, undefined)
-    else storeCache.delete(key)
-    ringFor($, key)
+    since = await $.clock.now()
   } catch {}
+  const w: StoreWrite = { value, deleted, since }
+  noteAsked(key, w)
+  lastAsked.set(key, w)
+  if (lateWrites.size > 0 && landsLate(key)) {
+    lateWrites.set(key, w)
+    pumpLate($)
+    return false
+  }
+  const tries = hold && !storeRefusing ? STORE_TRIES : 1
+  for (let n = 1; ; n++) {
+    if (await storeOnce($, key, w)) {
+      storeRefusing = false
+      if (lastAsked.get(key) === w) lastAsked.delete(key)
+      if (n > 1) {
+        storeCounts.landedLater++
+        debugLine($, `store: ${what} landed on try ${n}`)
+      }
+      return true
+    }
+    debugLine($, `store: ${what} rejected (try ${n} of ${tries}): ${storeLast?.why ?? ''}`)
+    if (lastAsked.get(key) !== w) return false
+    if (n >= tries) break
+    await $.clock.sleep(STORE_RETRY_MS)
+    if (lastAsked.get(key) !== w) return false
+  }
+  storeRefusing = true
+  if (landsLate(key)) {
+    lateWrites.set(key, w)
+    pumpLate($)
+    return false
+  }
+  lastAsked.delete(key)
+  storeCounts.givenUp++
+  debugLine($, `store: ${what} given up after ${tries === 1 ? 'one try' : `${tries} tries`}`)
+  return false
+}
+
+// The writes that wait, tried from a timer of the mod's own. A rejection stands for the round (the lock rejects every
+// writer alike, two thirds of a second each): the rest wait for the next one
+function pumpLate($: any) {
+  if (latePump) return
+  if (ownPump) ownPump()
+  else runPump($)
+}
+
+function runPump($: any) {
+  if (latePump) return
+  latePump = true
+  const drop = (key: string, w: StoreWrite) => {
+    lateWrites.delete(key)
+    if (lastAsked.get(key) === w) lastAsked.delete(key)
+  }
+  bg(
+    (async () => {
+      try {
+        while (lateWrites.size > 0) {
+          await $.clock.sleep(STORE_LATE_MS)
+          for (const [key, w] of [...lateWrites]) {
+            if (lateWrites.get(key) !== w) continue
+            const landed = await storeOnce($, key, w)
+            const now = await $.clock.now()
+            if (landed) {
+              storeRefusing = false
+              if (lateWrites.get(key) !== w) continue
+              drop(key, w)
+              storeCounts.landedLater++
+              debugLine($, `store: ${w.deleted ? 'delete' : 'set'} ${key} landed ${now - w.since} ms after it was asked`)
+              continue
+            }
+            for (const [k, x] of [...lateWrites]) {
+              if (now - x.since < STORE_LATE_FOR_MS) continue
+              drop(k, x)
+              storeCounts.givenUp++
+              debugLine($, `store: ${x.deleted ? 'delete' : 'set'} ${k} given up, rejected for ${now - x.since} ms: ${storeLast?.why ?? ''}`)
+            }
+            break
+          }
+        }
+      } catch (err) {
+        // The pump can't go on (its $ is gone): nothing waits any more, and the next write tries for itself
+        storeCounts.givenUp += lateWrites.size
+        for (const [k, x] of [...lateWrites]) drop(k, x)
+        debugLine($, `store: the writes that waited are given up: ${String(err).slice(0, 120)}`)
+      } finally {
+        latePump = false
+      }
+    })(),
+  )
+}
+
+async function storeSet($: any, key: string, value: unknown, hold = true): Promise<boolean> {
+  return storeWrite($, key, value, false, hold)
+}
+
+async function storeDelete($: any, key: string, hold = true): Promise<boolean> {
+  return storeWrite($, key, undefined, true, hold)
+}
+
+// /sessions status, about the store's rejected writes: one line, and only once there was one
+function storeText(now: number): string {
+  const c = storeCounts
+  if (c.rejections + c.restored === 0) return ''
+  const parts = [`${c.rejections === 1 ? '1 write try' : `${c.rejections} write tries`} rejected since this session started (the store's lock was held)`, `${c.landedLater} landed on a later try`]
+  if (lateWrites.size > 0) parts.push(`${lateWrites.size} still trying`)
+  parts.push(`${c.givenUp} given up`)
+  if (c.restored > 0) parts.push(`its own record put back ${c.restored === 1 ? 'once' : `${c.restored} times`} (another session's late write had put an older one over it)`)
+  const last = storeLast ? ` · last: ${storeLast.key}, ${Math.max(0, Math.round((now - storeLast.at) / 1000))} s ago (${storeLast.why})` : ''
+  return `Store: ${parts.join(' · ')}${last}`
 }
 
 // The bell (watch.ts) a write of the store rings, so the panels that watch read it again: only a write that others draw
@@ -682,22 +856,73 @@ function noteOwn(key: string, value: unknown) {
   else selfSeen.finished = Number((value as SessionState | undefined)?.finished) || 0
 }
 
+// What the store has, and over it what still waits to land: this session's own last word, which the seen check goes by
 async function ownSeenState($: any): Promise<{ finished: number; seen: number }> {
-  if (selfSeen && selfSeen.id === myId) return selfSeen
-  const next = { id: myId, finished: (await readState($, myId))?.finished ?? 0, seen: await seenAt($, myId) }
-  selfSeen = next
-  return next
+  let own = selfSeen
+  if (!own || own.id !== myId) {
+    own = { id: myId, finished: Number((await storeStored($, `state:${myId}`))?.finished) || 0, seen: Number(await storeStored($, `seen:${myId}`)) || 0 }
+    selfSeen = own
+  }
+  const state = lateWrites.get(`state:${own.id}`)
+  const seen = lateWrites.get(`seen:${own.id}`)
+  return {
+    finished: state ? (state.deleted ? 0 : Number((state.value as SessionState | undefined)?.finished) || 0) : own.finished,
+    seen: seen ? (seen.deleted ? 0 : Number(seen.value) || 0) : own.seen,
+  }
 }
 
-// The keys of this session's namespace, without it
+// The last record and seen time this session asked the store to keep, landed or not: only it writes either, so they
+// are what should be there. A session frozen for longer than the store's lock lasts (10 s) while it held it writes the
+// whole file back as it read it, over what every session wrote meanwhile, and nothing rejects: the pass reads both
+// back from the store and writes them again when they went backwards (restoreOwn), which also puts back one given up
+let ownAsked: { id: string; state?: SessionState; seen?: number } = { id: '' }
+function noteAsked(key: string, w: StoreWrite) {
+  if (!myId || (key !== `state:${myId}` && key !== `seen:${myId}`)) return
+  if (ownAsked.id !== myId) ownAsked = { id: myId }
+  if (key === `seen:${myId}`) ownAsked.seen = w.deleted ? undefined : Number(w.value) || 0
+  else ownAsked.state = w.deleted || !w.value || typeof w.value !== 'object' ? undefined : (w.value as SessionState)
+}
+
+async function restoreOwn($: any) {
+  if (!myId || ownAsked.id !== myId) return
+  const seenKey = `seen:${myId}`
+  const stateKey = `state:${myId}`
+  const seen = ownAsked.seen
+  if (seen !== undefined && !lastAsked.has(seenKey)) {
+    const stored = Number(await storeStored($, seenKey)) || 0
+    if (stored < seen && ownAsked.seen === seen && !lastAsked.has(seenKey)) {
+      storeCounts.restored++
+      debugLine($, `store: seen:${myId} went back to ${stored} (this session wrote ${seen}): written again`)
+      await storeSet($, seenKey, seen)
+    }
+  }
+  const state = ownAsked.state
+  if (state && !lastAsked.has(stateKey)) {
+    const stored = await storeStored($, stateKey)
+    if (recordBehind(stored && typeof stored === 'object' ? (stored as SessionState) : null, state) && ownAsked.state === state && !lastAsked.has(stateKey)) {
+      storeCounts.restored++
+      debugLine($, `store: state:${myId} went back to an older record (finished ${Number(stored?.finished) || 0}, this session wrote ${state.finished ?? 0}): written again`)
+      await storeSet($, stateKey, state)
+    }
+  }
+}
+
+// The keys of this session's namespace, without it, as this session reads them: with the ones a waiting write sets
+// and without the ones one deletes
 async function storeKeys($: any): Promise<string[]> {
+  let keys: string[] = []
   try {
     const ns = await storeNamespaceOf($)
     const all: string[] = await $.store.keys()
-    return ns ? all.filter(k => k.startsWith(ns)).map(k => k.slice(ns.length)) : all.filter(k => !k.startsWith('@'))
-  } catch {
-    return []
+    keys = ns ? all.filter(k => k.startsWith(ns)).map(k => k.slice(ns.length)) : all.filter(k => !k.startsWith('@'))
+  } catch {}
+  if (lateWrites.size === 0) return keys
+  const late = new Set(keys)
+  for (const [k, w] of lateWrites) {
+    if (w.deleted) late.delete(k)
+    else late.add(k)
   }
+  return [...late]
 }
 
 // The store as it is, every namespace's keys with their namespace: only for the leader's prune of the test namespaces
@@ -1422,6 +1647,7 @@ function requestRefresh($: any, push = true): Promise<void> {
 // (a missed event costs at most a pass), the leader's turn, and while watched what the short timer does otherwise
 async function pass($: any) {
   storeCache.clear()
+  await restoreOwn($)
   await syncFiles($, true)
   await requestRefresh($)
   await drawHeld($)
@@ -2637,7 +2863,11 @@ async function stillEnded($: any, s: EndedSession): Promise<string> {
       why = 'it no longer reads as ended with the service (stopped by you, or it ran since)'
       return
     }
-    await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at })
+    // A claim the store didn't take is no claim: another panel could bring it back too
+    if (!(await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at }))) {
+      why = "Claude's store didn't take the claim (its lock was held)"
+      return
+    }
     why = ''
   })
   return why
@@ -3070,7 +3300,11 @@ async function claimWake($: any, s: any, name: string): Promise<{ why: string; a
         return
       }
       await storeSet($, 'modelWakes', [...log, { at, by: myId, target: s.sessionId }])
-      await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at })
+      // A claim the store didn't take is no claim: a panel's b, or another wake, could bring it back too
+      if (!(await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at }))) {
+        why = "Claude's store didn't take the claim on this wake (its lock was held): try again in a few seconds"
+        return
+      }
       why = ''
       claimed = at
     },
@@ -3377,8 +3611,10 @@ async function pushWaits($: any) {
       $,
       async () => {
         due = dueWaits(waits, await pushed(), now, waitPushMs, first)
-        for (const w of due) await storeSet($, `pushed:${w.sessionId}`, w.since)
-        return due.length > 0
+        // A wait the store didn't record as pushed would be pushed again by the next session: not sent now
+        let recorded = true
+        for (const w of due) recorded = (await storeSet($, `pushed:${w.sessionId}`, w.since)) && recorded
+        return due.length > 0 && recorded
       },
       () => waitText(due, now),
     )
@@ -3476,7 +3712,8 @@ async function refresh($: any) {
     const e = keys.has(`state:${s.sessionId}`) ? await readState($, s.sessionId) : null
     if (s.sessionId !== myId && typeof e?.usualHour === 'number' && e.usualHour > 0) usuals.push(e.usualHour)
     const seen = keys.has(`seen:${s.sessionId}`) ? await seenAt($, s.sessionId) : 0
-    if (s.sessionId === myId) selfSeen = { id: myId, finished: e?.finished ?? 0, seen }
+    // Kept only as the store has it: not while a write of either waits to land (these reads answer with it)
+    if (s.sessionId === myId && !lateWrites.has(`state:${myId}`) && !lateWrites.has(`seen:${myId}`)) selfSeen = { id: myId, finished: e?.finished ?? 0, seen }
     const unnamed = !s.name || s.name === s.id
     const ownTitle = unnamed && keys.has(`title:${s.sessionId}`) ? String((await storeGet($, `title:${s.sessionId}`)) ?? '') : ''
     // Since when it's been waiting for you: the panel records it the first time it sees it "waiting"
@@ -3487,7 +3724,7 @@ async function refresh($: any) {
     } else if (s.status !== 'waiting' && waitingSince) {
       await storeDelete($, `waiting:${s.sessionId}`)
     }
-    const { color, since } = colorOf(s, e, seen, waitingSince)
+    const { color, since, unasked } = colorOf(s, e, seen, waitingSince)
     const staling = staleMs > 0 && since && (color === 'blue' || (color === 'yellow' && s.kind === 'background'))
     sinces.push({ since, staleFrom: staling && since ? since + staleMs : undefined })
     // A stopped session doesn't run any version: it opens with the installed one
@@ -3545,6 +3782,7 @@ async function refresh($: any) {
       folded: false,
       helpers,
       stale: isStale({ color, background: s.kind === 'background' }, since, minute, staleMs),
+      unasked: unasked === true,
     })
   }
   waitsNow = waits
@@ -3706,7 +3944,8 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     waitingOnly,
     sessions: projectRows.length,
     waiting: others.filter(f => f.color === 'red').length,
-    unseen: others.filter(f => f.color === 'yellow').length,
+    unseen: others.filter(f => f.color === 'yellow' && !f.unasked).length,
+    unasked: others.filter(f => f.color === 'yellow' && f.unasked).length,
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
   // Nobody could be looking: kept, not drawn (held)
@@ -3733,7 +3972,7 @@ async function closedByYou($: any): Promise<boolean> {
 }
 
 async function openByYou($: any) {
-  await storeDelete($, 'panelClosed')
+  await storeDelete($, 'panelClosed', false)
   await $.ui.open({ id: PANE, title: 'Sessions', focus: true, columns: requestedWidth || undefined })
   await paneState($)
 }
@@ -3923,6 +4162,7 @@ function peerRow(sessionId: string, carried: Record<string, unknown> = {}): Row 
     folded: false,
     helpers: 0,
     stale: false,
+    unasked: false,
   }
 }
 
@@ -4051,7 +4291,10 @@ async function perform($: any, f: Row, action: Action, closeWindows = true) {
     if (!(await respawnWithWindows($, f.id, f.title))) {
       $.ui.toast(`Couldn't restart “${f.title}”`)
     } else {
-      // The ↑ mark goes away right away, without waiting for the new session to record its version
+      // The ↑ mark goes away right away, without waiting for the new session to record its version. Its record is that
+      // session's own: read from the store now, never as this panel last read it, which would put an older record
+      // (an earlier finish) back over what it wrote since
+      forgetStored(k => k === `state:${f.sessionId}`)
       const e = await readState($, f.sessionId)
       if (e && installedVersion) await storeSet($, `state:${f.sessionId}`, { ...e, version: installedVersion })
       $.ui.toast(`“${f.title}” restarted${f.outdated && installedVersion ? ` on Claude ${installedVersion}` : ''}`)
@@ -4746,6 +4989,60 @@ async function notifyWhenBack($: any) {
   }
 }
 
+// ---- Whose turn it is ----
+// A turn's end turns the session's row yellow until the person looks: a full dot when they started that turn, a hollow
+// one (unasked) when something else did. Every prompt that starts a turn of the main conversation comes through
+// prompt.submit with its origin, before the turn's turn.start (seen in test sessions on Claude 2.1.322: a typed prompt
+// and the one a session is launched with are `composer`; the end of a background command, `task-notification`;
+// another session's SendMessage and a background subagent's report, `peer`, raised when the session is idle or, when
+// it arrived during a turn, once that turn ended), but for the mod's own ccc tell (a plugin never hears its own
+// $.prompt.submit: that turn is known by the request's id in its text). startedByPerson (state.ts) says which origins
+// are the person's; a turn nothing announced is taken as theirs. Another plugin's $.prompt.submit is heard here
+// (origin `plugin`, with its name), whether or not that plugin depends on this one, when its turn is about to start:
+// one made during a turn is raised once that turn ended.
+// nextTurn: what the last prompt said about the turn to come (the person's word stays until that turn starts, whatever
+// comes after it; one that didn't enter says nothing), used once: every turn's start clears it, so a turn never takes
+// the one before's. turnAsked: whether the person started the turn that runs now
+// (or ran last), or typed into it; turnFrom: where it came from, for /sessions status. In memory only: a reload in
+// the middle of a turn makes it the person's
+let nextTurn: { person: boolean; from: string } | null = null
+let turnAsked = true
+let turnFrom = ''
+
+// A prompt on its way in (prompt.submit), before the plugins beneath: the word it says about the next turn, when it
+// has one (a delivery into the turn that runs starts none, and nothing takes the person's word's place)
+function promptComing(origin: unknown, intoTurn: boolean): { person: boolean; from: string } | null {
+  const person = startedByPerson(origin)
+  const from = String((origin as { kind?: unknown } | null | undefined)?.kind ?? 'unknown')
+  if (!person && (intoTurn || nextTurn?.person)) return null
+  // Typed while a turn runs: what that turn answers is for them too
+  if (person && intoTurn) {
+    turnAsked = true
+    turnFrom = from
+  }
+  nextTurn = { person, from }
+  return nextTurn
+}
+
+// A turn of the main conversation starts: whose it is
+function turnBegins($: any, text: string) {
+  if (tellIdIn(text)) {
+    turnAsked = false
+    turnFrom = 'ccc tell'
+  } else {
+    turnAsked = nextTurn?.person ?? true
+    turnFrom = nextTurn?.from ?? ''
+    nextTurn = null
+  }
+  debugLine($, `turn: started by ${turnFrom || 'nothing that said so'} (${turnAsked ? "the person's" : "not the person's: ○ until seen"})`)
+}
+
+// /sessions status, about the last turn here and the hollow dot
+function turnText(): string {
+  const who = turnAsked ? `you${turnFrom ? ` (${turnFrom})` : ' (nothing said otherwise)'}` : `something else (${turnFrom}), not you`
+  return `Turns: the last one here was started by ${who} · ○ on a row: done and unseen, and you didn't start those turns (another session's message, a subagent's or a task's report, a schedule, a script); ● while an answer to you is unseen`
+}
+
 // This session's own row, from its own turn hooks: drawn at once (the registry says the same 0.6 s later, withOwnHint)
 async function ownStatus($: any, status: 'busy' | 'idle') {
   ownHint = { status, at: await $.clock.now() }
@@ -5057,9 +5354,9 @@ async function rebind($: any) {
 }
 
 // Starts, wakes and restarts other plugins asked for, queued or running in this module: a reload now would drop them
-// after they were told queued
+// after they were told queued. And the store writes that wait to land (lateWrites), which it would drop too
 function queuedHere(): boolean {
-  return launching || waking || restarting || launches.length > 0 || wakes.length > 0 || restarts.length > 0
+  return launching || waking || restarting || launches.length > 0 || wakes.length > 0 || restarts.length > 0 || lateWrites.size > 0
 }
 
 // A newer version of this mod is installed: update this session's in place with /reload-plugins, when that cuts
@@ -5198,9 +5495,12 @@ async function statusText($: any): Promise<string> {
       ? `Marks: ${markSources.map(m => `${m.source} (${m.rows === 1 ? '1 row' : `${m.rows} rows`}, ${Math.max(0, Math.ceil((m.until - now) / 60000))} min left)`).join(', ')}`
       : 'Marks: none',
     await notificationsText($, now),
+    turnText(),
     await liveText($, now),
   ]
   lines.push(await platformText($, now))
+  const stored = storeText(now)
+  if (stored) lines.push(stored)
   if (!platform.frontKnown) lines.push("Seen: this machine can't tell which window is in front (no X11 display, or no xprop), so nothing checks for it: a session's answer counts as seen when you type in it, use its panel or arrive there (Enter or a click in another panel, ccc)")
   const apart = await apartText($)
   if (apart) lines.push(apart)
@@ -5476,7 +5776,8 @@ function sessionsApi($: any): Sessions {
             result = { ok: false, reason: 'busy', detail: "couldn't write pins.json: try again" }
             return
           }
-          await storeSet($, 'pluginPins', c.plugin)
+          // One try: the caller's hook waits for this call
+          await storeSet($, 'pluginPins', c.plugin, false)
           debugLine($, `${pinned ? 'pin' : 'unpin'} “${name}” (${reason || 'no reason given'}): ${c.refused ?? (c.changed ? 'done' : 'nothing to change')}`)
           result = c.refused ? { ok: false, reason: 'refused', detail: `“${name}”: ${c.refused}` } : { ok: true }
         },
@@ -5554,6 +5855,7 @@ async function afterDraw($: any, write: () => Promise<unknown>) {
 }
 
 async function start($: any) {
+  ownPump = () => runPump($)
   try {
     startedAt = await $.clock.now()
   } catch {}
@@ -5839,6 +6141,7 @@ export const register: Register = (on, options) => {
   // The main loop's turns only: a subagent's run inside a turn starts no new one (the working time and ⧗ count from
   // the main turn), and nothing here holds the run up
   on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) turnBegins($, String(e.text ?? ''))
     if (active && e.agentId === undefined) {
       bg(ownStatus($, 'busy'))
       bg(markTurnStart($))
@@ -5849,8 +6152,9 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // A turn triggered by another session (SendMessage) doesn't go through turn.start. Notices from another session's
-  // panel are intercepted here: they aren't queued, aren't shown and the model doesn't read them
+  // Notices from another session's panel are intercepted here: they aren't queued, aren't shown and the model doesn't
+  // read them. Any other delivery is passed on (another session's message starts a turn of its own through
+  // prompt.submit and turn.start, at once or after the turn that runs: "Whose turn it is")
   on('session.receive', async ($, e, next) => {
     if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(NOTICE_MARKER)) {
       bg(ensureStarted($, 'notice'))
@@ -5889,6 +6193,9 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // Whose turn ended, read before anything is awaited: the next turn can start while this hook still runs (a prompt
+    // that waited for this turn's end starts its own within milliseconds)
+    const asked = turnAsked
     const r = await next(e)
     if (active && e.agentId === undefined) {
       const answer = String(e.answer ?? '').trim()
@@ -5898,14 +6205,20 @@ export const register: Register = (on, options) => {
           .map(l => l.trim())
           .filter(Boolean)
           .at(-1) ?? ''
+      const previous = (await readState($, myId)) ?? {}
+      const finished = await $.clock.now()
       const state: SessionState = {
-        ...((await readState($, myId)) ?? {}),
-        finished: await $.clock.now(),
+        ...previous,
+        finished,
+        // The last finish of a turn the person started: this one, or as it was (a record from before this field: its
+        // finish)
+        personFinished: asked ? finished : (previous.personFinished ?? previous.finished ?? 0),
         reason: e.reason,
         answer: line.slice(0, 70),
         question: line.endsWith('?'),
       }
-      await storeSet($, `state:${myId}`, state)
+      // One try here (hold false): rejected, it lands late from the mod's own timer, and the turn's end isn't held
+      await storeSet($, `state:${myId}`, state, false)
       bg(ownStatus($, 'idle'))
       void recordTitle($).catch(() => {})
       bg(publishUsage($))
@@ -5921,17 +6234,22 @@ export const register: Register = (on, options) => {
     return r
   })
 
-  // Typing in the box (or from the phone) counts as having seen the session; a message from another session doesn't
+  // Typing in the box (or from the phone) counts as having seen the session; a message from another session doesn't.
+  // Every prompt says whose the turn it starts is (promptComing)
   on('prompt.submit', async ($, e, next) => {
+    const word = promptComing(e.origin, e.turnId !== undefined)
     if (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') {
       bg(ensureStarted($, 'prompt'))
       if (active) {
         bg(arrived($))
-        await storeSet($, `seen:${myId}`, await $.clock.now())
+        await storeSet($, `seen:${myId}`, await $.clock.now(), false)
         bg(rearmTells($))
       }
     }
-    return next(e)
+    const r = await next(e)
+    // A prompt that didn't enter starts no turn
+    if (r?.drop !== undefined && word && nextTurn === word) nextTurn = null
+    return r
   })
 
   on('command.run', { command: 'sessions' }, async ($, e) => {
@@ -5955,7 +6273,7 @@ export const register: Register = (on, options) => {
     }
     const pane = (await $.ui.panes()).find(p => p.id === PANE)
     if (pane?.isFocused) {
-      await storeSet($, 'panelClosed', true)
+      await storeSet($, 'panelClosed', true, false)
       await $.ui.close({ id: PANE })
       await paneState($)
       return { text: '' }
@@ -5970,7 +6288,7 @@ export const register: Register = (on, options) => {
   on('ui.close', async ($, e, next) => {
     const r = await next(e)
     if (e.id === PANE && e.origin.kind === 'person') {
-      await storeSet($, 'panelClosed', true)
+      await storeSet($, 'panelClosed', true, false)
       if (!sameData(await read($, paneNote), 'closed')) await update($, paneNote, () => 'closed')
     }
     return r
@@ -6020,7 +6338,8 @@ export const register: Register = (on, options) => {
     return r
   })
 
-  // The line above the prompt: how many sessions wait for you (red) or have something unseen (yellow), why the panel
+  // The line above the prompt: how many sessions wait for you (red), have an answer to you unseen (yellow) or finished
+  // unseen a turn you didn't start (a hollow yellow dot), why the panel
   // isn't shown (with a button that opens it: shift+→ then Enter, or a click), the account's windows on a subscription,
   // and this session's short id. One row, with whatever other mods (and Claude) draw there after it: the band is
   // shared. Its first draw starts the mod when nothing else did (a session draws even with no window attached; a draw
@@ -6041,6 +6360,8 @@ export const register: Register = (on, options) => {
     const about = held?.summary ?? written
     const reds = about.waiting
     const yellows = about.unseen
+    // Done and unseen, and nobody asked: a hollow dot (0 for a summary a module before this one left)
+    const hollows = about.unasked || 0
     const id = await read($, shortId)
     const note = await read($, paneNote)
     const why = note === 'closed' ? 'panel closed · /sessions to open' : note === 'narrow' ? 'panel hidden: window too narrow · /sessions to show' : ''
@@ -6055,7 +6376,9 @@ export const register: Register = (on, options) => {
         {reds > 0 && `${reds}  `}
         {yellows > 0 && <Text color={TINT.yellow}>● </Text>}
         {yellows > 0 && `${yellows}  `}
-        {reds + yellows > 0 && !why && '/sessions  '}
+        {hollows > 0 && <Text color={TINT.yellow}>○ </Text>}
+        {hollows > 0 && `${hollows}  `}
+        {reds + yellows + hollows > 0 && !why && '/sessions  '}
       </Text>
     )
     const own =
@@ -6142,7 +6465,7 @@ export const register: Register = (on, options) => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
+      lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.unasked) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
     // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
     const usageData = showUsage ? await read($, usage) : null
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
@@ -6205,7 +6528,8 @@ export const register: Register = (on, options) => {
       <Box key={`row:${f.sessionId}`} flexDirection="row" backgroundColor={f.current ? 'userMessageBackground' : undefined}>
         {f.current ? <Text color="claude">▌</Text> : <Text> </Text>}
         {f.depth > 0 && <Text>{' '.repeat(INDENT)}</Text>}
-        <Text color={TINT[f.color]}>●</Text>
+        {/* ○: done and unseen, and you didn't start those turns (unasked) */}
+        <Text color={TINT[f.color]}>{f.unasked ? '○' : '●'}</Text>
         <Text> </Text>
         {inTerminal ? (
           <Button
@@ -6313,6 +6637,12 @@ export const register: Register = (on, options) => {
           <Text dimColor>
             <Text color={TINT.yellow}>!</Text>
             {' Panel not running there · u: Restart'}
+          </Text>
+        )}
+        {list.some(f => f.unasked) && (
+          <Text dimColor>
+            <Text color={TINT.yellow}>○</Text>
+            {truncate(' Done, not asked by you: a message or a task', total - 1)}
           </Text>
         )}
         {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (auto with Remote Control)</Text>}

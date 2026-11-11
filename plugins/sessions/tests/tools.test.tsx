@@ -792,6 +792,19 @@ test("the lock held elsewhere: refused, try again", async ($, on) => {
   expect(t.respawned).toEqual([])
 })
 
+test("a claim Claude's store doesn't take (its lock held past the tries) is no claim: refused, and nothing restarts", async ($, on) => {
+  const t = setup(on)
+  await started($, t)
+  t.w.storeLock.until = t.w.clock.now() + 9000
+  expect(await denied(call($, t, { tool: 'mcp__sessions__wake', session: 'worker a' }, 9500))).toBe("Not woken: Claude's store didn't take the claim on this wake (its lock was held): try again in a few seconds.")
+  expect(t.respawned).toEqual([])
+  expect(t.w.store.get('broughtBack')).toBe(undefined)
+  // The lock gone, the same wake goes through
+  await t.w.clock.advance(1000)
+  expect((await wake($, t, 'worker a')).result).toBe(WOKE)
+  expect(t.respawned).toEqual(['dddddddd'])
+})
+
 test("before the panel read the list: try again in a few seconds", async ($, on) => {
   const t = setup(on)
   expect(await denied(wake($, t, 'worker a'))).toBe("the sessions panel hasn't read the session list in this session yet: try again in a few seconds")
