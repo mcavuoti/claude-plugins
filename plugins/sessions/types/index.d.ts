@@ -41,14 +41,19 @@ export type Row = {
   helpers: number
   // Working, or done and unseen in the background, for the staleMinutes option or longer: a dim ⧗ before its time
   stale: boolean
+  // Done and unseen (yellow), and none of it answers the person: the turns that finished since they last looked were
+  // started by another session's message, a subagent's or a background task's report, a schedule or a script. Drawn
+  // as a hollow dot (○) where an answer to the person is a full one
+  unasked: boolean
 }
 
 // One rate-limit window of the account, as a session's last response reported it (five_hour, seven_day, …)
 export type RateLimit = { kind: string; percent: number }
 // About all the project's rows, whatever the panel shows: whether the f filter is on (only the sessions waiting for
-// you), how many sessions the project has, how many others wait for you (red) or have something unseen (yellow), and
-// what they spent at list price (null: none is on an API account)
-export type PanelSummary = { waitingOnly: boolean; sessions: number; waiting: number; unseen: number; spent: number | null }
+// you), how many sessions the project has, how many others wait for you (red), have an answer to you unseen (yellow)
+// or finished unseen a turn you didn't start (yellow, hollow: unasked), and what they spent at list price (null: none
+// is on an API account)
+export type PanelSummary = { waitingOnly: boolean; sessions: number; waiting: number; unseen: number; unasked: number; spent: number | null }
 // The panel's line about the background sessions of every folder that ended with Claude's background service and are
 // still stopped: what it says ("3 sessions ended with the background service at 14:05"), what its key does ("brings
 // them back"), the latest death's time and how many; null: none, or the person dismissed it for that death

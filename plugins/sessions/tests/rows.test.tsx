@@ -1,10 +1,11 @@
 import { expect, test } from 'claude-code/testing'
 
-import { FORMAT, buildNotice, heartbeatText, parseNotice } from '../hooks/state'
-import { BAND, COMMAND, DATA, panelRing, ROOT, SID, SLOW, startSession, world } from './world'
+import { FORMAT, buildNotice, colorOf, heartbeatText, parseNotice, sortRows, startedByPerson, tellPrompt } from '../hooks/state'
+import { BAND, COMMAND, DATA, panelRing, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel's rows show beyond each session: sections (the person's /sessions section, the headers, the freeze
-// while the panel has the keyboard, sections.json kept tidy) and what the sessions spend
+// while the panel has the keyboard, sections.json kept tidy), what the sessions spend, and whose turn finished unseen
+// (the full and the hollow yellow dot)
 
 const SECTIONS = `${DATA}/sections.json`
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
@@ -711,4 +712,260 @@ test('the panel overflows: a "more below" line at the top, and only the rows tha
   expect(text).toMatch(/↓ \d+ more below · shift\+→, then ↑↓/)
   expect(text).toContain('asks you 1: /fleet')
   expect(text).not.toContain('main moved under 1 file')
+})
+
+// ---- The dot: whose turn finished unseen ----
+// A turn's end turns the row yellow until the person looks: a full dot (●) when they started that turn, a hollow one
+// (○, unasked) when another session's message, a subagent's or a background task's report, a schedule or a script did
+
+const CHARLIE = 'cccccccc-0000-0000-0000-000000000000'
+const STATE = `state:${SID}`
+
+// The origins as the engine stamps them (prompt.submit's e.origin)
+const TYPED = { kind: 'composer' } as const
+const PHONE = { kind: 'bridge' } as const
+const MESSAGE = { kind: 'peer' } as const
+const TASK = { kind: 'task-notification' } as const
+
+// What the engine does with a prompt and a turn's end beneath the mod; drop: the prompts that don't enter
+function turns(on: any, drop: (text: string) => boolean = () => false) {
+  on('prompt.submit', (_: any, e: any) => (drop(String(e.text)) ? { drop: 'removed from the queue before it ran' } : { text: e.text, origin: e.origin }))
+  on('turn.complete', (_: any, e: any) => ({ text: String(e.answer ?? '') }) as any)
+}
+
+// A whole turn of this session: its prompt as the engine raises it (none: a turn nothing announced), its start, its end
+let turnNumber = 0
+async function turn($: any, w: World, origin: unknown, text = 'go') {
+  const turnId = `t${++turnNumber}`
+  if (origin) await $.prompt.submit({ text, origin, wait: false } as any)
+  await $.turn.start({ turnId, text } as any)
+  await w.clock.advance(1000)
+  await $.turn.complete({ turnId, answer: 'done', reason: 'answer' } as any)
+  await w.clock.advance(1000)
+}
+
+// A row's dot as the panel draws it now: its glyph and its color
+async function dot($: any, sessionId: string): Promise<{ glyph: string; color: string } | undefined> {
+  const ui = await $.ui.mount(PANEL)
+  const drawn = await ui.drawn()
+  await ui.unmount()
+  const find = (n: any): any => (n?.props?.key === `row:${sessionId}` ? n : (n?.children ?? []).map(find).find(Boolean))
+  const mark = find(JSON.parse(JSON.stringify(drawn)))?.children?.[1]
+  return mark ? { glyph: String(([] as unknown[]).concat(mark.children ?? []).join('')), color: String(mark.props?.color) } : undefined
+}
+const FULL = { glyph: '●', color: 'warning' }
+const HOLLOW = { glyph: '○', color: 'warning' }
+const state = (w: World) => w.store.get(STATE) as any
+
+test('startedByPerson: typed, the phone, their own ping and what can’t be told are the person’s; messages, reports, schedules and plugins aren’t', () => {
+  for (const kind of ['composer', 'bridge', 'slack-ping', 'auto-continuation', 'sdk', 'unclassified', 'channel', 'something-new']) expect(startedByPerson({ kind })).toBe(true)
+  for (const kind of ['peer', 'peer-send-message', 'task-notification', 'scheduled-trigger', 'projects-relay', 'coordinator', 'observer', 'observer-activity']) expect(startedByPerson({ kind })).toBe(false)
+  expect(startedByPerson({ kind: 'plugin', name: 'fleet' })).toBe(false)
+  expect(startedByPerson({ kind: 'plugin', name: 'fleet', asUser: true })).toBe(true)
+  expect(startedByPerson(undefined)).toBe(true)
+  expect(startedByPerson('peer')).toBe(true)
+})
+
+test('colorOf: unasked while every finish since the person last looked was of a turn they didn’t start', () => {
+  const idle = { status: 'idle' }
+  // A record without the field (a session whose mod doesn't write it): its finish is an answer to the person
+  expect(colorOf(idle, { finished: 100 }, 0)).toEqual({ color: 'yellow', since: 100 })
+  expect(colorOf(idle, { finished: 100, personFinished: 100 }, 0)).toEqual({ color: 'yellow', since: 100 })
+  // The person's answer seen (or none ever), then a turn they didn't start
+  expect(colorOf(idle, { finished: 100, personFinished: 0 }, 0)).toEqual({ color: 'yellow', since: 100, unasked: true })
+  expect(colorOf(idle, { finished: 100, personFinished: 40 }, 50)).toEqual({ color: 'yellow', since: 100, unasked: true })
+  // An answer to the person still unseen, whatever finished after it
+  expect(colorOf(idle, { finished: 100, personFinished: 60 }, 50)).toEqual({ color: 'yellow', since: 100 })
+  // Seen clears both
+  expect(colorOf(idle, { finished: 100, personFinished: 0 }, 100)).toEqual({ color: 'green', since: 100 })
+  expect(colorOf(idle, { finished: 100, personFinished: 100 }, 120)).toEqual({ color: 'green', since: 100 })
+  // Working or waiting says nothing of it
+  expect(colorOf({ status: 'busy' }, { finished: 100, personFinished: 0, turnStarted: 110 }, 0)).toEqual({ color: 'blue', since: 110 })
+  expect(colorOf({ status: 'waiting' }, { finished: 100, personFinished: 0 }, 0, 120)).toEqual({ color: 'red', since: 120 })
+})
+
+test('sortRows: the answers to the person, then what nobody asked for, then the ones working', () => {
+  const rows = [
+    { color: 'blue' as const, title: 'a working' },
+    { color: 'yellow' as const, title: 'b unasked', unasked: true },
+    { color: 'yellow' as const, title: 'z answered you', unasked: false },
+    { color: 'red' as const, title: 'waits' },
+    { color: 'green' as const, title: 'idle' },
+    { color: 'yellow' as const, title: 'a unasked', unasked: true },
+  ]
+  expect(sortRows(rows).map(r => r.title)).toEqual(['waits', 'z answered you', 'a unasked', 'b unasked', 'a working', 'idle'])
+})
+
+test('a turn the person typed, or sent from the phone, or that nothing announced: a full yellow dot, as before', SLOW, async ($, on) => {
+  const w = world(on)
+  turns(on)
+  await startSession($, w)
+  await turn($, w, TYPED)
+  expect(await dot($, SID)).toEqual(FULL)
+  expect(state(w).personFinished).toBe(state(w).finished)
+  await turn($, w, PHONE)
+  expect(await dot($, SID)).toEqual(FULL)
+  expect(state(w).personFinished).toBe(state(w).finished)
+  // No prompt.submit before its start: taken as the person's
+  await turn($, w, null)
+  expect(await dot($, SID)).toEqual(FULL)
+  expect(state(w).personFinished).toBe(state(w).finished)
+  const said: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+  expect(String(said.text)).toContain('Turns: the last one here was started by you (nothing said otherwise)')
+})
+
+const OTHERS: [string, unknown, string][] = [
+  ['another session’s message, or a subagent’s report (peer)', MESSAGE, '<cross-session-message from-name="bravo">\nPING\n</cross-session-message>'],
+  ['a background task’s notification', TASK, '<task-notification>\n<task-id>x1</task-id>\n</task-notification>'],
+  ['a schedule', { kind: 'scheduled-trigger' }, 'check the build'],
+  ['another plugin’s prompt', { kind: 'plugin', name: 'other' }, 'The other plugin sent a message:\nhello'],
+]
+for (const [what, origin, text] of OTHERS) {
+  test(`a turn started by ${what}: the hollow dot, and seeing the session clears it`, SLOW, async ($, on) => {
+    const w = world(on)
+    turns(on)
+    await startSession($, w)
+    await turn($, w, origin, text)
+    expect(await dot($, SID)).toEqual(HOLLOW)
+    expect(state(w).finished).toBeGreaterThan(0)
+    expect(state(w).personFinished).toBe(0)
+    const said: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
+    expect(String(said.text)).toContain(`Turns: the last one here was started by something else (${(origin as any).kind}), not you`)
+    // A second one: still hollow
+    await turn($, w, origin, text)
+    expect(await dot($, SID)).toEqual(HOLLOW)
+    // The person looks (a key in its panel): green
+    await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: `s:${SID}`, origin: { kind: 'person' } } as any)
+    await w.clock.advance(3500)
+    expect(await dot($, SID)).toEqual({ glyph: '●', color: 'success' })
+  })
+}
+
+test('ccc tell’s turn, the mod’s own prompt that it never hears: known by its text, the hollow dot', SLOW, async ($, on) => {
+  const w = world(on)
+  turns(on)
+  await startSession($, w)
+  turnNumber++
+  await $.turn.start({ turnId: `t${turnNumber}`, text: `The sessions plugin sent a message:\n${tellPrompt('12-3', 'nightly', 'run the checks')}` } as any)
+  await w.clock.advance(1000)
+  await $.turn.complete({ turnId: `t${turnNumber}`, answer: 'done', reason: 'answer' } as any)
+  await w.clock.advance(1000)
+  expect(await dot($, SID)).toEqual(HOLLOW)
+})
+
+test('an unseen answer to the person stays a full dot whatever finishes after it; once seen, the next unasked one is hollow', SLOW, async ($, on) => {
+  const w = world(on)
+  turns(on)
+  await startSession($, w)
+  await turn($, w, TYPED)
+  const answered = state(w).finished
+  expect(await dot($, SID)).toEqual(FULL)
+  await turn($, w, MESSAGE)
+  await turn($, w, TASK)
+  expect(await dot($, SID)).toEqual(FULL)
+  expect(state(w).finished).toBeGreaterThan(answered)
+  expect(state(w).personFinished).toBe(answered)
+  // Seen: both gone
+  await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: `s:${SID}`, origin: { kind: 'person' } } as any)
+  await w.clock.advance(3500)
+  expect((await dot($, SID))?.color).toBe('success')
+  await turn($, w, MESSAGE)
+  expect(await dot($, SID)).toEqual(HOLLOW)
+  // And the person's own next turn is full again
+  await turn($, w, TYPED)
+  expect(await dot($, SID)).toEqual(FULL)
+})
+
+test('the person’s word wins: typed into a turn something else started, typed before a message’s turn starts, and a prompt that didn’t enter says nothing', SLOW, async ($, on) => {
+  const w = world(on)
+  turns(on, text => text.startsWith('DROPPED'))
+  await startSession($, w)
+  // A message's turn runs, and the person types over it (the prompt carries that turn's id): its answer is theirs too
+  await $.prompt.submit({ text: 'PING', origin: MESSAGE, wait: false } as any)
+  await $.turn.start({ turnId: 'p1', text: 'PING' } as any)
+  await $.prompt.submit({ text: 'and this', origin: TYPED, turnId: 'p1', wait: false } as any)
+  await w.clock.advance(1000)
+  await $.turn.complete({ turnId: 'p1', answer: 'done', reason: 'answer' } as any)
+  await w.clock.advance(1000)
+  expect(state(w).personFinished).toBe(state(w).finished)
+  // The typed prompt's own turn, whatever arrives before it starts
+  await $.prompt.submit({ text: 'PING', origin: MESSAGE, wait: false } as any)
+  await turn($, w, null)
+  expect(state(w).personFinished).toBe(state(w).finished)
+  // A message delivered into a running turn of the person's starts none, and changes nothing
+  await $.prompt.submit({ text: 'go', origin: TYPED, wait: false } as any)
+  await $.turn.start({ turnId: 'p2', text: 'go' } as any)
+  await $.prompt.submit({ text: 'PING', origin: MESSAGE, turnId: 'p2', wait: false } as any)
+  await w.clock.advance(1000)
+  await $.turn.complete({ turnId: 'p2', answer: 'done', reason: 'answer' } as any)
+  await w.clock.advance(1000)
+  expect(state(w).personFinished).toBe(state(w).finished)
+  const answered = state(w).finished
+  // A task's notification that didn't enter says nothing about the turn after it
+  await $.prompt.submit({ text: 'DROPPED notification', origin: TASK, wait: false } as any)
+  await turn($, w, null)
+  expect(state(w).personFinished).toBe(state(w).finished)
+  expect(state(w).finished).toBeGreaterThan(answered)
+})
+
+// ---- What the other sessions' rows, the band and the order file do with it ----
+
+function project(): any[] {
+  return [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'mine' },
+    { id: 'bbbbbbbb', sessionId: BRAVO, cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'zz answered you' },
+    { id: 'cccccccc', sessionId: CHARLIE, cwd: ROOT, kind: 'background', status: 'idle', pid: 4244, name: 'aa on its own' },
+    { id: 'dddddddd', sessionId: DELTA, cwd: ROOT, kind: 'background', status: 'busy', pid: 4245, name: 'ab working' },
+  ]
+}
+// Bravo answered the person and they haven't looked; charlie finished a turn a message started, its last answer to
+// the person seen; delta works
+const RECORDS = {
+  [`state:${BRAVO}`]: { created: 1, finished: 500, personFinished: 500 },
+  [`state:${CHARLIE}`]: { created: 1, finished: 700, personFinished: 300 },
+  [`seen:${CHARLIE}`]: 400,
+  [`state:${DELTA}`]: { created: 1, turnStarted: 900, finished: 100, personFinished: 100 },
+}
+
+test('other sessions’ rows: ● for an answer to the person, ○ for one nobody asked for; the band counts each; the order file keeps yellow', SLOW, async ($, on) => {
+  const w = world(on, { list: project(), store: RECORDS })
+  await startSession($, w)
+  await w.clock.advance(3500)
+  expect(await dot($, BRAVO)).toEqual(FULL)
+  expect(await dot($, CHARLIE)).toEqual(HOLLOW)
+  expect(await dot($, DELTA)).toEqual({ glyph: '●', color: 'suggestion' })
+  // The legend says what the hollow dot is, only while a row has one: whole, in the narrowest panel (50 columns)
+  const ui = await $.ui.mount({ ...PANEL, props: { ...PANEL.props, bodyColumns: 50 } })
+  expect(JSON.stringify(await ui.drawn())).toContain('Done, not asked by you: a message or a task"')
+  await ui.unmount()
+  // The band: one of each
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' } as any)
+  const text = JSON.stringify(await band.drawn())
+  await band.unmount()
+  expect(text).toMatch(/"● ".*"1  ".*"○ ".*"1  "/)
+  // The order file ccc opens the first row of: the answer to the person, then the unasked one, then the one working,
+  // whatever their names; both yellow there, in the same format
+  const order = (w.files.get(`${DATA}/order/_Users_x_myapp`) ?? '').split('\n')
+  expect(order[0]).toBe(`format=${FORMAT}`)
+  expect(order.filter(l => l.startsWith('row=')).map(l => l.slice(4).split('\t').slice(0, 3))).toEqual([
+    [BRAVO, 'yellow', 'bbbbbbbb'],
+    [CHARLIE, 'yellow', 'cccccccc'],
+    [DELTA, 'blue', 'dddddddd'],
+    [SID, 'green', 'aaaaaaaa'],
+  ])
+})
+
+test('no row unasked: no legend line for it, and no hollow count in the band', SLOW, async ($, on) => {
+  const w = world(on, { list: project(), store: { ...RECORDS, [`state:${CHARLIE}`]: { created: 1, finished: 700, personFinished: 700 } } })
+  await startSession($, w)
+  await w.clock.advance(3500)
+  expect(await dot($, CHARLIE)).toEqual(FULL)
+  const ui = await $.ui.mount(PANEL)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('Done, not asked by you')
+  await ui.unmount()
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' } as any)
+  const text = JSON.stringify(await band.drawn())
+  await band.unmount()
+  expect(text).toContain('"2  "')
+  expect(text).not.toContain('○')
 })

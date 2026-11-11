@@ -178,6 +178,10 @@ export type SessionState = {
   created?: number
   turnStarted?: number
   finished?: number
+  // When the last turn the person started finished (startedByPerson); `finished` is the last turn's, whoever started
+  // it. A record without it (a session whose mod doesn't write it, or that hasn't finished a turn since it does)
+  // counts its finish as an answer to the person
+  personFinished?: number
   reason?: string
   answer?: string
   question?: boolean
@@ -246,22 +250,43 @@ export function timeSince(ms: number, now: number): string {
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`
 }
 
+// Who started a turn, from where its prompt came (prompt.submit's origin): the person, or something else. The
+// person's: typed in the session or its launch prompt (composer), from a remote client (bridge: the phone is the
+// person), their own ping from Slack, a follow-up to something they did in the interface, a plugin's prompt sent as
+// their own words, the host's own in a non-interactive run, a message through a channel (whoever wrote it there), and
+// any origin that can't be told (unclassified, or one this list doesn't know): the stronger mark when in doubt. Not
+// theirs: another session's message and a subagent's report (peer, peer-send-message, projects-relay, coordinator,
+// observer, observer-activity), a background task's notification, a schedule, and a plugin's own prompt
+const NOT_THE_PERSON = new Set(['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'coordinator', 'observer', 'observer-activity'])
+export function startedByPerson(origin: unknown): boolean {
+  const o = origin && typeof origin === 'object' ? (origin as { kind?: unknown; asUser?: unknown }) : {}
+  if (o.kind === 'plugin') return o.asUser === true
+  return !(typeof o.kind === 'string' && NOT_THE_PERSON.has(o.kind))
+}
+
 // The color comes from the official status (busy/idle/waiting, reported by the session itself) and from what the mod
 // records in each session. "since" is the moment the time counts from: working since, waiting for you since, finished ago.
-export function colorOf(s: any, state: SessionState | null, seen: number, waitingSince?: number): { color: Color; since?: number } {
+// unasked: done and unseen (yellow), and none of what's unseen answers the person: every turn that finished since
+// they last looked was started by something else (startedByPerson). The row is full yellow while an answer to a turn
+// they started is unseen, whatever finished after it; seeing the session clears both
+export function colorOf(s: any, state: SessionState | null, seen: number, waitingSince?: number): { color: Color; since?: number; unasked?: true } {
   if (s.status === undefined || s.status === null) return { color: 'gray' }
   if (s.status === 'busy') return { color: 'blue', since: state?.turnStarted }
   if (s.status === 'waiting') return { color: 'red', since: waitingSince }
   if (s.status !== 'idle') return { color: 'gray' }
   if (!state?.finished) return { color: 'green', since: state?.created }
-  return { color: seen >= state.finished ? 'green' : 'yellow', since: state.finished }
+  if (seen >= state.finished) return { color: 'green', since: state.finished }
+  const asked = typeof state.personFinished === 'number' ? state.personFinished : state.finished
+  return seen >= asked ? { color: 'yellow', since: state.finished, unasked: true } : { color: 'yellow', since: state.finished }
 }
 
-// The panel's order when it doesn't have the keyboard: waiting for you, done and unseen, working, idle, stopped; then
-// by title. The launcher opens the first row of this order (it reads it from the order file the panels write)
+// The panel's order when it doesn't have the keyboard: waiting for you, done and unseen (the answers to the person
+// first, then the ones nobody asked for: unasked), working, idle, stopped; then by title. The launcher opens the first
+// row of this order (it reads it from the order file the panels write)
 export const COLOR_RANK: Record<Color, number> = { red: 0, yellow: 1, blue: 2, green: 3, gray: 4 }
-export function sortRows<T extends { color: Color; title: string }>(rows: readonly T[]): T[] {
-  return [...rows].sort((a, b) => COLOR_RANK[a.color] - COLOR_RANK[b.color] || a.title.localeCompare(b.title))
+export function sortRows<T extends { color: Color; title: string; unasked?: boolean }>(rows: readonly T[]): T[] {
+  const rank = (r: T) => COLOR_RANK[r.color] + (r.color === 'yellow' && r.unasked ? 0.5 : 0)
+  return [...rows].sort((a, b) => rank(a) - rank(b) || a.title.localeCompare(b.title))
 }
 
 // "claude-opus-5-5[1m]", "Opus 5.5 (1M context)" or "claude-haiku-4-5-20251001" → "Opus 5.5" / "Haiku 4.5"
@@ -971,7 +996,8 @@ export function expectsHeartbeat(s: { pid?: number; status?: string; startedAt?:
 
 // The order file: <data>/order/<project root as a file name>, the panel's rows in the unfocused order, written by the
 // panels of the project's sessions (when it changes, and every 20 s) and read by the launcher, which opens the first
-// one. Rows: sessionId, color, id (or -) and title, separated by tabs
+// one. Rows: sessionId, color, id (or -) and title, separated by tabs. A row done and unseen that nobody asked for
+// (unasked) is yellow here as any other: only its place says so, after the answers to the person
 export type OrderRow = { sessionId: string; color: Color; id: string | null; title: string }
 export function orderFileText(root: string, rows: readonly OrderRow[], now: number): string {
   const clean = (t: string) => t.replace(/[\t\r\n]+/g, ' ')

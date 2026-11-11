@@ -137,6 +137,7 @@ import {
   parseTranscriptStarts,
   type Whereabouts,
   sortRows,
+  startedByPerson,
   windowTargetText,
   SHOWING,
   type Showing,
@@ -242,7 +243,7 @@ const paneNote = atom({ plugin: 'sessions', key: 'paneNote' } as const, '' as Pa
 // line above the prompt
 const limits = atom({ plugin: 'sessions', key: 'limits' } as const, [] as RateLimit[])
 // About all the project's rows, whatever is shown: the f filter, how many there are, what they spent
-const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, waiting: 0, unseen: 0, spent: null } as PanelSummary)
+const summary = atom({ plugin: 'sessions', key: 'summary' } as const, { waitingOnly: false, sessions: 0, waiting: 0, unseen: 0, unasked: 0, spent: null } as PanelSummary)
 // The ccc tell request on its way to a turn (checkTells): in $.state, which a reload of the mod's code keeps
 const tellInFlight = atom({ plugin: 'sessions', key: 'tellInFlight' } as const, null as TellInFlight)
 // What this session's classic.SessionStart had the engine watch (watch.ts): in $.state, which a reload keeps as the
@@ -3723,7 +3724,7 @@ async function refresh($: any) {
     } else if (s.status !== 'waiting' && waitingSince) {
       await storeDelete($, `waiting:${s.sessionId}`)
     }
-    const { color, since } = colorOf(s, e, seen, waitingSince)
+    const { color, since, unasked } = colorOf(s, e, seen, waitingSince)
     const staling = staleMs > 0 && since && (color === 'blue' || (color === 'yellow' && s.kind === 'background'))
     sinces.push({ since, staleFrom: staling && since ? since + staleMs : undefined })
     // A stopped session doesn't run any version: it opens with the installed one
@@ -3781,6 +3782,7 @@ async function refresh($: any) {
       folded: false,
       helpers,
       stale: isStale({ color, background: s.kind === 'background' }, since, minute, staleMs),
+      unasked: unasked === true,
     })
   }
   waitsNow = waits
@@ -3942,7 +3944,8 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     waitingOnly,
     sessions: projectRows.length,
     waiting: others.filter(f => f.color === 'red').length,
-    unseen: others.filter(f => f.color === 'yellow').length,
+    unseen: others.filter(f => f.color === 'yellow' && !f.unasked).length,
+    unasked: others.filter(f => f.color === 'yellow' && f.unasked).length,
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
   // Nobody could be looking: kept, not drawn (held)
@@ -4159,6 +4162,7 @@ function peerRow(sessionId: string, carried: Record<string, unknown> = {}): Row 
     folded: false,
     helpers: 0,
     stale: false,
+    unasked: false,
   }
 }
 
@@ -4985,6 +4989,57 @@ async function notifyWhenBack($: any) {
   }
 }
 
+// ---- Whose turn it is ----
+// A turn's end turns the session's row yellow until the person looks: a full dot when they started that turn, a hollow
+// one (unasked) when something else did. Every prompt that starts a turn of the main conversation comes through
+// prompt.submit with its origin, before the turn's turn.start (seen in test sessions on Claude 2.1.322: a typed prompt
+// and the one a session is launched with are `composer`; the end of a background command, `task-notification`;
+// another session's SendMessage and a background subagent's report, `peer`, raised when the session is idle or, when
+// it arrived during a turn, once that turn ended), but for the mod's own ccc tell (a plugin never hears its own
+// $.prompt.submit: that turn is known by the request's id in its text). startedByPerson (state.ts) says which origins
+// are the person's; a turn nothing announced is taken as theirs.
+// nextTurn: what the last prompt said about the turn to come (the person's word stays until that turn starts, whatever
+// comes after it; one that didn't enter says nothing). turnAsked: whether the person started the turn that runs now
+// (or ran last), or typed into it; turnFrom: where it came from, for /sessions status. In memory only: a reload in
+// the middle of a turn makes it the person's
+let nextTurn: { person: boolean; from: string } | null = null
+let turnAsked = true
+let turnFrom = ''
+
+// A prompt on its way in (prompt.submit), before the plugins beneath: the word it says about the next turn, when it
+// has one (a delivery into the turn that runs starts none, and nothing takes the person's word's place)
+function promptComing(origin: unknown, intoTurn: boolean): { person: boolean; from: string } | null {
+  const person = startedByPerson(origin)
+  const from = String((origin as { kind?: unknown } | null | undefined)?.kind ?? 'unknown')
+  if (!person && (intoTurn || nextTurn?.person)) return null
+  // Typed while a turn runs: what that turn answers is for them too
+  if (person && intoTurn) {
+    turnAsked = true
+    turnFrom = from
+  }
+  nextTurn = { person, from }
+  return nextTurn
+}
+
+// A turn of the main conversation starts: whose it is
+function turnBegins($: any, text: string) {
+  if (tellIdIn(text)) {
+    turnAsked = false
+    turnFrom = 'ccc tell'
+  } else {
+    turnAsked = nextTurn?.person ?? true
+    turnFrom = nextTurn?.from ?? ''
+    nextTurn = null
+  }
+  debugLine($, `turn: started by ${turnFrom || 'nothing that said so'} (${turnAsked ? "the person's" : "not the person's: ○ until seen"})`)
+}
+
+// /sessions status, about the last turn here and the hollow dot
+function turnText(): string {
+  const who = turnAsked ? `you${turnFrom ? ` (${turnFrom})` : ' (nothing said otherwise)'}` : `something else (${turnFrom}), not you`
+  return `Turns: the last one here was started by ${who} · ○ on a row: done and unseen, and you didn't start those turns (another session's message, a subagent's or a task's report, a schedule, a script); ● while an answer to you is unseen`
+}
+
 // This session's own row, from its own turn hooks: drawn at once (the registry says the same 0.6 s later, withOwnHint)
 async function ownStatus($: any, status: 'busy' | 'idle') {
   ownHint = { status, at: await $.clock.now() }
@@ -5437,6 +5492,7 @@ async function statusText($: any): Promise<string> {
       ? `Marks: ${markSources.map(m => `${m.source} (${m.rows === 1 ? '1 row' : `${m.rows} rows`}, ${Math.max(0, Math.ceil((m.until - now) / 60000))} min left)`).join(', ')}`
       : 'Marks: none',
     await notificationsText($, now),
+    turnText(),
     await liveText($, now),
   ]
   lines.push(await platformText($, now))
@@ -6082,6 +6138,7 @@ export const register: Register = (on, options) => {
   // The main loop's turns only: a subagent's run inside a turn starts no new one (the working time and ⧗ count from
   // the main turn), and nothing here holds the run up
   on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) turnBegins($, String(e.text ?? ''))
     if (active && e.agentId === undefined) {
       bg(ownStatus($, 'busy'))
       bg(markTurnStart($))
@@ -6092,8 +6149,9 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // A turn triggered by another session (SendMessage) doesn't go through turn.start. Notices from another session's
-  // panel are intercepted here: they aren't queued, aren't shown and the model doesn't read them
+  // Notices from another session's panel are intercepted here: they aren't queued, aren't shown and the model doesn't
+  // read them. Any other delivery is passed on (another session's message starts a turn of its own through
+  // prompt.submit and turn.start, at once or after the turn that runs: "Whose turn it is")
   on('session.receive', async ($, e, next) => {
     if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(NOTICE_MARKER)) {
       bg(ensureStarted($, 'notice'))
@@ -6141,9 +6199,14 @@ export const register: Register = (on, options) => {
           .map(l => l.trim())
           .filter(Boolean)
           .at(-1) ?? ''
+      const previous = (await readState($, myId)) ?? {}
+      const finished = await $.clock.now()
       const state: SessionState = {
-        ...((await readState($, myId)) ?? {}),
-        finished: await $.clock.now(),
+        ...previous,
+        finished,
+        // The last finish of a turn the person started: this one, or as it was (a record from before this field: its
+        // finish)
+        personFinished: turnAsked ? finished : (previous.personFinished ?? previous.finished ?? 0),
         reason: e.reason,
         answer: line.slice(0, 70),
         question: line.endsWith('?'),
@@ -6165,8 +6228,10 @@ export const register: Register = (on, options) => {
     return r
   })
 
-  // Typing in the box (or from the phone) counts as having seen the session; a message from another session doesn't
+  // Typing in the box (or from the phone) counts as having seen the session; a message from another session doesn't.
+  // Every prompt says whose the turn it starts is (promptComing)
   on('prompt.submit', async ($, e, next) => {
+    const word = promptComing(e.origin, e.turnId !== undefined)
     if (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') {
       bg(ensureStarted($, 'prompt'))
       if (active) {
@@ -6175,7 +6240,10 @@ export const register: Register = (on, options) => {
         bg(rearmTells($))
       }
     }
-    return next(e)
+    const r = await next(e)
+    // A prompt that didn't enter starts no turn
+    if (r?.drop !== undefined && word && nextTurn === word) nextTurn = null
+    return r
   })
 
   on('command.run', { command: 'sessions' }, async ($, e) => {
@@ -6264,7 +6332,8 @@ export const register: Register = (on, options) => {
     return r
   })
 
-  // The line above the prompt: how many sessions wait for you (red) or have something unseen (yellow), why the panel
+  // The line above the prompt: how many sessions wait for you (red), have an answer to you unseen (yellow) or finished
+  // unseen a turn you didn't start (a hollow yellow dot), why the panel
   // isn't shown (with a button that opens it: shift+→ then Enter, or a click), the account's windows on a subscription,
   // and this session's short id. One row, with whatever other mods (and Claude) draw there after it: the band is
   // shared. Its first draw starts the mod when nothing else did (a session draws even with no window attached; a draw
@@ -6285,6 +6354,8 @@ export const register: Register = (on, options) => {
     const about = held?.summary ?? written
     const reds = about.waiting
     const yellows = about.unseen
+    // Done and unseen, and nobody asked: a hollow dot (0 for a summary a module before this one left)
+    const hollows = about.unasked || 0
     const id = await read($, shortId)
     const note = await read($, paneNote)
     const why = note === 'closed' ? 'panel closed · /sessions to open' : note === 'narrow' ? 'panel hidden: window too narrow · /sessions to show' : ''
@@ -6299,7 +6370,9 @@ export const register: Register = (on, options) => {
         {reds > 0 && `${reds}  `}
         {yellows > 0 && <Text color={TINT.yellow}>● </Text>}
         {yellows > 0 && `${yellows}  `}
-        {reds + yellows > 0 && !why && '/sessions  '}
+        {hollows > 0 && <Text color={TINT.yellow}>○ </Text>}
+        {hollows > 0 && `${hollows}  `}
+        {reds + yellows + hollows > 0 && !why && '/sessions  '}
       </Text>
     )
     const own =
@@ -6386,7 +6459,7 @@ export const register: Register = (on, options) => {
     const showUsage =
       inTerminal &&
       e.props.placement === 'dock' &&
-      lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
+      lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.unasked) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
     // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
     const usageData = showUsage ? await read($, usage) : null
     const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
@@ -6449,7 +6522,8 @@ export const register: Register = (on, options) => {
       <Box key={`row:${f.sessionId}`} flexDirection="row" backgroundColor={f.current ? 'userMessageBackground' : undefined}>
         {f.current ? <Text color="claude">▌</Text> : <Text> </Text>}
         {f.depth > 0 && <Text>{' '.repeat(INDENT)}</Text>}
-        <Text color={TINT[f.color]}>●</Text>
+        {/* ○: done and unseen, and you didn't start those turns (unasked) */}
+        <Text color={TINT[f.color]}>{f.unasked ? '○' : '●'}</Text>
         <Text> </Text>
         {inTerminal ? (
           <Button
@@ -6557,6 +6631,12 @@ export const register: Register = (on, options) => {
           <Text dimColor>
             <Text color={TINT.yellow}>!</Text>
             {' Panel not running there · u: Restart'}
+          </Text>
+        )}
+        {list.some(f => f.unasked) && (
+          <Text dimColor>
+            <Text color={TINT.yellow}>○</Text>
+            {truncate(' Done, not asked by you: a message or a task', total - 1)}
           </Text>
         )}
         {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (auto with Remote Control)</Text>}

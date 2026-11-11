@@ -155,6 +155,23 @@ test('current and status: not ready before the start, then this session and the 
   expect((await call($, 'status', { refs: [1, null], names: 'one' })).rows).toEqual([])
 })
 
+test('status: a session done and unseen is idle, whoever started its last turn; the row has the fields it had, and no other', WITH_PROBE, async ($, on) => {
+  const three = 'dddddddd-0000-0000-0000-000000000000'
+  const rows = [
+    { id: 'aaaaaaaa', sessionId: SID, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' },
+    { id: 'bbbbbbbb', sessionId: TWO, cwd: ROOT, kind: 'background', status: 'idle', pid: 4243, name: 'two' },
+    { id: 'dddddddd', sessionId: three, cwd: ROOT, kind: 'background', status: 'idle', pid: 4245, name: 'three' },
+  ]
+  // Two answered the person and they haven't looked; three finished a turn a message started (the panel's hollow dot)
+  const w = world(on, { list: rows, store: { [`state:${TWO}`]: { created: 1, finished: 500, personFinished: 500, root: ROOT }, [`state:${three}`]: { created: 1, finished: 700, personFinished: 0, root: ROOT } } })
+  await startSession($, w)
+  const s = await call($, 'status', { refs: ['bbbbbbbb', 'dddddddd'] })
+  expect(s.rows).toEqual([
+    { ref: 'bbbbbbbb', sessionId: TWO, name: 'two', state: 'idle', panel: 'none', root: ROOT, background: true, agent: null },
+    { ref: 'dddddddd', sessionId: three, name: 'three', state: 'idle', panel: 'none', root: ROOT, background: true, agent: null },
+  ])
+})
+
 test("agent: the transcript's first row says which agent the session runs as", WITH_PROBE, async ($, on) => {
   const w = world(on, { transcript: `{"type":"agent-setting","agentSetting":"scout","sessionId":"${SID}"}\n{"type":"user"` })
   await startSession($, w)
