@@ -192,6 +192,14 @@ export type SessionState = {
   usualHour?: number
 }
 
+// Whether the record the store has for a session is older than the last one that session wrote itself: gone, or with
+// an earlier turn start or finish. Only the session writes its record, so that's the store's file written back as
+// another session read it a while ago (one frozen while it held the store's lock, past the 10 s the lock lasts)
+export function recordBehind(stored: SessionState | null, own: SessionState): boolean {
+  if (!stored) return true
+  return (Number(stored.finished) || 0) < (own.finished ?? 0) || (Number(stored.turnStarted) || 0) < (own.turnStarted ?? 0)
+}
+
 // What a session spends, read per session and never assumed: on a subscription its responses report rate-limit windows
 // (five_hour, seven_day, …; any can be missing); off one (an API key) there are none, and the cost at list price is what
 // says how much. Before its first response a session reports no window and costs nothing: nothing is known yet
