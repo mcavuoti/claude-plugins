@@ -876,6 +876,55 @@ test('an unseen answer to the person stays a full dot whatever finishes after it
   expect(await dot($, SID)).toEqual(FULL)
 })
 
+test('a turn nothing announced is the person’s whatever the turn before it was: after a message’s, after another plugin’s, after their own', SLOW, async ($, on) => {
+  const w = world(on)
+  turns(on)
+  await startSession($, w)
+  for (const before of [MESSAGE, { kind: 'plugin', name: 'other' }, TASK, TYPED]) {
+    await turn($, w, before, 'x')
+    const earlier = state(w).finished
+    // No prompt.submit reached the mod for this one: nothing is left of the turn before
+    await turn($, w, null)
+    expect(state(w).finished).toBeGreaterThan(earlier)
+    expect(state(w).personFinished).toBe(state(w).finished)
+  }
+  // And the other way: after an unannounced turn, a message's turn is still its own
+  await $.ui.focus({ component: 'Pane', requestId: 'sessions', plugin: 'sessions', element: `s:${SID}`, origin: { kind: 'person' } } as any)
+  await w.clock.advance(3500)
+  await turn($, w, { kind: 'plugin', name: 'other' }, 'x')
+  expect(await dot($, SID)).toEqual(HOLLOW)
+})
+
+test('a turn that starts while the last one’s end is still being recorded: each finish keeps its own turn’s origin', SLOW, async ($, on) => {
+  const w = world(on)
+  // The plugins beneath answer a turn's end 50 ms late, and the next prompt (one that waited for that end) comes at once
+  on('prompt.submit', (_: any, e: any) => ({ text: e.text, origin: e.origin }))
+  on('turn.complete', async (_: any, e: any) => {
+    await w.clock.sleep(50)
+    return { text: String(e.answer ?? '') } as any
+  })
+  await startSession($, w)
+  // A message's turn ends, and the person's queued prompt starts the next one before that end is recorded
+  await $.prompt.submit({ text: 'PING', origin: MESSAGE, wait: false } as any)
+  await $.turn.start({ turnId: 'r1', text: 'PING' } as any)
+  await w.clock.advance(1000)
+  const ending = $.turn.complete({ turnId: 'r1', answer: 'done', reason: 'answer' } as any)
+  await $.prompt.submit({ text: 'mine', origin: TYPED, wait: false } as any)
+  await $.turn.start({ turnId: 'r2', text: 'mine' } as any)
+  await w.clock.advance(100)
+  await ending
+  expect(state(w).finished).toBeGreaterThan(0)
+  expect(state(w).personFinished).toBe(0)
+  // The other way round: the person's turn ends, and another plugin's prompt starts the next one at once
+  await w.clock.advance(1000)
+  const mine = $.turn.complete({ turnId: 'r2', answer: 'done', reason: 'answer' } as any)
+  await $.prompt.submit({ text: 'from a plugin', origin: { kind: 'plugin', name: 'other' }, wait: false } as any)
+  await $.turn.start({ turnId: 'r3', text: 'from a plugin' } as any)
+  await w.clock.advance(100)
+  await mine
+  expect(state(w).personFinished).toBe(state(w).finished)
+})
+
 test('the person’s word wins: typed into a turn something else started, typed before a message’s turn starts, and a prompt that didn’t enter says nothing', SLOW, async ($, on) => {
   const w = world(on)
   turns(on, text => text.startsWith('DROPPED'))

@@ -4997,9 +4997,12 @@ async function notifyWhenBack($: any) {
 // another session's SendMessage and a background subagent's report, `peer`, raised when the session is idle or, when
 // it arrived during a turn, once that turn ended), but for the mod's own ccc tell (a plugin never hears its own
 // $.prompt.submit: that turn is known by the request's id in its text). startedByPerson (state.ts) says which origins
-// are the person's; a turn nothing announced is taken as theirs.
+// are the person's; a turn nothing announced is taken as theirs. Another plugin's $.prompt.submit is heard here
+// (origin `plugin`, with its name), whether or not that plugin depends on this one, when its turn is about to start:
+// one made during a turn is raised once that turn ended.
 // nextTurn: what the last prompt said about the turn to come (the person's word stays until that turn starts, whatever
-// comes after it; one that didn't enter says nothing). turnAsked: whether the person started the turn that runs now
+// comes after it; one that didn't enter says nothing), used once: every turn's start clears it, so a turn never takes
+// the one before's. turnAsked: whether the person started the turn that runs now
 // (or ran last), or typed into it; turnFrom: where it came from, for /sessions status. In memory only: a reload in
 // the middle of a turn makes it the person's
 let nextTurn: { person: boolean; from: string } | null = null
@@ -6190,6 +6193,9 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // Whose turn ended, read before anything is awaited: the next turn can start while this hook still runs (a prompt
+    // that waited for this turn's end starts its own within milliseconds)
+    const asked = turnAsked
     const r = await next(e)
     if (active && e.agentId === undefined) {
       const answer = String(e.answer ?? '').trim()
@@ -6206,7 +6212,7 @@ export const register: Register = (on, options) => {
         finished,
         // The last finish of a turn the person started: this one, or as it was (a record from before this field: its
         // finish)
-        personFinished: turnAsked ? finished : (previous.personFinished ?? previous.finished ?? 0),
+        personFinished: asked ? finished : (previous.personFinished ?? previous.finished ?? 0),
         reason: e.reason,
         answer: line.slice(0, 70),
         question: line.endsWith('?'),
