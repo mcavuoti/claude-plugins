@@ -161,7 +161,7 @@ const say = (label: string, c: unknown) => console.log(`F0142 ${label} ${JSON.st
 
 // ---- The session ----
 
-async function session($: any, on: any, kind: Kind, opts: { n?: number; hourEvents?: number; window?: 'shut' | 'open'; files?: Record<string, string>; rosterExtra?: Record<string, unknown>; role?: Record<string, unknown>; worldJson?: Record<string, unknown> } = {}): Promise<S> {
+async function session($: any, on: any, kind: Kind, opts: { n?: number; hourEvents?: number; window?: 'shut' | 'open'; files?: Record<string, string>; rosterExtra?: Record<string, unknown>; role?: Record<string, unknown>; worldJson?: Record<string, unknown>; live?: boolean } = {}): Promise<S> {
   const isInstance = kind === 'instance'
   const notes: Record<string, string> = {}
   for (let i = 1; i <= 40; i++) notes[`${ROOT}/notes/n${i}.md`] = `note ${i}\n`
@@ -208,11 +208,13 @@ async function session($: any, on: any, kind: Kind, opts: { n?: number; hourEven
   }
   sessionsSay(w, { current: isInstance ? CURRENT : PERSON, rows: { [REF]: row(REF, isInstance ? 'Owner A' : 'Person', 'idle'), bbbbbbbb: row('bbbbbbbb', 'Owner B', 'working') } })
   await startSession($, w)
-  await $.classic.SessionStart({ source: 'startup', ...(isInstance ? { agent_type: 'owner' } : {}) } as any)
-  await w.clock.settle()
-  // Claude brings the probe back: live updates on
-  await step(s, 1100)
-  await changed($, s, `${FLEET}/bell/probe`)
+  if (opts.live !== false) {
+    await $.classic.SessionStart({ source: 'startup', ...(isInstance ? { agent_type: 'owner' } : {}) } as any)
+    await w.clock.settle()
+    // Claude brings the probe back: live updates on
+    await step(s, 1100)
+    await changed($, s, `${FLEET}/bell/probe`)
+  }
   // First it sweeps, so the sweeper's files are there as a real one writes them
   await step(s, 4 * MIN)
   if (isInstance) {
@@ -333,6 +335,25 @@ test('a landing on a record a file the instance wrote cites looks at its nudges 
   expect(diff(s, a, snap(s)).nudgePasses).toBe(1)
 })
 
+test('an item from outside routed to the instance (an intake landing that names it) looks at its nudges within 7 s; one routed to another does not', LONG, async ($, on) => {
+  const s = await session($, on, 'instance')
+  const w = s.w
+  land(w, 'notes/n19.md', 'by B, first\n')
+  await changed($, s, LATEST)
+  await step(s, 2 * MIN)
+  const meta = (to: string) => ({ kind: 'information', tags: [], from: 'someone@example.invalid', standing: 'other', auth: 'unverified', summary: 'a note', to: [to], drafter: null, front: false, targets: [], source: 'mail' })
+  let a = snap(s)
+  land(w, 'intake/I-1.md', 'for another\n', { more: { via: 'intake', id: 'I-1', by: null, intake: meta('Owner B') } })
+  await changed($, s, LATEST)
+  await step(s, 10 * SECOND)
+  expect(diff(s, a, snap(s)).nudgePasses).toBe(0)
+  a = snap(s)
+  land(w, 'intake/I-2.md', 'for it\n', { more: { via: 'intake', id: 'I-2', by: null, intake: meta('Owner A') } })
+  await changed($, s, LATEST)
+  await step(s, 7 * SECOND)
+  expect(diff(s, a, snap(s)).nudgePasses).toBe(1)
+})
+
 // ---- 2. The chain in events/latest ----
 
 test("this session's own landing leaves events/latest with the chain: what it held before, then its own event", LONG, async ($, on) => {
@@ -380,6 +401,46 @@ test('a landing whose chain reaches the one this session held is read alone: one
   expect(c.listEntries).toBeLessThan(50)
   expect(c.latestReads).toBe(5)
   for (const n of names) expect(taken(w, n)).toBe(true)
+})
+
+test("after its own landing a session still holds the chain: the peer's next one is read alone", LONG, async ($, on) => {
+  const s = await session($, on, 'person')
+  const w = s.w
+  land(w, 'notes/n20.md', 'one\n')
+  await changed($, s, LATEST)
+  await step(s, 5 * SECOND)
+  await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/n3.md` } as any)
+  await $.tool.call({ tool: 'Write', file_path: `${ROOT}/notes/n3.md`, content: 'mine\n' } as any)
+  await changed($, s, LATEST)
+  await step(s, 5 * SECOND)
+  const a = snap(s)
+  const name = land(w, 'notes/n21.md', 'two\n')
+  await changed($, s, LATEST)
+  await step(s, 5 * SECOND)
+  const c = diff(s, a, snap(s))
+  expect(c.hourLists).toBe(0)
+  expect(taken(w, name)).toBe(true)
+  expect(json(w, LATEST).chain.length).toBe(3)
+})
+
+test('with live updates off (the timers), landings are read by the chain too, and the whole pull that follows is one listing', LONG, async ($, on) => {
+  const s = await session($, on, 'person', { live: false })
+  const w = s.w
+  expect(await fleet($, 'status')).toContain('live updates off')
+  land(w, 'notes/n20.md', 'one\n')
+  await step(s, 2 * MIN)
+  const a = snap(s)
+  const names: string[] = []
+  for (let i = 0; i < 5; i++) {
+    names.push(land(w, `notes/n2${i}.md`, `more ${i}\n`))
+    await step(s, 3 * SECOND)
+    // The 2 s look found it
+    expect(taken(w, names[i] as string)).toBe(true)
+  }
+  await step(s, MIN)
+  const c = diff(s, a, snap(s))
+  say('five landings, live updates off', c)
+  expect(c.hourLists).toBeLessThanOrEqual(2)
 })
 
 test("a latest with no chain (another writer's making), or one whose chain doesn't reach back, costs a listing and loses nothing", LONG, async ($, on) => {
@@ -430,6 +491,34 @@ test('an event the chain never named (two writers at once, one overwrote the oth
   expect(w.clock.now() - from).toBeLessThanOrEqual(65 * SECOND)
 })
 
+test('the same under a stream that never stops (a landing a second): an unnamed event is still taken in within the minute, whenever it comes', LONG, async ($, on) => {
+  const s = await session($, on, 'instance')
+  const w = s.w
+  land(w, 'notes/n19.md', 'first\n')
+  await changed($, s, LATEST)
+  await step(s, 2 * MIN)
+  let k = 0
+  const stream = async (ms: number) => {
+    for (let t = 0; t < ms; t += SECOND) {
+      land(w, `notes/n${25 + (k % 10)}.md`, `stream ${k++}\n`)
+      await changed($, s, LATEST)
+      await step(s, SECOND)
+    }
+  }
+  const waits: number[] = []
+  // Dropped at six moments of the minute's pass
+  for (let i = 0; i < 6; i++) {
+    await stream(70 * SECOND)
+    const unnamed = eventFile(w, 'notes/n24.md', hashText(`unnamed ${i}`), w.clock.now())
+    const from = w.clock.now()
+    while (!taken(w, unnamed) && w.clock.now() - from < 2 * MIN) await stream(SECOND)
+    expect(taken(w, unnamed)).toBe(true)
+    waits.push((w.clock.now() - from) / SECOND)
+  }
+  say('unnamed events under a landing a second: taken in after (s)', waits)
+  expect(Math.max(...waits)).toBeLessThanOrEqual(65)
+})
+
 test('a whole pull lists an hour folder only when something came or went in it since it was last listed', LONG, async ($, on) => {
   const s = await session($, on, 'person', { hourEvents: 300 })
   const w = s.w
@@ -469,7 +558,8 @@ test('idle, ten landings a second apart are taken in by three looks at most (ten
   const c = diff(s, a, snap(s))
   say('ten landings a second apart, idle', c)
   expect(c.latestReads).toBeLessThanOrEqual(3)
-  expect(c.hourLists).toBe(0)
+  // (the minute's whole pull may fall in these seconds: one listing at most)
+  expect(c.hourLists).toBeLessThanOrEqual(1)
   for (const n of names) expect(taken(w, n)).toBe(true)
   // One alone: not yet a second later (it waits for quiet), taken in 2 s later
   await step(s, 10 * SECOND)

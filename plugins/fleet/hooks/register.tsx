@@ -2032,16 +2032,17 @@ let eventCursor: string | null = null
 const CHAIN_MAX = 32
 const EVENTS_VERIFY_MS = 50000
 // Events were read by chain since the last whole pull (counted, so a whole pull that began before a read by chain
-// doesn't pass for the one after it), and when the last whole pull ended
+// doesn't pass for the one after it), and when the net's last whole pull was asked for
 let chainReads = 0
 let chainReadsPulled = 0
+let chainVerifiedAt = 0
 // An hour folder's time (a file added or removed in it moves it) as its last whole listing found it, taken before the
 // listing: while it hasn't moved, nothing came or went, and a whole pull doesn't list it again (the hour before the
 // current one never moves once its hour is over). Kept only when the folder was quiet FOLDER_SETTLE_MS at the listing
-// (a file system that keeps times to the second, or to the kernel's tick, gives two landings one time), and listed
-// again anyway every FOLDER_RELIST_MS
+// (a file system that keeps times to the second or two, or to the kernel's tick, gives two landings one time), and
+// listed again anyway every FOLDER_RELIST_MS
 const folderMarks = new Map<string, { m: number; at: number }>()
-const FOLDER_SETTLE_MS = 2000
+const FOLDER_SETTLE_MS = 3000
 const FOLDER_RELIST_MS = 10 * 60000
 type LatestFile = { last: string; chain: string[] | null }
 function parseLatest(text: string | null): LatestFile | null {
@@ -2695,19 +2696,20 @@ async function eventsTick($: any, fromPoll = false) {
   // A landing (not this session's own) the watcher hadn't brought when this look took it in, whoever looked (the poll, or
   // a tool step's digest): the poll's next look counts it as a miss if the watcher still hasn't brought it
   if (watchingLatest && !unwatched && m !== latestMark && latestMark !== 0 && Math.abs(m - ownTriggerAt) > 15000 && fileChangedAt < m) unwatched = m
-  if (m === latestMark) {
-    // Nothing new by latest. The net for what the chain never named: a whole pull once events were read by chain
-    // since the last one, at a look of the world's tick (it lists only the hour folders that moved)
-    if (fromPoll && chainReads > chainReadsPulled && (await $.clock.now()) - chainVerifiedAt >= EVENTS_VERIFY_MS) {
-      chainVerifiedAt = await $.clock.now()
+  if (m !== latestMark) {
+    latestMark = m
+    await pullLatest($)
+  }
+  // The net for what the chain never named: a whole pull once events were read by chain since the last one, at a look
+  // of the world's tick (it lists only the hour folders that moved)
+  if (fromPoll && chainReads > chainReadsPulled) {
+    const now = await $.clock.now()
+    if (now - chainVerifiedAt >= EVENTS_VERIFY_MS) {
+      chainVerifiedAt = now
       await pullWhole($)
     }
-    return
   }
-  latestMark = m
-  await pullLatest($)
 }
-let chainVerifiedAt = 0
 
 /** A whole pull that began after this call: one in flight may have listed before what brought the call */
 async function pullWhole($: any) {
@@ -4763,7 +4765,10 @@ async function startWorld($: any) {
     saveReadsSoon($, true)
   }
   await refreshName($)
+  // The start's pull is whole: with what latest named before it, this session holds the chain from its first landing
+  const named = pulling ? null : parseLatest(await readText($, `${eventsDir()}/latest`))
   await pullEvents($, 25, true)
+  if (named) eventCursor = named.last
   // fleet's own state (versions, suspects, check results, the sweeper's lease) stays out of git whatever .gitignore says
   await run($, ['mkdir', '-p', stateDir('revs'), stateDir('checks')])
   if (!(await exists($, stateDir('.gitignore')))) {
