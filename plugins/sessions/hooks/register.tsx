@@ -1314,12 +1314,13 @@ async function listWithAge($: any, maxAge = LIST_MS): Promise<Listed | string> {
   return listing
 }
 
-// One try at the machine-wide lock; a lock older than LIST_LOCK_STALE_MS was left by a session cut off mid-listing
-async function takeListLock($: any, lock: string): Promise<boolean> {
+// One try at a machine-wide lock (a folder, made with mkdir): a session that finds it taken doesn't wait for it. One
+// older than staleMs was left by a session cut off while it held it, and is taken over
+async function takeLock($: any, lock: string, staleMs: number): Promise<boolean> {
   if ((await runSafe($, ['mkdir', lock])).exitCode === 0) return true
   try {
     const st = await $.fs.stat(lock)
-    if ((await $.clock.now()) - st.mtimeMs > LIST_LOCK_STALE_MS) {
+    if ((await $.clock.now()) - st.mtimeMs > staleMs) {
       await runSafe($, ['rmdir', lock])
       return (await runSafe($, ['mkdir', lock])).exitCode === 0
     }
@@ -1329,7 +1330,7 @@ async function takeListLock($: any, lock: string): Promise<boolean> {
 
 async function fetchList($: any, maxAge: number): Promise<Listed | string> {
   const lock = dataDir ? `${dataDir}/list.lock` : ''
-  const holding = lock ? await takeListLock($, lock) : false
+  const holding = lock ? await takeLock($, lock, LIST_LOCK_STALE_MS) : false
   if (lock && !holding) {
     // Another session is listing: its list, once stored, serves here too. Until then the stored one, however old; with
     // none stored yet, wait for one a while, and only then list here without the lock
@@ -3554,70 +3555,152 @@ async function tellPerson($: any, text: string): Promise<{ phone: string; notifi
   return { phone, notification }
 }
 
-// One notification, when the quiet hours and the cap a day allow it. claim runs under the push lock (<data>/push.lock,
-// which every session takes) and says whether it's still to be sent, recording it as sent so that no other session
-// sends it too; the day's count (the store's pushCount, { day, count }) goes up with it. What it said and what each
-// channel answered is kept in lastPush, for /sessions status. Whether it was sent
-async function notifyOnce($: any, claim: () => Promise<boolean>, text: () => string): Promise<boolean> {
+// One notification, when it may go: notifications on, outside the quiet hours, under the cap a day. What says it can't
+// go is asked first, with nothing taken and no command run (mayNotify, capLeft): a session with nothing it could send
+// takes no lock, and once it knows the day's cap reached (capDay) it reads nothing either until the day changes. The
+// cap is every session's (the store's pushCount, { day, count }), and another session may be the one that reaches it:
+// what this one knows of the count is what it last read (again a pass apart at most, and only with something to send)
+// or wrote, and the count is read again under the lock before anything is claimed. claim runs under the push lock
+// (<data>/push.lock, which every session takes, in one try: a session that finds it taken leaves it to whoever holds
+// it, most likely for the same thing, and answers 'busy') and says whether it's still to be sent, recording it as sent
+// so that no other session sends it too; the day's count goes up with it. What it said and what each channel answered
+// is kept in lastPush, for /sessions status. 'sent', or 'no': nothing to send now
+const PUSH_LOCK_STALE_MS = 5000
+// The day whose cap this session found reached ('': none)
+let capDay = ''
+// The day's count as this session last read or wrote it, and when
+let countKnown: { day: string; count: number; at: number } | null = null
+
+// The notifications sent today, as the store has them now
+async function sentNow($: any, day: string): Promise<number> {
+  return sentToday(await storeGet($, 'pushCount'), day)
+}
+
+// Whether a notification could go now, by what takes no call: notifications on, outside the quiet hours, and the
+// day's cap not known reached
+function mayNotify(now: number): boolean {
   if (!dataDir || notificationsPerDay <= 0) return false
-  const now = await $.clock.now()
-  if (inQuietHours(quietHours, new Date(now))) return false
+  const at = new Date(now)
+  return !inQuietHours(quietHours, at) && capDay !== dayOf(at)
+}
+
+// Whether the day's cap leaves room for one more, by the count as last read: read again a pass apart at most
+async function capLeft($: any, now: number): Promise<boolean> {
   const day = dayOf(new Date(now))
+  if (capDay === day) return false
+  if (!countKnown || countKnown.day !== day || now - countKnown.at >= PASS_MS || now < countKnown.at) countKnown = { day, count: await sentNow($, day), at: now }
+  if (countKnown.count < notificationsPerDay) return true
+  capDay = day
+  return false
+}
+
+async function notifyOnce($: any, claim: () => Promise<boolean>, text: () => string): Promise<'sent' | 'no' | 'busy'> {
+  const now = await $.clock.now()
+  if (!mayNotify(now) || !(await capLeft($, now))) return 'no'
+  const day = dayOf(new Date(now))
+  const lock = `${dataDir}/push.lock`
+  if (!(await takeLock($, lock, PUSH_LOCK_STALE_MS))) return 'busy'
   let go = false
-  await withLock(
-    $,
-    `${dataDir}/push`,
-    async () => {
-      const count = sentToday(await storeGet($, 'pushCount'), day)
-      if (count >= notificationsPerDay || !(await claim())) return
-      await storeSet($, 'pushCount', { day, count: count + 1 })
+  try {
+    const count = await sentNow($, day)
+    countKnown = { day, count, at: now }
+    if (count >= notificationsPerDay) capDay = day
+    else if (await claim()) {
+      if (await storeSet($, 'pushCount', { day, count: count + 1 })) {
+        countKnown = { day, count: count + 1, at: now }
+        if (count + 1 >= notificationsPerDay) capDay = day
+      }
       go = true
-    },
-    10,
-  )
-  if (!go) return false
+    }
+  } finally {
+    await runSafe($, ['rmdir', lock])
+  }
+  if (!go) return 'no'
   const message = text()
   const r = await tellPerson($, message)
   await storeSet($, 'lastPush', { at: now, text: message, from: myShortId(), ...r })
   debugLine($, `notified: ${message} · phone ${r.phone}${r.notification ? `, notification ${r.notification}` : ''}`)
-  return true
+  return 'sent'
 }
 
-// The project's sessions waiting for the person, as the last refresh found them
+// The project's sessions waiting for the person, as the last refresh found them, and when it did
 let waitsNow: Wait[] = []
+let waitsAt = 0
 
 // A push once a session of the project has waited for the person waitPushMinutes, once per wait (pushed:<sessionId>
 // holds the since of the wait pushed), whichever session of the project gets there first: one with Remote Control right
-// away (its push can reach the phone), the others a minute later (PUSH_GRACE_MS). Several due at once go in one push
+// away (its push can reach the phone), the others a minute later (PUSH_GRACE_MS) and then each after a share of
+// PUSH_SPREAD_MS of its own (from its id, as the pass's offset is), so the sessions that one event woke together don't
+// all go for the lock: the first one pushes, and the rest read that it did. Several waits due at once go in one push.
+// This runs after every refresh from a timer or a file event, in every session, and most of the time there's nothing
+// to push: it reads nothing and runs nothing while no wait is past its time other than the ones known pushed
+// (pushedKnown: a wait's record, once it holds that wait's since, never changes back), nor while nothing could be sent
+// (mayNotify: notifications off, the quiet hours, the day's cap reached). A try that didn't push and left a wait due
+// (the lock taken by another session, a record the store refused) is made again PUSH_RETRY_MS later, not at every
+// refresh
+const PUSH_SPREAD_MS = 3000
+const PUSH_RETRY_MS = 15000
+// pushed:<sessionId> as this session last read or wrote it, by session id
+const pushedKnown = new Map<string, number>()
 let pushingWaits = false
+let pushTimer: { cancel: () => void } | null = null
+let pushRetryAt = 0
+
+// Whether this session goes first: it has Remote Control, so its push can reach the phone
+async function pushesFirst($: any): Promise<boolean> {
+  const own = lastList.find(s => s.sessionId === myId)
+  return own?.kind === 'background' && typeof own.id === 'string' && (await hasRemoteControl($, own.id)) === true
+}
+
 async function pushWaits($: any) {
-  if (pushingWaits || !(waitPushMs > 0) || waitsNow.length === 0) return
+  if (pushingWaits || pushTimer || !(waitPushMs > 0) || waitsNow.length === 0) return
+  const now = waitsAt
+  const due = (first: boolean) => dueWaits(waitsNow, Object.fromEntries(pushedKnown), now, waitPushMs, first)
+  if (due(true).length === 0 || !mayNotify(now) || now < pushRetryAt) return
+  const first = await pushesFirst($)
+  if (due(first).length === 0) return
+  if (first) return pushDue($)
+  pushTimer = $.clock.after(wakeStagger(myId, PUSH_SPREAD_MS), () => {
+    pushTimer = null
+    bg(pushDue($))
+  })
+}
+
+// The waits due a push now, pushed: what other sessions pushed meanwhile is read first (the records of the waits due,
+// no others), and again under the lock
+async function pushDue($: any) {
+  if (pushingWaits) return
   pushingWaits = true
   try {
     const now = await $.clock.now()
+    if (!mayNotify(now) || !(await capLeft($, now))) return
+    const first = await pushesFirst($)
     const waits = waitsNow
-    const pushed = async () => {
-      const out: Record<string, number> = {}
-      for (const w of waits) out[w.sessionId] = Number(await storeGet($, `pushed:${w.sessionId}`)) || 0
-      return out
+    for (const id of [...pushedKnown.keys()]) if (!waits.some(w => w.sessionId === id)) pushedKnown.delete(id)
+    const due = () => dueWaits(waits, Object.fromEntries(pushedKnown), now, waitPushMs, first)
+    const readPushed = async () => {
+      for (const w of due()) pushedKnown.set(w.sessionId, Number(await storeGet($, `pushed:${w.sessionId}`)) || 0)
     }
-    const before = await pushed()
-    if (dueWaits(waits, before, now, waitPushMs, true).length === 0) return
-    const own = lastList.find(s => s.sessionId === myId)
-    const first = own?.kind === 'background' && typeof own.id === 'string' && (await hasRemoteControl($, own.id)) === true
-    if (dueWaits(waits, before, now, waitPushMs, first).length === 0) return
-    let due: Wait[] = []
-    await notifyOnce(
+    await readPushed()
+    if (due().length === 0) return
+    let pushing: Wait[] = []
+    const r = await notifyOnce(
       $,
       async () => {
-        due = dueWaits(waits, await pushed(), now, waitPushMs, first)
+        await readPushed()
+        pushing = due()
         // A wait the store didn't record as pushed would be pushed again by the next session: not sent now
         let recorded = true
-        for (const w of due) recorded = (await storeSet($, `pushed:${w.sessionId}`, w.since)) && recorded
-        return due.length > 0 && recorded
+        for (const w of pushing) {
+          const landed = await storeSet($, `pushed:${w.sessionId}`, w.since)
+          if (landed) pushedKnown.set(w.sessionId, w.since)
+          recorded = landed && recorded
+        }
+        return pushing.length > 0 && recorded
       },
-      () => waitText(due, now),
+      () => waitText(pushing, now),
     )
+    if (r !== 'sent' && due().length > 0) pushRetryAt = now + PUSH_RETRY_MS
   } finally {
     pushingWaits = false
   }
@@ -3661,7 +3744,7 @@ async function notifySpend($: any) {
     if (!e || !alert || alert.notified || alert.since === spendNotified) return
     const own = lastList.find(s => s.sessionId === myId)
     const name = projectRows.find(f => f.current)?.title ?? String(own?.name || own?.id || myShortId())
-    if (!(await notifyOnce($, async () => true, () => spendText(name, alert, spendOf(e).mode)))) return
+    if ((await notifyOnce($, async () => true, () => spendText(name, alert, spendOf(e).mode))) !== 'sent') return
     spendNotified = alert.since
     const now = (await readState($, myId)) ?? e
     if (now.spendAlert?.since === alert.since) await storeSet($, `state:${myId}`, { ...now, spendAlert: { ...now.spendAlert, notified: true } })
@@ -3786,6 +3869,7 @@ async function refresh($: any) {
     })
   }
   waitsNow = waits
+  waitsAt = now
   projectUsual = median(usuals)
   installedVersion = newest
   // ↑ also when a session runs an older version of this mod than the installed one (its heartbeat says which)
@@ -5458,7 +5542,7 @@ async function keyboardBack($: any, key: string) {
 async function notificationsText($: any, now: number): Promise<string> {
   const when = waitPushMs > 0 ? `a push once a session waits ${howLong(waitPushMs)}` : 'no push for waiting sessions (waitPushMinutes 0)'
   const quiet = quietHours ? `, none ${quietHoursText}` : quietHoursText ? `, quiet hours “${quietHoursText}” not understood (write them as 22-7)` : ''
-  const count = `${sentToday(await storeGet($, 'pushCount'), dayOf(new Date(now)))} of ${notificationsPerDay} today`
+  const count = `${await sentNow($, dayOf(new Date(now)))} of ${notificationsPerDay} today`
   const last = await storeGet($, 'lastPush')
   const lastText =
     last && typeof last === 'object'

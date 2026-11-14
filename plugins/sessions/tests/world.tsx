@@ -121,6 +121,8 @@ export type WorldOptions = {
   onStart?: ($: any) => Promise<void>
   // The python3 on the PATH (command -v python3); none by default
   python?: string
+  // When the mocked clock starts (1_000_000_000 by default: 13:46:40 UTC of a 12 January)
+  now?: number
   // On Linux: $DISPLAY (':0' by default) and the xprop on the PATH (one by default; '': none)
   display?: string
   xpropPath?: string
@@ -185,7 +187,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  const clock = mock.clock(on, { now: 1_000_000_000 })
+  const clock = mock.clock(on, { now: options.now ?? 1_000_000_000 })
   const env: Record<string, string> = { HOME: '/Users/x', SESSIONS_CLAUDE: '/bin/claude', SESSIONS_JOBS_DIR: '/Users/x/jobs', SESSIONS_DAEMON_LOG: '/Users/x/daemon.log', ...options.env }
   mock.env(on, env)
   // The store, in memory (readable by the tests). These overrides put the mod's keys under a namespace of their own
