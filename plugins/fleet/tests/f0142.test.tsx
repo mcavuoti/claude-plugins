@@ -13,8 +13,16 @@ import { DEC, FLEET, REF, ROOT, SID, fleet, json, row, sessionsSay, startSession
 //   3. an idle session that doesn't sweep takes landings in once they've been quiet 1.5 s, 5 s at most.
 // Placeholders only: /Users/x/proj, ids aaaaaaaa and bbbbbbbb, made-up names.
 //
-// Measured here (host calls: file reads, stats, lists, writes, commands, $.state gets and sets, $.sessions calls), an
-// idle instance that doesn't sweep, per minute, 0.14.1 → 0.14.2, by the peers' landings a minute: see the stream tests
+// Measured here (host calls: file reads, stats, lists, writes, commands, $.state gets and sets, $.sessions calls), per
+// minute, 0.14.1 → 0.14.2, by the peers' landings a minute (0, 7.5, 20, 60), one in ten on a file the session read, its
+// wakes' window shut:
+//   an idle instance that doesn't sweep   82, 306, 472, 632 → 82, 108, 145, 170   (nudge passes 1, 8.5, 13, 13 →
+//                                         1, 1, 1, 1; hour folders listed 0, 15, 40, 120 → 0, 1, 1, 1)
+//   a person's session that doesn't sweep 24,  54, 104, 264 → 24,  50,  87, 111
+//   the sweeper (a person's session)     202, 289, 413, 812 → 202, 290, 402, 760  (hour folders listed 0, 27, 52, 132 →
+//                                         0, 6, 6, 6: its own passes after a landing are as they were)
+// and with 1,200 events already in this hour's folder and the last one's, 20 landings a minute: 50,000 entries listed a
+// minute → about 1,500 (this hour once a minute, the last one never)
 
 declare const console: { log: (...a: unknown[]) => void }
 
@@ -23,6 +31,8 @@ const MIN = 60000
 const STATE = `${FLEET}/state`
 const HB = `${FLEET}/instances/owner-a`
 const LATEST = `${FLEET}/events/latest`
+// When the world's clock starts
+const T0 = Date.UTC(2026, 10, 2, 12, 0, 0)
 const B_SID = 'bbbbbbbb-0000-0000-0000-000000000000'
 const B = { ref: 'bbbbbbbb', sessionId: B_SID, name: 'Owner B', root: ROOT }
 const GO = [{ question: 'Go ahead with the split?', options: [{ label: 'Yes' }, { label: 'No' }], recommended: 'Yes', why: 'w' }]
@@ -173,7 +183,9 @@ async function session($: any, on: any, kind: Kind, opts: { n?: number; hourEven
       [`${FLEET}/roster.json`]: roster(opts.n ?? 24, opts.rosterExtra, opts.role),
       [`${ROOT}/.claude/agents/owner.md`]: OWNER,
       [`${FLEET}/seeds/owner.md`]: 'Plan your part.',
-      ...(isInstance ? { [`${FLEET}/instances/owner-a.json`]: '{"env":{}}\n', [`${HB}/seed-${REF}.json`]: JSON.stringify({ format: 1, ref: REF, at: 1 }) } : {}),
+      // Its wakes' window: shut (nudged as the test begins, the default hour not over) unless open. There from the start:
+      // one its fleet found missing isn't looked for again for ten minutes
+      ...(isInstance ? { [`${FLEET}/instances/owner-a.json`]: '{"env":{}}\n', [`${HB}/seed-${REF}.json`]: JSON.stringify({ format: 1, ref: REF, at: 1 }), [`${HB}/nudges.json`]: JSON.stringify({ format: 1, day: '2026-11-02', count: 1, last: T0 - (opts.window === 'open' ? 3 * 60 * MIN : 0) }) } : {}),
       ...notes,
       ...opts.files,
     },
@@ -218,10 +230,9 @@ async function session($: any, on: any, kind: Kind, opts: { n?: number; hourEven
   // First it sweeps, so the sweeper's files are there as a real one writes them
   await step(s, 4 * MIN)
   if (isInstance) {
-    // It read two shared files in an earlier turn; its wakes' window is shut (nudged ten minutes ago) unless open
+    // It read two shared files in an earlier turn
     await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/n1.md` } as any)
     await $.tool.call({ tool: 'Read', file_path: `${ROOT}/notes/n2.md` } as any)
-    w.touch(`${HB}/nudges.json`, JSON.stringify({ format: 1, day: '2026-11-02', count: 1, last: w.clock.now() - (opts.window === 'open' ? 3 * 60 : 10) * MIN }))
   }
   if (kind !== 'sweeper') {
     s.sweeps = 'other'
@@ -313,6 +324,7 @@ test('a landing under a path the instance watches nudges it, one beside it under
 
 test('a landing on a record a file the instance wrote cites looks at its nudges again once the sweeper had time to flag it (10 s)', LONG, async ($, on) => {
   const s = await session($, on, 'instance', {
+    window: 'open',
     worldJson: { records: { ids: ['R-<n>'], revKey: 'rev', changeKey: 'change' } },
     files: { [`${ROOT}/notes/R-1.md`]: '---\nid: R-1\nrev: 1\n---\nA result.\n' },
   })
@@ -336,7 +348,7 @@ test('a landing on a record a file the instance wrote cites looks at its nudges 
 })
 
 test('an item from outside routed to the instance (an intake landing that names it) looks at its nudges within 7 s; one routed to another does not', LONG, async ($, on) => {
-  const s = await session($, on, 'instance')
+  const s = await session($, on, 'instance', { window: 'open' })
   const w = s.w
   land(w, 'notes/n19.md', 'by B, first\n')
   await changed($, s, LATEST)
@@ -352,6 +364,29 @@ test('an item from outside routed to the instance (an intake landing that names 
   await changed($, s, LATEST)
   await step(s, 7 * SECOND)
   expect(diff(s, a, snap(s)).nudgePasses).toBe(1)
+})
+
+test("while its wakes' window is shut a landing on a file it read doesn't look at its nudges; the nudge goes as the window opens", LONG, async ($, on) => {
+  // Nudged as the test began: the window (60 min) opens an hour in
+  const s = await session($, on, 'instance')
+  const w = s.w
+  const before = w.submits.length
+  await step(s, 2 * MIN)
+  const quiet = snap(s)
+  await step(s, MIN)
+  const without = diff(s, quiet, snap(s))
+  const a = snap(s)
+  land(w, 'notes/n2.md', 'n2 by B\n')
+  await changed($, s, LATEST)
+  await step(s, MIN)
+  expect(diff(s, a, snap(s)).nudgePasses).toBe(without.nudgePasses)
+  expect(w.submits.length).toBe(before)
+  // To the window's opening (60 min after the nudge the test began with), a few seconds over
+  await step(s, T0 + 60 * MIN - w.clock.now() - 2 * SECOND)
+  expect(w.submits.length).toBe(before)
+  await step(s, 8 * SECOND)
+  expect(w.submits.length).toBe(before + 1)
+  expect(w.submits[before]).toContain('- notes/n2.md: changed at')
 })
 
 // ---- 2. The chain in events/latest ----
@@ -637,6 +672,26 @@ test('a decision its work waits on, once closed (the queue folder moved), still 
   expect(waited).toBeLessThanOrEqual(6 * SECOND)
 })
 
+test('a run finished (the runs folder, its bell) and a restart asked (restart.json, its bell) are looked at within 6 s, as before', LONG, async ($, on) => {
+  const s = await session($, on, 'instance')
+  const w = s.w
+  let a = snap(s)
+  w.touch(`${FLEET}/runs/run-9.done.json`, JSON.stringify({ format: 1, id: 'run-9', at: w.clock.now(), exit: 0 }))
+  w.touch(`${FLEET}/bell/runs`, JSON.stringify({ format: 1, by: 'bbbbbbbb', at: w.clock.now() }))
+  await changed($, s, `${FLEET}/bell/runs`)
+  await step(s, 6 * SECOND)
+  expect(diff(s, a, snap(s)).nudgePasses).toBe(1)
+  await step(s, 30 * SECOND)
+  a = snap(s)
+  const before = w.readCount.get(`${HB}/restart.json`) ?? 0
+  w.touch(`${HB}/restart.json`, JSON.stringify({ format: 1, at: w.clock.now() }))
+  w.touch(`${FLEET}/bell/restart`, JSON.stringify({ format: 1, by: 'bbbbbbbb', at: w.clock.now() }))
+  await changed($, s, `${FLEET}/bell/restart`)
+  await step(s, 6 * SECOND)
+  // Its nudge pass read the request (and asks sessions once it's been idle a minute)
+  expect((w.readCount.get(`${HB}/restart.json`) ?? 0) - before).toBeGreaterThanOrEqual(1)
+})
+
 test("the sweeper's flag on a file it wrote, with no event of any kind, reaches the idle instance at its minute's pass", LONG, async ($, on) => {
   const s = await session($, on, 'instance', { window: 'open' })
   const w = s.w
@@ -658,10 +713,10 @@ test("the sweeper's flag on a file it wrote, with no event of any kind, reaches 
 // ---- The numbers: host calls a minute by the peers' landings a minute ----
 
 const TARGET: Record<Kind, Record<string, number>> = {
-  // 0.14.1: 87, 334, 488, 641
-  instance: { '0': 95, '7.5': 150, '20': 230, '60': 380 },
+  // 0.14.1: 82, 306, 472, 632
+  instance: { '0': 90, '7.5': 120, '20': 160, '60': 190 },
   // 0.14.1: 24, 54, 104, 264
-  person: { '0': 27, '7.5': 55, '20': 95, '60': 165 },
+  person: { '0': 27, '7.5': 55, '20': 95, '60': 125 },
   // 0.14.1: 202, 289, 413, 812 (its own passes after each landing are as they were; its listings aren't)
   sweeper: { '0': 210, '7.5': 300, '20': 420, '60': 790 },
 }

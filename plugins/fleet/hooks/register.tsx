@@ -2608,11 +2608,24 @@ async function landedFor($: any, e: ChangeEvent, prev: ChangeEvent | undefined) 
   }
 }
 function settleLanded($: any) {
-  if (landed.now) kickNudge($)
-  if (landed.later) kickNudge($, FLAG_SETTLE_MS)
+  const now = landed.now
+  const later = landed.later
   landed.now = false
   landed.later = false
+  if (!now && !later) return
+  bg(
+    (async () => {
+      // Its wakes are shut (their window, or the day's count, as its last pass found them): a landing can't nudge it
+      // before they open, and the pass set for that moment, or the minute's, has what landed meanwhile
+      const t = await $.clock.now()
+      if (now && t >= nudgeShutUntil) kickNudge($)
+      if (later && t + FLAG_SETTLE_MS >= nudgeShutUntil) kickNudge($, FLAG_SETTLE_MS)
+    })(),
+  )
 }
+/** Until when this instance's wakes are shut, as its last nudge pass found them (0: open, or not reckoned): the window
+ * since its last nudge, or the day's count used up (then until the next pass looks again) */
+let nudgeShutUntil = 0
 
 /** An hour's events in one file (events/<day>/<hour>/index, no .json: a reader that lists the hour's events skips it),
  * written once by the sweeper when the hour is older than the two a start reads whole: every .json file of the hour
@@ -8660,9 +8673,13 @@ async function nudgeTick($: any) {
   // offered to it, a run of its that finished, its budget raised, or what it had in flight after a restart
   const urgent = (await slotLines($)).urgent || (await workLines($, true)).urgent || !!(await budgetLine($))?.urgent
   const verdict = wakeVerdict(mine, others, now, day, wakes, urgent)
+  nudgeShutUntil = 0
   if (verdict !== 'ok') {
     // The wakes' window shut: looked at again the moment it opens (an urgent nudge waits ten minutes at most)
-    if (verdict === 'window' && mine) kickNudge($, mine.last + (urgent ? Math.min(URGENT_GAP_MIN, wakes.everyMin) : wakes.everyMin) * 60000 - now + 500)
+    const opens = verdict === 'window' && mine ? mine.last + (urgent ? Math.min(URGENT_GAP_MIN, wakes.everyMin) : wakes.everyMin) * 60000 : 0
+    if (opens) kickNudge($, opens - now + 500)
+    // Until then (the day's count used up: until the next pass has looked again) a landing doesn't look at its nudges
+    nudgeShutUntil = opens || now + NUDGE_PASS_MS + NUDGE_MIN_GAP_MS
     return
   }
   // What the cadence nudges carry from one write to the next: the period last nudged for, and today's count of them
