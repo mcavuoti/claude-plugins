@@ -712,7 +712,10 @@ function fileChanged($: any, path: string, engine: boolean) {
   if (root && path.endsWith('/.claude/fleet/events/latest')) {
     bg(
       (async () => {
-        fileChangedAt = await $.clock.now()
+        const now = await $.clock.now()
+        fileChangedAt = now
+        // An idle session that doesn't sweep takes a stream of landings in once it's quiet (landingSoon)
+        if (live && !sweep.holding && !sweep.takenAt && !turnRunning) return landingSoon($, now)
         await eventsTick($)
         // The sweeper's suspects follow a landing at once (live: its own tick comes only every 10 s)
         if (live && sweep.holding) ringHere($, ['sweep'])
@@ -754,6 +757,39 @@ function fileChanged($: any, path: string, engine: boolean) {
       ringHere($, ['beat'])
     }
   }
+}
+
+// Landings while this session is idle (0.14.2): with no turn running and no sweeping to do, nothing here needs a
+// landing the moment it comes (a tool step reads what's new by itself, and the sweeper takes each at once). So they're
+// taken in once events/latest has been quiet LANDING_QUIET_MS, LANDING_MAX_MS after the first at most: a stream of them
+// is a few looks, not one each. One timer at a time, set again while they keep coming
+const LANDING_QUIET_MS = 1500
+const LANDING_MAX_MS = 5000
+const landing = { first: 0, last: 0, waiting: false }
+/** A main-thread turn runs here, as this module saw it start and end (after a reload mid-turn it reads idle until the
+ * turn's end: a landing then waits LANDING_MAX_MS at most, and the turn's own steps read what's new) */
+let turnRunning = false
+function landingSoon($: any, now: number) {
+  landing.last = now
+  if (landing.waiting) return
+  landing.waiting = true
+  landing.first = now
+  const wait = (ms: number) => {
+    $.clock.after(ms, () =>
+      bg(
+        (async () => {
+          const t = await $.clock.now()
+          const due = Math.min(landing.last + LANDING_QUIET_MS, landing.first + LANDING_MAX_MS)
+          if (t < due) return wait(due - t)
+          landing.waiting = false
+          await eventsTick($)
+          // It took the lease meanwhile: its suspects follow
+          if (live && sweep.holding) ringHere($, ['sweep'])
+        })(),
+      ),
+    )
+  }
+  wait(LANDING_QUIET_MS)
 }
 
 /** /fleet status's line on live updates; sessionStart: whether classic.SessionStart reached fleet in this session */
@@ -1984,6 +2020,43 @@ let otherEvents = 0
 let latestMark = -1
 let pulling: Promise<void> | null = null
 let pullAgain = false
+// events/latest's chain (0.14.2). events/latest names the last landing and, in `chain`, the landings before it, oldest
+// first, ending with it: each writer continues the chain it found (trigger). A session that holds the landing latest
+// named when it last had everything (eventCursor) reads just the events the chain names after it: one read each, no
+// listing. Anything else is a gap and costs a whole pull, never an event: a latest with no chain (another writer's
+// making), a chain that doesn't reach back to the cursor, a torn read, an event file it can't read. Two writers at once
+// can leave an event the chain never names (the later write of latest wins): so a whole pull follows the reads by chain
+// within EVENTS_VERIFY_MS, at a look of the world's tick (the minute's pass in a live session that doesn't sweep).
+// null: not known (the next look pulls whole)
+let eventCursor: string | null = null
+const CHAIN_MAX = 32
+const EVENTS_VERIFY_MS = 50000
+// Events were read by chain since the last whole pull (counted, so a whole pull that began before a read by chain
+// doesn't pass for the one after it), and when the net's last whole pull was asked for
+let chainReads = 0
+let chainReadsPulled = 0
+let chainVerifiedAt = 0
+// An hour folder's time (a file added or removed in it moves it) as its last whole listing found it, taken before the
+// listing: while it hasn't moved, nothing came or went, and a whole pull doesn't list it again (the hour before the
+// current one never moves once its hour is over). Kept only when the folder was quiet FOLDER_SETTLE_MS at the listing
+// (a file system that keeps times to the second or two, or to the kernel's tick, gives two landings one time), and
+// listed again anyway every FOLDER_RELIST_MS
+const folderMarks = new Map<string, { m: number; at: number }>()
+const FOLDER_SETTLE_MS = 3000
+const FOLDER_RELIST_MS = 10 * 60000
+type LatestFile = { last: string; chain: string[] | null }
+function parseLatest(text: string | null): LatestFile | null {
+  const p = text === null ? null : parseWire<{ last?: unknown; chain?: unknown }>(text)
+  if (!p || !('value' in p) || typeof p.value.last !== 'string') return null
+  const c = p.value.chain
+  const whole = Array.isArray(c) && c.length > 0 && c.every(x => typeof x === 'string' && x) && c[c.length - 1] === p.value.last
+  return { last: p.value.last, chain: whole ? (c as string[]) : null }
+}
+/** The hour folder an event's name puts it in (its name starts with when it was made), or null */
+function eventFolder(name: string): string | null {
+  const at = Number(name.slice(0, name.indexOf('-')))
+  return /^\d{12,}-[^/]+\.json$/.test(name) && Number.isFinite(at) ? hourFolder(at) : null
+}
 // What the pull asked for while one ran wanted (a start's 25 hours, from the indexes): the one after it does that
 let pullAgainHours = 2
 let pullAgainIndexed = false
@@ -2388,12 +2461,29 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
     pullAgainIndexed ||= indexed
     return pulling
   }
+  const readsBefore = chainReads
   pulling = (async () => {
     const now = await $.clock.now()
     const folders = windowFolders(now, hours)
     for (let i = 0; i < folders.length; i++) {
       const dir = eventsDir(folders[i])
-      const listed = await names($, dir)
+      // Its time first: what comes after this look moves it again
+      const m = await folderTime($, dir)
+      if (m === -1) {
+        folderMarks.delete(dir)
+        continue
+      }
+      const mark = folderMarks.get(dir)
+      if (mark && mark.m === m && now - mark.at < FOLDER_RELIST_MS) continue
+      // the listing itself can fail, and so can a read: the folder is marked only once all of it was taken
+      let whole = true
+      let listed: string[] = []
+      try {
+        listed = (await $.fs.list(dir)).map((x: any) => String(x.name))
+      } catch {
+        whole = false
+      }
+      folderMarks.delete(dir)
       let covered: Set<string> | null = null
       if (indexed && i >= 2 && listed.includes(EVENT_INDEX)) {
         const ix = parseWire<EventIndex>((await readText($, `${dir}/${EVENT_INDEX}`)) ?? '')
@@ -2411,18 +2501,27 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
       for (const name of listed) {
         if (!name.endsWith('.json') || seen.has(name) || covered?.has(name)) continue
         const t = await readText($, `${dir}/${name}`)
-        if (t === null) continue
+        if (t === null) {
+          whole = false
+          continue
+        }
         let v: any
         try {
           v = JSON.parse(t)
         } catch {
+          whole = false
           continue
         }
         await takeEvent($, name, v, now)
       }
+      if (whole && now - m >= FOLDER_SETTLE_MS) folderMarks.set(dir, { m, at: now })
     }
     for (const [name, at] of seen) if (now - at > 3 * HOUR) seen.delete(name)
     for (const [id, e] of intakeEvents) if (now - e.at > 3 * 24 * HOUR) intakeEvents.delete(id)
+    for (const dir of [...folderMarks.keys()]) if (!folders.some(f => eventsDir(f) === dir) && now - (folderMarks.get(dir)?.at ?? 0) > 3 * HOUR) folderMarks.delete(dir)
+    // Whole as of its listings: the reads by chain before it began are covered
+    chainReadsPulled = Math.max(chainReadsPulled, readsBefore)
+    settleLanded($)
   })()
     .catch(() => {})
     .finally(() => {
@@ -2438,8 +2537,9 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
   return pulling
 }
 
-/** One event file, as read (or as an hour's index has it) */
+/** One event file, as read (or as an hour's index has it); once per name */
 async function takeEvent($: any, name: string, v: any, now: number) {
+  if (seen.has(name)) return
   seen.set(name, now)
   digestGen++
   if (!isEvent(v)) {
@@ -2463,7 +2563,81 @@ async function takeEvent($: any, name: string, v: any, now: number) {
   remember(v)
   sweep.dirty = true
   if (v.id) forget(v.id)
+  // only once the event is in `latest`: a whole pull that skips it as seen must find it there
+  if (myInstance && jobRef) await landedFor($, v, prev)
 }
+
+// What a landing means for this instance's nudges (0.14.2). Before, every landing anywhere looked at them within 5 s;
+// now only one that can change what they'd say: a file its main thread read (the digest's own test), a path under its
+// `watch` globs, an intake pointer addressed to it, a file it wrote last that another session changed. A landing on a
+// record that a file of its own cites (one it wrote last, or a derived document it owns) can raise a flag on that file,
+// which the sweeper reckons a few seconds after the landing: its nudges are looked at FLAG_SETTLE_MS later. Everything
+// else its nudges act on has a trigger of its own (the bells, the queue and answers folders, a slot's line, its timers)
+// and the minute's pass. Told to kickNudge once a pull is over (settleLanded)
+const FLAG_SETTLE_MS = 10000
+const landed = { now: false, later: false }
+let watchRes: { key: string; res: RegExp[] } | null = null
+// The main thread's reads as $.state has them, read again only after a write of them (readsRev moves at each): a
+// stream of landings asks $.state once, not once a landing
+let readsRev = 0
+let mainReads: { rev: number; of: Readonly<Record<string, FleetRead>> | undefined } | null = null
+async function mainReadsNow($: any): Promise<Readonly<Record<string, FleetRead>> | undefined> {
+  if (!mainReads || mainReads.rev !== readsRev) {
+    const rev = readsRev
+    mainReads = { rev, of: (await read($, reads)).main }
+  }
+  return mainReads.of
+}
+async function landedFor($: any, e: ChangeEvent, prev: ChangeEvent | undefined) {
+  const inst = myInstance
+  if (!inst || (landed.now && landed.later)) return
+  const sessionId = String(await $.session.id())
+  const mine = { sessionId, ref: myRef ?? jobRef }
+  // Its own landing is no news to it (its own process's, or the one before a restart)
+  if (ownedBy(e.by, mine)) return
+  if (!landed.now) {
+    if (e.via === 'intake' && e.intake?.to.includes(inst.name)) landed.now = true
+    else if (prev && ownedBy(ownerWho(prev), mine)) landed.now = true
+    else {
+      const key = inst.watch.join('\n')
+      if (!watchRes || watchRes.key !== key) watchRes = { key, res: inst.watch.map(g => globRegex(g, insensitive)) }
+      if (watchRes.res.some(re => re.test(e.path))) landed.now = true
+      else {
+        const r = (await mainReadsNow($))?.[e.path]
+        if (r && newer(prev, e) && digestItems({ [e.path]: r }, new Map([[e.path, e]]), { sessionId } as Me, 'main').length) landed.now = true
+      }
+    }
+  }
+  if (!landed.later && e.id) {
+    for (const [path, k] of known) {
+      if (!k.pins?.some(pin => parsePin(pin)?.id === e.id)) continue
+      const kind = derivedKinds.length ? derivedKindOf(path, derivedKinds) : null
+      if (ownedBy(ownerWho(latest.get(path)), mine) || (kind && ownsKind(kind, inst))) {
+        landed.later = true
+        break
+      }
+    }
+  }
+}
+function settleLanded($: any) {
+  const now = landed.now
+  const later = landed.later
+  landed.now = false
+  landed.later = false
+  if (!now && !later) return
+  bg(
+    (async () => {
+      // Its wakes are shut (their window, or the day's count, as its last pass found them): a landing can't nudge it
+      // before they open, and the pass set for that moment, or the minute's, has what landed meanwhile
+      const t = await $.clock.now()
+      if (now && t >= nudgeShutUntil) kickNudge($)
+      if (later && t + FLAG_SETTLE_MS >= nudgeShutUntil) kickNudge($, FLAG_SETTLE_MS)
+    })(),
+  )
+}
+/** Until when this instance's wakes are shut, as its last nudge pass found them (0: open, or not reckoned): the window
+ * since its last nudge, or the day's count used up (then until the next pass looks again) */
+let nudgeShutUntil = 0
 
 /** An hour's events in one file (events/<day>/<hour>/index, no .json: a reader that lists the hour's events skips it),
  * written once by the sweeper when the hour is older than the two a start reads whole: every .json file of the hour
@@ -2547,11 +2721,62 @@ async function eventsTick($: any, fromPoll = false) {
   // A landing (not this session's own) the watcher hadn't brought when this look took it in, whoever looked (the poll, or
   // a tool step's digest): the poll's next look counts it as a miss if the watcher still hasn't brought it
   if (watchingLatest && !unwatched && m !== latestMark && latestMark !== 0 && Math.abs(m - ownTriggerAt) > 15000 && fileChangedAt < m) unwatched = m
-  if (m === latestMark) return
-  latestMark = m
+  if (m !== latestMark) {
+    latestMark = m
+    await pullLatest($)
+  }
+  // The net for what the chain never named: a whole pull once events were read by chain since the last one, at a look
+  // of the world's tick (it lists only the hour folders that moved)
+  if (fromPoll && chainReads > chainReadsPulled) {
+    const now = await $.clock.now()
+    if (now - chainVerifiedAt >= EVENTS_VERIFY_MS) {
+      chainVerifiedAt = now
+      await pullWhole($)
+    }
+  }
+}
+
+/** A whole pull that began after this call: one in flight may have listed before what brought the call */
+async function pullWhole($: any) {
+  if (pulling) {
+    pullAgain = true
+    await pulling
+    if (pulling) await pulling
+    return
+  }
   await pullEvents($)
-  // Something landed: an instance's nudges are looked at (within the old 5 s pace)
-  if (myInstance) kickNudge($)
+}
+
+/** events/latest moved: the events its chain names after the one this session held, read one by one; a whole pull
+ * when the chain doesn't reach back to it (then this session holds everything up to what latest named, again) */
+async function pullLatest($: any) {
+  const cur = parseLatest(await readText($, `${eventsDir()}/latest`))
+  const from = cur?.chain && eventCursor !== null ? (cur.last === eventCursor ? cur.chain.length - 1 : cur.chain.lastIndexOf(eventCursor)) : -1
+  if (!cur || !cur.chain || from === -1) {
+    await pullWhole($)
+    eventCursor = cur ? cur.last : null
+    return
+  }
+  const now = await $.clock.now()
+  for (const name of cur.chain.slice(from + 1)) {
+    if (seen.has(name)) continue
+    const folder = eventFolder(name)
+    const t = folder ? await readText($, `${eventsDir(folder)}/${name}`) : null
+    let v: any
+    try {
+      v = t === null ? undefined : JSON.parse(t)
+    } catch {}
+    if (v === undefined) {
+      // Named and not there (or not whole yet): the folders say what is
+      await pullWhole($)
+      eventCursor = cur.last
+      return
+    }
+    chainReads++
+    await takeEvent($, name, v, now)
+  }
+  eventCursor = cur.last
+  settleLanded($)
 }
 
 // One landing: published once under a name of its own in the current hour's folder, then events/latest rewritten so
@@ -2566,7 +2791,7 @@ async function writeEvent($: any, ev: Omit<ChangeEvent, 'format' | 'at'> & { at?
       return null
     }
     eventLanded($, x)
-    await trigger($, x.name)
+    await trigger($, [x.name])
     return x.e
   }
   return null
@@ -2601,12 +2826,23 @@ function eventLanded($: any, x: { e: ChangeEvent; name: string; now: number }) {
   log($, `${e.path}: ${e.via}${e.tool ? ` (${e.tool})` : ''}${e.blind ? ', landed blind' : ''}${e.overwrote ? ', over a change' : ''}`)
 }
 
-/** events/latest rewritten: every session's watcher fires */
-async function trigger($: any, name: string) {
+/** events/latest rewritten: every session's watcher fires. It names this session's landings (the last one, `last`)
+ * after the chain it held (eventCursor's note): a reader that holds the landing before them reads just these */
+async function trigger($: any, names: readonly string[]) {
+  const last = names[names.length - 1]
+  if (!last) return
   ownTriggerAt = await $.clock.now()
+  const path = `${eventsDir()}/latest`
+  const cur = parseLatest(await readText($, path))
+  const before = cur ? (cur.chain ?? (cur.last ? [cur.last] : [])) : []
+  const chain = [...before.filter(n => !names.includes(n)), ...names].slice(-CHAIN_MAX)
+  // It held everything latest named: it still does, its own landings included (they're known here as they're made)
+  if (cur && eventCursor !== null && cur.last === eventCursor) eventCursor = last
   try {
-    await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: name }))
+    await $.fs.write(path, json({ format: FORMAT, last, chain }))
   } catch {}
+  // this write may have replaced another writer's, whose landing no chain names now: the net runs
+  chainReads++
 }
 
 // ---- What each thread read ----
@@ -2620,12 +2856,14 @@ async function setRead($: any, thread: string, rel: string, v: string | null, re
   // the thread's digest, so it doesn't move the digest's generation; any other might add one
   const e = latest.get(rel)
   if (e && e.to !== v) digestGen++
+  readsRev++
   await update($, reads, m => {
     const mine = { ...(m[thread] ?? {}) }
     if (v === null) delete mine[rel]
     else mine[rel] = { v, at: now, told: v, ...(rev ? { rev } : {}) }
     return { ...m, [thread]: mine }
   })
+  readsRev++
   await update($, warned, m => (m[thread]?.[rel] === undefined ? m : { ...m, [thread]: omit(m[thread] as Record<string, string>, [rel]) }))
   saveReadsSoon($)
 }
@@ -2724,7 +2962,9 @@ async function runningHere($: any): Promise<Running[]> {
 async function dropThread($: any, thread: string) {
   toldHere.delete(thread)
   digestSeen.delete(thread)
+  readsRev++
   await touched(update($, reads, m => (m[thread] ? omit(m, [thread]) : m)))
+  readsRev++
   await touched(update($, warned, m => (m[thread] ? omit(m, [thread]) : m)))
   saveReadsSoon($)
 }
@@ -2732,7 +2972,9 @@ async function dropThread($: any, thread: string) {
 async function clearReads($: any, oldSessionId: string) {
   toldHere.clear()
   digestSeen.clear()
+  readsRev++
   await touched(update($, reads, () => ({})))
+  readsRev++
   await touched(update($, warned, () => ({})))
   // The new conversation doesn't remember what it was told about the files it wrote: it hears it again. It read
   // nothing from outside either, and it's a period of its own
@@ -2819,11 +3061,13 @@ async function digestFor($: any, thread: string, withBudget = true, forNudge = f
       await alone()
       if (items.length) {
         for (const i of items) if (i.event.to !== null) toldMemo(thread, i.path, i.event.to)
+        readsRev++
         await touched(update($, reads, m => {
           const t = { ...(m[thread] ?? {}) }
           for (const i of items) if (t[i.path] && i.event.to !== null) t[i.path] = { ...(t[i.path] as FleetRead), told: i.event.to }
           return { ...m, [thread]: t }
         }))
+        readsRev++
         log($, `digest to ${thread}: ${items.map(i => i.path).join(', ')}`)
         saveReadsSoon($)
       }
@@ -3591,7 +3835,9 @@ async function gate($: any, e: any, next: any) {
       await touched(update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: cur.v as string } })))
       if (mine && cur.v) {
         toldMemo(thread, w.rel, cur.v)
+        readsRev++
         await touched(update($, reads, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [w.rel]: { ...mine, told: cur.v as string } } })))
+        readsRev++
       }
       texts.push(gateText(v, w.rel, last && last.to === cur.v ? last : null, cur.mtimeMs, me))
       // A new board item someone else just made under the id this thread meant for its own (ids race): the next free one
@@ -4033,16 +4279,16 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
   const evs = []
   for (const x of todo) if (!x.skip) evs.push({ x, ev: await eventFor($, { path: x.rel, from: x.takeover && x.last ? x.last.from : x.last && x.last.to !== x.f.v ? x.last.to : (x.k?.v ?? null), to: x.f.v, via: 'bash', tool: 'Bash', blind: true, by: x.by, ...x.fields }) })
   const published = await publishAll($, evs.map(({ ev }) => ({ path: ev.path, text: json(ev.e) })))
-  let last = ''
+  const landedNames: string[] = []
   for (const { x, ev } of evs) {
     const r = published.get(ev.path)
     if (r === 'ok') {
       eventLanded($, ev)
-      last = ev.name
+      landedNames.push(ev.name)
     } else if (r === 'exists') await writeEvent($, { ...ev.e })
     else log($, `couldn't write the event of ${x.rel}`)
   }
-  if (last) await trigger($, last)
+  await trigger($, landedNames)
   for (const x of todo) {
     if (x.skip) continue
     const v = x.f.v
@@ -4507,16 +4753,16 @@ async function scanWorld($: any) {
     } else evs.push({ x, ev: await eventFor($, { ...(x.s ? { changedAt: Math.floor(x.s.mtimeMs) } : {}), path: x.rel, from, to: x.v, via: 'outside', blind: true, by: null, ...(x.author.candidates.length ? { candidates: x.author.candidates } : {}), ...fields }) })
   }
   const published = await publishAll($, evs.map(({ ev }) => ({ path: ev.path, text: json(ev.e) })))
-  let lastName = ''
+  const landedNames: string[] = []
   for (const { x, ev } of evs) {
     const r = published.get(ev.path)
     if (r === 'ok') {
       eventLanded($, ev)
-      lastName = ev.name
+      landedNames.push(ev.name)
     } else if (r === 'exists') await writeEvent($, { ...ev.e })
     else log($, `couldn't write the event of ${x.rel}`)
   }
-  if (lastName) await trigger($, lastName)
+  await trigger($, landedNames)
   if (evs.length > 1) log($, `scan: ${evs.length} files changed outside fleet, recorded together`)
   for (const x of todo) x.settle()
 }
@@ -4537,14 +4783,19 @@ async function startWorld($: any) {
   if (!Object.keys(had).length && !(await read($, outside))) {
     const t = await readText($, readsPath(String(await $.session.id())))
     const p = t === null ? null : parseReads(t)
+    readsRev++
     if (p && 'threads' in p && p.threads.main) await touched(update($, reads, () => ({ main: p.threads.main as Record<string, FleetRead> })))
+    readsRev++
   } else {
     // A reload: what the module before it hadn't written yet (a read in its last 10 s, the outside mark of its last
     // second) is written now, once
     saveReadsSoon($, true)
   }
   await refreshName($)
+  // The start's pull is whole: with what latest named before it, this session holds the chain from its first landing
+  const named = pulling ? null : parseLatest(await readText($, `${eventsDir()}/latest`))
   await pullEvents($, 25, true)
+  if (named) eventCursor = named.last
   // fleet's own state (versions, suspects, check results, the sweeper's lease) stays out of git whatever .gitignore says
   await run($, ['mkdir', '-p', stateDir('revs'), stateDir('checks')])
   if (!(await exists($, stateDir('.gitignore')))) {
@@ -8208,7 +8459,10 @@ const NUDGE_MIN_GAP_MS = 5000
 let nudgeRunning = false
 let nudgeAgain = false
 let nudgeLastRun = 0
-let nudgeKickAt = 0
+// When each look on its way runs. One on its way sooner covers a later one (the pass it runs asks again for what's
+// still ahead), so a look far ahead (the wakes' window opening) is one timer, not one more at each pass
+const nudgeKicks: number[] = []
+const NUDGE_FAR_SLACK_MS = 1000
 let nudgeFrom = 0
 function kickNudge($: any, delayMs = 0) {
   if (!jobRef || !root) return
@@ -8218,11 +8472,14 @@ function kickNudge($: any, delayMs = 0) {
       // Never before its first look (5 s after its timers started, as the old tick), nor closer than the old pace
       if (!nudgeFrom) nudgeFrom = now + NUDGE_MIN_GAP_MS
       const at = Math.max(now + Math.max(0, delayMs), nudgeLastRun + NUDGE_MIN_GAP_MS, nudgeFrom)
-      // One on its way sooner, or at the same time, covers this one
-      if (nudgeKickAt && nudgeKickAt > now && nudgeKickAt <= at) return
-      nudgeKickAt = at
+      // One on its way sooner, or at the same time, covers this one (a look past the next pass: within a second of it,
+      // since the same moment asked for twice comes out a few ms apart)
+      const slack = at - now > NUDGE_PASS_MS ? NUDGE_FAR_SLACK_MS : 0
+      if (nudgeKicks.some(t => t > now && t <= at + slack)) return
+      nudgeKicks.push(at)
       $.clock.after(at - now, () => {
-        if (nudgeKickAt === at) nudgeKickAt = 0
+        const i = nudgeKicks.indexOf(at)
+        if (i !== -1) nudgeKicks.splice(i, 1)
         bg(runNudge($))
       })
     })(),
@@ -8430,9 +8687,13 @@ async function nudgeTick($: any) {
   // offered to it, a run of its that finished, its budget raised, or what it had in flight after a restart
   const urgent = (await slotLines($)).urgent || (await workLines($, true)).urgent || !!(await budgetLine($))?.urgent
   const verdict = wakeVerdict(mine, others, now, day, wakes, urgent)
+  nudgeShutUntil = 0
   if (verdict !== 'ok') {
     // The wakes' window shut: looked at again the moment it opens (an urgent nudge waits ten minutes at most)
-    if (verdict === 'window' && mine) kickNudge($, mine.last + (urgent ? Math.min(URGENT_GAP_MIN, wakes.everyMin) : wakes.everyMin) * 60000 - now + 500)
+    const opens = verdict === 'window' && mine ? mine.last + (urgent ? Math.min(URGENT_GAP_MIN, wakes.everyMin) : wakes.everyMin) * 60000 : 0
+    if (opens) kickNudge($, opens - now + 500)
+    // Until then (the day's count used up: until the next pass has looked again) a landing doesn't look at its nudges
+    nudgeShutUntil = opens || now + NUDGE_PASS_MS + NUDGE_MIN_GAP_MS
     return
   }
   // What the cadence nudges carry from one write to the next: the period last nudged for, and today's count of them
@@ -13765,6 +14026,7 @@ export const register: Register = on => {
       }
       // Busy whatever the timers are: a hot reload mid-turn resets them (module state) while busy lives on in $.state,
       // and the turn's end has to find it set to clear it. Only the closing work waits for the timers
+      turnRunning = true
       await touched(update($, busy, () => true))
       // A turn of fleet's own that carries who the instance is (submitOwn): its conversation knows now
       if (String(e.text ?? '').includes('fleet: this session is ')) await touched(update($, identityTold, () => true))
@@ -13789,6 +14051,7 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       bg(
         (async () => {
+          turnRunning = false
           await touched(update($, busy, () => false))
           const now = await $.clock.now()
           await touched(update($, idleSince, () => now))

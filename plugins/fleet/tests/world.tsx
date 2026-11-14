@@ -154,6 +154,7 @@ export type World = {
   // Writes a file as another program would (an editor, a script, another session): bumps its time, or sets the one
   // given (a copy that keeps its source's time: rsync -a, cp -p)
   touch: (path: string, text: string, mtimeMs?: number) => void
+  beforeWrite: { value: (path: string) => void }
   // Files whose reads fail for now (too many open files, a hiccup), though they're there
   unreadable: Set<string>
   // Any other command fleet runs (git, a check script, the person's channel): its answer, or undefined for "unknown
@@ -220,12 +221,13 @@ export function world(on: On, options: WorldOptions = {}): World {
   }) as unknown as On
   const clock = mock.clock(counted, { now: Date.UTC(2026, 10, 2, 12, 0, 0) })
   const files = new Map<string, string>(Object.entries(options.files ?? {}))
-  // When each file was last written (fs.list's mtimeMs); a folder's time is a counter that moves when an entry in it
-  // comes or goes (fleet only compares a folder's times)
+  // When each file was last written (fs.list's mtimeMs); a folder's time moves when an entry in it comes or goes: the
+  // clock's, a hair later than the last one given so two moves in one tick differ (fleet compares a folder's times,
+  // and with the clock for how long a folder has been still)
   const mtimes = new Map<string, number>()
   const dirTimes = new Map<string, number>()
-  let dirTick = 0
-  const moved = (path: string) => dirTimes.set(path.slice(0, path.lastIndexOf('/')) || '/', ++dirTick)
+  let dirLast = 0
+  const moved = (path: string) => dirTimes.set(path.slice(0, path.lastIndexOf('/')) || '/', (dirLast = Math.max(clock.now(), dirLast + 0.001)))
   const dirs = new Set<string>(['/', '/Users', HOME, ROOT, JOB, `${HOME}/.claude`, `${HOME}/.claude/jobs`])
   const addFile = (path: string, text: string) => {
     if (!files.has(path)) moved(path)
@@ -289,6 +291,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   const unreadable = new Set<string>()
+  const beforeWrite = { value: (_path: string): void => {} }
   const readCount = new Map<string, number>()
   const statCount = new Map<string, number>()
   const ops = new Map<string, number>()
@@ -304,6 +307,8 @@ export function world(on: On, options: WorldOptions = {}): World {
     return { value: text }
   })
   on('fs.write', (_, e) => {
+    // (review-0142) runs as a write of fleet's own starts: another session writing just then
+    beforeWrite.value(e.path)
     op(`write ${e.path}`)
     addFile(e.path, e.text)
     return { value: undefined }
@@ -478,7 +483,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, unreadable, exec, readCount, statCount, ops, registering, timerCount }
+  return { files, dirs, clock, id, root, tools, commands, runs, lists, submits, answerSubmit, logs, messages, band, prompts, bash, beforeTool, touch, beforeWrite, unreadable, exec, readCount, statCount, ops, registering, timerCount }
 }
 
 export async function startSession($: any, w: World, isInteractive = true) {
