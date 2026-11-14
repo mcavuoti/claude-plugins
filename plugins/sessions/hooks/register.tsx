@@ -1500,21 +1500,28 @@ async function flush($: any) {
       dirty = noDirt()
       if (d.inbox || d.all) bg(solo('inbox', () => checkInbox($)))
       if (d.tell || d.all) bg(solo('tells', () => checkTells($)))
-      let redraw = d.rows || d.pins || d.job || d.all
+      // What the rows are read again for: this session's own (its turn, its job's state, its own file in the
+      // registry), at once; what other sessions did (their registry files, their bells, the pins), at once too while
+      // someone could be looking, else in batches (refreshForOthers)
+      let own = d.rows || d.job || d.all
+      let others = d.pins
       if (d.registry || d.all) {
         const problem = sessionFiles?.problem ?? ''
         const news = await syncFiles($, d.all)
         // A file the panel can't read, or one it can again: the list from claude agents, or from the files
-        if ((sessionFiles?.problem ?? '') !== problem) redraw = true
+        if ((sessionFiles?.problem ?? '') !== problem) own = true
         if (news?.changed.size) {
           // A session's status moved: its record is read again with it (its turn's start or end). The list other
-          // plugins' calls answer from follows sessions of every folder, the rows only this project's
+          // plugins' calls answer from follows sessions of every folder, the rows only this project's; it's taken
+          // from the files here and now, whatever the rows wait for: $.sessions.status, wake, restart, pin and start
+          // never answer from a list a batch old
           for (const id of news.changed) forgetStored(k => k.endsWith(`:${id}`))
-          redraw ||= [...news.changed].some(inThisProject)
-          if (!redraw && sessionFiles && !slowList && sessionFiles.usable(myId, myPid)) lastList = sessionFiles.list()
+          if (news.changed.has(myId)) own = true
+          else others ||= [...news.changed].some(inThisProject)
+          if (sessionFiles && !slowList && sessionFiles.usable(myId, myPid)) lastList = sessionFiles.list()
           // A session came or went in another folder: the line about the sessions that ended with the background
           // service counts every folder's (a refresh does it otherwise)
-          if (!redraw && news.membership) bg(solo('ended', () => readEnded($)))
+          if (!own && !others && news.membership) bg(solo('ended', () => readEnded($)))
         }
         // Who leads changes only when a session comes or goes; what the leader does, when a turn ends or Remote Control
         // moves (the rest waits for the pass)
@@ -1537,9 +1544,10 @@ async function flush($: any) {
           forgetStored(k => k.endsWith(`:${name}`))
           if (!inThisProject(name)) continue
         }
-        redraw = true
+        others = true
       }
-      if (redraw) await requestRefresh($)
+      if (own) await requestRefresh($)
+      else if (others) await refreshForOthers($)
     }
   } finally {
     flushing = false
@@ -1642,6 +1650,38 @@ function requestRefresh($: any, push = true): Promise<void> {
   }
   refreshRun = runs()
   return refreshRun
+}
+
+// A refresh for what other sessions did, or for the rows' times. While someone could be looking at this session (as
+// its last refresh found, or after an arrival: unseen false) it runs at once, as it always did. While nobody could, its
+// panel and band aren't drawn anyway (held), and what's left of a refresh is what others count on: the order file ccc
+// reads, who waits since when and their pushes, the marks' records. Those are minutes' matters, so they're read in
+// batches: at most one refresh every BATCH_MS. The first event after a quiet spell (no refresh in the last BATCH_MS)
+// is read at once, as before; the ones that follow are noted, and one refresh reads them all BATCH_MS after the last
+// one (batchTimer). 5 s: the order file is then at most 5 s behind what ccc would pick from (ccc's own request to the
+// session it picks is answered at once, and arriving reads what's pending first: arrived), a wait's start is recorded
+// at most 5 s late against a push after minutes, and an idle session nobody looks at refreshes at most 12 times a
+// minute for other sessions, however many of them work. What doesn't wait: this session's own events (its turn, its
+// job's state, its own registry file), ccc's requests and ccc tell's (the inbox and tell folders are read on their
+// own events), the notices, the registry itself (read on every event of its own: the list $.sessions and the leader
+// answer from is never a batch old), the leader's turn, and anything the person does here (an arrival runs what's
+// pending before anything else). Only where the list comes from Claude's files on file events: on the short timer
+// and with the list read the slow way, as before
+const BATCH_MS = 5000
+// Nobody could be looking at this session, as its last refresh found (layout); an arrival or a turn of its own ends it
+let unseen = false
+let batchTimer: { cancel: () => void } | null = null
+async function refreshForOthers($: any): Promise<void> {
+  if (!unseen || !live || slowList) return requestRefresh($)
+  if (batchTimer) return
+  const now = await $.clock.now()
+  const wait = listedAt + BATCH_MS - now
+  if (batchTimer) return
+  if (!unseen || wait <= 0 || wait > BATCH_MS) return requestRefresh($)
+  batchTimer = $.clock.after(wait, () => {
+    batchTimer = null
+    bg(requestRefresh($))
+  })
 }
 
 // The pass: every PASS_MS in every session, from an offset of its own. Everything read again, whatever the events said
@@ -1891,7 +1931,7 @@ function scheduleLabel($: any, next: number, now: number) {
   labelTimer = $.clock.after(Math.max(1000, next - now + 50), () => {
     labelTimer = null
     labelAt = 0
-    bg(requestRefresh($))
+    bg(refreshForOthers($))
   })
 }
 
@@ -3764,6 +3804,9 @@ async function refresh($: any) {
   }
   lastList = list
   listedAt = await $.clock.now()
+  // What waited for its batch is read by this refresh, whatever asked for it
+  batchTimer?.cancel()
+  batchTimer = null
   const own = list.find(s => s.sessionId === myId)
   if (own?.pid) myPid = own.pid
   {
@@ -3930,11 +3973,13 @@ function withOwnHint(s: any, now: number): any {
 // while nobody could be looking (couldBeLooking), a refresh reads everything as always, and what follows from the
 // reads goes on (the order file, who waits and the pushes, the marks' records, the leader's work, `$.sessions`), but
 // what the panel and the band would show is kept here (held) instead of written. Whenever Claude draws them anyway (a
-// viewer attaching at a new size, a remote client asking) they draw what's held, so that frame is current too. It's
-// written, and drawn, the moment someone could look (arrived: Enter or a click in another panel, ccc's request,
-// typing, a key in the panel, /sessions, a remote client attaching), whenever a refresh finds someone could, and at
-// the pass, so a viewer opened by hand, at the size the session was last drawn at, shows a panel a pass old at most
-// until a key is pressed there
+// viewer attaching at a new size, a remote client asking) they draw what's held, so that frame is as the last refresh
+// found things too. It's written, and drawn, the moment someone could look (arrived: Enter or a click in another
+// panel, ccc's request, typing, a key in the panel, /sessions, a remote client attaching), whenever a refresh finds
+// someone could, and at the pass, so a viewer opened by hand, at the size the session was last drawn at, shows a panel
+// a pass old at most until a key is pressed there. And since nothing is drawn meanwhile, the refreshes for other
+// sessions' events come in batches (refreshForOthers): what's held is at most BATCH_MS behind, and an arrival reads
+// what waits before it draws
 let held: { rows: Row[]; summary: PanelSummary } | null = null
 // The person's last sign here, for LOOKED_MS: an arrival, typing, a key in the panel, /sessions, a turn of this session
 const LOOKED_MS = 60000
@@ -3991,9 +4036,13 @@ async function drawHeld($: any) {
   if (held === h) held = null
 }
 
-// The person is here, or may be: drawn before anything else
+// The person is here, or may be: drawn before anything else, as it is now. What other sessions did since the last
+// refresh and still waits for its batch is read first (a refresh, which draws: someone could be looking from here on);
+// with nothing pending, what's held is what a refresh would find
 async function arrived($: any) {
   lookedAt = await $.clock.now()
+  unseen = false
+  if (batchTimer) await requestRefresh($, false)
   await drawHeld($)
 }
 
@@ -4032,8 +4081,9 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     unasked: others.filter(f => f.color === 'yellow' && f.unasked).length,
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
-  // Nobody could be looking: kept, not drawn (held)
-  if (!reflow && !(await couldBeLooking($))) {
+  // Nobody could be looking: kept, not drawn (held), and other sessions' events are read in batches from here on
+  unseen = !reflow && !(await couldBeLooking($))
+  if (unseen) {
     held = { rows: shown, summary: next }
     return
   }
@@ -5132,6 +5182,7 @@ async function ownStatus($: any, status: 'busy' | 'idle') {
   ownHint = { status, at: await $.clock.now() }
   // Its own turn, starting or ending: someone may be watching it (couldBeLooking)
   lookedAt = ownHint.at
+  unseen = false
   scheduleFlush($, 0, d => (d.rows = true))
 }
 
@@ -5699,8 +5750,14 @@ async function ownVersion($: any): Promise<string> {
 async function statusOf($: any, s: any, now: number, reasons: () => Promise<StopLog>): Promise<SessionsStatus> {
   const e = await readState($, s.sessionId)
   const mine = s.sessionId === myId
-  const hb = mine ? 'ok' : s.pid ? heartbeatStatus((await readHeartbeats($, [s.sessionId]))[s.sessionId] ?? null, s.pid, now) : 'missing'
-  const shown = projectRows.find(f => f.sessionId === s.sessionId)?.title
+  const beat = mine || !s.pid ? null : ((await readHeartbeats($, [s.sessionId]))[s.sessionId] ?? null)
+  const hb = mine ? 'ok' : s.pid ? heartbeatStatus(beat, s.pid, now) : 'missing'
+  // The project its heartbeat names, learnt here when no refresh has yet (a session that started since the last one)
+  if (beat && beat.format === FORMAT && beat.root.startsWith('/') && !recordedRoots.has(s.sessionId)) recordedRoots.set(s.sessionId, beat.root)
+  // Its name as the rows show it: Claude's own where it has one, from the list (as fresh as the registry's last
+  // event, also while the rows wait for their batch); else the title the rows found for it (its first prompt)
+  const named = typeof s.name === 'string' && !!s.name && s.name !== s.id
+  const shown = named ? s.name : projectRows.find(f => f.sessionId === s.sessionId)?.title
   const state = s.status === 'busy' ? 'working' : s.status === 'waiting' ? 'waiting' : s.status === 'idle' ? 'idle' : 'stopped'
   return {
     ref: refOf(s),

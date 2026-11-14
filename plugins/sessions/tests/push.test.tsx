@@ -1,14 +1,15 @@
 import { expect, test } from 'claude-code/testing'
 
 import { buildNotice, fileKey, FORMAT, goneNamespaces, heartbeatText, showingText, isOldKey, labelMinute, nextLabelChange, reloadDecision, storeNamespace, timeSince } from '../hooks/state'
-import { bellOfKey, classify, directList, jobIds, listDrift, parseRegistry, SessionFiles, WATCH_SET, watchPaths, watchSetOf } from '../hooks/watch'
+import { bellOfKey, bellText, classify, directList, jobIds, listDrift, parseRegistry, SessionFiles, WATCH_SET, watchPaths, watchSetOf } from '../hooks/watch'
 import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, processGone, processStartsArgv, provenRunning } from '../hooks/leader'
 import { COMMAND, DATA, panelRing, ROOT, SID, SLOW, STARTED, startSession, world, type World } from './world'
 
 // What the panel learns by watching files (watch.ts): the paths it hands the engine at SessionStart, a row that changes
 // within a file event with no command run, the bells other sessions ring, its own row from its own turns, the one
 // session that leads the machine-wide work (leader.ts), a session that came in by a reload reading on its short
-// timer and saying so, and the mod's own watch where no SessionStart reaches it (watcher.py watch-paths)
+// timer and saying so, the mod's own watch where no SessionStart reaches it (watcher.py watch-paths), and a session
+// nobody could be looking at: what it keeps undrawn, and other sessions' events read in batches
 
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
 const BRAVO = 'bbbbbbbb-0000-0000-0000-000000000000'
@@ -1012,7 +1013,8 @@ const BUSY_BRAVO = { ...SESSIONS[1]!, status: 'busy' }
 const TTY = '/dev/ttys001'
 
 // A live background session no window shows: Claude draws on its terminal alone ($.session.surfaces), no ccc window
-// or listing shows it, no Remote Control. Five seconds in, past its first pass (which draws what's held). surfaces:
+// or listing shows it, no Remote Control. Eleven seconds in: past its first pass (which draws what's held), and a
+// quiet spell after it (BATCH_MS with no refresh), so the next event of another session is read at once. surfaces:
 // what $.session.surfaces answers, which a test can change. rowsAt: how many ui.open calls had been made at each write
 // of the rows from then on (to tell what came first); drawsAt(writes): the rows' writes since
 async function unseenSession($: any, on: any, sessions: Session[] = SESSIONS) {
@@ -1022,7 +1024,7 @@ async function unseenSession($: any, on: any, sessions: Session[] = SESSIONS) {
   on('turn.complete', (_: any, e: any) => ({ text: String(e.answer ?? '') }) as any)
   on('session.attach', (_: any, e: any) => ({ clientId: e.clientId }) as any)
   const s = await liveSession($, on, sessions)
-  await s.w.clock.advance(5000)
+  await s.w.clock.advance(11000)
   const rowsAt: number[] = []
   s.writes.onRows = () => rowsAt.push(s.w.opens.length)
   return { ...s, surfaces, rowsAt }
@@ -1165,9 +1167,10 @@ test('nobody looking: a listing that saw it in a ccc window that shows another s
   const rows = writes.count.rows ?? 0
   await bravoBusy($, w)
   expect(writes.count.rows ?? 0).toBe(rows)
-  // A viewer of it the listing saw in a window opened another way still counts
+  // A viewer of it the listing saw in a window opened another way still counts (the next event, a quiet spell later,
+  // is read at once and finds it)
   w.store.set('windowsList', { at: w.clock.now() - 10 * MIN, windows: { byId: { aaaaaaaa: [TTY, '/dev/ttys002'] }, byPid: {}, agentsViews: [], clients: { [TTY]: '101' }, launchers: { [TTY]: '100' } } })
-  await w.clock.advance(3000)
+  await w.clock.advance(6000)
   registryFile(w, { ...SESSIONS[1]!, status: 'waiting' })
   await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
   await w.clock.advance(50)
@@ -1246,4 +1249,302 @@ test("its own turn, and a minute after it: drawn at once; then another session's
   await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
   await w.clock.advance(50)
   expect(writes.count.rows ?? 0).toBe(after)
+})
+
+// ---- Nobody looking: other sessions' events are read in batches ----
+
+const BATCH = 5000
+const TELL = `${DATA}/tell/aaaaaaaa`
+const WAITING_BRAVO = { ...SESSIONS[1]!, status: 'waiting' }
+
+// The test's on, with what a test counts noted on the way to the world's own hooks (a test hooks an event once): this
+// session's refreshes (each one stats sections.json once), and the prompts the mod submits
+type Noted = { refreshes: number; prompts: string[] }
+function noting(on: any, n: Noted) {
+  return ((name: string, ...rest: any[]) => {
+    if (name === 'fs.stat' || name === 'prompt.submit') {
+      const hook = rest[rest.length - 1]
+      rest[rest.length - 1] = ($: any, e: any, next: any) => {
+        if (name === 'prompt.submit') n.prompts.push(String(e.text))
+        else if (e.path === `${DATA}/sections.json`) n.refreshes++
+        return hook($, e, next)
+      }
+    }
+    return on(name, ...rest)
+  }) as any
+}
+
+// What other sessions do: Claude rewrites one's registry file, one rings a bell, pins.json changes
+async function registryEvent($: any, w: World, s: Session, event: 'change' | 'add' = 'change') {
+  registryFile(w, s)
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/${s.pid}.json`, event })
+}
+async function bellEvent($: any, w: World, name: string, from = BRAVO) {
+  w.write(`${DATA}/bell/${name}`, bellText(from, w.clock.now()))
+  await $.classic.FileChanged({ file_path: `${DATA}/bell/${name}`, event: 'change' })
+}
+async function pinsEvent($: any, w: World, pins: string[]) {
+  w.write(`${JOBS}/pins.json`, JSON.stringify(pins))
+  await $.classic.FileChanged({ file_path: `${JOBS}/pins.json`, event: 'change' })
+}
+// A row in the order file ccc reads (bravo's by default): the color a refresh last found
+const orderOf = (w: World, sessionId = BRAVO) => (w.files.get(`${DATA}/order/${fileKey(ROOT)}`) ?? '').match(new RegExp(`row=${sessionId}\t(\\w+)\t`))?.[1]
+
+// A session nobody could be looking at, with a batch pending: bravo turned busy after a quiet spell (read at once, and
+// kept: nothing is drawn), and a second later it waits for the person. That one is noted and not read: it waits for
+// the batch's time, 5 s after the first. read: the refreshes so far. quiet: more idle time first
+async function batchPending($: any, on: any, sessions: Session[] = SESSIONS, quiet = 0) {
+  const n: Noted = { refreshes: 0, prompts: [] }
+  const s = await unseenSession($, noting(on, n), sessions)
+  if (quiet) await s.w.clock.advance(quiet)
+  await bravoBusy($, s.w)
+  expect(orderOf(s.w)).toBe('blue')
+  const read = n.refreshes
+  await s.w.clock.advance(1000)
+  await registryEvent($, s.w, WAITING_BRAVO)
+  await s.w.clock.advance(50)
+  expect(n.refreshes).toBe(read)
+  expect(orderOf(s.w)).toBe('blue')
+  return { ...s, n, read }
+}
+
+test('nobody looking: twenty events of other sessions in 2 s are read in two refreshes, the first at once and one 5 s after it; a minute of them, in twelve', SLOW, async ($, on) => {
+  const n: Noted = { refreshes: 0, prompts: [] }
+  const { w, writes } = await unseenSession($, noting(on, n))
+  const [before, rows] = [n.refreshes, writes.count.rows ?? 0]
+  // Bravo's turns and bells, another plugin's marks, the pins: one every 100 ms
+  for (let i = 0; i < 19; i++) {
+    if (i % 4 === 0) await registryEvent($, w, i % 8 === 0 ? BUSY_BRAVO : SESSIONS[1]!)
+    else if (i % 4 === 1) await bellEvent($, w, BRAVO)
+    else if (i % 4 === 2) await bellEvent($, w, 'marks')
+    else await pinsEvent($, w, i % 8 === 3 ? ['bbbbbbbb'] : [])
+    await w.clock.advance(100)
+  }
+  await registryEvent($, w, WAITING_BRAVO)
+  await w.clock.advance(100)
+  // The first one came after a quiet spell and was read at once, as before; the other nineteen are noted
+  expect(n.refreshes - before).toBe(1)
+  expect(orderOf(w)).toBe('blue')
+  // 5 s after that refresh, one more reads them all: bravo waits for the person
+  await w.clock.advance(BATCH - 2000 + 50)
+  expect(n.refreshes - before).toBe(2)
+  expect(orderOf(w)).toBe('red')
+  await w.clock.advance(BATCH)
+  expect(n.refreshes - before).toBe(2)
+  // Nothing was drawn for any of it
+  expect(writes.count.rows ?? 0).toBe(rows)
+  // A minute of bells, four a second: a refresh every 5 s, and the pass
+  const from = n.refreshes
+  for (let i = 0; i < 240; i++) {
+    await bellEvent($, w, BRAVO)
+    await w.clock.advance(250)
+  }
+  expect(n.refreshes - from).toBeGreaterThanOrEqual(11)
+  expect(n.refreshes - from).toBeLessThanOrEqual(13)
+})
+
+// Every way of arriving, with a batch pending: what waited is read then, and the panel is drawn as it is now, before
+// anything else
+for (const [how, arrive] of ARRIVALS) {
+  test(`nobody looking, a batch pending, then ${how}: what waited is read, and the panel drawn as it is now, first`, SLOW, async ($, on) => {
+    const { w, writes, surfaces, rowsAt, n, read } = await batchPending($, on)
+    const rows = writes.count.rows ?? 0
+    // What's kept is a batch behind: a draw Claude makes anyway shows bravo working
+    expect(dotOf(await drawnNow($), BRAVO)).toBe('suggestion')
+    const opens = w.opens.length
+    await arrive($, w, surfaces)
+    await w.clock.advance(200)
+    // Read at the arrival, not at the batch's time 4 s later; drawn once, bravo red, before the panel took the keyboard
+    if (!how.startsWith('the pass')) expect(n.refreshes).toBeGreaterThan(read)
+    expect(writes.count.rows).toBe(rows + 1)
+    expect(colorOf(writes, BRAVO)).toBe('red')
+    expect(orderOf(w)).toBe('red')
+    const focus = w.opens.findIndex((o: any, i: number) => i >= opens && o.focus === true)
+    if (focus >= 0) expect(rowsAt[0]).toBeLessThanOrEqual(focus)
+    expect(dotOf(await drawnNow($), BRAVO)).toBe('error')
+    // Nothing is left for the batch's time
+    const after = n.refreshes
+    await w.clock.advance(BATCH)
+    expect(n.refreshes).toBe(after)
+    expect(writes.count.rows).toBe(rows + 1)
+  })
+}
+
+test("a batch pending: this session's own turn is read and drawn at once, with what waited", SLOW, async ($, on) => {
+  const { w, writes, n, read } = await batchPending($, on)
+  await $.turn.start({ turnId: 't1', text: 'go' } as any)
+  await w.clock.advance(20)
+  expect(n.refreshes).toBe(read + 1)
+  expect(colorOf(writes, SID)).toBe('blue')
+  expect(colorOf(writes, BRAVO)).toBe('red')
+})
+
+test("a batch pending: this session's own job state and its own registry file are read at once", SLOW, async ($, on) => {
+  const { w, n, read } = await batchPending($, on)
+  w.write(`${JOBS}/aaaaaaaa/state.json`, JSON.stringify({ state: 'running', inFlight: [{ kind: 'agent' }] }))
+  await $.classic.FileChanged({ file_path: `${JOBS}/aaaaaaaa/state.json`, event: 'change' })
+  await w.clock.advance(50)
+  expect(n.refreshes).toBe(read + 1)
+  expect(orderOf(w)).toBe('red')
+  // Its own file in the registry: this session waits for the person (a permission prompt)
+  await w.clock.advance(1000)
+  await bellEvent($, w, BRAVO)
+  await w.clock.advance(50)
+  expect(n.refreshes).toBe(read + 1)
+  await registryEvent($, w, { ...SESSIONS[0]!, status: 'waiting' })
+  await w.clock.advance(50)
+  expect(n.refreshes).toBe(read + 2)
+  expect(orderOf(w, SID)).toBe('red')
+})
+
+test("a batch pending: ccc's request and ccc tell's are taken at once", SLOW, async ($, on) => {
+  const { w, n, read } = await batchPending($, on)
+  // ccc asks this session to wake bravo for a tell, and waits 3 s for the answer: it runs, by the registry as it is
+  const reply = `${DATA}/replies/r1`
+  w.write(`${DATA}/inbox/${SID}`, `format=3\naction=wake\nat=${w.clock.now()}\nref=bbbbbbbb\nreply=${reply}\n`)
+  await $.classic.FileChanged({ file_path: `${DATA}/inbox/${SID}`, event: 'add' })
+  await w.clock.advance(100)
+  expect(w.files.has(`${DATA}/inbox/${SID}`)).toBe(false)
+  expect(w.files.get(reply)).toContain('result=ok')
+  expect(w.files.get(reply)).toContain('state=running')
+  // A script's text for this session, which the person let in: submitted as its turn
+  w.files.set(`${TELL}/allow`, 'format=3\nat=1\n')
+  const id = `${w.clock.now()}-501`
+  w.files.set(`${TELL}/${id}.txt`, 'New mail, id 42')
+  w.files.set(`${TELL}/${id}.status`, 'format=3\nstate=queued\nreason=\nat=1\n')
+  w.write(`${TELL}/${id}.req`, `format=3\nfrom=cron\nat=${w.clock.now()}\n`)
+  await $.classic.FileChanged({ file_path: `${TELL}/${id}.req`, event: 'add' })
+  await w.clock.advance(100)
+  expect(n.prompts.some(p => p.includes('New mail, id 42'))).toBe(true)
+  // Neither is a reason to read the rows: they still wait for the batch
+  expect(n.refreshes).toBe(read)
+})
+
+// $.sessions from another plugin, as a sweeper running in an idle session nobody looks at calls it
+const CALLER = {
+  name: 'caller',
+  register(on: any) {
+    on('command.run', { command: 'caller' }, async ($: any, e: any) => {
+      const { m, input } = JSON.parse(String(e.args))
+      try {
+        return { text: JSON.stringify(m === 'status' ? await $.sessions.status(input) : m === 'wake' ? await $.sessions.wake(input) : m === 'setMarks' ? await $.sessions.setMarks(input) : await $.sessions.restart(input)) }
+      } catch (err) {
+        return { text: JSON.stringify({ threw: String(err) }) }
+      }
+    })
+  },
+}
+async function ask($: any, m: string, input: unknown): Promise<any> {
+  const r: any = await $.command.run({ command: 'caller', args: JSON.stringify({ m, input }), origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as any)
+  return JSON.parse(r.text)
+}
+const DELTA: Session = { pid: 4250, sessionId: 'dddddddd-0000-0000-0000-000000000000', id: 'dddddddd', status: 'idle', name: 'delta' }
+
+test('a batch pending: $.sessions.status, wake and restart answer from the registry as it is now, never from rows a batch old', { ...SLOW, plugins: [CALLER] }, async ($, on) => {
+  // Delta is stopped: the service retired it for being idle (its job's state, and the service's log)
+  const n: Noted = { refreshes: 0, prompts: [] }
+  const { w } = await unseenSession($, noting(on, n))
+  w.write(`${JOBS}/dddddddd/state.json`, JSON.stringify({ sessionId: DELTA.sessionId, cwd: ROOT, name: 'delta', state: 'done' }))
+  w.files.set('/Users/x/daemon.log', '[2026-10-26T10:00:00.000Z] [bg] bg retire dddddddd: settled, idle 61m\n[2026-10-26T10:00:01.000Z] [bg] bg settled dddddddd (done)')
+  await w.clock.advance(PASS_MS + BATCH)
+  const row = async (ref: string) => (await ask($, 'status', { refs: [ref] })).rows[0]
+  expect(await row('dddddddd')).toMatchObject({ state: 'stopped', stopped: 'idle', name: 'delta' })
+  // A batch pending: bravo turned busy (read at once), then waits for the person (noted)
+  await bravoBusy($, w)
+  const read = n.refreshes
+  await w.clock.advance(1000)
+  await registryEvent($, w, WAITING_BRAVO)
+  await w.clock.advance(50)
+  expect(n.refreshes).toBe(read)
+  expect(orderOf(w)).toBe('blue')
+  // The rows are a batch behind; the answers aren't: bravo waits, and isn't restarted while it does
+  expect(await row('bbbbbbbb')).toMatchObject({ state: 'waiting', name: 'bravo' })
+  expect(await ask($, 'restart', { ref: 'bbbbbbbb' })).toMatchObject({ ok: false, state: 'refused', detail: "“bravo” is waiting for the person: ask again once it's idle" })
+  // Delta was just woken by someone else: it runs, so a wake asked now starts nothing
+  await registryEvent($, w, DELTA, 'add')
+  await w.clock.advance(50)
+  expect(n.refreshes).toBe(read)
+  expect(await row('dddddddd')).toMatchObject({ state: 'idle', name: 'delta' })
+  expect(await ask($, 'wake', { ref: 'dddddddd', reason: 'an answer for it' })).toEqual({ ok: true, state: 'running' })
+  await w.clock.advance(600)
+  expect(w.runs.some(a => a[1] === 'respawn')).toBe(false)
+  // A session that started since the last refresh is there too, with its project as its heartbeat names it
+  const echo: Session = { pid: 4260, sessionId: 'eeeeeeee-0000-0000-0000-000000000000', id: 'eeeeeeee', status: 'busy', name: 'echo' }
+  w.write(`${DATA}/alive/${echo.sessionId}`, heartbeatText({ pid: echo.pid, at: w.clock.now(), version: '0.14.0', via: 'session.start', root: ROOT }))
+  await registryEvent($, w, echo, 'add')
+  await w.clock.advance(50)
+  expect(await row('eeeeeeee')).toMatchObject({ state: 'working', name: 'echo', root: ROOT, panel: 'ok' })
+  // Bravo renamed, then gone: said at once too
+  await registryEvent($, w, { ...WAITING_BRAVO, name: 'bravo two' })
+  await w.clock.advance(50)
+  expect(await row('bbbbbbbb')).toMatchObject({ state: 'waiting', name: 'bravo two' })
+  w.files.delete(`${REGISTRY}/4243.json`)
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'unlink' })
+  await w.clock.advance(50)
+  expect(await row('bbbbbbbb')).toMatchObject({ state: 'gone' })
+  expect(n.refreshes).toBe(read)
+  // The rows catch up at the batch's time
+  await w.clock.advance(BATCH)
+  expect(n.refreshes).toBe(read + 1)
+  expect(orderOf(w)).toBe(undefined)
+})
+
+test('a batch pending: marks another plugin sets from here are stored and their bell rung at once; only the rows wait', { ...SLOW, plugins: [CALLER] }, async ($, on) => {
+  const { w, n, read } = await batchPending($, on)
+  const bell = w.files.get(`${DATA}/bell/marks`)
+  expect(await ask($, 'setMarks', { source: 'probe', ttlMs: 600000, rows: { bbbbbbbb: { badge: '?1', needsPerson: true } } })).toEqual({ ok: true })
+  expect((w.store.get(`marks:probe:${SID}`) as any)?.rows).toEqual({ bbbbbbbb: { badge: '?1', needsPerson: true } })
+  expect(w.files.get(`${DATA}/bell/marks`)).not.toBe(bell)
+  expect(w.files.get(`${DATA}/bell/marks`)).toContain(`from=${SID}`)
+  // The bell's event comes back to this session too: its own rows read the marks at the batch's time
+  await $.classic.FileChanged({ file_path: `${DATA}/bell/marks`, event: 'change' })
+  await w.clock.advance(50)
+  expect(n.refreshes).toBe(read)
+  expect(w.store.has(`needsSince:${BRAVO}`)).toBe(false)
+  await w.clock.advance(BATCH)
+  expect(n.refreshes).toBe(read + 1)
+  expect((w.store.get(`needsSince:${BRAVO}`) as any)?.since).toBeGreaterThan(0)
+})
+
+test("a batch pending: the leader's turn on a registry event isn't held (a Remote Control connection is pinned at once)", SLOW, async ($, on) => {
+  // 20 s more idle first: the leader's pins pass keeps 15 s from the last one
+  const { w, n, read } = await batchPending($, on, SESSIONS, 20000)
+  expect(w.files.get(`${JOBS}/pins.json`) ?? '[]').not.toContain('bbbbbbbb')
+  w.write(`${JOBS}/bbbbbbbb/state.json`, JSON.stringify({ bridgeSessionId: 'session_x' }))
+  w.write(`${REGISTRY}/4243.json`, JSON.stringify({ pid: 4243, sessionId: BRAVO, cwd: ROOT, kind: 'bg', status: 'waiting', statusUpdatedAt: w.clock.now(), name: 'bravo', jobId: 'bbbbbbbb-0000-0000-0000-000000000000', startedAt: 999_000_000, procStart: 'x', bridgeSessionId: 'session_x' }))
+  await $.classic.FileChanged({ file_path: `${REGISTRY}/4243.json`, event: 'change' })
+  await w.clock.advance(200)
+  expect(w.files.get(`${JOBS}/pins.json`)).toContain('bbbbbbbb')
+  expect(n.refreshes).toBe(read)
+})
+
+test('a batch pending, and someone could be looking by the time it is read: drawn then, and every event after it is read and drawn at once, as before', SLOW, async ($, on) => {
+  const { w, writes, surfaces, n, read } = await batchPending($, on)
+  const rows = writes.count.rows ?? 0
+  // A remote client shows the session (with no arrival said): the batch's refresh finds it, and draws
+  surfaces.value = ['terminal', 'desktop']
+  await w.clock.advance(BATCH)
+  expect(n.refreshes).toBe(read + 1)
+  expect(writes.count.rows).toBe(rows + 1)
+  expect(colorOf(writes, BRAVO)).toBe('red')
+  // From then on, as before: each event read 30 ms later and drawn
+  const colors: string[] = []
+  for (const status of ['idle', 'busy', 'waiting', 'idle', 'busy']) {
+    await registryEvent($, w, { ...SESSIONS[1]!, status })
+    await w.clock.advance(500)
+    colors.push(colorOf(writes, BRAVO))
+  }
+  expect(colors).toEqual(['green', 'blue', 'red', 'green', 'blue'])
+  expect(n.refreshes).toBe(read + 6)
+  expect(writes.count.rows).toBe(rows + 6)
+})
+
+test("a batch pending: Claude's list tool answers from a refresh made then", SLOW, async ($, on) => {
+  on('tool.check', () => ({ decision: 'allow' }) as any)
+  const { w, n, read } = await batchPending($, on)
+  const answer = $.tool.call({ tool: 'mcp__sessions__list' } as any)
+  await w.clock.advance(100)
+  expect(String(((await answer) as any).result)).toContain('- “bravo” · bbbbbbbb · waiting for the person · wake: no (it runs)')
+  expect(n.refreshes).toBe(read + 1)
+  expect(orderOf(w)).toBe('red')
 })
