@@ -5979,10 +5979,11 @@ function ensureStarted($: any, via: string): Promise<void> {
 }
 
 // The first draw starts the mod from a timer it sets (a draw only draws), with that draw's $, and the timer can fire
-// before the draw has settled (the band's own reads, or the plugins beneath it, still answering). Until it has, the
-// engine refuses every $.state write made with that $ ("made while ui.render is being dispatched"), so the start's
-// first write is tried again 10 ms apart until it's taken, for 2 s at most; any other failure ends the wait. Once the
-// draw has settled no later write meets it
+// before the band's hook has answered that draw (its own reads still answering). Until it has, the engine refuses
+// every $.state write made with that $ ("made while ui.render is being dispatched"), so the start's first write is
+// tried again 10 ms apart until it's taken, for 2 s at most; any other failure ends the wait. Once the hook has
+// answered no later write meets it, even while the rest of the band is still being drawn (since Claude 2.1.323 each
+// plugin's row is drawn on its own): the engine sees the value changed under that draw and draws the band again
 async function afterDraw($: any, write: () => Promise<unknown>) {
   for (let tries = 1; ; tries++) {
     try {
