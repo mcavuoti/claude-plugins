@@ -388,7 +388,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   // A move of the focus that reaches Claude lands where the chain left it (panelRing reads it). The mod's own $.ui.focus
   // never gets here: the kit skips the mod's own hook on it, and with it what's beneath, so it's denied
   const focusLanded: { value: string | undefined } = { value: undefined }
-  on('ui.focus', (_, e) => {
+  on('ui.focus', { plugin: '*' }, (_, e) => {
     focusLanded.value = e.element
     return {}
   })
