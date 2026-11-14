@@ -1314,12 +1314,13 @@ async function listWithAge($: any, maxAge = LIST_MS): Promise<Listed | string> {
   return listing
 }
 
-// One try at the machine-wide lock; a lock older than LIST_LOCK_STALE_MS was left by a session cut off mid-listing
-async function takeListLock($: any, lock: string): Promise<boolean> {
+// One try at a machine-wide lock (a folder, made with mkdir): a session that finds it taken doesn't wait for it. One
+// older than staleMs was left by a session cut off while it held it, and is taken over
+async function takeLock($: any, lock: string, staleMs: number): Promise<boolean> {
   if ((await runSafe($, ['mkdir', lock])).exitCode === 0) return true
   try {
     const st = await $.fs.stat(lock)
-    if ((await $.clock.now()) - st.mtimeMs > LIST_LOCK_STALE_MS) {
+    if ((await $.clock.now()) - st.mtimeMs > staleMs) {
       await runSafe($, ['rmdir', lock])
       return (await runSafe($, ['mkdir', lock])).exitCode === 0
     }
@@ -1329,7 +1330,7 @@ async function takeListLock($: any, lock: string): Promise<boolean> {
 
 async function fetchList($: any, maxAge: number): Promise<Listed | string> {
   const lock = dataDir ? `${dataDir}/list.lock` : ''
-  const holding = lock ? await takeListLock($, lock) : false
+  const holding = lock ? await takeLock($, lock, LIST_LOCK_STALE_MS) : false
   if (lock && !holding) {
     // Another session is listing: its list, once stored, serves here too. Until then the stored one, however old; with
     // none stored yet, wait for one a while, and only then list here without the lock
@@ -1499,21 +1500,28 @@ async function flush($: any) {
       dirty = noDirt()
       if (d.inbox || d.all) bg(solo('inbox', () => checkInbox($)))
       if (d.tell || d.all) bg(solo('tells', () => checkTells($)))
-      let redraw = d.rows || d.pins || d.job || d.all
+      // What the rows are read again for: this session's own (its turn, its job's state, its own file in the
+      // registry), at once; what other sessions did (their registry files, their bells, the pins), at once too while
+      // someone could be looking, else in batches (refreshForOthers)
+      let own = d.rows || d.job || d.all
+      let others = d.pins
       if (d.registry || d.all) {
         const problem = sessionFiles?.problem ?? ''
         const news = await syncFiles($, d.all)
         // A file the panel can't read, or one it can again: the list from claude agents, or from the files
-        if ((sessionFiles?.problem ?? '') !== problem) redraw = true
+        if ((sessionFiles?.problem ?? '') !== problem) own = true
         if (news?.changed.size) {
           // A session's status moved: its record is read again with it (its turn's start or end). The list other
-          // plugins' calls answer from follows sessions of every folder, the rows only this project's
+          // plugins' calls answer from follows sessions of every folder, the rows only this project's; it's taken
+          // from the files here and now, whatever the rows wait for: $.sessions.status, wake, restart, pin and start
+          // never answer from a list a batch old
           for (const id of news.changed) forgetStored(k => k.endsWith(`:${id}`))
-          redraw ||= [...news.changed].some(inThisProject)
-          if (!redraw && sessionFiles && !slowList && sessionFiles.usable(myId, myPid)) lastList = sessionFiles.list()
+          if (news.changed.has(myId)) own = true
+          else others ||= [...news.changed].some(inThisProject)
+          if (sessionFiles && !slowList && sessionFiles.usable(myId, myPid)) lastList = sessionFiles.list()
           // A session came or went in another folder: the line about the sessions that ended with the background
           // service counts every folder's (a refresh does it otherwise)
-          if (!redraw && news.membership) bg(solo('ended', () => readEnded($)))
+          if (!own && !others && news.membership) bg(solo('ended', () => readEnded($)))
         }
         // Who leads changes only when a session comes or goes; what the leader does, when a turn ends or Remote Control
         // moves (the rest waits for the pass)
@@ -1536,9 +1544,10 @@ async function flush($: any) {
           forgetStored(k => k.endsWith(`:${name}`))
           if (!inThisProject(name)) continue
         }
-        redraw = true
+        others = true
       }
-      if (redraw) await requestRefresh($)
+      if (own) await requestRefresh($)
+      else if (others) await refreshForOthers($)
     }
   } finally {
     flushing = false
@@ -1641,6 +1650,38 @@ function requestRefresh($: any, push = true): Promise<void> {
   }
   refreshRun = runs()
   return refreshRun
+}
+
+// A refresh for what other sessions did, or for the rows' times. While someone could be looking at this session (as
+// its last refresh found, or after an arrival: unseen false) it runs at once, as it always did. While nobody could, its
+// panel and band aren't drawn anyway (held), and what's left of a refresh is what others count on: the order file ccc
+// reads, who waits since when and their pushes, the marks' records. Those are minutes' matters, so they're read in
+// batches: at most one refresh every BATCH_MS. The first event after a quiet spell (no refresh in the last BATCH_MS)
+// is read at once, as before; the ones that follow are noted, and one refresh reads them all BATCH_MS after the last
+// one (batchTimer). 5 s: the order file is then at most 5 s behind what ccc would pick from (ccc's own request to the
+// session it picks is answered at once, and arriving reads what's pending first: arrived), a wait's start is recorded
+// at most 5 s late against a push after minutes, and an idle session nobody looks at refreshes at most 12 times a
+// minute for other sessions, however many of them work. What doesn't wait: this session's own events (its turn, its
+// job's state, its own registry file), ccc's requests and ccc tell's (the inbox and tell folders are read on their
+// own events), the notices, the registry itself (read on every event of its own: the list $.sessions and the leader
+// answer from is never a batch old), the leader's turn, and anything the person does here (an arrival runs what's
+// pending before anything else). Only where the list comes from Claude's files on file events: on the short timer
+// and with the list read the slow way, as before
+const BATCH_MS = 5000
+// Nobody could be looking at this session, as its last refresh found (layout); an arrival or a turn of its own ends it
+let unseen = false
+let batchTimer: { cancel: () => void } | null = null
+async function refreshForOthers($: any): Promise<void> {
+  if (!unseen || !live || slowList) return requestRefresh($)
+  if (batchTimer) return
+  const now = await $.clock.now()
+  const wait = listedAt + BATCH_MS - now
+  if (batchTimer) return
+  if (!unseen || wait <= 0 || wait > BATCH_MS) return requestRefresh($)
+  batchTimer = $.clock.after(wait, () => {
+    batchTimer = null
+    bg(requestRefresh($))
+  })
 }
 
 // The pass: every PASS_MS in every session, from an offset of its own. Everything read again, whatever the events said
@@ -1890,7 +1931,7 @@ function scheduleLabel($: any, next: number, now: number) {
   labelTimer = $.clock.after(Math.max(1000, next - now + 50), () => {
     labelTimer = null
     labelAt = 0
-    bg(requestRefresh($))
+    bg(refreshForOthers($))
   })
 }
 
@@ -3554,70 +3595,152 @@ async function tellPerson($: any, text: string): Promise<{ phone: string; notifi
   return { phone, notification }
 }
 
-// One notification, when the quiet hours and the cap a day allow it. claim runs under the push lock (<data>/push.lock,
-// which every session takes) and says whether it's still to be sent, recording it as sent so that no other session
-// sends it too; the day's count (the store's pushCount, { day, count }) goes up with it. What it said and what each
-// channel answered is kept in lastPush, for /sessions status. Whether it was sent
-async function notifyOnce($: any, claim: () => Promise<boolean>, text: () => string): Promise<boolean> {
+// One notification, when it may go: notifications on, outside the quiet hours, under the cap a day. What says it can't
+// go is asked first, with nothing taken and no command run (mayNotify, capLeft): a session with nothing it could send
+// takes no lock, and once it knows the day's cap reached (capDay) it reads nothing either until the day changes. The
+// cap is every session's (the store's pushCount, { day, count }), and another session may be the one that reaches it:
+// what this one knows of the count is what it last read (again a pass apart at most, and only with something to send)
+// or wrote, and the count is read again under the lock before anything is claimed. claim runs under the push lock
+// (<data>/push.lock, which every session takes, in one try: a session that finds it taken leaves it to whoever holds
+// it, most likely for the same thing, and answers 'busy') and says whether it's still to be sent, recording it as sent
+// so that no other session sends it too; the day's count goes up with it. What it said and what each channel answered
+// is kept in lastPush, for /sessions status. 'sent', or 'no': nothing to send now
+const PUSH_LOCK_STALE_MS = 5000
+// The day whose cap this session found reached ('': none)
+let capDay = ''
+// The day's count as this session last read or wrote it, and when
+let countKnown: { day: string; count: number; at: number } | null = null
+
+// The notifications sent today, as the store has them now
+async function sentNow($: any, day: string): Promise<number> {
+  return sentToday(await storeGet($, 'pushCount'), day)
+}
+
+// Whether a notification could go now, by what takes no call: notifications on, outside the quiet hours, and the
+// day's cap not known reached
+function mayNotify(now: number): boolean {
   if (!dataDir || notificationsPerDay <= 0) return false
-  const now = await $.clock.now()
-  if (inQuietHours(quietHours, new Date(now))) return false
+  const at = new Date(now)
+  return !inQuietHours(quietHours, at) && capDay !== dayOf(at)
+}
+
+// Whether the day's cap leaves room for one more, by the count as last read: read again a pass apart at most
+async function capLeft($: any, now: number): Promise<boolean> {
   const day = dayOf(new Date(now))
+  if (capDay === day) return false
+  if (!countKnown || countKnown.day !== day || now - countKnown.at >= PASS_MS || now < countKnown.at) countKnown = { day, count: await sentNow($, day), at: now }
+  if (countKnown.count < notificationsPerDay) return true
+  capDay = day
+  return false
+}
+
+async function notifyOnce($: any, claim: () => Promise<boolean>, text: () => string): Promise<'sent' | 'no' | 'busy'> {
+  const now = await $.clock.now()
+  if (!mayNotify(now) || !(await capLeft($, now))) return 'no'
+  const day = dayOf(new Date(now))
+  const lock = `${dataDir}/push.lock`
+  if (!(await takeLock($, lock, PUSH_LOCK_STALE_MS))) return 'busy'
   let go = false
-  await withLock(
-    $,
-    `${dataDir}/push`,
-    async () => {
-      const count = sentToday(await storeGet($, 'pushCount'), day)
-      if (count >= notificationsPerDay || !(await claim())) return
-      await storeSet($, 'pushCount', { day, count: count + 1 })
+  try {
+    const count = await sentNow($, day)
+    countKnown = { day, count, at: now }
+    if (count >= notificationsPerDay) capDay = day
+    else if (await claim()) {
+      if (await storeSet($, 'pushCount', { day, count: count + 1 })) {
+        countKnown = { day, count: count + 1, at: now }
+        if (count + 1 >= notificationsPerDay) capDay = day
+      }
       go = true
-    },
-    10,
-  )
-  if (!go) return false
+    }
+  } finally {
+    await runSafe($, ['rmdir', lock])
+  }
+  if (!go) return 'no'
   const message = text()
   const r = await tellPerson($, message)
   await storeSet($, 'lastPush', { at: now, text: message, from: myShortId(), ...r })
   debugLine($, `notified: ${message} · phone ${r.phone}${r.notification ? `, notification ${r.notification}` : ''}`)
-  return true
+  return 'sent'
 }
 
-// The project's sessions waiting for the person, as the last refresh found them
+// The project's sessions waiting for the person, as the last refresh found them, and when it did
 let waitsNow: Wait[] = []
+let waitsAt = 0
 
 // A push once a session of the project has waited for the person waitPushMinutes, once per wait (pushed:<sessionId>
 // holds the since of the wait pushed), whichever session of the project gets there first: one with Remote Control right
-// away (its push can reach the phone), the others a minute later (PUSH_GRACE_MS). Several due at once go in one push
+// away (its push can reach the phone), the others a minute later (PUSH_GRACE_MS) and then each after a share of
+// PUSH_SPREAD_MS of its own (from its id, as the pass's offset is), so the sessions that one event woke together don't
+// all go for the lock: the first one pushes, and the rest read that it did. Several waits due at once go in one push.
+// This runs after every refresh from a timer or a file event, in every session, and most of the time there's nothing
+// to push: it reads nothing and runs nothing while no wait is past its time other than the ones known pushed
+// (pushedKnown: a wait's record, once it holds that wait's since, never changes back), nor while nothing could be sent
+// (mayNotify: notifications off, the quiet hours, the day's cap reached). A try that didn't push and left a wait due
+// (the lock taken by another session, a record the store refused) is made again PUSH_RETRY_MS later, not at every
+// refresh
+const PUSH_SPREAD_MS = 3000
+const PUSH_RETRY_MS = 15000
+// pushed:<sessionId> as this session last read or wrote it, by session id
+const pushedKnown = new Map<string, number>()
 let pushingWaits = false
+let pushTimer: { cancel: () => void } | null = null
+let pushRetryAt = 0
+
+// Whether this session goes first: it has Remote Control, so its push can reach the phone
+async function pushesFirst($: any): Promise<boolean> {
+  const own = lastList.find(s => s.sessionId === myId)
+  return own?.kind === 'background' && typeof own.id === 'string' && (await hasRemoteControl($, own.id)) === true
+}
+
 async function pushWaits($: any) {
-  if (pushingWaits || !(waitPushMs > 0) || waitsNow.length === 0) return
+  if (pushingWaits || pushTimer || !(waitPushMs > 0) || waitsNow.length === 0) return
+  const now = waitsAt
+  const due = (first: boolean) => dueWaits(waitsNow, Object.fromEntries(pushedKnown), now, waitPushMs, first)
+  if (due(true).length === 0 || !mayNotify(now) || now < pushRetryAt) return
+  const first = await pushesFirst($)
+  if (due(first).length === 0) return
+  if (first) return pushDue($)
+  pushTimer = $.clock.after(wakeStagger(myId, PUSH_SPREAD_MS), () => {
+    pushTimer = null
+    bg(pushDue($))
+  })
+}
+
+// The waits due a push now, pushed: what other sessions pushed meanwhile is read first (the records of the waits due,
+// no others), and again under the lock
+async function pushDue($: any) {
+  if (pushingWaits) return
   pushingWaits = true
   try {
     const now = await $.clock.now()
+    if (!mayNotify(now) || !(await capLeft($, now))) return
+    const first = await pushesFirst($)
     const waits = waitsNow
-    const pushed = async () => {
-      const out: Record<string, number> = {}
-      for (const w of waits) out[w.sessionId] = Number(await storeGet($, `pushed:${w.sessionId}`)) || 0
-      return out
+    for (const id of [...pushedKnown.keys()]) if (!waits.some(w => w.sessionId === id)) pushedKnown.delete(id)
+    const due = () => dueWaits(waits, Object.fromEntries(pushedKnown), now, waitPushMs, first)
+    const readPushed = async () => {
+      for (const w of due()) pushedKnown.set(w.sessionId, Number(await storeGet($, `pushed:${w.sessionId}`)) || 0)
     }
-    const before = await pushed()
-    if (dueWaits(waits, before, now, waitPushMs, true).length === 0) return
-    const own = lastList.find(s => s.sessionId === myId)
-    const first = own?.kind === 'background' && typeof own.id === 'string' && (await hasRemoteControl($, own.id)) === true
-    if (dueWaits(waits, before, now, waitPushMs, first).length === 0) return
-    let due: Wait[] = []
-    await notifyOnce(
+    await readPushed()
+    if (due().length === 0) return
+    let pushing: Wait[] = []
+    const r = await notifyOnce(
       $,
       async () => {
-        due = dueWaits(waits, await pushed(), now, waitPushMs, first)
+        await readPushed()
+        pushing = due()
         // A wait the store didn't record as pushed would be pushed again by the next session: not sent now
         let recorded = true
-        for (const w of due) recorded = (await storeSet($, `pushed:${w.sessionId}`, w.since)) && recorded
-        return due.length > 0 && recorded
+        for (const w of pushing) {
+          const landed = await storeSet($, `pushed:${w.sessionId}`, w.since)
+          if (landed) pushedKnown.set(w.sessionId, w.since)
+          recorded = landed && recorded
+        }
+        return pushing.length > 0 && recorded
       },
-      () => waitText(due, now),
+      () => waitText(pushing, now),
     )
+    if (r !== 'sent' && due().length > 0) pushRetryAt = now + PUSH_RETRY_MS
   } finally {
     pushingWaits = false
   }
@@ -3661,7 +3784,7 @@ async function notifySpend($: any) {
     if (!e || !alert || alert.notified || alert.since === spendNotified) return
     const own = lastList.find(s => s.sessionId === myId)
     const name = projectRows.find(f => f.current)?.title ?? String(own?.name || own?.id || myShortId())
-    if (!(await notifyOnce($, async () => true, () => spendText(name, alert, spendOf(e).mode)))) return
+    if ((await notifyOnce($, async () => true, () => spendText(name, alert, spendOf(e).mode))) !== 'sent') return
     spendNotified = alert.since
     const now = (await readState($, myId)) ?? e
     if (now.spendAlert?.since === alert.since) await storeSet($, `state:${myId}`, { ...now, spendAlert: { ...now.spendAlert, notified: true } })
@@ -3681,6 +3804,9 @@ async function refresh($: any) {
   }
   lastList = list
   listedAt = await $.clock.now()
+  // What waited for its batch is read by this refresh, whatever asked for it
+  batchTimer?.cancel()
+  batchTimer = null
   const own = list.find(s => s.sessionId === myId)
   if (own?.pid) myPid = own.pid
   {
@@ -3786,6 +3912,7 @@ async function refresh($: any) {
     })
   }
   waitsNow = waits
+  waitsAt = now
   projectUsual = median(usuals)
   installedVersion = newest
   // ↑ also when a session runs an older version of this mod than the installed one (its heartbeat says which)
@@ -3846,11 +3973,13 @@ function withOwnHint(s: any, now: number): any {
 // while nobody could be looking (couldBeLooking), a refresh reads everything as always, and what follows from the
 // reads goes on (the order file, who waits and the pushes, the marks' records, the leader's work, `$.sessions`), but
 // what the panel and the band would show is kept here (held) instead of written. Whenever Claude draws them anyway (a
-// viewer attaching at a new size, a remote client asking) they draw what's held, so that frame is current too. It's
-// written, and drawn, the moment someone could look (arrived: Enter or a click in another panel, ccc's request,
-// typing, a key in the panel, /sessions, a remote client attaching), whenever a refresh finds someone could, and at
-// the pass, so a viewer opened by hand, at the size the session was last drawn at, shows a panel a pass old at most
-// until a key is pressed there
+// viewer attaching at a new size, a remote client asking) they draw what's held, so that frame is as the last refresh
+// found things too. It's written, and drawn, the moment someone could look (arrived: Enter or a click in another
+// panel, ccc's request, typing, a key in the panel, /sessions, a remote client attaching), whenever a refresh finds
+// someone could, and at the pass, so a viewer opened by hand, at the size the session was last drawn at, shows a panel
+// a pass old at most until a key is pressed there. And since nothing is drawn meanwhile, the refreshes for other
+// sessions' events come in batches (refreshForOthers): what's held is at most BATCH_MS behind, and an arrival reads
+// what waits before it draws
 let held: { rows: Row[]; summary: PanelSummary } | null = null
 // The person's last sign here, for LOOKED_MS: an arrival, typing, a key in the panel, /sessions, a turn of this session
 const LOOKED_MS = 60000
@@ -3907,9 +4036,13 @@ async function drawHeld($: any) {
   if (held === h) held = null
 }
 
-// The person is here, or may be: drawn before anything else
+// The person is here, or may be: drawn before anything else, as it is now. What other sessions did since the last
+// refresh and still waits for its batch is read first (a refresh, which draws: someone could be looking from here on);
+// with nothing pending, what's held is what a refresh would find
 async function arrived($: any) {
   lookedAt = await $.clock.now()
+  unseen = false
+  if (batchTimer) await requestRefresh($, false)
   await drawHeld($)
 }
 
@@ -3948,8 +4081,9 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     unasked: others.filter(f => f.color === 'yellow' && f.unasked).length,
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
   }
-  // Nobody could be looking: kept, not drawn (held)
-  if (!reflow && !(await couldBeLooking($))) {
+  // Nobody could be looking: kept, not drawn (held), and other sessions' events are read in batches from here on
+  unseen = !reflow && !(await couldBeLooking($))
+  if (unseen) {
     held = { rows: shown, summary: next }
     return
   }
@@ -5048,6 +5182,7 @@ async function ownStatus($: any, status: 'busy' | 'idle') {
   ownHint = { status, at: await $.clock.now() }
   // Its own turn, starting or ending: someone may be watching it (couldBeLooking)
   lookedAt = ownHint.at
+  unseen = false
   scheduleFlush($, 0, d => (d.rows = true))
 }
 
@@ -5458,7 +5593,7 @@ async function keyboardBack($: any, key: string) {
 async function notificationsText($: any, now: number): Promise<string> {
   const when = waitPushMs > 0 ? `a push once a session waits ${howLong(waitPushMs)}` : 'no push for waiting sessions (waitPushMinutes 0)'
   const quiet = quietHours ? `, none ${quietHoursText}` : quietHoursText ? `, quiet hours “${quietHoursText}” not understood (write them as 22-7)` : ''
-  const count = `${sentToday(await storeGet($, 'pushCount'), dayOf(new Date(now)))} of ${notificationsPerDay} today`
+  const count = `${await sentNow($, dayOf(new Date(now)))} of ${notificationsPerDay} today`
   const last = await storeGet($, 'lastPush')
   const lastText =
     last && typeof last === 'object'
@@ -5615,8 +5750,14 @@ async function ownVersion($: any): Promise<string> {
 async function statusOf($: any, s: any, now: number, reasons: () => Promise<StopLog>): Promise<SessionsStatus> {
   const e = await readState($, s.sessionId)
   const mine = s.sessionId === myId
-  const hb = mine ? 'ok' : s.pid ? heartbeatStatus((await readHeartbeats($, [s.sessionId]))[s.sessionId] ?? null, s.pid, now) : 'missing'
-  const shown = projectRows.find(f => f.sessionId === s.sessionId)?.title
+  const beat = mine || !s.pid ? null : ((await readHeartbeats($, [s.sessionId]))[s.sessionId] ?? null)
+  const hb = mine ? 'ok' : s.pid ? heartbeatStatus(beat, s.pid, now) : 'missing'
+  // The project its heartbeat names, learnt here when no refresh has yet (a session that started since the last one)
+  if (beat && beat.format === FORMAT && beat.root.startsWith('/') && !recordedRoots.has(s.sessionId)) recordedRoots.set(s.sessionId, beat.root)
+  // Its name as the rows show it: Claude's own where it has one, from the list (as fresh as the registry's last
+  // event, also while the rows wait for their batch); else the title the rows found for it (its first prompt)
+  const named = typeof s.name === 'string' && !!s.name && s.name !== s.id
+  const shown = named ? s.name : projectRows.find(f => f.sessionId === s.sessionId)?.title
   const state = s.status === 'busy' ? 'working' : s.status === 'waiting' ? 'waiting' : s.status === 'idle' ? 'idle' : 'stopped'
   return {
     ref: refOf(s),
@@ -5838,10 +5979,11 @@ function ensureStarted($: any, via: string): Promise<void> {
 }
 
 // The first draw starts the mod from a timer it sets (a draw only draws), with that draw's $, and the timer can fire
-// before the draw has settled (the band's own reads, or the plugins beneath it, still answering). Until it has, the
-// engine refuses every $.state write made with that $ ("made while ui.render is being dispatched"), so the start's
-// first write is tried again 10 ms apart until it's taken, for 2 s at most; any other failure ends the wait. Once the
-// draw has settled no later write meets it
+// before the band's hook has answered that draw (its own reads still answering). Until it has, the engine refuses
+// every $.state write made with that $ ("made while ui.render is being dispatched"), so the start's first write is
+// tried again 10 ms apart until it's taken, for 2 s at most; any other failure ends the wait. Once the hook has
+// answered no later write meets it, even while the rest of the band is still being drawn (since Claude 2.1.323 each
+// plugin's row is drawn on its own): the engine sees the value changed under that draw and draws the band again
 async function afterDraw($: any, write: () => Promise<unknown>) {
   for (let tries = 1; ; tries++) {
     try {

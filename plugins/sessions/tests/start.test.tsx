@@ -52,14 +52,30 @@ test("without session.start, the first draw starts the mod (the old pre-started 
   await ui.unmount()
 })
 
-// The first draw's timer can fire while that draw is still being dispatched (here the band beneath answers 5 ms late),
-// and the engine refuses a $.state write made with that draw's $ until it has settled: the start waits for it
+// The first draw's timer can fire while that draw is still being dispatched (here the band's first read, of its
+// summary, answers 5 ms late), and the engine refuses a $.state write made with that draw's $ until the band's hook has
+// answered: the start waits for it. Only something the band's own hook waits for holds its draw: since Claude 2.1.323
+// each plugin draws a row of its own in the band, so another plugin's hook there (the world's) is beside it, not beneath
 test("the first draw's start writes nothing while that draw is still being dispatched: no step fails", async ($, on) => {
   const w = world(on)
-  w.bandLate.value = 5
+  let late = 5
+  on('state.get', { plugin: 'sessions', key: 'summary' }, async (_, e, next) => {
+    const ms = late
+    late = 0
+    if (ms > 0) await w.clock.sleep(ms)
+    return next(e)
+  })
+  // When the start's first write got through (a refused try reaches no hook)
+  let wroteAt = 0
+  on('state.set', { plugin: 'sessions', key: 'shortId' }, (_, e, next) => {
+    wroteAt ||= w.clock.now()
+    return next(e)
+  })
   const drawing = $.ui.mount({ ...BAND, surface: 'terminal' })
   await w.clock.advance(50)
   const ui = await drawing
+  // The first try met the draw and was refused; the next, 10 ms on, got through (else nothing here waited for anything)
+  expect(wroteAt).toBe(1_000_000_000 + 10)
   expect(w.registered).toEqual(['sessions'])
   const r: any = await $.command.run({ command: 'sessions', args: 'status', ...COMMAND })
   expect(r.text).toContain('started 0 s ago by first draw')

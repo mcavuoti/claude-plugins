@@ -1,12 +1,13 @@
 import { expect, test } from 'claude-code/testing'
 
-import { addSpend, clockText, dueWaits, inQuietHours, median, parseQuietHours, spendBurst, spendIsHigh, spendLine, spendText, usualHour, waitText, type SpendAlert } from '../hooks/state'
-import { COMMAND, ROOT, SID, startSession, world, type World, SLOW } from './world'
+import { addSpend, clockText, dayOf, dueWaits, inQuietHours, median, parseQuietHours, spendBurst, spendIsHigh, spendLine, spendText, usualHour, waitText, type SpendAlert } from '../hooks/state'
+import { COMMAND, DATA, ROOT, SID, startSession, world, type World, SLOW } from './world'
 
 // Telling the person: a push when a session of the project waits too long (once per wait, one session for the
-// project, quiet hours and a cap a day), the ⧗ on rows working or unseen for long, a session whose spend runs far
-// above its own usual hour, and the line about the sessions that ended with the background service, whose b brings
-// them back once the person says so. Nothing here ever stops a session or reaches the model
+// project, quiet hours and a cap a day; no lock, no command and nothing read while there's nothing to send), the ⧗ on
+// rows working or unseen for long, a session whose spend runs far above its own usual hour, and the line about the
+// sessions that ended with the background service, whose b brings them back once the person says so. Nothing here
+// ever stops a session or reaches the model
 
 const BRAVO = 'bbbbbbbb-0000-0000-0000-000000000000'
 const PANEL = { plugin: 'sessions', surface: 'terminal', component: 'Pane', requestId: 'sessions', props: { title: 'Sessions', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
@@ -302,6 +303,164 @@ test('a session that spends far from its first hour is told by the usual hour it
   await w.clock.advance(3000)
   expect(await drawn($)).toContain("$8.50 last hour · project's usual $0.50")
   expect(await status($)).toContain("the project's sessions usually $0.50 (it has too few active hours of its own yet)")
+})
+
+// ---- Nothing to send: no lock, no command, nothing read ----
+
+const REGISTRY = '/Users/x/.claude/sessions'
+const LOCK = `${DATA}/push.lock`
+const SEC = 1000
+
+// The test's on, with every store read noted by its key on the way to the world's own hook (a test hooks an event once)
+function notingReads(on: any, reads: string[]) {
+  return ((name: string, ...rest: any[]) => {
+    if (name === 'store.get') {
+      const hook = rest[rest.length - 1]
+      rest[rest.length - 1] = ($: any, e: any, next: any) => {
+        reads.push(String(e.key))
+        return hook($, e, next)
+      }
+    }
+    return on(name, ...rest)
+  }) as any
+}
+
+// A live session (its SessionStart came: it reads on file events and on the pass) with bravo waiting for the person
+// since `ago` before the start. event: bravo's bell rings, and this session refreshes; reads: how many times it read
+// the store's keys that start so; locks: how many times it ran that program on the push lock
+async function waitingSession($: any, on: any, o: { ago: number; now?: number; store?: (w: World) => Record<string, unknown>; lockTaken?: boolean }) {
+  const all: string[] = []
+  const w = world(notingReads(on, all), { list: list('waiting'), now: o.now })
+  w.store.set(`waiting:${BRAVO}`, w.clock.now() - o.ago)
+  for (const [k, v] of Object.entries(o.store?.(w) ?? {})) w.store.set(k, v)
+  for (const s of list('waiting')) {
+    w.write(`${REGISTRY}/${s.pid}.json`, JSON.stringify({ pid: s.pid, sessionId: s.sessionId, cwd: ROOT, kind: 'bg', status: s.status, statusUpdatedAt: w.clock.now(), name: s.name, jobId: `${s.id}-0000-0000-0000-000000000000`, startedAt: 999_000_000, procStart: 'x' }))
+  }
+  // Another session holds the push lock, and goes on holding it (a lock older than 5 s would be taken over)
+  if (o.lockTaken) {
+    w.dirs.add(LOCK)
+    w.made.set(LOCK, w.clock.now() + HOUR)
+  }
+  await $.classic.SessionStart({ source: 'startup', session_id: SID } as any)
+  await startSession($, w)
+  const event = async (after = 2 * SEC) => {
+    w.write(`${DATA}/bell/${BRAVO}`, `format=3\nfrom=${BRAVO}\nat=${w.clock.now()}\n`)
+    await $.classic.FileChanged({ file_path: `${DATA}/bell/${BRAVO}`, event: 'change' } as any)
+    await w.clock.advance(after)
+  }
+  const reads = (prefix: string) => all.filter(k => (k.startsWith(w.namespace) ? k.slice(w.namespace.length) : k).startsWith(prefix)).length
+  const locks = (program: 'mkdir' | 'rmdir') => w.runs.filter(a => a[0] === program && a[1] === LOCK).length
+  return { w, event, reads, locks }
+}
+
+test("the day's cap reached: one read of the count, then no lock, no command and nothing read, refresh after refresh; the next day it notifies again", { ...SLOW, options: { notificationsPerDay: 1 } }, async ($, on) => {
+  // 23:40, local time: the day changes 20 minutes in
+  const { w, event, reads, locks } = await waitingSession($, on, { ago: 20 * MIN, now: new Date(1970, 0, 12, 23, 40).getTime(), store: w => ({ pushCount: { day: dayOf(new Date(w.clock.now())), count: 1 } }) })
+  const refreshes = () => reads('waiting:')
+  const before = refreshes()
+  // Five minutes of another session's events, and the passes: bravo waits past its time at every one of them
+  for (let i = 0; i < 150; i++) await event()
+  expect(refreshes() - before).toBeGreaterThan(150)
+  expect(w.pushes).toEqual([])
+  expect(w.notifies).toEqual([])
+  expect([locks('mkdir'), locks('rmdir')]).toEqual([0, 0])
+  expect(reads('pushCount')).toBe(1)
+  expect(reads('pushed:')).toBe(0)
+  // Past midnight the count starts over: the wait is pushed, under the lock, and counted
+  await w.clock.advance(20 * MIN)
+  expect(w.pushes).toHaveLength(1)
+  expect(w.pushes[0]).toContain('“bravo” has been waiting for you')
+  expect([locks('mkdir'), locks('rmdir')]).toEqual([1, 1])
+  expect(w.store.get('pushCount')).toEqual({ day: dayOf(new Date(w.clock.now())), count: 1 })
+  expect(w.store.get(`pushed:${BRAVO}`)).toBe(w.store.get(`waiting:${BRAVO}`))
+  // And that was the day's one: nothing more is taken or read
+  const [count, pushed] = [reads('pushCount'), reads('pushed:')]
+  for (let i = 0; i < 30; i++) await event()
+  expect(w.pushes).toHaveLength(1)
+  expect([locks('mkdir'), locks('rmdir')]).toEqual([1, 1])
+  expect([reads('pushCount'), reads('pushed:')]).toEqual([count, pushed])
+})
+
+test('a wait under waitPushMinutes reads nothing; once due it is pushed once, with one lock taken; then nothing is read for it again', SLOW, async ($, on) => {
+  const { w, event, reads, locks } = await waitingSession($, on, { ago: 0 })
+  // Nine minutes in: not due yet (10 minutes, and a minute more without Remote Control)
+  for (let i = 0; i < 54; i++) await event(10 * SEC)
+  expect(w.pushes).toEqual([])
+  expect([reads('pushed:'), reads('pushCount'), locks('mkdir')]).toEqual([0, 0, 0])
+  // Due at 11 minutes: one push, one lock, the count read before it and under it, the wait's record too
+  for (let i = 0; i < 15; i++) await event(10 * SEC)
+  expect(w.pushes).toEqual(['“bravo” has been waiting for you for 11 min'])
+  expect([locks('mkdir'), locks('rmdir')]).toEqual([1, 1])
+  expect([reads('pushed:'), reads('pushCount')]).toEqual([2, 2])
+  expect(w.store.get('pushCount')).toMatchObject({ count: 1 })
+  // Pushed: it waits on, and no refresh reads its record or takes the lock again
+  for (let i = 0; i < 60; i++) await event()
+  expect(w.pushes).toHaveLength(1)
+  expect([locks('mkdir'), locks('rmdir')]).toEqual([1, 1])
+  expect([reads('pushed:'), reads('pushCount')]).toEqual([2, 2])
+})
+
+test('the push lock taken by another session: one try, not ten, and the next one 15 s later; once that session pushed the wait, no more', SLOW, async ($, on) => {
+  const { w, event, reads, locks } = await waitingSession($, on, { ago: 20 * MIN, lockTaken: true })
+  // The wait is due from the start: this session's turn comes within 3 s, and finds the lock taken
+  await w.clock.advance(4 * SEC)
+  expect(locks('mkdir')).toBe(1)
+  // Refresh after refresh, no other try for 15 s
+  for (let i = 0; i < 5; i++) await event()
+  expect(locks('mkdir')).toBe(1)
+  for (let i = 0; i < 4; i++) await event()
+  expect(locks('mkdir')).toBe(2)
+  expect(w.pushes).toEqual([])
+  // The session that held it pushed the wait and let go: this one reads that at its next try, and takes nothing
+  w.store.set(`pushed:${BRAVO}`, w.store.get(`waiting:${BRAVO}`))
+  w.store.set('pushCount', { day: dayOf(new Date(w.clock.now())), count: 1 })
+  w.dirs.delete(LOCK)
+  for (let i = 0; i < 10; i++) await event()
+  const pushed = reads('pushed:')
+  for (let i = 0; i < 30; i++) await event()
+  expect(locks('mkdir')).toBe(2)
+  expect(locks('rmdir')).toBe(0)
+  expect(reads('pushed:')).toBe(pushed)
+  expect(w.pushes).toEqual([])
+  expect(w.store.get('pushCount')).toMatchObject({ count: 1 })
+})
+
+const NOTHING_GOES: [string, Record<string, string | number>][] = [
+  ['the quiet hours', { quietHours: '0-24' }],
+  ['notifications off (notificationsPerDay 0)', { notificationsPerDay: 0 }],
+]
+for (const [why, options] of NOTHING_GOES) {
+  test(`${why}: a wait past its time takes no lock and reads nothing`, { ...SLOW, options }, async ($, on) => {
+    const { w, event, reads, locks } = await waitingSession($, on, { ago: 20 * MIN })
+    for (let i = 0; i < 60; i++) await event()
+    expect(w.pushes).toEqual([])
+    expect([locks('mkdir'), locks('rmdir')]).toEqual([0, 0])
+    expect([reads('pushed:'), reads('pushCount')]).toEqual([0, 0])
+  })
+}
+
+test("a spend alert with the day's cap reached: the count is read once, and no lock is taken at any pass", { ...SLOW, options: { notificationsPerDay: 1 } }, async ($, on) => {
+  const now = 1_000_000_000
+  const samples = [
+    [now - 6 * HOUR, 0, -1],
+    [now - 5 * HOUR, 0.5, -1],
+    [now - 4 * HOUR, 1, -1],
+    [now - 3 * HOUR, 1.5, -1],
+    [now - 2 * HOUR, 2, -1],
+    [now - HOUR - 1, 2.5, -1],
+  ]
+  const all: string[] = []
+  const w = world(notingReads(on, all), { store: { [`spend:${SID}`]: { last: 2.5, total: 2.5, kind: '', samples }, pushCount: { day: dayOf(new Date(now)), count: 1 } } })
+  remoteControl(w)
+  await startSession($, w)
+  w.usage.value = { context: { percent: 10 }, rateLimits: [], cost: { usd: 8.5 } }
+  // Five minutes: the spend is looked at every 15 s on the short timer
+  await w.clock.advance(5 * MIN)
+  expect((w.store.get(`state:${SID}`) as any)?.spendAlert).toMatchObject({ hour: 6, usual: 0.5, notified: false })
+  expect(await drawn($)).toContain('$6.00 in the last hour · usually $0.50')
+  expect(w.pushes).toEqual([])
+  expect(w.runs.filter(a => a[1] === LOCK)).toEqual([])
+  expect(all.filter(k => k.endsWith('pushCount'))).toHaveLength(1)
 })
 
 // ---- The sessions that ended with the background service ----

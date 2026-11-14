@@ -52,10 +52,8 @@ export type World = {
   toasts: string[]
   // What $.session.usage() answers
   usage: { value: any }
-  // What Claude (and the mods beneath this one) draw in the band above the prompt: nothing, or a line; and how late
-  // they answer the next draw, in ms (0: at once): that draw held open that long, as a slow plugin beneath holds it
+  // What another mod draws in the band above the prompt, in a row of its own: nothing, or a line
   band: { value: string }
-  bandLate: { value: number }
   // The start of the session's transcript (WorldOptions.transcript), which a test can change
   transcript: { value: string | undefined }
   // A file read that answers only once its promise resolves, by path (a slow disk, or a start held up at that step)
@@ -121,6 +119,8 @@ export type WorldOptions = {
   onStart?: ($: any) => Promise<void>
   // The python3 on the PATH (command -v python3); none by default
   python?: string
+  // When the mocked clock starts (1_000_000_000 by default: 13:46:40 UTC of a 12 January)
+  now?: number
   // On Linux: $DISPLAY (':0' by default) and the xprop on the PATH (one by default; '': none)
   display?: string
   xpropPath?: string
@@ -177,15 +177,11 @@ export function world(on: On, options: WorldOptions = {}): World {
   const plugins = { value: '[]' }
   const installedFail = { value: false }
   const installedLate = { value: 0 }
-  const bandLate = { value: 0 }
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e) => {
-    const late = bandLate.value
-    bandLate.value = 0
-    if (late > 0) await clock.sleep(late)
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return band.value ? <Text>{band.value}</Text> : <Box />
   })
-  const clock = mock.clock(on, { now: 1_000_000_000 })
+  const clock = mock.clock(on, { now: options.now ?? 1_000_000_000 })
   const env: Record<string, string> = { HOME: '/Users/x', SESSIONS_CLAUDE: '/bin/claude', SESSIONS_JOBS_DIR: '/Users/x/jobs', SESSIONS_DAEMON_LOG: '/Users/x/daemon.log', ...options.env }
   mock.env(on, env)
   // The store, in memory (readable by the tests). These overrides put the mod's keys under a namespace of their own
@@ -409,7 +405,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, storeLock, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, bandLate, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer, focusLanded }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, storeLock, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer, focusLanded }
 }
 
 // The panel's focus ring as Claude keeps it, for a test that presses the arrows in a mounted panel: by position, not by
