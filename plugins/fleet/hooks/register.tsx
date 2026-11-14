@@ -2475,9 +2475,15 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
       }
       const mark = folderMarks.get(dir)
       if (mark && mark.m === m && now - mark.at < FOLDER_RELIST_MS) continue
-      const listed = await names($, dir)
-      if (now - m >= FOLDER_SETTLE_MS) folderMarks.set(dir, { m, at: now })
-      else folderMarks.delete(dir)
+      // the listing itself can fail, and so can a read: the folder is marked only once all of it was taken
+      let whole = true
+      let listed: string[] = []
+      try {
+        listed = (await $.fs.list(dir)).map((x: any) => String(x.name))
+      } catch {
+        whole = false
+      }
+      folderMarks.delete(dir)
       let covered: Set<string> | null = null
       if (indexed && i >= 2 && listed.includes(EVENT_INDEX)) {
         const ix = parseWire<EventIndex>((await readText($, `${dir}/${EVENT_INDEX}`)) ?? '')
@@ -2495,15 +2501,20 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
       for (const name of listed) {
         if (!name.endsWith('.json') || seen.has(name) || covered?.has(name)) continue
         const t = await readText($, `${dir}/${name}`)
-        if (t === null) continue
+        if (t === null) {
+          whole = false
+          continue
+        }
         let v: any
         try {
           v = JSON.parse(t)
         } catch {
+          whole = false
           continue
         }
         await takeEvent($, name, v, now)
       }
+      if (whole && now - m >= FOLDER_SETTLE_MS) folderMarks.set(dir, { m, at: now })
     }
     for (const [name, at] of seen) if (now - at > 3 * HOUR) seen.delete(name)
     for (const [id, e] of intakeEvents) if (now - e.at > 3 * 24 * HOUR) intakeEvents.delete(id)
@@ -2536,7 +2547,6 @@ async function takeEvent($: any, name: string, v: any, now: number) {
     return
   }
   const prev = latest.get(v.path)
-  if (myInstance && jobRef) await landedFor($, v, prev)
   if (newer(prev, v)) {
     latest.set(v.path, v)
     if (v.probably) await overwroteLater($, v, prev)
@@ -2553,6 +2563,8 @@ async function takeEvent($: any, name: string, v: any, now: number) {
   remember(v)
   sweep.dirty = true
   if (v.id) forget(v.id)
+  // only once the event is in `latest`: a whole pull that skips it as seen must find it there
+  if (myInstance && jobRef) await landedFor($, v, prev)
 }
 
 // What a landing means for this instance's nudges (0.14.2). Before, every landing anywhere looked at them within 5 s;
@@ -2829,6 +2841,8 @@ async function trigger($: any, names: readonly string[]) {
   try {
     await $.fs.write(path, json({ format: FORMAT, last, chain }))
   } catch {}
+  // this write may have replaced another writer's, whose landing no chain names now: the net runs
+  chainReads++
 }
 
 // ---- What each thread read ----

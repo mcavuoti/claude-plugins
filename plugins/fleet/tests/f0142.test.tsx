@@ -747,3 +747,35 @@ test('under the stream every landing is known, and one on a file it read still n
   expect(s.w.submits.length).toBe(before + 1)
   expect(s.w.submits[before]).toContain('- notes/n1.md: changed at')
 })
+
+// ---- The folder-time trust (review 0142: the test world's folder times were a counter, so "still 3 s" never ran) ----
+
+const hourDir = (w: World) => `${FLEET}/events/${hourFolder(w.clock.now())}`
+const listsOf = (w: World, dir: string) => w.ops.get(`list ${dir}`) ?? 0
+
+test("a whole pull trusts an hour folder's time only when the folder had been still 3 s at the listing: one listed sooner is listed again", LONG, async ($, on) => {
+  const s = await session($, on, 'person')
+  const w = s.w
+  const dir = hourDir(w)
+  // A landing just now: the folder moved under a second ago
+  land(w, 'notes/n21.md', 'fresh\n')
+  const a = listsOf(w, dir)
+  await fleet($, 'status')
+  const b = listsOf(w, dir)
+  expect(b).toBeGreaterThan(a)
+  // Nothing moved, but that listing was of a folder not yet still: its time isn't kept, and the next whole pull lists it
+  await fleet($, 'status')
+  const c = listsOf(w, dir)
+  expect(c).toBeGreaterThan(b)
+  // Still 3 s by now: this listing's time is kept, and the pull after it lists nothing
+  await step(s, 4 * SECOND)
+  await fleet($, 'status')
+  const d = listsOf(w, dir)
+  await fleet($, 'status')
+  expect(listsOf(w, dir)).toBe(d)
+  // An entry more moves the folder's time: listed again
+  land(w, 'notes/n22.md', 'more\n')
+  await step(s, 4 * SECOND)
+  await fleet($, 'status')
+  expect(listsOf(w, dir)).toBeGreaterThan(d)
+})
