@@ -15,3 +15,6 @@ bash "$here/test-statusline.sh"
 
 # Which project usage.py counts each response in, from conversation logs written in a throwaway folder
 bash "$here/test-usage.sh"
+
+# The process sampler of /sessions debug perf: a real window over a stand-in session, and both systems' parsers
+bash "$here/test-sampler.sh"

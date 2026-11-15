@@ -22,6 +22,7 @@ import type {
 } from '../types'
 
 import {
+  HEARTBEAT_FRESH_MS,
   abbreviate,
   AGENT_ROW,
   agentFromFlags,
@@ -208,6 +209,10 @@ import {
 import { choosePlatform, macos, type Me, type Platform, type Run, type Shown } from './platform'
 import { bellFrom, bellOfKey, bellText, checkWatchPaths, classify, jobIds, listDrift, ownWatchedFolders, SessionFiles, type Listed as FileListed, WATCH_SET, watchPaths, watchPathsArgv, watchSetOf, type Locations, type RegistryEntry, type RegistryNews } from './watch'
 import { electLeader, LEADER_STALE_MS, leaderText, LIST_SAFETY_MS, parseLeader, parseProcessStarts, PASS_MS, PROCESS_STARTS_ENV, processGone, processStartsArgv, provenRunning, type Candidate } from './leader'
+import { createMeter, WINDOW_GRACE_MS, type ActionSpec, type Held } from './debug/meter'
+import { buildReport, checkHandIn, PROGRAMS, TERMINALS } from './debug/report'
+import type { ReportSession, SamplerOutput, Value } from './debug/types'
+import { HAND_IN_MAX, handInFile, parseHandInFile, parseWindow, PERF_MAX_S, PERF_MIN_S, perfSeconds, PLUGIN_NAME, REPORT_ID, windowText, type DebugWindow } from './debug/window'
 
 const PANE = 'sessions'
 
@@ -413,14 +418,143 @@ let workDir = '/'
 // only sets over the session's, it can't unset
 const LAUNCHER_ONLY: Record<string, string> = { SESSIONS_PLUGIN_VERSION: '', SESSIONS_PLUGIN_SINCE: '' }
 
+// /sessions debug: the mod's units of work (debug/meter.ts), each with what makes it run (its own timer, this session's
+// own turns, the person, another session) and what makes one run cost more. A name here is what a report prints.
+// Nothing is counted or timed until a window opens (/sessions debug perf), and only until it closes
+const ACTIONS: Record<string, ActionSpec> = {
+  // A watched file changed, by what it was: counted as it comes, before anything is read
+  'event.registry': { drivers: ['peer', 'self'] },
+  'event.bell': { drivers: ['peer', 'self'] },
+  'event.inbox': { drivers: ['peer'] },
+  'event.tell': { drivers: ['peer'] },
+  'event.pins': { drivers: ['peer'] },
+  'event.job': { drivers: ['self'] },
+  // What those events lead to: the changes taken in, Claude's registry read again, the rows read and written
+  events: { drivers: ['peer', 'self'], grows: ['sessions'] },
+  list: { drivers: ['peer', 'clock'], grows: ['sessions'] },
+  refresh: { drivers: ['peer', 'self'], grows: ['sessions'] },
+  poll: { drivers: ['clock'], grows: ['sessions'] },
+  'draw.panel': { drivers: ['peer', 'person'], grows: ['sessions'] },
+  'draw.band': { drivers: ['peer', 'person'] },
+  // Its own timers' jobs
+  heartbeat: { drivers: ['clock'] },
+  pass: { drivers: ['clock'], grows: ['sessions'] },
+  chores: { drivers: ['clock'], grows: ['sessions'] },
+  leader: { drivers: ['clock', 'peer'], grows: ['sessions'] },
+  notify: { drivers: ['clock'], grows: ['sessions'] },
+  seen: { drivers: ['clock', 'person'] },
+  usage: { drivers: ['clock'] },
+  'watch.start': { drivers: ['clock'] },
+  // What other sessions and scripts ask of this one
+  inbox: { drivers: ['peer'] },
+  tells: { drivers: ['peer'] },
+  answer: { drivers: ['peer'] },
+  ended: { drivers: ['peer'], grows: ['sessions'] },
+  // A timer that fired, whatever it then did
+  'timer.quick': { drivers: ['clock'] },
+  'timer.poll': { drivers: ['clock'] },
+  'timer.seen': { drivers: ['clock'] },
+  'timer.chores': { drivers: ['clock'] },
+  'timer.leader': { drivers: ['clock'] },
+  'timer.usage': { drivers: ['clock'] },
+  'timer.inbox': { drivers: ['clock'] },
+  'timer.heartbeat': { drivers: ['clock'] },
+  'timer.pass': { drivers: ['clock'] },
+  // This session's own turns, and the person's keys
+  'hook.turn-start': { drivers: ['self'] },
+  'hook.turn-end': { drivers: ['self'] },
+  'hook.prompt': { drivers: ['self'] },
+  'hook.receive': { drivers: ['peer'] },
+  'hook.focus': { drivers: ['person'] },
+  'hook.scroll': { drivers: ['person'] },
+  command: { drivers: ['person'] },
+  debug: { drivers: ['person'] },
+}
+const meter = createMeter(ACTIONS, Date.now())
+
+// The mod's file calls. While a debug window is open each is counted (what it was, whether it failed, the bytes it
+// moved); otherwise it's the engine's own call and nothing more
+async function fsRead($: any, path: string): Promise<any> {
+  if (!meter.on) return $.fs.read(path)
+  meter.work('read')
+  try {
+    const text = await $.fs.read(path)
+    meter.bytes(String(text).length, 0)
+    return text
+  } catch (err) {
+    meter.failed('read')
+    throw err
+  }
+}
+
+async function fsWrite($: any, path: string, text: string): Promise<any> {
+  if (!meter.on) return $.fs.write(path, text)
+  meter.work('write')
+  meter.bytes(0, String(text).length)
+  try {
+    return await $.fs.write(path, text)
+  } catch (err) {
+    meter.failed('write')
+    throw err
+  }
+}
+
+async function fsStat($: any, path: string): Promise<any> {
+  if (!meter.on) return $.fs.stat(path)
+  meter.work('stat')
+  try {
+    return await $.fs.stat(path)
+  } catch (err) {
+    meter.failed('stat')
+    throw err
+  }
+}
+
+async function fsList($: any, path: string): Promise<any> {
+  if (!meter.on) return $.fs.list(path)
+  meter.work('list')
+  try {
+    const entries = await $.fs.list(path)
+    if (Array.isArray(entries)) meter.work('listed', entries.length)
+    return entries
+  } catch (err) {
+    meter.failed('list')
+    throw err
+  }
+}
+
+async function fsExists($: any, path: string): Promise<any> {
+  if (meter.on) meter.work('exists')
+  return $.fs.exists(path)
+}
+
+// A command's program as a report names it: the executable's own name (any python is python3), and for a lock taken
+// by making its folder (mkdir with nothing else), that it's a lock
+function programOf(argv: readonly string[]): string {
+  const base = String(argv[0] ?? '').split('/').pop() || 'other'
+  if (base.startsWith('python')) return 'python3'
+  if (base === 'mkdir' && argv.length === 2) return 'mkdir:lock'
+  return /^[a-z][A-Za-z0-9.-]{0,30}$/.test(base) ? base : 'other'
+}
+
 async function runSafe(
   $: any,
   argv: string[],
   init?: { stdin?: string; timeoutMs?: number; cwd?: string; env?: Record<string, string> },
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  // Counted while a debug window is open: the command, the process it starts, and whether it failed (a lock's mkdir
+  // that failed is a lock try lost)
+  const program = meter.on ? programOf(argv) : ''
+  if (program) {
+    meter.work('command')
+    meter.started(program)
+  }
   try {
-    return await $.process.run(argv, { ...init, cwd: init?.cwd || workDir, env: { ...init?.env, ...LAUNCHER_ONLY } })
+    const r = await $.process.run(argv, { ...init, cwd: init?.cwd || workDir, env: { ...init?.env, ...LAUNCHER_ONLY } })
+    if (program && r.exitCode !== 0) meter.failed(program === 'mkdir:lock' ? 'lock' : 'command')
+    return r
   } catch (err) {
+    if (program) meter.failed('command')
     return { exitCode: 127, stdout: '', stderr: String(err) }
   }
 }
@@ -431,7 +565,7 @@ async function run($: any, argv: string[], cwd?: string) {
 
 async function exists($: any, path: string): Promise<boolean> {
   try {
-    return !!(await $.fs.exists(path))
+    return !!(await fsExists($, path))
   } catch {
     return false
   }
@@ -444,14 +578,14 @@ const fileCache = new Map<string, { mtimeMs: number; size: number; text: string 
 async function readIfChanged($: any, path: string): Promise<string | null> {
   let st: any
   try {
-    st = await $.fs.stat(path)
+    st = await fsStat($, path)
   } catch {
     fileCache.delete(path)
     return null
   }
   const held = fileCache.get(path)
   if (held && held.mtimeMs === st.mtimeMs && held.size === st.size) return held.text
-  const text = String(await $.fs.read(path))
+  const text = String(await fsRead($, path))
   if (fileCache.size > 200) fileCache.clear()
   fileCache.set(path, { mtimeMs: Number(st.mtimeMs), size: Number(st.size), text })
   return text
@@ -678,6 +812,7 @@ async function storeGet($: any, key: string): Promise<any> {
   if (late) return late.deleted ? undefined : late.value
   if (cacheable(key) && storeCache.has(key)) return storeCache.get(key)
   try {
+    if (meter.on) meter.work('store')
     const value = await $.store.get(`${await storeNamespaceOf($)}${key}`)
     if (cacheable(key)) storeCache.set(key, value)
     return value
@@ -690,10 +825,13 @@ async function storeGet($: any, key: string): Promise<any> {
 async function storeOnce($: any, key: string, w: StoreWrite): Promise<boolean> {
   try {
     const name = `${await storeNamespaceOf($)}${key}`
+    if (meter.on) meter.work('store')
     if (w.deleted) await $.store.delete(name)
     else await $.store.set(name, w.value)
+    if (meter.on) meter.sent('store')
   } catch (err) {
     storeCounts.rejections++
+    if (meter.on) meter.failed('store')
     let at = 0
     try {
       at = await $.clock.now()
@@ -840,7 +978,8 @@ async function ring($: any, name: string) {
     from ||= String(await $.session.id())
   } catch {}
   try {
-    await $.fs.write(`${dir}/bell/${name}`, bellText(from, await $.clock.now()))
+    await fsWrite($, `${dir}/bell/${name}`, bellText(from, await $.clock.now()))
+    if (meter.on) meter.sent('bell')
   } catch {}
 }
 
@@ -994,7 +1133,7 @@ async function switchInPlace($: any, target: WindowTarget, front: string, listed
   const pid = v.clients[front]
   if (!pid || !v.launchers[front] || !dataDir) return false
   try {
-    await $.fs.write(windowFile(front), windowTargetText(target))
+    await fsWrite($, windowFile(front), windowTargetText(target))
   } catch {
     return false
   }
@@ -1008,14 +1147,14 @@ async function launcherWindows($: any): Promise<Showing[]> {
   if (!dataDir) return []
   let names: string[]
   try {
-    names = (await $.fs.list(`${dataDir}/windows`)).filter((e: any) => e.kind === 'file' && String(e.name).endsWith(SHOWING)).map((e: any) => String(e.name))
+    names = (await fsList($, `${dataDir}/windows`)).filter((e: any) => e.kind === 'file' && String(e.name).endsWith(SHOWING)).map((e: any) => String(e.name))
   } catch {
     return []
   }
   const read = await Promise.all(
     names.map(async name => {
       try {
-        const s = parseShowing(String(await $.fs.read(`${dataDir}/windows/${name}`)))
+        const s = parseShowing(String(await fsRead($, `${dataDir}/windows/${name}`)))
         return s && `${fileKey(s.tty)}${SHOWING}` === name ? s : null
       } catch {
         return null
@@ -1063,7 +1202,7 @@ async function switchByLaunchers($: any, f: Row): Promise<boolean> {
   }
   const file = windowFile(plan.from.tty)
   try {
-    await $.fs.write(file, windowTargetText({ command: 'attach', id: f.id, title: f.title, end: true }))
+    await fsWrite($, file, windowTargetText({ command: 'attach', id: f.id, title: f.title, end: true }))
   } catch {
     return false
   }
@@ -1213,6 +1352,10 @@ async function shownWindows($: any, v: Windows): Promise<Shown[]> {
 let seenCheckedAt = 0
 let seenQuietUntil = 0
 async function markSeenIfLooking($: any) {
+  return meter.run('seen', () => markSeenIfLookingNow($))
+}
+
+async function markSeenIfLookingNow($: any) {
   if (!platform.frontKnown || !seenCheck) return
   const { finished, seen } = await ownSeenState($)
   if (finished <= seen) return
@@ -1292,13 +1435,13 @@ async function registrySignature($: any): Promise<string | null> {
   if (!home) return null
   let registry: ListedFile[]
   try {
-    registry = (await $.fs.list(`${home}/.claude/sessions`)).map((f: any) => ({ name: String(f.name), mtimeMs: Number(f.mtimeMs), size: Number(f.size) }))
+    registry = (await fsList($, `${home}/.claude/sessions`)).map((f: any) => ({ name: String(f.name), mtimeMs: Number(f.mtimeMs), size: Number(f.size) }))
   } catch {
     return null
   }
   let jobs: { name: string }[] = []
   try {
-    if (jobsDir) jobs = (await $.fs.list(jobsDir)).map((f: any) => ({ name: String(f.name) }))
+    if (jobsDir) jobs = (await fsList($, jobsDir)).map((f: any) => ({ name: String(f.name) }))
   } catch {}
   return listSignature(registry, jobs, myPid)
 }
@@ -1320,7 +1463,7 @@ async function listWithAge($: any, maxAge = LIST_MS): Promise<Listed | string> {
 async function takeLock($: any, lock: string, staleMs: number): Promise<boolean> {
   if ((await runSafe($, ['mkdir', lock])).exitCode === 0) return true
   try {
-    const st = await $.fs.stat(lock)
+    const st = await fsStat($, lock)
     if ((await $.clock.now()) - st.mtimeMs > staleMs) {
       await runSafe($, ['rmdir', lock])
       return (await runSafe($, ['mkdir', lock])).exitCode === 0
@@ -1399,23 +1542,27 @@ async function directListed($: any, maxAge: number): Promise<Listed | null> {
 // a full pass; else the new ones and those whose session just left the registry). What moved, for the caller
 let retrying = false
 async function syncFiles($: any, full = false): Promise<RegistryNews | null> {
+  return meter.run('list', () => syncFilesNow($, full))
+}
+
+async function syncFilesNow($: any, full = false): Promise<RegistryNews | null> {
   if (!sessionFiles) return null
   const news = await syncRegistry($, sessionFiles)
   if (locations.jobs) {
     let names: string[] = []
     try {
-      names = jobIds(await $.fs.list(locations.jobs))
+      names = jobIds(await fsList($, locations.jobs))
     } catch {}
     for (const id of sessionFiles.jobsToCheck(names, full, news.left)) {
       const path = `${locations.jobs}/${id}/state.json`
       let st: { mtimeMs: number; size: number } | null = null
       try {
-        const s = await $.fs.stat(path)
+        const s = await fsStat($, path)
         st = { mtimeMs: Number(s.mtimeMs), size: Number(s.size) }
       } catch {}
       if (!sessionFiles.jobMoved(id, st) || !st) continue
       try {
-        sessionFiles.setJob(id, st, JSON.parse(String(await $.fs.read(path))))
+        sessionFiles.setJob(id, st, JSON.parse(String(await fsRead($, path))))
       } catch {}
     }
   }
@@ -1437,12 +1584,12 @@ async function syncFiles($: any, full = false): Promise<RegistryNews | null> {
 async function syncRegistry($: any, files: SessionFiles): Promise<RegistryNews> {
   let listed: FileListed[] | null = null
   try {
-    listed = (await $.fs.list(files.locations.registry)).map((f: any) => ({ name: String(f?.name ?? ''), mtimeMs: Number(f?.mtimeMs), size: Number(f?.size) }))
+    listed = (await fsList($, files.locations.registry)).map((f: any) => ({ name: String(f?.name ?? ''), mtimeMs: Number(f?.mtimeMs), size: Number(f?.size) }))
   } catch {}
   const texts = new Map<string, string | null>()
   for (const name of listed ? files.toRead(listed) : []) {
     try {
-      texts.set(name, String(await $.fs.read(`${files.locations.registry}/${name}`)))
+      texts.set(name, String(await fsRead($, `${files.locations.registry}/${name}`)))
     } catch {
       texts.set(name, null)
     }
@@ -1467,6 +1614,8 @@ let leaderNews = { bridge: false, ended: false }
 function fileChanged($: any, path: string, event: string) {
   const c = classify(path, locations)
   if (!c) return
+  // (the debug window's own bell isn't the session's work)
+  if (meter.on && !(c.kind === 'bell' && c.name === DEBUG_BELL)) meter.tick(`event.${c.kind}`)
   scheduleFlush($, 30, d => {
     if (c.kind === 'registry') d.registry = true
     else if (c.kind === 'bell') d.bells.add(c.name)
@@ -1493,6 +1642,10 @@ function scheduleFlush($: any, ms: number, mark: (d: Dirty) => void) {
 }
 
 async function flush($: any) {
+  return meter.run('events', () => flushNow($))
+}
+
+async function flushNow($: any) {
   if (flushing) return
   flushing = true
   try {
@@ -1529,6 +1682,11 @@ async function flush($: any) {
         if (news && (news.membership || (leading && (news.bridge || news.ended)))) bg(solo('leader', () => leaderTurn($, 'event')))
       }
       for (const name of d.bells) {
+        // A debug window opened or closed (/sessions debug perf, in any session)
+        if (name === DEBUG_BELL) {
+          bg(debugRing($))
+          continue
+        }
         if (name === 'marks') forgetStored(k => k.startsWith('marks:'))
         else if (name === 'prefs') forgetStored(k => k === 'waitingOnly' || k === 'collapsed')
         else if (name === 'usage') bg(readUsage($, USAGE_FOLLOWER_MS))
@@ -1617,7 +1775,7 @@ async function firstCwds($: any, ids: string[]): Promise<Record<string, string> 
 
 async function bellRinger($: any, name: string): Promise<string> {
   try {
-    return bellFrom(String(await $.fs.read(`${dataDir}/bell/${name}`)))
+    return bellFrom(String(await fsRead($, `${dataDir}/bell/${name}`)))
   } catch {
     return ''
   }
@@ -1688,6 +1846,10 @@ async function refreshForOthers($: any): Promise<void> {
 // The pass: every PASS_MS in every session, from an offset of its own. Everything read again, whatever the events said
 // (a missed event costs at most a pass), the leader's turn, and while watched what the short timer does otherwise
 async function pass($: any) {
+  return meter.run('pass', () => passNow($))
+}
+
+async function passNow($: any) {
   storeCache.clear()
   await restoreOwn($)
   await syncFiles($, true)
@@ -1706,6 +1868,10 @@ async function pass($: any) {
 // What the 15 s timer did besides the heartbeat: a /clear's new id, the agent, the session's usage and spend, the
 // update in place. Watched, once a pass; on the short timer, every 15 s
 async function chores($: any) {
+  return meter.run('chores', () => choresNow($))
+}
+
+async function choresNow($: any) {
   await rebind($)
   await readAgent($)
   await publishUsage($)
@@ -1725,11 +1891,13 @@ function setPace($: any) {
   if (!live) bg(startHelper($))
   if (!live && pollTimers.length === 0) {
     pollTimers = [
-      $.clock.every(500, () => quickTick($)),
+      $.clock.every(500, () => (meter.tick('timer.quick'), quickTick($))),
       $.clock.every(3000, () => {
+        meter.tick('timer.poll')
         bg(pollRefresh($))
       }),
       $.clock.every(2000, () => {
+        meter.tick('timer.seen')
         bg(
           solo('seen', async () => {
             if (await justWoke($)) return
@@ -1738,12 +1906,15 @@ function setPace($: any) {
         )
       }),
       $.clock.every(15000, () => {
+        meter.tick('timer.chores')
         bg(chores($))
       }),
       $.clock.every(20000, () => {
+        meter.tick('timer.leader')
         bg(solo('leader', () => leaderTurn($, 'tick')))
       }),
       $.clock.every(60000, () => {
+        meter.tick('timer.usage')
         bg(readUsage($))
       }),
     ]
@@ -1755,6 +1926,7 @@ function setPace($: any) {
   const slow = live && slowList
   if (slow && !slowTimer) {
     slowTimer = $.clock.every(3000, () => {
+      meter.tick('timer.poll')
       bg(pollRefresh($))
     })
   }
@@ -1778,6 +1950,11 @@ function quickTick($: any, byPass = false) {
 // The list on the short timer: after a sleep this session's own offset first (justWoke); with nothing watched, what
 // other sessions wrote in the store is read anew every time
 async function pollRefresh($: any) {
+  return meter.run('poll', () => pollRefreshNow($))
+}
+
+async function pollRefreshNow($: any) {
+  if (!live) bg(debugPoll($))
   if (refreshRun || (await justWoke($))) return
   if (!live) storeCache.clear()
   // The poll is what reads the files: Claude's registry anew every time
@@ -1815,6 +1992,10 @@ let helperEnded = ''
 let engineWatch = false
 
 async function startHelper($: any) {
+  return meter.run('watch.start', () => startHelperNow($))
+}
+
+async function startHelperNow($: any) {
   if (helper || live || !active || helperRetry || helperFailures >= HELPER_TRIES || !locations.registry || !locations.data || !myId) return
   if (!reloadedInto && !startSkipped && (await $.clock.now()) - startedAt < ROLE_SKIP_CHECK_MS) return
   const h: Helper = { stream: null, how: platform.fileWatch, paths: 0, pid: '', watched: 0, readyAt: 0, stopping: false }
@@ -1832,6 +2013,7 @@ async function startHelper($: any) {
     const paths = watchPaths(locations, ownJob)
     h.paths = paths.length
     if (h.stopping) return
+    if (meter.on) meter.started('python3:watch')
     h.stream = $.process.spawn({ argv: watchPathsArgv(py, WATCHER, h.how, paths), cwd: workDir, env: LAUNCHER_ONLY })
     let buf = ''
     for await (const chunk of h.stream) {
@@ -1977,11 +2159,15 @@ async function leaderCandidates($: any, now: number): Promise<Candidate[]> {
 // Remote Control connection moved, the token usage when a turn ended (two minutes apart at least, and every 10
 // minutes)
 async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
+  return meter.run('leader', () => leaderTurnNow($, why))
+}
+
+async function leaderTurnNow($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   if (!dataDir || !myId || !myPid) return
   const now = await $.clock.now()
   let text: string | null = null
   try {
-    text = String(await $.fs.read(`${dataDir}/leader.json`))
+    text = String(await fsRead($, `${dataDir}/leader.json`))
   } catch {}
   const record = parseLeader(text)
   const e = electLeader({ pid: myPid, sessionId: myId }, await leaderCandidates($, now), record, now)
@@ -1992,7 +2178,7 @@ async function leaderTurn($: any, why: 'start' | 'event' | 'pass' | 'tick') {
   if (!e.lead) return
   if (first || record?.pid !== myPid || now - leaderWrittenAt >= PASS_MS / 2) {
     try {
-      await $.fs.write(`${dataDir}/leader.json`, leaderText({ pid: myPid, sessionId: myId, at: now }))
+      await fsWrite($, `${dataDir}/leader.json`, leaderText({ pid: myPid, sessionId: myId, at: now }))
       leaderWrittenAt = now
     } catch {}
   }
@@ -2122,7 +2308,7 @@ async function readHeartbeats($: any, ids: string[]): Promise<Record<string, Hea
   if (!dataDir) return out
   let files: Map<string, { mtimeMs: number; size: number }>
   try {
-    files = new Map((await $.fs.list(`${dataDir}/alive`)).map((f: any) => [String(f.name), { mtimeMs: Number(f.mtimeMs), size: Number(f.size) }]))
+    files = new Map((await fsList($, `${dataDir}/alive`)).map((f: any) => [String(f.name), { mtimeMs: Number(f.mtimeMs), size: Number(f.size) }]))
   } catch {
     return out
   }
@@ -2135,7 +2321,7 @@ async function readHeartbeats($: any, ids: string[]): Promise<Record<string, Hea
       continue
     }
     try {
-      const h = parseHeartbeat(await $.fs.read(`${dataDir}/alive/${id}`))
+      const h = parseHeartbeat(await fsRead($, `${dataDir}/alive/${id}`))
       if (beatCache.size > 500) beatCache.clear()
       beatCache.set(id, { ...f, beat: h })
       if (h) out[id] = h
@@ -2146,9 +2332,14 @@ async function readHeartbeats($: any, ids: string[]): Promise<Record<string, Hea
 
 // This session's heartbeat (see Heartbeat in state.ts), every 15 s, with the project it belongs to (settleProject)
 async function beat($: any) {
+  return meter.run('heartbeat', () => beatNow($))
+}
+
+async function beatNow($: any) {
   if (!dataDir || !myId) return
   const at = await $.clock.now()
-  await $.fs.write(`${dataDir}/alive/${myId}`, heartbeatText({ pid: myPid, at, version: modVersion, via: startedVia, root: myCwd }))
+  await fsWrite($, `${dataDir}/alive/${myId}`, heartbeatText({ pid: myPid, at, version: modVersion, via: startedVia, root: myCwd }))
+  if (meter.on) meter.sent('heartbeat')
   lastBeat = at
 }
 
@@ -2177,7 +2368,7 @@ async function prune($: any) {
   }
   let files: string[] = []
   try {
-    files = (await $.fs.list(`${dataDir}/alive`)).map((f: any) => String(f.name))
+    files = (await fsList($, `${dataDir}/alive`)).map((f: any) => String(f.name))
   } catch {}
   for (const f of files) if (!alive.has(f)) ids.add(f)
   const beats = await readHeartbeats($, [...ids])
@@ -2195,7 +2386,7 @@ async function prune($: any) {
   // ccc tell folders of background sessions no longer in the list
   try {
     const shorts = new Set(list.map(s => String(s.id ?? '')))
-    const gone = (await $.fs.list(`${dataDir}/tell`)).map((f: any) => String(f.name)).filter((n: string) => isRef(n) && !n.startsWith('sid:') && !shorts.has(n))
+    const gone = (await fsList($, `${dataDir}/tell`)).map((f: any) => String(f.name)).filter((n: string) => isRef(n) && !n.startsWith('sid:') && !shorts.has(n))
     if (gone.length) await runSafe($, ['rm', '-rf', ...gone.map((n: string) => `${dataDir}/tell/${n}`)])
   } catch {}
   // Section members of sessions no longer in the list (a regular one's stays while its heartbeat is fresh), and the
@@ -2284,7 +2475,7 @@ async function pruneNamespaces($: any, now: number) {
 async function pruneOrders($: any, now: number) {
   let files: any[] = []
   try {
-    files = await $.fs.list(`${dataDir}/order`)
+    files = await fsList($, `${dataDir}/order`)
   } catch {
     return
   }
@@ -2293,8 +2484,8 @@ async function pruneOrders($: any, now: number) {
     const path = `${dataDir}/order/${String(f.name)}`
     if (f.kind !== 'file' || !(now - Number(f.mtimeMs) >= ORDER_ORPHAN_MS)) continue
     try {
-      const root = orderOrphanRoot(String(f.name), Number(f.mtimeMs), String(await $.fs.read(path)), now)
-      if (root && (await $.fs.exists(root)) === false) gone.push(path)
+      const root = orderOrphanRoot(String(f.name), Number(f.mtimeMs), String(await fsRead($, path)), now)
+      if (root && (await fsExists($, root)) === false) gone.push(path)
     } catch {}
   }
   if (gone.length === 0) return
@@ -2339,9 +2530,9 @@ const USAGE_FOLLOWER_MS = 900000
 async function sharedUsage($: any, maxAge: number): Promise<UsageSummary | null> {
   try {
     const path = `${dataDir}/usage/summary.json`
-    const st = await $.fs.stat(path)
+    const st = await fsStat($, path)
     if ((await $.clock.now()) - Number(st.mtimeMs) > maxAge) return null
-    return usageSummaryOf(JSON.parse(String(await $.fs.read(path))))
+    return usageSummaryOf(JSON.parse(String(await fsRead($, path))))
   } catch {
     return null
   }
@@ -2351,6 +2542,10 @@ async function sharedUsage($: any, maxAge: number): Promise<UsageSummary | null>
 // the panel open, unless always (the leader's run)
 let readingUsage = false
 async function readUsage($: any, maxAge = USAGE_SHARED_MS, always = false) {
+  return meter.run('usage', () => readUsageNow($, maxAge, always))
+}
+
+async function readUsageNow($: any, maxAge = USAGE_SHARED_MS, always = false) {
   if (readingUsage || !home || !dataDir) return
   if (!always && !(await $.ui.panes()).some((p: any) => p.id === PANE)) return
   readingUsage = true
@@ -2468,8 +2663,8 @@ function pinsPath(): string {
 async function pinsFromFile($: any, fresh = false): Promise<string[] | null> {
   try {
     if (fresh) {
-      if (!(await $.fs.exists(pinsPath()))) return []
-      return parsePins(await $.fs.read(pinsPath()))
+      if (!(await fsExists($, pinsPath()))) return []
+      return parsePins(await fsRead($, pinsPath()))
     }
     const text = await readIfChanged($, pinsPath())
     return text === null ? [] : parsePins(text)
@@ -2493,7 +2688,7 @@ async function withLock($: any, file: string, body: () => Promise<void>, tries =
       return true
     }
     try {
-      const st = await $.fs.stat(lock)
+      const st = await fsStat($, lock)
       if ((await $.clock.now()) - st.mtimeMs > 5000) await runSafe($, ['rmdir', lock])
     } catch {}
     await $.clock.sleep(50)
@@ -2518,7 +2713,7 @@ async function readSectionsFile($: any, fresh = false): Promise<{ file: Sections
   try {
     if (fresh) {
       if (!(await exists($, path))) return { file: emptySectionsFile() }
-      return parseSectionsFile(await $.fs.read(path))
+      return parseSectionsFile(await fsRead($, path))
     }
     const text = await readIfChanged($, path)
     return text === null ? { file: emptySectionsFile() } : parseSectionsFile(text)
@@ -2554,7 +2749,7 @@ async function changeSections(
         return
       }
       const temporary = `${path}.sessions-${myPid || 'mod'}-${await $.clock.now()}.tmp`
-      await $.fs.write(temporary, sectionsFileText(next.file))
+      await fsWrite($, temporary, sectionsFileText(next.file))
       if ((await runSafe($, ['mv', '-f', temporary, path])).exitCode !== 0) {
         await runSafe($, ['rm', '-f', temporary])
         result = { ok: false, reason: 'busy', detail: "couldn't write sections.json: try again" }
@@ -2586,7 +2781,7 @@ async function hasRemoteControl($: any, id: string): Promise<boolean | null> {
 // unpinning also deletes the position the session had among the pinned ones, as Claude does. Under the pins lock
 async function writePins($: any, file: string, pins: readonly string[], unpinned: readonly string[]): Promise<boolean> {
   const temporary = `${file}.sessions-${myPid || 'mod'}-${await $.clock.now()}.tmp`
-  await $.fs.write(temporary, JSON.stringify(pins, null, 2))
+  await fsWrite($, temporary, JSON.stringify(pins, null, 2))
   if ((await runSafe($, ['mv', '-f', temporary, file])).exitCode !== 0) {
     await runSafe($, ['rm', '-f', temporary])
     return false
@@ -2736,7 +2931,7 @@ let logTail: { mtimeMs: number; size: number; text: string } | null = null
 async function daemonLogTail($: any): Promise<string | null> {
   let st: any = null
   try {
-    st = await $.fs.stat(daemonLog)
+    st = await fsStat($, daemonLog)
   } catch {}
   if (st && logTail && logTail.mtimeMs === Number(st.mtimeMs) && logTail.size === Number(st.size)) return logTail.text
   const r = await runSafe($, ['tail', '-n', '4000', daemonLog])
@@ -2791,6 +2986,10 @@ async function endedSessions($: any, list: readonly any[], keys: ReadonlySet<str
 // when a session came or went in any folder (the line counts every folder's). Those of the death the person dismissed
 // the line for, and of the ones before it, are left out (endedDismissed)
 async function readEnded($: any, keys?: ReadonlySet<string>) {
+  return meter.run('ended', () => readEndedNow($, keys))
+}
+
+async function readEndedNow($: any, keys?: ReadonlySet<string>) {
   const k = keys ?? new Set(await storeKeys($))
   const all = await endedSessions($, lastList, k)
   const shown = all.length ? endedShown(all, k.has('endedDismissed') ? await storeGet($, 'endedDismissed') : undefined) : []
@@ -3036,7 +3235,7 @@ async function agentFile($: any, agent: string, cwd: string): Promise<string | n
   if (h) folders.push(`${h}/.claude/agents`)
   for (const f of folders) {
     try {
-      return String(await $.fs.read(`${f}/${agent}.md`))
+      return String(await fsRead($, `${f}/${agent}.md`))
     } catch {}
   }
   return null
@@ -3074,7 +3273,7 @@ async function roleFromFiles($: any): Promise<{ role: { agent: string | null }; 
   let flags: unknown[] | null = null
   if (jobDir.startsWith('/')) {
     try {
-      const f = JSON.parse(String(await $.fs.read(`${jobDir}/state.json`)))?.respawnFlags
+      const f = JSON.parse(String(await fsRead($, `${jobDir}/state.json`)))?.respawnFlags
       if (Array.isArray(f)) flags = f
     } catch {}
   }
@@ -3539,7 +3738,7 @@ async function writeOrder($: any, list: Row[], now: number) {
   const body = orderFileText(myCwd, sortRows(list), 0)
   if (body === lastOrder && now - lastOrderAt < 20000) return
   try {
-    await $.fs.write(`${dataDir}/order/${fileKey(myCwd)}`, orderFileText(myCwd, sortRows(list), now))
+    await fsWrite($, `${dataDir}/order/${fileKey(myCwd)}`, orderFileText(myCwd, sortRows(list), now))
     lastOrder = body
     lastOrderAt = now
   } catch {}
@@ -3694,6 +3893,10 @@ async function pushesFirst($: any): Promise<boolean> {
 }
 
 async function pushWaits($: any) {
+  return meter.run('notify', () => pushWaitsNow($))
+}
+
+async function pushWaitsNow($: any) {
   if (pushingWaits || pushTimer || !(waitPushMs > 0) || waitsNow.length === 0) return
   const now = waitsAt
   const due = (first: boolean) => dueWaits(waitsNow, Object.fromEntries(pushedKnown), now, waitPushMs, first)
@@ -3798,6 +4001,10 @@ async function notifySpend($: any) {
 // when it changed (sameData), and the rows' times are reckoned at the minute (labelMinute): a refresh that finds
 // nothing new draws nothing, and an idle panel is drawn about once a minute, for its times
 async function refresh($: any) {
+  return meter.run('refresh', () => refreshNow($))
+}
+
+async function refreshNow($: any) {
   const list = await officialList($)
   if (typeof list === 'string') {
     if (!sameData(await read($, notice), list)) await update($, notice, () => list)
@@ -4407,7 +4614,7 @@ async function respawnWithWindows($: any, id: string, title: string): Promise<bo
   for (const tty of v.byId[id] ?? []) {
     if (!v.launchers[tty] || !dataDir) continue
     try {
-      await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id, title }))
+      await fsWrite($, windowFile(tty), windowTargetText({ command: 'attach', id, title }))
       written.push(windowFile(tty))
     } catch {}
   }
@@ -4560,6 +4767,10 @@ async function answerQuestion($: any, data: Record<string, unknown>) {
 // The answer a session that couldn't send notices left in the store for this one (answerQuestion), while a question
 // of this one waits
 async function checkStoredAnswer($: any) {
+  return meter.run('answer', () => checkStoredAnswerNow($))
+}
+
+async function checkStoredAnswerNow($: any) {
   if (!pendingAsk) return
   const a = await storeGet($, `answer:${myId}`)
   if (!a || typeof a !== 'object') return
@@ -4675,7 +4886,7 @@ async function respawnSelf($: any, id: string, title: string) {
   await storeSet($, `restarted:${myId}`, await $.clock.now())
   for (const tty of returning) {
     try {
-      await $.fs.write(windowFile(tty), windowTargetText({ command: 'attach', id, title }))
+      await fsWrite($, windowFile(tty), windowTargetText({ command: 'attach', id, title }))
     } catch {}
   }
   // claude respawn ends this process. Run as a child of this session, it went away with it before starting it again
@@ -5210,14 +5421,18 @@ const INBOX_EVENT_MS = 2000
 let inboxTimer: { cancel: () => void } | null = null
 let checkingInbox = false
 async function checkInbox($: any, byPass = false) {
+  return meter.run('inbox', () => checkInboxNow($, byPass))
+}
+
+async function checkInboxNow($: any, byPass = false) {
   if (checkingInbox || !dataDir || !myId) return
   const path = `${dataDir}/inbox/${myId}`
   checkingInbox = true
   try {
-    if (!(await $.fs.exists(path))) return
+    if (!(await fsExists($, path))) return
     let text = ''
     try {
-      text = await $.fs.read(path)
+      text = await fsRead($, path)
     } catch {}
     await runSafe($, ['rm', '-f', path])
     const r = parseInbox(text)
@@ -5225,7 +5440,7 @@ async function checkInbox($: any, byPass = false) {
     const answer = async (result: 'ok' | 'failed', reason = '', state?: string) => {
       if (!r.reply.startsWith(`${dataDir}/replies/`)) return
       try {
-        await $.fs.write(r.reply, keyLines({ format: FORMAT, result, state, reason }))
+        await fsWrite($, r.reply, keyLines({ format: FORMAT, result, state, reason }))
       } catch {}
     }
     if (r.format !== FORMAT) {
@@ -5237,6 +5452,7 @@ async function checkInbox($: any, byPass = false) {
     const since = (await read($, watching))?.at
     if (byPass && live && !inboxTimer && since && r.at > since + 1000 && now - r.at > INBOX_EVENT_MS) {
       inboxTimer = $.clock.every(500, () => {
+        meter.tick('timer.inbox')
         bg(solo('inbox', () => checkInbox($)))
       })
       debugLine($, `inbox: a request from ${Math.round((now - r.at) / 1000)} s ago came with no file event: the inbox is read every 0.5 s from now on`)
@@ -5291,16 +5507,20 @@ function tellDir(): string {
 
 async function tellStatus($: any, dir: string, id: string, state: TellState, reason = '') {
   try {
-    await $.fs.write(`${dir}/${id}.status`, tellStatusText(state, reason, await $.clock.now()))
+    await fsWrite($, `${dir}/${id}.status`, tellStatusText(state, reason, await $.clock.now()))
   } catch {}
 }
 
 async function checkTells($: any) {
+  return meter.run('tells', () => checkTellsNow($))
+}
+
+async function checkTellsNow($: any) {
   const dir = tellDir()
   if (telling || !dir || !active) return
   let entries: any[] = []
   try {
-    entries = await $.fs.list(dir)
+    entries = await fsList($, dir)
   } catch {
     return
   }
@@ -5353,8 +5573,8 @@ async function tellOne($: any, dir: string, names: string[], next: string) {
   let req: ReturnType<typeof parseTellRequest> = null
   let text = ''
   try {
-    req = parseTellRequest(await $.fs.read(`${dir}/${next}`))
-    text = await $.fs.read(`${dir}/${id}.txt`)
+    req = parseTellRequest(await fsRead($, `${dir}/${next}`))
+    text = await fsRead($, `${dir}/${id}.txt`)
   } catch {}
   if (!req || req.format !== FORMAT) return refuse('written by another version of the sessions mod: restart the sessions (u)')
   if (!names.includes('allow')) return refuse("this session doesn't take text from ccc tell: /sessions tell on in it")
@@ -5410,7 +5630,7 @@ async function rearmTells($: any) {
   if (!dir) return
   let names: string[] = []
   try {
-    names = (await $.fs.list(dir)).map((f: any) => String(f.name)).filter((n: string) => /^\d+-\d+\.held$/.test(n))
+    names = (await fsList($, dir)).map((f: any) => String(f.name)).filter((n: string) => /^\d+-\d+\.held$/.test(n))
   } catch {
     return
   }
@@ -5432,7 +5652,7 @@ async function tellCommand($: any, word: string): Promise<string> {
   const how = `ccc tell ${JSON.stringify(name)} "<text>" (or its id, ${own.id}) hands this session text from any script, as a turn of its own when it's idle (4 KB at most; the model reads it as sent by the sessions plugin, not by you). Have scripts send pointers ("new mail, id …"), not outside text`
   if (word === 'on') {
     await runSafe($, ['mkdir', '-p', dir])
-    await $.fs.write(allow, keyLines({ format: FORMAT, at: await $.clock.now() }))
+    await fsWrite($, allow, keyLines({ format: FORMAT, at: await $.clock.now() }))
     return `On. ${how}. /sessions tell off turns it off`
   }
   if (word === 'off') {
@@ -5521,7 +5741,7 @@ async function updateInPlace($: any) {
   const tasks = own?.id ? ((await backgroundTasks($, own.id))?.count ?? null) : 0
   let installedSource: string | null = null
   try {
-    installedSource = String(await $.fs.read(`${plugin.path}/hooks/watch.ts`))
+    installedSource = String(await fsRead($, `${plugin.path}/hooks/watch.ts`))
   } catch {}
   const decision = reloadDecision({
     running: modVersion,
@@ -5633,6 +5853,7 @@ async function statusText($: any): Promise<string> {
     await notificationsText($, now),
     turnText(),
     await liveText($, now),
+    meter.on ? `Debug: counting its own work for report ${meter.report()} (/sessions debug perf, run in some session)` : 'Debug: nothing is counted or timed until /sessions debug perf runs',
   ]
   lines.push(await platformText($, now))
   const stored = storeText(now)
@@ -5646,6 +5867,282 @@ async function statusText($: any): Promise<string> {
     lines.push("Problem: python3 isn't usable here, and the plugin needs it (its own file watch where no SessionStart reaches it, ccc, token usage): install it (on a Mac, the developer tools: xcode-select --install)")
   }
   return lines.join('\n')
+}
+
+// ---- /sessions debug perf: CPU and memory of every session over a window, and which of the plugins' actions account
+// for them (debug/meter.ts, debug/window.ts, debug/report.ts, debug/sampler.py) ----
+//
+// Nothing here runs until the command does. The asking session makes the report's folder, writes the window file as
+// open and rings the debug bell; every session's mod starts counting. It runs the sampler for the window's length,
+// writes the window as closed and rings again; every session writes its totals into the report's folder and stops.
+// The asking session waits a few seconds, puts the report together, and removes the folder.
+// Its own files and commands here are the engine's calls as they are (not the counted helpers): what the report costs
+// to make isn't counted as the session's work.
+const SAMPLER = `${(import.meta as any).dir}/debug/sampler.py`
+const DEBUG_BELL = 'debug'
+// How long the asking session waits after the close for every session's totals: this long at least, then until no new
+// one came for two looks a second apart (a plugin may read a few things before it hands in), and never past the most
+const HAND_IN_WAIT_MS = 3000
+const HAND_IN_MOST_MS = 12000
+const DEBUG_USAGE = `/sessions debug perf [seconds]: measures every session's CPU and memory for a minute (${PERF_MIN_S} to ${PERF_MAX_S} s) and what the plugins did meanwhile; /sessions debug show: the last report again`
+
+async function reportsFolder($: any): Promise<string> {
+  const dir = await dataFolder($)
+  return dir ? `${dir}/reports` : ''
+}
+
+// The window as its file has it now: null with no file, an empty one, or another format
+async function readWindow($: any): Promise<DebugWindow | null> {
+  const dir = await reportsFolder($)
+  if (!dir) return null
+  try {
+    return parseWindow(String(await $.fs.read(`${dir}/window`)))
+  } catch {
+    return null
+  }
+}
+
+// What the mod keeps, for a report: how many of each and about how many bytes
+function heldNow(): Held {
+  let cached = 0
+  for (const f of fileCache.values()) cached += f.text.length
+  const timers = pollTimers.length + [slowTimer, inboxTimer, flushTimer, batchTimer, helperRetry].filter(Boolean).length
+  return {
+    list: { grows: ['sessions'], now: [lastList.length, null] },
+    rows: { grows: ['sessions'], now: [projectRows.length, null] },
+    'file-cache': { grows: ['files', 'bytes'], now: [fileCache.size, cached] },
+    'heartbeat-cache': { grows: ['sessions'], now: [beatCache.size, null] },
+    'store-cache': { grows: ['keys'], now: [storeCache.size, null] },
+    'store-queue': { grows: ['events'], now: [lateWrites.size + lastAsked.size, null] },
+    queues: { grows: ['events'], now: [wakes.length + restarts.length + launches.length + waitsNow.length + answering.size, null] },
+    'transcript-starts': { grows: ['sessions', 'time'], now: [transcriptStarts.size + recordedRoots.size, null] },
+    'notified': { grows: ['sessions', 'time'], now: [pushedKnown.size + tellFailures.size, null] },
+    timers: { grows: [], now: [timers, null] },
+  }
+}
+
+// What explains this session's rates: how it hears of changes, whether its SessionStart came, whether it leads the
+// machine-wide work, whether anybody could be looking at it, and where its list comes from
+async function factsNow($: any): Promise<Record<string, Value>> {
+  let looking = false
+  try {
+    looking = await couldBeLooking($)
+  } catch {}
+  return {
+    live: engineWatch ? 'claude-watch' : helperLive && helper ? 'own-watch' : 'timers',
+    start: sawSessionStart ? 'came' : 'skipped',
+    leads: leading,
+    looking,
+    list: slowList ? 'agents' : 'files',
+  }
+}
+
+// The debug bell rang (or, on the short timer, the window file moved): a window opened, and the mod counts from zero
+// until it ends; or it closed, and the totals go into the report's folder, once. A window this session already
+// counts for, or one whose end has passed, is left alone
+async function debugRing($: any) {
+  const w = await readWindow($)
+  if (!w) return
+  if (w.open) {
+    if (meter.report() === w.report) return
+    const now = await $.clock.now()
+    if (w.until <= now) return
+    meter.open(w.report, Date.now() + (w.until - now), heldNow())
+    return
+  }
+  const handIn = meter.close(w.report, heldNow(), {})
+  if (!handIn || !myId) return
+  const file = handInFile(myId, 'sessions')
+  if (!file) return
+  handIn.facts = await factsNow($)
+  try {
+    await $.fs.write(`${await reportsFolder($)}/${w.report}/${file}`, JSON.stringify(handIn))
+  } catch {}
+}
+
+// A session on the short timer hears no bell: it looks at the window file's time with its poll, and takes a change as
+// the bell. Its first look only notes the file as it is (a window already open isn't joined)
+let windowSeen = ''
+async function debugPoll($: any) {
+  const dir = await reportsFolder($)
+  if (!dir) return
+  let sig = ''
+  try {
+    const st = await $.fs.stat(`${dir}/window`)
+    sig = `${st.mtimeMs}:${st.size}`
+  } catch {
+    return
+  }
+  if (sig === windowSeen) return
+  const first = windowSeen === ''
+  windowSeen = sig
+  if (!first) await debugRing($)
+}
+
+async function plainRun($: any, argv: string[], timeoutMs: number): Promise<{ exitCode: number; stderr: string }> {
+  try {
+    const r = await $.process.run(argv, { cwd: workDir, env: LAUNCHER_ONLY, timeoutMs })
+    return { exitCode: r.exitCode, stderr: String(r.stderr ?? '') }
+  } catch (err) {
+    return { exitCode: 127, stderr: String(err) }
+  }
+}
+
+async function ringDebug($: any, report: string, open: boolean, until: number) {
+  const now = await $.clock.now()
+  await $.fs.write(`${await reportsFolder($)}/window`, windowText({ report, profile: 'perf', open, until }, now, myId))
+  await $.fs.write(`${dataDir}/bell/${DEBUG_BELL}`, bellText(myId, now))
+  // This session's own meter, without waiting for its own bell
+  await debugRing($)
+}
+
+async function entryCount($: any, dir: string): Promise<number> {
+  try {
+    return (await $.fs.list(dir)).length
+  } catch {
+    return 0
+  }
+}
+
+// The sessions of every folder that run now, as Claude's files (or its list) have them
+function runningSessions(): any[] {
+  const list = sessionFiles && !slowList && sessionFiles.usable(myId, myPid) ? sessionFiles.list() : lastList
+  return list.filter((x: any) => Number(x.pid) > 0 && /^[A-Za-z0-9-]{1,64}$/.test(String(x.sessionId ?? '')))
+}
+
+// One report at a time from a session; the last one stays for /sessions debug show
+let perfRunning: Promise<string> | null = null
+let lastReport: { report: string; text: string } | null = null
+
+async function debugCommand($: any, words: string[]): Promise<string> {
+  if (words[0] === 'show') return showReport($)
+  if (words[0] !== 'perf') return DEBUG_USAGE
+  const seconds = perfSeconds(words[1])
+  if (seconds === null) return `“${words[1]}” isn't a length: a whole number of seconds from ${PERF_MIN_S} to ${PERF_MAX_S}`
+  if (perfRunning) return 'This session is measuring a report already: /sessions debug show prints it when it is done'
+  perfRunning = runPerf($, seconds).finally(() => {
+    perfRunning = null
+  })
+  return perfRunning
+}
+
+async function runPerf($: any, seconds: number): Promise<string> {
+  const dir = await reportsFolder($)
+  if (!dir || !dataDir || !myId) return "The panel hasn't started in this session yet: try again in a few seconds"
+  const py = await usablePython($)
+  if (!py) return "python3 isn't usable here, and the report's sampler needs it: install it (on a Mac, the developer tools: xcode-select --install)"
+  let now = await $.clock.now()
+  const open = await readWindow($)
+  if (open?.open && open.until + WINDOW_GRACE_MS > now) return `Another session is measuring a report (${Math.max(1, Math.ceil((open.until - now) / 1000))} s left): one at a time on a machine`
+  const b = new Uint8Array(3)
+  crypto.getRandomValues(b)
+  const report = `r-${[...b].map(x => x.toString(16).padStart(2, '0')).join('')}`
+  const folder = `${dir}/${report}`
+  if ((await plainRun($, ['mkdir', '-p', folder], 15000)).exitCode !== 0) return `Couldn't make ${folder}`
+  const list = runningSessions()
+  const system = await ownPlatform($)
+  const until = now + seconds * 1000
+  await ringDebug($, report, true, until)
+  const out = `${folder}/sampler.json`
+  const sampled = await plainRun(
+    $,
+    [py, SAMPLER, 'perf', '--how', system.processStats, '--seconds', String(seconds), '--sessions', list.map((x: any) => `${x.pid}:${x.sessionId}`).join(','), '--programs', PROGRAMS.join(','), '--terminals', TERMINALS.join(','), ...(home ? ['--projects-dir', `${home}/.claude/projects`] : []), '--out', out],
+    (seconds + 60) * 1000,
+  )
+  // The window lasts its length whatever became of the sampler
+  now = await $.clock.now()
+  if (now < until) await $.clock.sleep(until - now)
+  await ringDebug($, report, false, until)
+  await $.clock.sleep(HAND_IN_WAIT_MS)
+  let handed = await entryCount($, folder)
+  for (let waited = HAND_IN_WAIT_MS, quiet = 0; waited < HAND_IN_MOST_MS && quiet < 2; waited += 1000) {
+    await $.clock.sleep(1000)
+    const now = await entryCount($, folder)
+    quiet = now === handed ? quiet + 1 : 0
+    handed = now
+  }
+
+  let sampler: SamplerOutput | null = null
+  try {
+    sampler = JSON.parse(String(await $.fs.read(out)))
+  } catch {}
+  const handIns: Record<string, Record<string, unknown>> = {}
+  let files: any[] = []
+  try {
+    files = await $.fs.list(folder)
+  } catch {}
+  for (const f of files) {
+    const who = parseHandInFile(String(f.name))
+    if (!who || Number(f.size) > HAND_IN_MAX) continue
+    try {
+      ;(handIns[who.sessionId] ??= {})[who.plugin] = JSON.parse(String(await $.fs.read(`${folder}/${f.name}`)))
+    } catch {}
+  }
+  // The files every session reads, counted once, by the asking session
+  const own: any = handIns[myId]?.sessions
+  if (own && typeof own === 'object') {
+    own.project = { shared: { registry: locations.registry ? await entryCount($, locations.registry) : 0, bells: await entryCount($, `${dataDir}/bell`), heartbeats: await entryCount($, `${dataDir}/alive`), inbox: await entryCount($, `${dataDir}/inbox`) } }
+  }
+  const at = await $.clock.now()
+  const beats = await readHeartbeats($, list.map((x: any) => String(x.sessionId)))
+  const sessions: ReportSession[] = list.map((x: any) => {
+    const id = String(x.sessionId)
+    const beat = beats[id]
+    const plugins = new Set<string>(Object.keys(handIns[id] ?? {}))
+    if (beat && at - beat.at < HEARTBEAT_FRESH_MS) plugins.add('sessions')
+    const started = Number(x.startedAt)
+    return {
+      sessionId: id,
+      pid: Number(x.pid),
+      root: String(x.cwd ?? ''),
+      title: String(x.name || x.id || ''),
+      kind: x.kind === 'background' || x.kind === 'bg' ? 'background' : 'regular',
+      status: x.status === 'busy' ? 'busy' : x.status === 'waiting' ? 'waiting' : 'idle',
+      ageHours: started > 0 ? Math.round(((at - started) / 3600000) * 10) / 10 : null,
+      plugins: [...plugins].sort(),
+    }
+  })
+  const built = buildReport({
+    report,
+    profile: 'perf',
+    at,
+    seconds,
+    host: { os: system.name, osMajor: null, claude: installedVersion || 'unknown', plugins: { sessions: (await ownVersion($)) || 'unknown' } },
+    sessions,
+    sampler,
+    handIns,
+    programs: PROGRAMS,
+  })
+  const failed = sampled.exitCode !== 0 ? `\nThe sampler ended with code ${sampled.exitCode}${sampled.stderr.trim() ? `: ${sampled.stderr.trim().split('\n')[0]}` : ''}` : ''
+  let written = `\nReport: ${dir}/${report}.json and ${report}.txt   safe to send: no names, paths or text\nKey (stays here): ${dir}/${report}.key.json`
+  try {
+    await $.fs.write(`${dir}/${report}.json`, `${JSON.stringify(built.report, null, 1)}\n`)
+    await $.fs.write(`${dir}/${report}.key.json`, `${JSON.stringify(built.key, null, 1)}\n`)
+    await $.fs.write(`${dir}/${report}.txt`, built.plain)
+    await $.fs.write(`${dir}/last`, report)
+  } catch (err) {
+    written = `\nThe report couldn't be written to ${dir}: ${String(err)}`
+  }
+  await plainRun($, ['rm', '-r', folder], 15000)
+  const text = `${built.text}${failed}${written}`
+  lastReport = { report, text }
+  try {
+    $.ui.toast('sessions debug: the report is ready (/sessions debug show)')
+  } catch {}
+  return text
+}
+
+// /sessions debug show: the last report, as this session made it (with names), or the last one on this machine as its
+// file has it (labels only)
+async function showReport($: any): Promise<string> {
+  if (perfRunning) return 'The report is still being measured'
+  if (lastReport) return lastReport.text
+  const dir = await reportsFolder($)
+  try {
+    const report = String(await $.fs.read(`${dir}/last`)).trim()
+    if (REPORT_ID.test(report)) return `${String(await $.fs.read(`${dir}/${report}.txt`))}\nReport: ${dir}/${report}.json and ${report}.txt`
+  } catch {}
+  return 'No report yet: /sessions debug perf makes one'
 }
 
 // /sessions status, about how the panel learns what changed: watched files or the short timer, where the list comes
@@ -5674,7 +6171,7 @@ async function liveText($: any, now: number): Promise<string> {
   const list = slowList ? `the list from claude agents (${sessionFiles?.problem || "this session isn't in Claude's registry"})` : "the list from Claude's files"
   let record: ReturnType<typeof parseLeader> = null
   try {
-    record = parseLeader(String(await $.fs.read(`${dataDir}/leader.json`)))
+    record = parseLeader(String(await fsRead($, `${dataDir}/leader.json`)))
   } catch {}
   const leader = leading ? 'this session leads the machine-wide work' : record ? `pid ${record.pid} leads the machine-wide work (${Math.max(0, Math.round((now - record.at) / 1000))} s ago${now - record.at >= LEADER_STALE_MS ? ', late' : ''})` : 'no session leads yet'
   return `${how} · ${list} · ${leader}`
@@ -5727,7 +6224,7 @@ async function sectionsList($: any): Promise<string> {
 // here: current and status answer ready: false, and the section methods find the data folder from the environment
 const SESSIONS_API: SessionsApi = 1
 // The methods this copy serves: a key missing from Sessions, or one too many, fails the type check
-const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1, setMarks: 1, pin: 1, restart: 1, watchCommand: 1 } satisfies Record<SessionsMethod, 1>
+const METHODS = { contract: 1, current: 1, status: 1, sections: 1, defineSection: 1, assignSection: 1, start: 1, wake: 1, setMarks: 1, pin: 1, restart: 1, watchCommand: 1, debugPath: 1, debugWindow: 1, debugReport: 1 } satisfies Record<SessionsMethod, 1>
 // How long another plugin's call waits for the sections lock before answering busy (6 × 50 ms)
 const CALL_LOCK_TRIES = 6
 
@@ -5740,7 +6237,7 @@ async function ownVersion($: any): Promise<string> {
   if (modVersion) return modVersion
   if (!versionRead) {
     try {
-      versionRead = String(JSON.parse(await $.fs.read(`${PLUGIN_DIR}/.claude-plugin/plugin.json`))?.version ?? '')
+      versionRead = String(JSON.parse(await fsRead($, `${PLUGIN_DIR}/.claude-plugin/plugin.json`))?.version ?? '')
     } catch {}
   }
   return versionRead
@@ -5839,7 +6336,7 @@ function sessionsApi($: any): Sessions {
       if (l.cwd === home) return { ok: false, reason: 'refused', detail: bgRefusal('trusted one session at a time', l.cwd) }
       let folder = false
       try {
-        folder = (await $.fs.stat(l.cwd)).kind === 'dir'
+        folder = (await fsStat($, l.cwd)).kind === 'dir'
       } catch {}
       if (!folder) return { ok: false, reason: 'invalid', detail: `${l.cwd} isn't a folder` }
       if (l.settings && !(await exists($, l.settings))) return { ok: false, reason: 'invalid', detail: `${l.settings} doesn't exist` }
@@ -5965,6 +6462,45 @@ function sessionsApi($: any): Sessions {
       if (!py) return { ok: false, reason: 'no-python', detail: "no usable python3 here, which sessions needs: install it (on a Mac, the developer tools: xcode-select --install)" }
       return { ok: true, argv: watchPathsArgv(py, WATCHER, how, v.paths, 0), how }
     },
+    // /sessions debug, for another plugin: the file that changes when a window opens and when it closes (made empty
+    // when it isn't there: a watch wants its file to exist), what it says now, and the plugin's totals at the close
+    debugPath: async () => {
+      const dir = await reportsFolder($)
+      if (!dir) return { ok: false, reason: 'unavailable', detail: 'no data folder (no home folder?)' }
+      const path = `${dir}/window`
+      if (!(await exists($, path))) {
+        await runSafe($, ['mkdir', '-p', dir])
+        try {
+          await $.fs.write(path, '')
+        } catch {}
+      }
+      return { ok: true, path }
+    },
+    debugWindow: async () => ({ ok: true, window: await readWindow($) }),
+    debugReport: async input => {
+      const source = String(input?.source ?? '')
+      const report = String(input?.report ?? '')
+      if (!PLUGIN_NAME.test(source) || source === 'sessions') return { ok: false, reason: 'invalid', detail: 'source: a plugin name in lower case' }
+      if (!REPORT_ID.test(report)) return { ok: false, reason: 'invalid', detail: 'report: the id debugWindow gave' }
+      const w = await readWindow($)
+      if (!w || w.report !== report) return { ok: false, reason: 'closed', detail: 'no window of that report' }
+      const file = myId ? handInFile(myId, source) : null
+      if (!file) return { ok: false, reason: 'closed', detail: "sessions hasn't started in this session yet" }
+      let text = ''
+      try {
+        text = JSON.stringify(input.data) ?? ''
+      } catch {}
+      if (!text) return { ok: false, reason: 'invalid', detail: 'data: plain data' }
+      if (text.length > HAND_IN_MAX) return { ok: false, reason: 'too-big', detail: `data: over ${HAND_IN_MAX} characters as JSON` }
+      const checked = checkHandIn(input.data)
+      if (!checked.ok) return { ok: false, reason: 'invalid', detail: checked.why }
+      try {
+        await $.fs.write(`${await reportsFolder($)}/${report}/${file}`, text)
+      } catch {
+        return { ok: false, reason: 'closed', detail: "the report's folder is gone" }
+      }
+      return { ok: true }
+    },
   }
 }
 
@@ -6048,9 +6584,9 @@ async function start($: any) {
     const text = keyLines({ format: FORMAT, debug: debugLogs ? 1 : 0 })
     let current = ''
     try {
-      current = await $.fs.read(`${dataDir}/config`)
+      current = await fsRead($, `${dataDir}/config`)
     } catch {}
-    if (current !== text) await $.fs.write(`${dataDir}/config`, text)
+    if (current !== text) await fsWrite($, `${dataDir}/config`, text)
   })
   await step('claude and platform', async () => {
     const fixed = await $.env.get('SESSIONS_CLAUDE')
@@ -6059,7 +6595,7 @@ async function start($: any) {
     platform = await choosePlatform(sys($))
     platformChosen = true
     try {
-      modVersion = String(JSON.parse(await $.fs.read(`${PLUGIN_DIR}/.claude-plugin/plugin.json`))?.version ?? '')
+      modVersion = String(JSON.parse(await fsRead($, `${PLUGIN_DIR}/.claude-plugin/plugin.json`))?.version ?? '')
     } catch {}
   })
   await step('state', async () => {
@@ -6100,11 +6636,13 @@ async function start($: any) {
       $.clock.after(0, () => quickTick($))
     }
     $.clock.every(15000, () => {
+      meter.tick('timer.heartbeat')
       bg(beat($))
     })
     $.clock.after(wakeStagger(myId), () => {
       bg(solo('pass', () => pass($)))
       $.clock.every(PASS_MS, () => {
+        meter.tick('timer.pass')
         bg(solo('pass', () => pass($)))
       })
     })
@@ -6143,7 +6681,7 @@ async function start($: any) {
       name: 'sessions',
       description:
         'Sessions panel: open, focus or close. /sessions section <title>: put this session in a section (- takes it out); /sessions sections: list them. /sessions tell on|off: let scripts hand this session text with ccc tell. /sessions status: is the mod running here. /sessions setup: status line, shortcuts and the ccc command',
-      argumentHint: '[section <title> | section - | sections | tell on|off | status | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
+      argumentHint: '[section <title> | section - | sections | tell on|off | status | debug perf [seconds] | debug show | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
       immediate: true,
     }),
   )
@@ -6284,6 +6822,7 @@ export const register: Register = (on, options) => {
   // The main loop's turns only: a subagent's run inside a turn starts no new one (the working time and ⧗ count from
   // the main turn), and nothing here holds the run up
   on('turn.start', async ($, e, next) => {
+    meter.tick('hook.turn-start')
     if (e.agentId === undefined) turnBegins($, String(e.text ?? ''))
     if (active && e.agentId === undefined) {
       bg(ownStatus($, 'busy'))
@@ -6299,6 +6838,7 @@ export const register: Register = (on, options) => {
   // read them. Any other delivery is passed on (another session's message starts a turn of its own through
   // prompt.submit and turn.start, at once or after the turn that runs: "Whose turn it is")
   on('session.receive', async ($, e, next) => {
+    meter.tick('hook.receive')
     if (e.origin.kind === 'peer' && e.origin.plugin === 'sessions' && e.text.includes(NOTICE_MARKER)) {
       bg(ensureStarted($, 'notice'))
       const n = parseNotice(e.text)
@@ -6336,6 +6876,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    meter.tick('hook.turn-end')
     // Whose turn ended, read before anything is awaited: the next turn can start while this hook still runs (a prompt
     // that waited for this turn's end starts its own within milliseconds)
     const asked = turnAsked
@@ -6380,6 +6921,7 @@ export const register: Register = (on, options) => {
   // Typing in the box (or from the phone) counts as having seen the session; a message from another session doesn't.
   // Every prompt says whose the turn it starts is (promptComing)
   on('prompt.submit', async ($, e, next) => {
+    meter.tick('hook.prompt')
     const word = promptComing(e.origin, e.turnId !== undefined)
     if (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') {
       bg(ensureStarted($, 'prompt'))
@@ -6396,6 +6938,7 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'sessions' }, async ($, e) => {
+    meter.tick('command')
     if (active) await arrived($)
     // /sessions setup: the one-time setup (setup/setup.sh) for what a plugin can't configure by itself. Only its own
     // options are passed on, as separate arguments (no shell in between)
@@ -6404,6 +6947,7 @@ export const register: Register = (on, options) => {
       .split(/\s+/)
       .filter(Boolean)
     if (words[0] === 'status') return { text: await statusText($) }
+    if (words[0] === 'debug') return { text: await debugCommand($, words.slice(1)) }
     if (words[0] === 'section') return { text: await sectionCommand($, words.slice(1).join(' ')) }
     if (words[0] === 'sections') return { text: await sectionsList($) }
     if (words[0] === 'tell') return { text: await tellCommand($, words[1] ?? '') }
@@ -6440,6 +6984,7 @@ export const register: Register = (on, options) => {
   // The arrows (and Tab) only go through the sessions and the folded sections' lines: they don't leave the list towards
   // the buttons above and below or the panel's markers; those are reached with their key (n, a, s) or with the mouse
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
+    meter.tick('hook.focus')
     if (e.origin.kind !== 'person') {
       const r = await next(e)
       if (!r.deny && e.element) {
@@ -6488,6 +7033,7 @@ export const register: Register = (on, options) => {
   // row the window moves, which is how the buttons above and the legend below are reached. The wheel (it carries a
   // pointer), the page keys, Home and End (more than a row) and the mod's own moves stay Claude's
   on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    meter.tick('hook.scroll')
     if (e.origin.kind !== 'person' || e.pointer || Math.abs(e.by) !== 1) return next(e)
     // With the New or Rename field open the keys are the field's
     if ((await read($, askingName)) || (await read($, renaming))) return next(e)
@@ -6568,6 +7114,7 @@ export const register: Register = (on, options) => {
           {apart && <Text color={TINT.yellow}>{`  ${apart}`}</Text>}
         </Box>
       )
+    if (meter.on) meter.tick('draw.band')
     return (
       <Box flexDirection="column">
         {own}
@@ -6577,6 +7124,7 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const drawFrom = meter.on ? Date.now() : 0
     const { Box, Button, Text } = $.ui.resolve(e)
     const Input = e.surface === 'mobile' ? undefined : $.ui.resolve(e).Input
     // What's held while nobody could be looking, else what was written (read either way: its next write draws this)
@@ -6753,6 +7301,7 @@ export const register: Register = (on, options) => {
         <Text key={`h:${it.section}`} dimColor>{` ${label}`}</Text>
       )
     }
+    if (drawFrom) meter.timed('draw.panel', drawFrom)
     return (
       <Box flexDirection="column" height={showUsage && bodyRows ? bodyRows : undefined}>
         {/* The actions at the top, followed by the keyboard help: one row, which wraps where the panel is narrower than it */}

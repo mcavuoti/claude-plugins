@@ -55,6 +55,8 @@ export type Platform = {
   // The kernel's file watch for the mod's own watch (watcher.py watch-paths --how), where Claude watches nothing for the
   // session (no SessionStart reached the mod)
   fileWatch: 'kqueue' | 'inotify'
+  // How /sessions debug's sampler reads the processes here (debug/sampler.py perf --how): macOS's libproc, Linux's /proc
+  processStats: 'libproc' | 'procfs'
   // Notices whose advice depends on how windows work on this system
   text: {
     switchNeedsWindow: string
