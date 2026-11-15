@@ -7,7 +7,8 @@
 // Off, which is always unless the person opened a window: `M.on` is false, every counted helper tests it and goes on,
 // and nothing here runs. No timer, no file, no call. A window opens and closes by a ring of sessions' debug path
 // (register.tsx: debugRing): open → counters from zero; close → one hand-in (snapshot) and off. A window whose close
-// never came (the asking session died) ends by itself: the first count past its end turns the meter off.
+// never came (the asking session died) ends by itself: the first count past its end stops the counting (what was
+// counted, a few numbers, stays until the next ring).
 //
 // What the numbers are, and aren't:
 // - Time is how long an action took by the clock (`Date.now()`, in milliseconds), its waits on files and commands
@@ -160,6 +161,9 @@ function fresh(): Totals {
 /** The meter's state. `on` is the one thing a counted helper reads while no window is open */
 export const M = {
   on: false,
+  /** The window ran past its end with no close: counting stopped by itself, and what was counted waits for a close that
+   * may still come (a few numbers; the next window, or that close, lets them go) */
+  expired: false,
   /** The report this window is for, when it opened (the caller's clock) and when it ends by itself (`Date.now()`) */
   report: '',
   from: 0,
@@ -185,12 +189,14 @@ export function meterOpen(report: string, from: number, msLeft: number) {
   M.report = report
   M.from = from
   M.deadline = Date.now() + Math.max(0, msLeft)
+  M.expired = false
   M.on = true
 }
 
 /** The meter off, and what it held let go */
 export function meterOff() {
   M.on = false
+  M.expired = false
   M.report = ''
   M.actions = new Map()
   M.totals = fresh()
@@ -203,7 +209,9 @@ export function meterOff() {
 function counting(): boolean {
   if (!M.on) return false
   if (Date.now() > M.deadline) {
-    meterOff()
+    M.on = false
+    M.expired = true
+    M.stack = []
     return false
   }
   return true

@@ -856,7 +856,7 @@ async function debugRung($: any) {
   // Nothing sessions calls a window (an empty file, another format, a profile fleet doesn't know): nothing to do
   if (!win || win.profile !== 'perf' || typeof win.report !== 'string' || !win.report) return
   if (win.open) {
-    if (M.on && M.report === win.report) return
+    if (M.report === win.report && (M.on || M.expired)) return
     const held = await holdingsNow($)
     const now = await $.clock.now()
     const left = Number(win.until) - now
@@ -873,7 +873,8 @@ async function debugRung($: any) {
 
 /** The window closed: what this session counted, once, and the meter off */
 async function debugHandIn($: any, report: string) {
-  const counted = M.on && M.report === report
+  // (counted here, to its end at least: a window that ran out before its close still hands in what it had)
+  const counted = M.report === report && (M.on || M.expired)
   let data: ReturnType<typeof meterSnapshot>
   if (counted) {
     // Counting stops first: what the hand-in itself reads (holdings, the project's part) isn't the window's work
@@ -886,7 +887,7 @@ async function debugHandIn($: any, report: string) {
     meterOff()
   } else {
     // Another report's window still counting here ends too (its close never came)
-    if (M.on) meterOff()
+    if (M.on || M.expired) meterOff()
     // Not counted in this module: a module that came in by a reload inside this window says so; a session that started
     // inside it, or that the opening ring never reached, hands in nothing (sessions lists it)
     if ((await stateRead(read($, debugOpen))) !== report) return

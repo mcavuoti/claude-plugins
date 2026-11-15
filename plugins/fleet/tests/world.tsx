@@ -127,6 +127,7 @@ export const FAKE_SESSIONS = {
           return { ok: true, path: '/fake/data/reports/window' }
         },
         debugWindow: async () => {
+          await note({ debugWindow: true })
           let window: unknown = null
           try {
             const v = JSON.parse(await $.fs.read('/fake/data/reports/window'))
