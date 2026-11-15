@@ -221,12 +221,81 @@ export type Sessions = {
    * and on one line. It runs nothing and keeps nothing: the caller runs `argv` with `$.process.spawn` and reads its
    * lines (docs/plugin-contract.md says what they are and how the watcher ends) */
   watchCommand?: (input: { paths: string[] }) => Promise<SessionsWatchCommand>
+  /** 0.21.0. `/sessions debug perf` measures every session for a window, and a plugin may account for its own work
+   * in it (docs/plugin-contract.md). debugPath: the one file that changes when a window opens and when it closes; add
+   * it to the paths the plugin watches, and never read or write it. It answers as soon as sessions' module is loaded,
+   * and makes the file (empty) when it isn't there */
+  debugPath?: () => Promise<{ ok: true; path: string } | { ok: false; reason: 'unavailable'; detail: string }>
+  /** 0.21.0. What that file says now; call it when the path changed. null: no window. `open: true`: count from zero,
+   * and stop by yourself once `until` (ms) has passed. `open: false`: hand in now with debugReport, once, and stop */
+  debugWindow?: () => Promise<{ ok: true; window: SessionsDebugWindow | null }>
+  /** 0.21.0. The calling plugin's totals for the window that just closed, filed under the calling session. `source`:
+   * the plugin's name; `report`: the window's; `data`: a SessionsDebugHandIn. invalid (with why, in fixed words) when
+   * anything in it isn't a name, a number, a boolean or a label; too-big over 262144 characters as JSON; closed when
+   * the window isn't that report's any more */
+  debugReport?: (input: { source: string; report: string; data: SessionsDebugHandIn }) => Promise<{ ok: true } | { ok: false; reason: 'invalid' | 'closed' | 'too-big'; detail: string }>
 }
 /** What watchCommand answers: the command and the kernel watch it uses; or invalid (bad `paths`, with why) and no-python
  * (no usable python3 here, which sessions requires) */
 export type SessionsWatchCommand =
   | { ok: true; argv: string[]; how: 'kqueue' | 'inotify' }
   | { ok: false; reason: 'invalid' | 'no-python'; detail: string }
+/** A debug window, as debugWindow answers it: its report's id, whether it's open, and when it ends (ms) */
+export type SessionsDebugWindow = { report: string; profile: 'perf'; open: boolean; until: number }
+/** What makes an action run: its own timer, this session's own turns and tools, the person (keys, looking), or
+ * something another session did */
+export type SessionsDebugDriver = 'clock' | 'self' | 'person' | 'peer'
+/** A session (by the id `current()` and `status()` give) or a role a plugin names: the report prints a label of its
+ * own in its place (S1, R1) and writes what it stands for only in the key file, which stays on the machine */
+export type SessionsDebugLabel = { label: 'session' | 'role'; key: string }
+/** A value in a hand-in: a number, a boolean, a word (it matches /^[a-z][A-Za-z0-9.:-]{0,47}$/) or a label */
+export type SessionsDebugValue = number | boolean | string | SessionsDebugLabel
+/** Counts by kind. Work: read, stat, list, listed (entries), write, exists, store, state, call, model, tokens,
+ * command. Failures: the same kinds, and timeout, refused, lock. Signals sent for other sessions to react to: bell,
+ * store, heartbeat… Processes started: `program` or `program:purpose` (`mv:heartbeat`); a program the report doesn't
+ * name counts as `other` (`other:check` keeps its purpose) */
+export type SessionsDebugCounts = Record<string, number>
+/** One action's totals over the window. Every key of a hand-in and every word in it match the pattern above */
+export type SessionsDebugAction = {
+  drivers: SessionsDebugDriver[]
+  /** What makes one run cost more (`sessions`, `files`, `bytes`…); none when nothing does */
+  grows: string[]
+  /** The action this one is a part of (`sweep` for `sweep.outside`): printed under it, left out of the plugin's total */
+  within?: string
+  runs: number
+  /** Time inside the action in all and its slowest run, in ms, waits included (it isn't CPU) */
+  ms: number
+  slowest: number
+  /** The most calls of any kind one run made */
+  mostWork: number
+  work: SessionsDebugCounts
+  failed: SessionsDebugCounts
+  sent: SessionsDebugCounts
+  started: SessionsDebugCounts
+  bytesRead: number
+  bytesWritten: number
+}
+/** A named thing a plugin keeps, in memory or in files every session reads: how many and about how many bytes (null
+ * when it can't say) when the window opened and when it closed, and what it grows with */
+export type SessionsDebugHolding = { grows: string[]; open: [number, number | null]; close: [number, number | null] }
+/** What one plugin in one session hands in when a debug window closes (debugReport), format 1 */
+export type SessionsDebugHandIn = {
+  format: 1
+  /** When the module loaded, when it began to count and when it handed in (ms) */
+  loadedAt: number
+  from: number
+  to: number
+  /** Counted for part of the window only: the module was reloaded inside it */
+  partial?: 'reloaded'
+  /** What explains a rate: how the session hears of changes, whether it leads, a plugin's version as `v1.2.3` */
+  facts: Record<string, SessionsDebugValue>
+  actions: Record<string, SessionsDebugAction>
+  /** Exact, whichever action each call fell in */
+  totals: { work: SessionsDebugCounts; failed: SessionsDebugCounts; sent: SessionsDebugCounts; started: SessionsDebugCounts; bytesRead: number; bytesWritten: number }
+  holdings: Record<string, SessionsDebugHolding>
+  /** From the one session that does a project's shared work: sections of name → value, printed as they are */
+  project?: Record<string, Record<string, SessionsDebugValue>>
+}
 export type SessionsMethod = keyof Sessions
 
 declare module 'claude-code' {

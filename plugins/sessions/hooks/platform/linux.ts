@@ -210,6 +210,7 @@ export const linux: Platform = {
   },
 
   fileWatch: 'inotify',
+  processStats: 'procfs',
 
   text: {
     switchNeedsWindow: 'To switch, open this session with ccc (the launcher lets the panel switch that window)',
