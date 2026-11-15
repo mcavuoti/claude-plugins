@@ -381,6 +381,7 @@ import {
   type WakeCount,
   type WaveFacts,
 } from './roster'
+import { ACTIONS, HAND_IN_MAX, M, NAME, below, bytesRead as mBytesRead, bytesWritten as mBytesWritten, failed as mFailed, mark as mMark, meterOff, meterOpen, note as mNote, purposeOf, run as runAction, sent as mSent, signalOf, sized, snapshot as meterSnapshot, started as mStarted, work as mWork, under, type ActionName, type Holding, type Value } from './meter'
 import { dateLine, groupedLines, localFleetLine, localFleetRecords, modelDiffers } from './roster'
 import {
   CONFIRM_DESCRIPTION,
@@ -479,7 +480,7 @@ const processId = atom({ plugin: 'fleet', key: 'processId' } as const, '')
 
 /** This process's id, made once (a reload keeps it in $.state; a restart starts a new process with a new one) */
 async function processNow($: any): Promise<string> {
-  const had = await read($, processId)
+  const had = await stateRead(read($, processId))
   if (had) return had
   const id = `${(await $.clock.now()).toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   await touched(update($, processId, () => id))
@@ -512,7 +513,7 @@ function bellDir(): string {
 async function ringBell($: any, what: BellKind) {
   if (!root) return
   try {
-    await $.fs.write(`${bellDir()}/${what}`, json({ format: FORMAT, by: myRef ?? jobRef ?? null, at: await $.clock.now() }))
+    await fsWrite($, `${bellDir()}/${what}`, json({ format: FORMAT, by: myRef ?? jobRef ?? null, at: await $.clock.now() }))
   } catch {}
 }
 /** What changed on a watched path, run once after a short wait (a burst of events is one pass): the same code the
@@ -597,7 +598,7 @@ async function makeWatched($: any, w: { files: string[]; folders: string[] }) {
   for (const d of w.folders) if (await gone($, d)) missing.push(d)
   if (missing.length) await run($, ['mkdir', '-p', ...missing])
   for (const p of w.files) {
-    if (await gone($, p)) await $.fs.write(p, json({ format: FORMAT, last: '' })).catch(() => {})
+    if (await gone($, p)) await fsWrite($, p, json({ format: FORMAT, last: '' })).catch(() => {})
   }
 }
 function scheduleOwnWatch($: any, ms: number) {
@@ -812,6 +813,7 @@ let digestGen = 0
 /** Each $.state write of this module goes through here (update's target stays a literal atom at the call, for the
  * engine's scan): the generation moves as it starts and once it landed */
 function touched<T>(p: Promise<T>): Promise<T> {
+  if (M.on) mWork('state')
   digestGen++
   return p.finally(() => {
     digestGen++
@@ -886,7 +888,7 @@ const needs = atom({ plugin: 'fleet', key: 'needs' } as const, '')
 async function refreshNeeds($: any) {
   const lines = await dependencyLines($)
   const text = lines.length ? lines.map(l => l.replace(/^fleet needs /, '')).join('; ') : ''
-  if ((await read($, needs)) !== text) await touched(update($, needs, () => text))
+  if ((await stateRead(read($, needs))) !== text) await touched(update($, needs, () => text))
 }
 const classicSeen = atom({ plugin: 'fleet', key: 'classicSeen' } as const, {} as Record<string, number>)
 const identityTold = atom({ plugin: 'fleet', key: 'identityTold' } as const, false)
@@ -1031,9 +1033,14 @@ async function dependencyLines($: any): Promise<string[]> {
 
 // A $.sessions call, raced against 500 ms: null when it lost or threw
 async function race<T>($: any, call: () => Promise<T>): Promise<T | null> {
+  if (M.on) mWork('call')
   try {
-    return await Promise.race([call(), $.clock.sleep(500).then(() => null)])
+    const r = await Promise.race([call(), $.clock.sleep(500).then(() => null)])
+    // Not answered, or refused: a failure for the meter
+    if (M.on && (r === null || (r as any)?.ok === false)) mFailed('call')
+    return r
   } catch {
+    if (M.on) mFailed('call')
     return null
   }
 }
@@ -1060,17 +1067,115 @@ function dec(sub: string): string {
 // Every command runs from / (it exists; every path is absolute), except a project's check script and the person's
 // command channel, which run from the project's folder (it exists: fleet found its .claude/fleet/ there). One that
 // can't start counts as a failure (127), one still running at its timeout too (124)
-async function run($: any, argv: string[], opts: { cwd?: string; timeoutMs?: number; stdin?: string } = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+async function run($: any, argv: string[], opts: { cwd?: string; timeoutMs?: number; stdin?: string; as?: string } = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  if (M.on) {
+    mWork('command')
+    mStarted(argv[0] ?? '', opts.as ?? startedFor(argv))
+  }
   try {
-    return await $.process.run(argv, { cwd: opts.cwd ?? '/', timeoutMs: opts.timeoutMs ?? 10000, ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}) })
+    const r = await $.process.run(argv, { cwd: opts.cwd ?? '/', timeoutMs: opts.timeoutMs ?? 10000, ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}) })
+    if (M.on && r.exitCode !== 0) mFailed('command')
+    return r
   } catch (err) {
-    return { exitCode: /time/i.test(String(err)) ? 124 : 127, stdout: '', stderr: String(err) }
+    const late = /time/i.test(String(err))
+    if (M.on) mFailed(late ? 'timeout' : 'command')
+    return { exitCode: late ? 124 : 127, stdout: '', stderr: String(err) }
   }
 }
+/** What a process fleet starts is for, when its caller doesn't say (opts.as): by the file it's about */
+function startedFor(argv: readonly string[]): string {
+  const prog = String(argv[0] ?? '')
+  const base = prog.slice(prog.lastIndexOf('/') + 1)
+  if (base === 'mv' || base === 'ln' || base === 'mkdir' || base === 'rm') return purposeOf(String(argv[argv.length - 1] ?? ''))
+  if (base === 'sh') return 'publish'
+  if (base === 'kill') return 'watch'
+  return ''
+}
+
+// ---- The engine's file calls, counted while a debug window is open (meter.ts). Off, each is the engine's own call and
+// its own promise, with nothing added ----
+
+function fsStat($: any, ...a: any[]): Promise<any> {
+  if (!M.on) return $.fs.stat(...a)
+  mWork('stat')
+  return $.fs.stat(...a).catch((err: unknown) => {
+    mFailed('stat')
+    throw err
+  })
+}
+function fsList($: any, ...a: any[]): Promise<any[]> {
+  if (!M.on) return $.fs.list(...a)
+  mWork('list')
+  return $.fs.list(...a).then(
+    (r: any[]) => {
+      mWork('listed', Array.isArray(r) ? r.length : 0)
+      return r
+    },
+    (err: unknown) => {
+      mFailed('list')
+      throw err
+    },
+  )
+}
+function fsRead($: any, ...a: any[]): Promise<any> {
+  if (!M.on) return $.fs.read(...a)
+  mWork('read')
+  return $.fs.read(...a).then(
+    (t: unknown) => {
+      if (typeof t === 'string') mBytesRead(t.length)
+      return t
+    },
+    (err: unknown) => {
+      mFailed('read')
+      throw err
+    },
+  )
+}
+function fsWrite($: any, path: string, text: string): Promise<void> {
+  if (!M.on) return $.fs.write(path, text)
+  mWork('write')
+  return $.fs.write(path, text).then(
+    (r: void) => {
+      mBytesWritten(typeof text === 'string' ? text.length : 0)
+      const signal = signalOf(String(path))
+      if (signal) mSent(signal)
+      return r
+    },
+    (err: unknown) => {
+      mFailed('write')
+      throw err
+    },
+  )
+}
+function fsExists($: any, ...a: any[]): Promise<boolean> {
+  if (!M.on) return $.fs.exists(...a)
+  mWork('exists')
+  return $.fs.exists(...a).catch((err: unknown) => {
+    mFailed('exists')
+    throw err
+  })
+}
+/** A $.state read, counted (the read's atom stays a literal at the call, for the engine's scan) */
+function stateRead<T>(p: T): T {
+  if (M.on) mWork('state')
+  return p
+}
+/** One run of an action (meter.ts), when a debug window is open; else just the work */
+function act<T>(name: ActionName, fn: () => T): T {
+  return M.on ? runAction(name, fn) : fn()
+}
+/** A timer's tick as an action: counted as it fires, even when it then finds nothing to do */
+function tick(name: ActionName, fn: () => Promise<unknown> | void | undefined) {
+  const p = M.on ? runAction(name, fn) : fn()
+  if (p) bg(p)
+}
+/** What the plugins beneath a hook take (and the tool itself) isn't the hook's own time: `under(below(), next(e))`
+ * stops the running action's clock before `next` is called and starts it again once what it returned settles. Off,
+ * `below()` is null and `under` gives the engine's promise back as it is */
 
 async function exists($: any, path: string): Promise<boolean> {
   try {
-    return !!(await $.fs.exists(path))
+    return !!(await fsExists($, path))
   } catch {
     return false
   }
@@ -1079,7 +1184,7 @@ async function exists($: any, path: string): Promise<boolean> {
 /** Whether a file is surely not there: false when it is, and when the look failed (an error is no answer) */
 async function gone($: any, path: string): Promise<boolean> {
   try {
-    return !(await $.fs.exists(path))
+    return !(await fsExists($, path))
   } catch {
     return false
   }
@@ -1087,7 +1192,7 @@ async function gone($: any, path: string): Promise<boolean> {
 
 async function readText($: any, path: string): Promise<string | null> {
   try {
-    return await $.fs.read(path)
+    return await fsRead($, path)
   } catch {
     return null
   }
@@ -1095,7 +1200,7 @@ async function readText($: any, path: string): Promise<string | null> {
 
 async function names($: any, dir: string): Promise<string[]> {
   try {
-    return (await $.fs.list(dir)).map((x: any) => String(x.name))
+    return (await fsList($, dir)).map((x: any) => String(x.name))
   } catch {
     return []
   }
@@ -1103,7 +1208,7 @@ async function names($: any, dir: string): Promise<string[]> {
 
 async function tmpFile($: any, text: string): Promise<string> {
   const path = dec(`tmp/${await $.clock.now()}-${EPOCH}-${++tmpCount}`)
-  await $.fs.write(path, text)
+  await fsWrite($, path, text)
   return path
 }
 
@@ -1255,7 +1360,7 @@ function locate($: any): Promise<void> {
     located = (async () => {
       home = ((await $.env.get('HOME')) ?? '').replace(/\/+$/, '')
       try {
-        version = String(JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`))?.version ?? '')
+        version = String(JSON.parse(await fsRead($, `${$.plugin.root}/.claude-plugin/plugin.json`))?.version ?? '')
       } catch {}
       jobRef = await backgroundRef($)
       envRoot = ((await $.env.get('FLEET_ROOT')) ?? '').replace(/\/+$/, '')
@@ -1352,7 +1457,7 @@ function timers($: any) {
   $.clock.after(0, () =>
     bg(
       (async () => {
-        if (!live && (await read($, watching)) === FLEET_WATCH_SET) {
+        if (!live && (await stateRead(read($, watching))) === FLEET_WATCH_SET) {
           live = true
           forgetBelled()
           watchingLatest = true
@@ -1370,7 +1475,7 @@ function timers($: any) {
   if (jobRef) {
     $.clock.after(0, () => bg(rebuild($)))
     // A slot it waits for in a line it joined before a reload: watched again
-    $.clock.after(0, () => bg((async () => ((await read($, slotWait)).length ? watchSlots($) : undefined))()))
+    $.clock.after(0, () => bg((async () => ((await stateRead(read($, slotWait))).length ? watchSlots($) : undefined))()))
     // An instance of the roster: its binding, heartbeat and spend; its seed, and its nudges
     $.clock.after(1500, () => bg(instanceTick($)))
     $.clock.every(30000, () => bg(instanceTick($)))
@@ -1597,7 +1702,7 @@ async function close($: any, id: string, how: CloseHow) {
 }
 
 async function closeNow($: any, id: string, how: CloseHow) {
-  const readAt = how.readAt ?? (await read($, inflight))[id]?.at
+  const readAt = how.readAt ?? (await stateRead(read($, inflight)))[id]?.at
   const rec = await readQueue($, id)
   if (rec && !('otherFormat' in rec)) {
     const present = await answerNames($)
@@ -1707,25 +1812,25 @@ async function deliver($: any) {
   if (delivering) return
   delivering = true
   try {
-    const mine = await read($, open)
+    const mine = await stateRead(read($, open))
     const ids = Object.keys(mine)
     if (!ids.length) return
     const now = await $.clock.now()
-    const isBusy = await read($, busy)
-    const pending = await read($, inflight)
+    const isBusy = await stateRead(read($, busy))
+    const pending = await stateRead(read($, inflight))
     // Submits an older copy of the module waited on: their answer was lost with it. Once the session has been idle a
     // while, one that started its turn shows in the transcript; one that didn't is sent again
     const orphans = Object.keys(pending).filter(id => pending[id]?.epoch !== EPOCH)
-    if (orphans.length && !isBusy && now - (await read($, idleSince)) >= ORPHAN_IDLE_MS) {
+    if (orphans.length && !isBusy && now - (await stateRead(read($, idleSince))) >= ORPHAN_IDLE_MS) {
       const seen = await deliveredInTranscript($, orphans)
       for (const id of orphans) {
         if (seen.has(id)) await close($, id, { state: 'delivered' })
         else await touched(update($, inflight, m => omit(m, [id])))
       }
     }
-    if (isBusy || (await read($, stopped)) || now < (await read($, retryAt))) return
+    if (isBusy || (await stateRead(read($, stopped))) || now < (await stateRead(read($, retryAt)))) return
     const present = await answerNames($)
-    const inFlight = await read($, inflight)
+    const inFlight = await stateRead(read($, inflight))
     const parts: Delivery[] = []
     for (const id of ids) {
       if (inFlight[id] || !progress(id, mine[id] as number, present).complete) continue
@@ -1771,7 +1876,7 @@ async function submitted($: any, ids: string[], r: any) {
   // { text }: its turn has started, and turnStarted closes the records with the turn's id. A second later this closes
   // any it didn't get to
   await $.clock.sleep(1000)
-  const still = await read($, open)
+  const still = await stateRead(read($, open))
   for (const id of ids) if (still[id] !== undefined) await close($, id, { state: 'delivered' })
 }
 
@@ -1820,17 +1925,17 @@ async function turnStarted($: any, text: string, turnId: string) {
   const words = await personWords($, ids)
   if (words) await touched(update($, fleetTurn, () => ({ turnId, words })))
   // The person's overrules of a judge's answers, delivered in this turn
-  const over = await read($, overruling)
+  const over = await stateRead(read($, overruling))
   for (const id of ids) if (over[id] && text.includes(`[${id}] The person overruled`)) await overruleDelivered($, id, turnId)
   // His notes that came late, told in this turn
-  const late = await read($, lateNotes)
+  const late = await stateRead(read($, lateNotes))
   const told = ids.filter(id => late[id] && text.includes(`[${id}] The person added a note`))
   if (told.length) {
     await touched(update($, lateNotes, m => omit(m, told)))
     log($, `the late notes of ${told.join(', ')} were delivered (turn ${turnId})`)
   }
-  const mine = await read($, open)
-  const pending = await read($, inflight)
+  const mine = await stateRead(read($, open))
+  const pending = await stateRead(read($, inflight))
   const closing = ids.filter(id => mine[id] !== undefined || pending[id])
   if (!closing.length) return
   await touched(update($, inflight, m => omit(m, closing)))
@@ -1858,7 +1963,7 @@ async function personWords($: any, ids: readonly string[]): Promise<string> {
       for (const a of n.answers) if (a?.text) out.push(a.text)
       if (n.why) out.push(n.why)
     }
-    for (const x of (await read($, lateNotes))[id]?.notes ?? []) out.push(x.text)
+    for (const x of (await stateRead(read($, lateNotes)))[id]?.notes ?? []) out.push(x.text)
   }
   return out.join('\n')
 }
@@ -1870,7 +1975,7 @@ async function beat($: any) {
   const { records } = await queueRecords($)
   const present = await answerNames($)
   const n = heldCount(records, present, alikeQuestion)
-  if ((await read($, held)) !== n) await touched(update($, held, () => n))
+  if ((await stateRead(read($, held))) !== n) await touched(update($, held, () => n))
   await loadRoster($)
   // Over budget and running: one that's stopped spends nothing more today. Running as sessions sees it (as /fleet
   // status says); its fleet's heartbeat (beat in the last 3 min) only when sessions doesn't answer
@@ -1890,7 +1995,7 @@ async function beat($: any) {
       }
     }
   }
-  if ((await read($, overBudget)) !== o) await touched(update($, overBudget, () => o))
+  if ((await stateRead(read($, overBudget))) !== o) await touched(update($, overBudget, () => o))
   if (jobRef) await keepSection($, records, present)
   if (!myName || (await $.clock.now()) - nameAt >= 60000) await refreshName($)
   if (myInstance) await watchForNudge($, records, present)
@@ -1898,7 +2003,7 @@ async function beat($: any) {
   // background one a day old is taken as done
   if (worldOn()) {
     const now = await $.clock.now()
-    for (const [task, b] of Object.entries(await read($, bgCommands))) if (now - b.at > 24 * HOUR) await bgDone($, task)
+    for (const [task, b] of Object.entries(await stateRead(read($, bgCommands)))) if (now - b.at > 24 * HOUR) await bgDone($, task)
     if (((await runningHere($)).length || finishedHere.some(f => now - f.end < FINISHED_KEEP_MS)) && now - readsSavedAt > 60000) saveReadsSoon($, true)
   }
   // The outside scan is the sweeper's (claims dedupe it anyway); every session walks the world once, for its baseline
@@ -1914,7 +2019,7 @@ async function beat($: any) {
   const idleFlag = work ? idleFlagText(work.capacity) : ''
   const near = roster ? (await budgets($)).filter(b => b.state === 'warn').length : 0
   const notes = [...((await sweeperState($)).nobody ? ['nobody sweeps'] : []), ...(restarted ? [restarted] : []), ...(idleFlag ? [idleFlag] : []), ...(near ? [`${near} past 80% of budget`] : []), ...(tooBig && worldOn() ? ['world too big: no scan'] : [])].join(' · ')
-  if ((await read($, bandNote)) !== notes) await touched(update($, bandNote, () => notes))
+  if ((await stateRead(read($, bandNote))) !== notes) await touched(update($, bandNote, () => notes))
   await maybePrune($, records)
 }
 
@@ -1930,7 +2035,7 @@ async function keepSection($: any, records: QueueRecord[], present: ReadonlySet<
   const parent = above && !asks(above) ? above : null
   const want = waiting ? ASKING_SECTION : placed ? `fleet:${placed.id}` : 'none'
   const key = parent ? `${want}|${parent}` : want
-  if ((await read($, section)) === key) return
+  if ((await stateRead(read($, section))) === key) return
   if (!(await sessionsReady($))) return
   if (waiting || placed) {
     const spec = waiting ? { id: ASKING_SECTION, title: 'Asking you' } : { id: want, title: (placed as { title: string }).title, order: (placed as { order: number }).order }
@@ -1966,7 +2071,7 @@ async function maybePrune($: any, records: QueueRecord[]) {
   const old = async (dir: string, ms: number, keep: (name: string) => boolean) => {
     let entries: any[] = []
     try {
-      entries = await $.fs.list(dir)
+      entries = await fsList($, dir)
     } catch {}
     const paths = entries.filter(x => !keep(String(x.name)) && now - Number(x.mtimeMs) > ms).map(x => `${dir}/${x.name}`)
     await remove($, paths)
@@ -2215,7 +2320,7 @@ function ensureWorld($: any): Promise<void> {
 async function locateWorld($: any) {
   if (!realRoot) {
     try {
-      realRoot = String((await $.fs.stat(root as string, { resolve: true })).realPath ?? '').replace(/\/+$/, '')
+      realRoot = String((await fsStat($, root as string, { resolve: true })).realPath ?? '').replace(/\/+$/, '')
     } catch {}
     if (!realRoot) return
     // A volume that ignores case answers the project folder spelled in another case with the folder itself (C12: on
@@ -2223,7 +2328,7 @@ async function locateWorld($: any) {
     const probe = caseProbe(realRoot)
     if (probe) {
       try {
-        insensitive = (await $.fs.stat(probe, { resolve: true })).realPath === realRoot
+        insensitive = (await fsStat($, probe, { resolve: true })).realPath === realRoot
       } catch {
         insensitive = false
       }
@@ -2237,7 +2342,7 @@ async function loadWorld($: any) {
   const path = `${fleetDir()}/world.json`
   let st: any
   try {
-    st = await $.fs.stat(path)
+    st = await fsStat($, path)
   } catch {
     world = null
     worldProblem = ''
@@ -2310,13 +2415,13 @@ async function loadWorld($: any) {
 async function place($: any, path: string): Promise<string | null> {
   if (!placeable(path)) return null
   try {
-    const s = await $.fs.stat(path, { resolve: true })
+    const s = await fsStat($, path, { resolve: true })
     if (s.realPath) return String(s.realPath)
   } catch {}
   for (const { dir, rest } of ancestorsOf(path)) {
     let s: any
     try {
-      s = await $.fs.stat(dir, { resolve: true })
+      s = await fsStat($, dir, { resolve: true })
     } catch {
       continue
     }
@@ -2348,7 +2453,7 @@ async function worldFile($: any, path: unknown): Promise<Placed | null> {
 async function versionOf($: any, abs: string): Promise<{ v: string | null; mtimeMs: number; size: number; text: string | null }> {
   let st: any
   try {
-    st = await $.fs.stat(abs)
+    st = await fsStat($, abs)
   } catch {
     return { v: null, mtimeMs: 0, size: 0, text: null }
   }
@@ -2377,7 +2482,7 @@ async function mainCheckoutOf($: any, dir: string): Promise<string | null> {
   if (!g || g.gitDir === g.common || !g.common.endsWith('/.git')) return null
   let real = dir
   try {
-    real = String((await $.fs.stat(dir, { resolve: true })).realPath ?? dir).replace(/\/+$/, '')
+    real = String((await fsStat($, dir, { resolve: true })).realPath ?? dir).replace(/\/+$/, '')
   } catch {}
   if (real !== g.top && !real.startsWith(`${g.top}/`)) return null
   return `${g.common.slice(0, -'/.git'.length)}${real.slice(g.top.length)}`
@@ -2403,7 +2508,7 @@ async function refreshTrees($: any, force = false) {
   // The worktrees folder's time (-1: none, no linked worktree): the list is read again only once it moved
   let mark = -1
   try {
-    mark = Number((await $.fs.stat(`${g.common}/worktrees`)).mtimeMs)
+    mark = Number((await fsStat($, `${g.common}/worktrees`)).mtimeMs)
   } catch {}
   // (and every 10 minutes whatever it says: git worktree move rewrites a gitdir in place, which doesn't move it)
   if (!force && mark === trees.listMark && now - trees.listAt < 10 * 60000) return
@@ -2413,7 +2518,7 @@ async function refreshTrees($: any, force = false) {
   const linked: string[] = []
   for (const f of l.exitCode === 0 ? worktreeFolders(l.stdout).slice(1) : []) {
     try {
-      linked.push(String((await $.fs.stat(f, { resolve: true })).realPath ?? f).replace(/\/+$/, ''))
+      linked.push(String((await fsStat($, f, { resolve: true })).realPath ?? f).replace(/\/+$/, ''))
     } catch {}
   }
   trees.linked = linked
@@ -2479,7 +2584,7 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
       let whole = true
       let listed: string[] = []
       try {
-        listed = (await $.fs.list(dir)).map((x: any) => String(x.name))
+        listed = (await fsList($, dir)).map((x: any) => String(x.name))
       } catch {
         whole = false
       }
@@ -2584,7 +2689,7 @@ let mainReads: { rev: number; of: Readonly<Record<string, FleetRead>> | undefine
 async function mainReadsNow($: any): Promise<Readonly<Record<string, FleetRead>> | undefined> {
   if (!mainReads || mainReads.rev !== readsRev) {
     const rev = readsRev
-    mainReads = { rev, of: (await read($, reads)).main }
+    mainReads = { rev, of: (await stateRead(read($, reads))).main }
   }
   return mainReads.of
 }
@@ -2693,7 +2798,7 @@ async function eventsTick($: any, fromPoll = false) {
   if (!worldOn()) return
   let m = 0
   try {
-    m = Number((await $.fs.stat(`${eventsDir()}/latest`)).mtimeMs)
+    m = Number((await fsStat($, `${eventsDir()}/latest`)).mtimeMs)
   } catch {
     return
   }
@@ -2803,7 +2908,7 @@ async function eventFor($: any, ev: Omit<ChangeEvent, 'format' | 'at'> & { at?: 
   // This session's own landing: its cadence counts it, and the brief says when its writer had read outside content. One
   // the scan only blames on it (probably) isn't
   const own = !!ev.by && ev.by.sessionId === sessionId && !ev.by.person && (ev.via === 'tool' || ev.via === 'bash') && !ev.probably
-  const mark = own && (await read($, outside)) ? { outside: true as const } : {}
+  const mark = own && (await stateRead(read($, outside))) ? { outside: true as const } : {}
   const now = await $.clock.now()
   if (own) await touched(update($, landedAt, () => now))
   if (own && !(myInstance && ev.path === myInstance.journal)) {
@@ -2839,7 +2944,7 @@ async function trigger($: any, names: readonly string[]) {
   // It held everything latest named: it still does, its own landings included (they're known here as they're made)
   if (cur && eventCursor !== null && cur.last === eventCursor) eventCursor = last
   try {
-    await $.fs.write(path, json({ format: FORMAT, last, chain }))
+    await fsWrite($, path, json({ format: FORMAT, last, chain }))
   } catch {}
   // this write may have replaced another writer's, whose landing no chain names now: the net runs
   chainReads++
@@ -2857,6 +2962,8 @@ async function setRead($: any, thread: string, rel: string, v: string | null, re
   const e = latest.get(rel)
   if (e && e.to !== v) digestGen++
   readsRev++
+  // (two $.state writes, counted for the meter as the ones that go through touched are)
+  if (M.on) mWork('state', 2)
   await update($, reads, m => {
     const mine = { ...(m[thread] ?? {}) }
     if (v === null) delete mine[rel]
@@ -2883,7 +2990,7 @@ async function noteRead($: any, thread: string, path: unknown): Promise<string[]
     if (c.v === null) return []
     if (c.v !== f.v) {
       const key = `copy-read:${w.rel}`
-      if ((await read($, warned))[thread]?.[key] === c.v) return []
+      if ((await stateRead(read($, warned)))[thread]?.[key] === c.v) return []
       await touched(update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [key]: c.v as string } })))
       return [copyReadText(String(path), w.rel, main)]
     }
@@ -2937,13 +3044,13 @@ async function flushReads($: any) {
 }
 
 async function saveReads($: any) {
-  const mark = root ? await read($, outside) : null
+  const mark = root ? await stateRead(read($, outside)) : null
   if (!worldOn() && !mark) return
   const sessionId = String(await $.session.id())
   const running = await runningHere($)
   readsSavedAt = await $.clock.now()
   const finished = finishedHere.filter(f => readsSavedAt - f.end < FINISHED_KEEP_MS)
-  const file: ReadsFile = { format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: readsSavedAt, threads: await read($, reads), ...(mark ? { outside: mark } : {}), ...(running.length ? { running } : {}), ...(finished.length ? { finished } : {}) }
+  const file: ReadsFile = { format: FORMAT, sessionId, ref: myRef ?? jobRef, name: myName, at: readsSavedAt, threads: await stateRead(read($, reads)), ...(mark ? { outside: mark } : {}), ...(running.length ? { running } : {}), ...(finished.length ? { finished } : {}) }
   if (!(await replace($, readsPath(sessionId), json(file)))) {
     await run($, ['mkdir', '-p', `${fleetDir()}/reads`])
     await replace($, readsPath(sessionId), json(file))
@@ -2954,7 +3061,7 @@ async function saveReads($: any) {
 async function runningHere($: any): Promise<Running[]> {
   const out: Running[] = [...fgRunning.values()].filter(c => c.shown).map(c => ({ thread: c.thread, at: c.at, command: c.command }))
   // A background command that writes nothing in the world isn't one a change may be blamed on
-  for (const [task, b] of Object.entries(await read($, bgCommands))) if (!b.readOnly) out.push({ thread: b.thread, at: b.at, task, ...(b.command ? { command: b.command.slice(0, 300) } : {}) })
+  for (const [task, b] of Object.entries(await stateRead(read($, bgCommands)))) if (!b.readOnly) out.push({ thread: b.thread, at: b.at, task, ...(b.command ? { command: b.command.slice(0, 300) } : {}) })
   return out
 }
 
@@ -2979,15 +3086,15 @@ async function clearReads($: any, oldSessionId: string) {
   // The new conversation doesn't remember what it was told about the files it wrote: it hears it again. It read
   // nothing from outside either, and it's a period of its own
   await touched(update($, ownTold, () => ({})))
-  if (await read($, outside)) log($, 'the outside-content mark ends with the conversation (/clear)')
+  if (await stateRead(read($, outside))) log($, 'the outside-content mark ends with the conversation (/clear)')
   await touched(update($, outside, () => null))
   await touched(update($, personTurn, () => null))
   // Nor what it was told of its budget, of the slot leases it holds (0: held, not told in this conversation) and of the
   // items from outside the conversation that ended was pointed to: it hears them again, once
   await touched(update($, budgetTold, () => ''))
   await touched(update($, slotTold, m => Object.fromEntries(Object.keys(m).map(k => [k, 0]))))
-  const since = await read($, conversationAt)
-  const pointed = Object.entries(await read($, intakeTold)).filter(([, t]) => t >= since).map(([id]) => id)
+  const since = await stateRead(read($, conversationAt))
+  const pointed = Object.entries(await stateRead(read($, intakeTold))).filter(([, t]) => t >= since).map(([id]) => id)
   await touched(update($, intakeAgain, () => pointed))
   const now = await $.clock.now()
   await touched(update($, conversationAt, () => now))
@@ -3042,7 +3149,7 @@ async function digestFor($: any, thread: string, withBudget = true, forNudge = f
   const workOnly = own_.length === only.length
   if (!worldOn()) return only.length ? { lines: only, told: alone, urgent, workOnly } : none
   await eventsTick($)
-  const mine = (await read($, reads))[thread]
+  const mine = (await stateRead(read($, reads)))[thread]
   const me = await meNow($)
   const toldNow = toldHere.get(thread)
   const items = (await holdInputs($, mine && latest.size ? digestItems(mine, latest, me, thread) : [], await $.clock.now())).filter(i => toldNow?.get(i.path) !== i.event.to)
@@ -3111,7 +3218,7 @@ async function digestOnce($: any, thread: string): Promise<{ lines: string[]; to
   let mark = 0
   if (worldOn()) {
     try {
-      mark = Number((await $.fs.stat(`${eventsDir()}/latest`)).mtimeMs)
+      mark = Number((await fsStat($, `${eventsDir()}/latest`)).mtimeMs)
     } catch {}
   }
   const seen = digestSeen.get(thread)
@@ -3124,11 +3231,11 @@ async function digestOnce($: any, thread: string): Promise<{ lines: string[]; to
 /** The answers to this session's own decisions while it's busy (a long turn): told at its next tool step with the
  * digest, and closed there (G26), instead of waiting in queue/ for the turn to end */
 async function busyDelivery($: any): Promise<{ text: string; told: () => Promise<void> } | null> {
-  if (!(await read($, busy))) return null
-  const mine = await read($, open)
+  if (!(await stateRead(read($, busy)))) return null
+  const mine = await stateRead(read($, open))
   const ids = Object.keys(mine)
   if (!ids.length) return null
-  const inFlight = await read($, inflight)
+  const inFlight = await stateRead(read($, inflight))
   const present = await answerNames($)
   const parts: Delivery[] = []
   for (const id of ids) {
@@ -3178,7 +3285,7 @@ async function overwroteLater($: any, ev: ChangeEvent, prev: ChangeEvent | undef
   if (!ev.probably || !ev.by || ev.by.sessionId !== sessionId || ev.by.person) return
   if (!prev || prev.to === null || prev.to !== ev.from || !prev.by || prev.by.sessionId === sessionId) return
   const thread = ev.by.agentId ?? 'main'
-  if ((await read($, reads))[thread]?.[ev.path]?.v === prev.to) return
+  if ((await stateRead(read($, reads)))[thread]?.[ev.path]?.v === prev.to) return
   laterLines.set(thread, [...(laterLines.get(thread) ?? []), overwroteText(ev.path, prev, await meNow($), 'probably')])
 }
 
@@ -3207,7 +3314,7 @@ async function withLines($: any, r: any, thread: string, extra: string[] = []): 
 /** The answers waiting for this session's busy main thread, on the result of any tool it calls (G26): an Agent call, an
  * MCP call, a Grep, not only the steps the world's hooks see. In the same line as withLines, so an answer is told once */
 async function withAnswers($: any, r: any): Promise<any> {
-  if (!r || r.deny !== undefined || r.isError || !(await read($, busy))) return r
+  if (!r || r.deny !== undefined || r.isError || !(await stateRead(read($, busy)))) return r
   const mine = (lineChains.get('main') ?? Promise.resolve()).then(async () => {
     const answers = await busyDelivery($)
     if (!answers) return r
@@ -3243,7 +3350,7 @@ async function revsOf($: any, id: string, trustMs = 1000): Promise<Rev[]> {
   if (c && now - c.at < trustMs) return sortedRevs(c)
   let m = -1
   try {
-    m = Number((await $.fs.stat(revDir(id))).mtimeMs)
+    m = Number((await fsStat($, revDir(id))).mtimeMs)
   } catch {}
   if (!c) {
     c = { revs: new Map(), mtime: -2, at: 0, fixed: new Set() }
@@ -3412,7 +3519,7 @@ async function checkPins($: any, thread: string, text: string, before: ReadonlyS
   if (!pins.length) return null
   const states = new Map<string, PinState>()
   for (const p of pins) states.set(pinKey(p), pinState(p, await revsFor($, p.id)))
-  const mine = (await read($, reads))[thread] ?? {}
+  const mine = (await stateRead(read($, reads)))[thread] ?? {}
   const readStates = new Map<string, ReadState>()
   for (const p of pins) {
     if (readStates.has(p.id)) continue
@@ -3470,7 +3577,7 @@ async function outboundConfig($: any): Promise<OutboundConfig> {
   const path = `${fleetDir()}/outbound.json`
   const timeOf = async (p: string) => {
     try {
-      return String((await $.fs.stat(p)).mtimeMs)
+      return String((await fsStat($, p)).mtimeMs)
     } catch {
       return '-'
     }
@@ -3652,14 +3759,14 @@ async function staleSend($: any, thread: string): Promise<string | null> {
   const since = Math.min(now - SEND_FRESH_MS, thread === 'main' && mainTurnAt ? mainTurnAt : Infinity)
   const me = await meNow($)
   const stale: { path: string; v: string; e: ChangeEvent }[] = []
-  for (const [path, r] of Object.entries((await read($, reads))[thread] ?? {})) {
+  for (const [path, r] of Object.entries((await stateRead(read($, reads)))[thread] ?? {})) {
     const e = latest.get(path)
     if (r.at < since || !e || e.to === r.v || e.at < r.at) continue
     // Its own landing isn't news to it
     if (e.by?.sessionId && e.by.sessionId === me.sessionId && (e.by.agentId ?? 'main') === thread && !e.by.person) continue
     stale.push({ path, v: e.to ?? 'gone', e })
   }
-  const told = (await read($, warned))[thread] ?? {}
+  const told = (await stateRead(read($, warned)))[thread] ?? {}
   const fresh = stale.filter(s => told[`send:${s.path}`] !== s.v)
   if (!fresh.length) return null
   await touched(update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), ...Object.fromEntries(fresh.map(s => [`send:${s.path}`, s.v])) } })))
@@ -3769,7 +3876,7 @@ async function orgAskHold($: any, e: any, why: 'org' | 'rule' = 'org'): Promise<
 // until /clear. It can still do everything; a change it files waits for the person. The mark never travels ----
 
 async function markOutside($: any, what: string) {
-  if (!root || (await read($, outside))) return
+  if (!root || (await stateRead(read($, outside)))) return
   const now = await $.clock.now()
   await touched(update($, outside, () => ({ at: now, what })))
   log($, `outside content: ${what}; this conversation's changes wait for the person's apply until /clear`)
@@ -3778,7 +3885,7 @@ async function markOutside($: any, what: string) {
 
 /** After a restart (the same conversation), the mark comes back from this session's reads file */
 async function restoreMark($: any) {
-  if (!root || (await read($, outside))) return
+  if (!root || (await stateRead(read($, outside)))) return
   const p = parseReads((await readText($, readsPath(String(await $.session.id())))) ?? '')
   if (p && 'threads' in p && p.outside && typeof p.outside.at === 'number') await touched(update($, outside, () => p.outside as OutsideMark))
 }
@@ -3798,12 +3905,12 @@ async function gate($: any, e: any, next: any) {
     return { deny: refusal }
   }
   const w = await worldFile($, e.file_path ?? e.notebook_path)
-  if (!w) return next(e)
+  if (!w) return under(below(), next(e))
   const thread = threadOf(e)
   if (w.copy) return copyGate($, e, next, w, thread)
   const cur = await versionOf($, w.abs)
-  const mine = (await read($, reads))[thread]?.[w.rel]
-  const told = (await read($, warned))[thread] ?? {}
+  const mine = (await stateRead(read($, reads)))[thread]?.[w.rel]
+  const told = (await stateRead(read($, warned)))[thread] ?? {}
   // Under strict, nothing passes on a second try: only a read clears it. Nor does a second call of the batch whose
   // first was refused (the same step: the model hadn't seen the refusal)
   const strict = isStrict(records, w.rel)
@@ -3864,7 +3971,7 @@ async function gate($: any, e: any, next: any) {
   const mark = await inFlight($, w.rel, thread, text === null ? null : hashText(text))
   let r: any
   try {
-    r = await next(e)
+    r = await under(below(), next(e))
   } finally {
     if (!r || r.deny !== undefined || r.isError) await mark.done()
   }
@@ -4056,7 +4163,7 @@ async function pruneWriting($: any, now: number) {
   writingPrunedAt = now
   let entries: any[] = []
   try {
-    entries = await $.fs.list(stateDir('writing'))
+    entries = await fsList($, stateDir('writing'))
   } catch {
     return
   }
@@ -4076,12 +4183,12 @@ function mustProve(rel: string): boolean {
 // it), not again at each new version of the copy its own writes make. Nothing lands
 async function copyGate($: any, e: any, next: any, w: Placed, thread: string) {
   const key = `copy:${w.rel}`
-  if ((await read($, warned))[thread]?.[key] !== 'told') {
+  if ((await stateRead(read($, warned)))[thread]?.[key] !== 'told') {
     await touched(update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [key]: 'told' } })))
     log($, `refused once: ${e.tool} of a worktree copy of ${w.rel} by ${thread} (${w.copy})`)
     return { deny: copyWriteText(String(e.file_path ?? e.notebook_path), w.rel, `${realRoot}/${w.rel}`) }
   }
-  const r = await next(e)
+  const r = await under(below(), next(e))
   if (r && r.deny === undefined && !r.isError) log($, `${w.rel}: written in the worktree ${w.copy} only`)
   return r
 }
@@ -4110,7 +4217,7 @@ async function snapshot($: any): Promise<Snapshot | undefined> {
     if (depth > 16) return true
     let entries: any[] = []
     try {
-      entries = await $.fs.list(rel ? `${realRoot}/${rel}` : realRoot)
+      entries = await fsList($, rel ? `${realRoot}/${rel}` : realRoot)
     } catch {
       return true
     }
@@ -4206,7 +4313,7 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
     // or will, and the scan takes it then). It isn't this thread's landing: its model hears what changed under it
     if (readOnly) {
       // Told now only for a file it names (it may have read it mid-change); the digest tells the rest at its next step
-      if ((await read($, reads))[thread]?.[rel] && (!names || names(rel))) during.push({ rel, v })
+      if ((await stateRead(read($, reads)))[thread]?.[rel] && (!names || names(rel))) during.push({ rel, v })
       continue
     }
     if (names && !names(rel)) {
@@ -4227,7 +4334,7 @@ async function afterBash($: any, thread: string, before: Snapshot, startedAt: nu
       unnamed++
       continue
     }
-    const mine = (await read($, reads))[thread]?.[rel]
+    const mine = (await stateRead(read($, reads)))[thread]?.[rel]
     // The pins of what the command left, as the gate would have checked them (it isn't held: it's marked)
     let pc = f.text === null || isHistory(rel) ? null : await checkPins($, thread, f.text, new Set(k?.pins ?? []), isStrict(records, rel))
     // A copy from shared files the command names (cp, tail -n +N, cat a b > c, … >> log): a pin is carried when every
@@ -4405,7 +4512,7 @@ async function othersRunning($: any): Promise<Running[]> {
   const now = await $.clock.now()
   const sessionId = String(await $.session.id())
   const out: Running[] = [...fgRunning.values()].map(c => ({ thread: c.thread, at: c.at, command: c.command }))
-  for (const [task, b] of Object.entries(await read($, bgCommands))) if (!b.readOnly) out.push({ thread: b.thread, at: b.at, task, ...(b.command ? { command: b.command } : {}) })
+  for (const [task, b] of Object.entries(await stateRead(read($, bgCommands)))) if (!b.readOnly) out.push({ thread: b.thread, at: b.at, task, ...(b.command ? { command: b.command } : {}) })
   for (const name of await names($, `${fleetDir()}/reads`)) {
     if (!name.endsWith('.json') || name === `${sessionId}.json`) continue
     const p = parseReads((await readText($, `${fleetDir()}/reads/${name}`)) ?? '')
@@ -4423,7 +4530,7 @@ async function bashHook($: any, e: any, next: any) {
   await ensureWorld($)
   if (!worldOn()) {
     const at = await $.clock.now()
-    const r = await next(e)
+    const r = await under(below(), next(e))
     if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
     // An instance's command in the background, kept with its text: told after a restart or a compaction (G2)
     const task = typeof r?.result?.backgroundTaskId === 'string' && r.result.backgroundTaskId ? (r.result.backgroundTaskId as string) : null
@@ -4468,7 +4575,7 @@ async function bashHook($: any, e: any, next: any) {
   })
   let r: any
   try {
-    r = await next(e)
+    r = await under(below(), next(e))
   } finally {
     if (fgRunning.get(n)?.shown) saveReadsSoon($, true)
     fgRunning.delete(n)
@@ -4509,14 +4616,14 @@ async function bashHook($: any, e: any, next: any) {
 const NAMED_READS_MAX = 50
 async function namedReadsNow($: any, thread: string, command: string): Promise<Snapshot> {
   const out: Snapshot = new Map()
-  const mine = (await read($, reads))[thread]
+  const mine = (await stateRead(read($, reads)))[thread]
   if (!mine || !realRoot) return out
   const names = await bashNamer($, command)
   const rels = Object.keys(mine).filter(rel => names(rel))
   if (rels.length > NAMED_READS_MAX) return out
   for (const rel of rels) {
     try {
-      const s = await $.fs.stat(`${realRoot}/${rel}`)
+      const s = await fsStat($, `${realRoot}/${rel}`)
       if (s.kind === 'file') out.set(rel, { mtimeMs: Number(s.mtimeMs), size: Number(s.size) })
     } catch {}
   }
@@ -4531,7 +4638,7 @@ async function namedReadsAfter($: any, before: Snapshot, startedAt: number): Pro
   for (const [rel, s] of before) {
     let now: { mtimeMs: number; size: number } | null = null
     try {
-      const x = await $.fs.stat(`${realRoot}/${rel}`)
+      const x = await fsStat($, `${realRoot}/${rel}`)
       if (x.kind === 'file') now = { mtimeMs: Number(x.mtimeMs), size: Number(x.size) }
     } catch {}
     if (!now || now.mtimeMs !== s.mtimeMs || now.size !== s.size) changed.push(rel)
@@ -4578,7 +4685,7 @@ async function runningNow($: any): Promise<RunningNow> {
   const now = await $.clock.now()
   const sessionId = String(await $.session.id())
   const out: RunningNow = { now, foreground: [...fgRunning.values()].map(c => c.at), background: [], finished: [] }
-  for (const b of Object.values(await read($, bgCommands))) if (!b.readOnly) out.background.push({ who: await whoAmI($, b.thread), at: b.at })
+  for (const b of Object.values(await stateRead(read($, bgCommands)))) if (!b.readOnly) out.background.push({ who: await whoAmI($, b.thread), at: b.at })
   for (const f of finishedHere) if (now - f.end < FINISHED_KEEP_MS) out.finished.push({ who: await whoAmI($, f.thread), at: f.at, end: f.end })
   for (const name of await names($, `${fleetDir()}/reads`)) {
     if (!name.endsWith('.json') || name === `${sessionId}.json`) continue
@@ -4776,11 +4883,11 @@ async function startWorld($: any) {
   await run($, ['mkdir', '-p', eventsDir(), `${fleetDir()}/reads`, runsDir()])
   if (!(await exists($, `${eventsDir()}/latest`))) {
     try {
-      await $.fs.write(`${eventsDir()}/latest`, json({ format: FORMAT, last: '' }))
+      await fsWrite($, `${eventsDir()}/latest`, json({ format: FORMAT, last: '' }))
     } catch {}
   }
-  const had = await read($, reads)
-  if (!Object.keys(had).length && !(await read($, outside))) {
+  const had = await stateRead(read($, reads))
+  if (!Object.keys(had).length && !(await stateRead(read($, outside)))) {
     const t = await readText($, readsPath(String(await $.session.id())))
     const p = t === null ? null : parseReads(t)
     readsRev++
@@ -4802,7 +4909,7 @@ async function startWorld($: any) {
   await run($, ['mkdir', '-p', stateDir('revs'), stateDir('checks'), stateDir('confirms')])
   if (!(await exists($, stateDir('.gitignore')))) {
     try {
-      await $.fs.write(stateDir('.gitignore'), '# fleet’s own state: versions, suspects, check results, the sweeper\n*\n')
+      await fsWrite($, stateDir('.gitignore'), '# fleet’s own state: versions, suspects, check results, the sweeper\n*\n')
     } catch {}
   }
   // An inbox for the pollers, and its latest (which every session watches), when the project has intake
@@ -4810,7 +4917,7 @@ async function startWorld($: any) {
     await run($, ['mkdir', '-p', inboxDir()])
     if (!(await exists($, inboxDir('latest')))) {
       try {
-        await $.fs.write(inboxDir('latest'), '')
+        await fsWrite($, inboxDir('latest'), '')
       } catch {}
     }
   }
@@ -5113,7 +5220,7 @@ const flagged = { suspectsMtime: -1, suspects: null as SuspectsFile | null, chec
 async function loadFlags($: any) {
   let m = -1
   try {
-    m = Number((await $.fs.stat(stateDir('suspects.json'))).mtimeMs)
+    m = Number((await fsStat($, stateDir('suspects.json'))).mtimeMs)
   } catch {}
   if (m !== flagged.suspectsMtime) {
     flagged.suspectsMtime = m
@@ -5121,13 +5228,13 @@ async function loadFlags($: any) {
   }
   let c = -1
   try {
-    c = Number((await $.fs.stat(stateDir('checks'))).mtimeMs)
+    c = Number((await fsStat($, stateDir('checks'))).mtimeMs)
   } catch {}
   if (c !== flagged.checksMtime) {
     flagged.checksMtime = c
     let entries: any[] = []
     try {
-      entries = await $.fs.list(stateDir('checks'))
+      entries = await fsList($, stateDir('checks'))
     } catch {}
     const present = new Set<string>()
     for (const x of entries) {
@@ -5144,12 +5251,12 @@ async function loadFlags($: any) {
   // A file only behind a move isn't a flag of its own on the band: "20 behind R-1@4" says them all
   const direct = directSuspects()
   const n = new Set([...direct.filter(s => !movesOf(s)).map(s => s.path), ...failing().map(f => f.path), ...unprovenFiles().map(u => u.path)]).size
-  if ((await read($, flags)) !== n) await touched(update($, flags, () => n))
+  if ((await stateRead(read($, flags))) !== n) await touched(update($, flags, () => n))
   const behind = direct.filter(s => movesOf(s))
   const groups = behindGroups(behind, () => '')
   const top = groups[0]
   const line = top ? `${behind.length} behind ${top.move}${groups.length > 1 ? ` and ${groups.length - 1} other move${groups.length > 2 ? 's' : ''}` : ''}` : ''
-  if ((await read($, behindBand)) !== line) await touched(update($, behindBand, () => line))
+  if ((await stateRead(read($, behindBand))) !== line) await touched(update($, behindBand, () => line))
 }
 
 /** The files only behind a move, grouped by it (records.ts behindGroups), by who wrote each last */
@@ -5199,7 +5306,7 @@ function failing(): { path: string; owner: Who | null; check: string; message: s
  * staleness goes to its owner, not to whoever wrote it last) */
 async function ownLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   const me = { sessionId: String(await $.session.id()), ref: myRef ?? jobRef }
-  const told = await read($, ownTold)
+  const told = await stateRead(read($, ownTold))
   const checks: { key: string; line: string }[] = []
   const words = await meNow($)
   const mine: Suspect[] = []
@@ -5270,7 +5377,7 @@ async function holdInputs($: any, items: DigestItem[], now: number): Promise<Dig
   const kinds = derivedKinds.filter(k => ownsKind(k, inst))
   if (!kinds.length) return items
   await loadFlags($)
-  const told = await read($, ownTold)
+  const told = await stateRead(read($, ownTold))
   const stale = new Map<string, DerivedStale>((flagged.suspects?.derived ?? []).map(d => [d.path, d]))
   // Each input's path → the debounce of the documents that cite it and wait, or that might (not reckoned yet)
   const waits = new Map<string, number[]>()
@@ -5313,9 +5420,9 @@ async function intakeLines($: any): Promise<{ lines: string[]; ids: string[]; at
   const inst = myInstance
   if (!inst || !intakeEvents.size) return { lines: [], ids: [], at: 0 }
   await carryIntake($, inst)
-  const told = await read($, intakeTold)
+  const told = await stateRead(read($, intakeTold))
   // Those not told yet, and those told in a conversation a /clear ended (the new one doesn't remember them)
-  const again = new Set(await read($, intakeAgain))
+  const again = new Set(await stateRead(read($, intakeAgain)))
   const mine = [...intakeEvents.values()].filter(e => e.id && e.intake && e.intake.to.includes(inst.name) && (again.has(e.id) || (e.at > intakeSeen.at && !told[e.id]))).sort((a, b) => a.at - b.at)
   if (!mine.length) return { lines: [], ids: [], at: 0 }
   const text = pointerText(
@@ -5371,7 +5478,7 @@ async function intakeTick($: any) {
   const files: { source: string; name: string; path: string; mtime: number }[] = []
   let entries: any[] = []
   try {
-    entries = await $.fs.list(inboxDir())
+    entries = await fsList($, inboxDir())
   } catch {}
   for (const x of entries) {
     const name = String(x.name)
@@ -5380,7 +5487,7 @@ async function intakeTick($: any) {
     if (x.kind !== 'dir') continue
     let inner: any[] = []
     try {
-      inner = await $.fs.list(inboxDir(name))
+      inner = await fsList($, inboxDir(name))
     } catch {}
     for (const y of inner) if (y.kind === 'file' && String(y.name).endsWith('.json') && !String(y.name).startsWith('.')) files.push({ source: name, name: String(y.name), path: inboxDir(`${name}/${y.name}`), mtime: Number(y.mtimeMs) })
   }
@@ -5507,7 +5614,7 @@ async function intakeOne($: any, c: IntakeConfig, f: { source: string; name: str
     const aside = intakeDir(`failed/${f.source}-${f.name}`)
     await moveAside($, f.path, aside)
     if (bodyPath) await moveAside($, bodyPath, `${aside.replace(/\.json$/, '')}.body`)
-    await $.fs.write(`${aside.replace(/\.json$/, '')}.why`, `${why.why}, ${MAX_TRIES} tries (the last at ${new Date(now).toISOString()})\n`)
+    await fsWrite($, `${aside.replace(/\.json$/, '')}.why`, `${why.why}, ${MAX_TRIES} tries (the last at ${new Date(now).toISOString()})\n`)
     await replace($, seenPath, json({ format: FORMAT, source: item.source, ref: item.ref, at: now, failed: why.why }))
     log($, `intake ${f.source}/${f.name}: ${why.why}, ${MAX_TRIES} tries: moved to ${intakeDir('failed/')}`)
     return 'skip'
@@ -5714,7 +5821,7 @@ const codeRead = { mtime: -1, state: null as CodeState | null }
 async function codeStateNow($: any): Promise<CodeState | null> {
   let m = -1
   try {
-    m = Number((await $.fs.stat(stateDir('code.json'))).mtimeMs)
+    m = Number((await fsStat($, stateDir('code.json'))).mtimeMs)
   } catch {}
   if (m !== codeRead.mtime) {
     codeRead.mtime = m
@@ -5736,7 +5843,7 @@ async function overlapsNow($: any): Promise<Overlap[]> {
 async function codeLines($: any): Promise<{ lines: string[]; keys: string[] }> {
   const inst = myInstance
   if (!inst || !codeCfg.repos.length) return { lines: [], keys: [] }
-  const told = await read($, ownTold)
+  const told = await stateRead(read($, ownTold))
   const mine = (await overlapsNow($)).filter(o => o.slug === inst.slug && !told[`k|${overlapKey(o)}`])
   return mine.length ? { lines: codeDigest(mine, await meNow($)), keys: [...new Set(mine.map(o => `k|${overlapKey(o)}`))] } : { lines: [], keys: [] }
 }
@@ -5988,7 +6095,7 @@ async function loadSlots($: any): Promise<SlotSpec[]> {
   const path = `${fleetDir()}/slots.json`
   let st: any
   try {
-    st = await $.fs.stat(path)
+    st = await fsStat($, path)
   } catch {
     slotsCfg = null
     slotsProblem = ''
@@ -6195,8 +6302,8 @@ async function sweepSlotsNow($: any) {
 async function slotLines($: any): Promise<{ lines: string[]; told: () => Promise<void>; urgent: boolean }> {
   const none = { lines: [] as string[], told: async () => {}, urgent: false }
   if (!root) return none
-  const told = await read($, slotTold)
-  const waiting = await read($, slotWait)
+  const told = await stateRead(read($, slotTold))
+  const waiting = await stateRead(read($, slotWait))
   if (!Object.keys(told).length && !waiting.length) return none
   const now = await $.clock.now()
   const me = await meNow($)
@@ -6488,7 +6595,7 @@ async function pruneWorld($: any, now: number) {
   const old = async (dir: string) => {
     let entries: any[] = []
     try {
-      entries = await $.fs.list(dir)
+      entries = await fsList($, dir)
     } catch {}
     await remove($, entries.filter(x => x.kind === 'file' && now - Number(x.mtimeMs) > KEEP_DAYS * 24 * HOUR).map(x => `${dir}/${x.name}`))
   }
@@ -6521,13 +6628,13 @@ async function worldCommand($: any, action: 'list' | 'add' | 'remove', glob: str
   let g = glob
   if (action === 'add' && !/[*?{]/.test(g)) {
     try {
-      if ((await $.fs.stat(`${root}/${g.replace(/\/+$/, '')}`)).kind === 'dir') g = `${g.replace(/\/+$/, '')}/**`
+      if ((await fsStat($, `${root}/${g.replace(/\/+$/, '')}`)).kind === 'dir') g = `${g.replace(/\/+$/, '')}/**`
     } catch {}
   }
   const changed = action === 'add' ? addGlob(w, g) : removeGlob(w, g)
   if ('problem' in changed) return changed.problem
   w = changed.world
-  await $.fs.write(`${fleetDir()}/world.json`, worldText(w))
+  await fsWrite($, `${fleetDir()}/world.json`, worldText(w))
   // His own change (typed here): stamped, so it isn't flagged as made outside fleet
   await writeStamps($, ['.claude/fleet/world.json'])
   world = null
@@ -6637,7 +6744,7 @@ async function worldStatus($: any, all = false): Promise<string[]> {
     return versions.get(rel)
   }
   const sessionId = String(await $.session.id())
-  const sessions: { name: string; ref?: string | null; threads: Record<string, Record<string, FleetRead>> }[] = [{ name: 'this session', threads: await read($, reads) }]
+  const sessions: { name: string; ref?: string | null; threads: Record<string, Record<string, FleetRead>> }[] = [{ name: 'this session', threads: await stateRead(read($, reads)) }]
   let other = 0
   const now = await $.clock.now()
   for (const name of await names($, `${fleetDir()}/reads`)) {
@@ -7129,7 +7236,7 @@ async function loadRoster($: any) {
   const path = `${fleetDir()}/roster.json`
   let st: any
   try {
-    st = await $.fs.stat(path)
+    st = await fsStat($, path)
   } catch {
     roster = null
     rosterProblem = ''
@@ -7260,7 +7367,7 @@ async function heartbeat($: any, force = true) {
     // The same conversation in a new process (a restart; a reload of the module keeps $.state, and the mark in it):
     // what it had in flight, said at its next step (G2)
     const proc = `process|${sessionId}`
-    if (prev && prev.sessionId === sessionId && (await read($, workTold))[proc] === undefined) {
+    if (prev && prev.sessionId === sessionId && (await stateRead(read($, workTold)))[proc] === undefined) {
       const commands = (Array.isArray(prev.bg) ? prev.bg : []).map(x => (typeof x?.command === 'string' ? x.command : '')).filter(Boolean)
       await setInFlight($, 'restarted', commands)
     }
@@ -7271,13 +7378,13 @@ async function heartbeat($: any, force = true) {
       if (Object.keys(kept).length) await touched(update($, waitsOn, m => ({ ...kept, ...m })))
     }
   }
-  if (!(await read($, conversationAt))) await touched(update($, conversationAt, () => now))
-  if (!(await read($, startedHere))) await touched(update($, startedHere, () => now))
+  if (!(await stateRead(read($, conversationAt)))) await touched(update($, conversationAt, () => now))
+  if (!(await stateRead(read($, startedHere)))) await touched(update($, startedHere, () => now))
   const journalAt = await mtimeOf($, `${root}/${inst.journal}`)
-  const last = Math.max(carried.lastLanding, await read($, landedAt), journalAt ?? 0)
-  const work = Math.max(carried.lastWork, await read($, workLandedAt))
+  const last = Math.max(carried.lastLanding, await stateRead(read($, landedAt)), journalAt ?? 0)
+  const work = Math.max(carried.lastWork, await stateRead(read($, workLandedAt)))
   const owns = await ownedOpen($, inst)
-  const mark = await read($, outside)
+  const mark = await stateRead(read($, outside))
   await carryIntake($, inst)
   const beat: Heartbeat & Record<string, unknown> = {
     format: FORMAT,
@@ -7304,7 +7411,7 @@ async function heartbeat($: any, force = true) {
     owns,
     journal: inst.journal,
     journalAt,
-    conversationAt: await read($, conversationAt),
+    conversationAt: await stateRead(read($, conversationAt)),
     cadenceH: inst.cadenceH,
     freshH: inst.freshH,
     context: inst.context,
@@ -7322,15 +7429,15 @@ async function heartbeat($: any, force = true) {
     ...(stepRefused?.effort ? { effortRefused: stepRefused.effort } : {}),
     ...(stepRefused ? { refusedTimes: stepRefused.times, refusedUntil: stepRefused.until } : {}),
     failed: turnFailed,
-    idleSince: (await read($, idleSince)) || null,
-    classicStart: !!(await read($, classicSeen)).SessionStart,
+    idleSince: (await stateRead(read($, idleSince))) || null,
+    classicStart: !!(await stateRead(read($, classicSeen))).SessionStart,
     ...(orgAsk.size ? { orgAsk: [...orgAsk].sort() } : {}),
-    waits: await read($, waitsOn),
+    waits: await stateRead(read($, waitsOn)),
     ...(inst.poll ? { lastPoll: (await readWire<{ at: number }>($, `${dir}/poll.json`))?.at ?? null } : {}),
-    ...(inst.watch.length && (await read($, watchTold)) ? { watchTold: await read($, watchTold) } : {}),
+    ...(inst.watch.length && (await stateRead(read($, watchTold))) ? { watchTold: await stateRead(read($, watchTold)) } : {}),
     ...(restartWait ? { restartWait } : {}),
     ...(compactedAt ? { compactedAt } : {}),
-    bg: Object.values(await read($, bgCommands))
+    bg: Object.values(await stateRead(read($, bgCommands)))
       .filter(x => x.thread === 'main' && x.command)
       .slice(0, 10)
       .map(x => ({ command: (x.command as string).slice(0, 300), at: x.at })),
@@ -7439,7 +7546,7 @@ async function remoteControl($: any): Promise<boolean | null> {
 
 async function mtimeOf($: any, path: string): Promise<number | null> {
   try {
-    const st = await $.fs.stat(path)
+    const st = await fsStat($, path)
     return st.kind === 'file' ? Number(st.mtimeMs) : null
   } catch {
     return null
@@ -7943,12 +8050,12 @@ async function workLines($: any, forNudge = false): Promise<{ lines: string[]; t
   if (!inst || !root) return none
   const now = await $.clock.now()
   const me = await meNow($)
-  const told = await read($, workTold)
+  const told = await stateRead(read($, workTold))
   const lines: string[] = []
   const keys: string[] = []
   let urgent = false
-  const quietNote = await read($, inFlightQuiet)
-  const note = forNudge && quietNote ? '' : await read($, inFlightNote)
+  const quietNote = await stateRead(read($, inFlightQuiet))
+  const note = forNudge && quietNote ? '' : await stateRead(read($, inFlightNote))
   if (note) {
     lines.push(note)
     if (!quietNote) urgent = true
@@ -8339,11 +8446,11 @@ async function budgetLine($: any): Promise<{ line: string; key: string; urgent?:
   const b = (await budgets($)).find(x => x.inst.slug === inst.slug)
   if (!b) return null
   const day = today(await $.clock.now())
-  const told = await read($, budgetTold)
+  const told = await stateRead(read($, budgetTold))
   if (b.state !== 'over') {
     // Told it's used up (today or a day before: a new day resets the cap; a /clear keeps the day), or its last process
     // was over: once it's no longer, it hears to resume, once
-    const overDay = (await read($, budgetOverDay)) || (told.endsWith('|over') ? told.split('|')[0] : '') || carried.budgetOver
+    const overDay = (await stateRead(read($, budgetOverDay))) || (told.endsWith('|over') ? told.split('|')[0] : '') || carried.budgetOver
     if (!overDay || told === `${day}|resumed`) return null
     const cap = b.own === b.state || budgetCache.project.cap === null ? b.cap : budgetCache.project.cap
     const whose = b.own === b.state || budgetCache.project.cap === null ? "this instance's" : "the project's"
@@ -8380,14 +8487,14 @@ async function refOfInstance($: any, name: string): Promise<string | null> {
 async function maybeSeed($: any) {
   const inst = myInstance
   if (!inst || !bound || !jobRef || !root) return
-  if ((await read($, seedSent)) === jobRef) return
+  if ((await stateRead(read($, seedSent))) === jobRef) return
   const ref = jobRef
   const marker = `${instDir(inst.slug)}/seed-${ref}.json`
   if (await exists($, marker)) {
     await touched(update($, seedSent, () => ref))
     return
   }
-  if ((await read($, busy)) || (await read($, stopped))) return
+  if ((await stateRead(read($, busy))) || (await stateRead(read($, stopped)))) return
   const text = await seedText($, inst)
   await touched(update($, seedSent, () => ref))
   log($, `seed for ${inst.name}`)
@@ -8497,7 +8604,7 @@ const nudgeSeen: Record<'decisions' | 'work' | 'runs' | 'budget' | 'restart', st
  * waits (watchSlots, started as it joins a line). Whether it still waits */
 let slotTimes: string | null = null
 async function slotWatch($: any): Promise<boolean> {
-  const waits = await read($, slotWait)
+  const waits = await stateRead(read($, slotWait))
   if (!waits.length) {
     slotTimes = null
     return false
@@ -8523,7 +8630,7 @@ function watchSlots($: any) {
         slotTimer?.cancel()
         slotTimer = null
         // A line joined while this look found none: watched again
-        if ((await read($, slotWait)).length) watchSlots($)
+        if ((await stateRead(read($, slotWait))).length) watchSlots($)
       })(),
     ),
   )
@@ -8538,7 +8645,7 @@ async function watchForNudge($: any, records: readonly QueueRecord[], present: R
     nudgeSeen[k] = v
     if (before !== null && before !== v) moved = true
   }
-  if (Object.keys(await read($, waitsOn)).length) see('decisions', `${records.map(r => r.id).sort().join(',')}|${[...present].sort().join(',')}`)
+  if (Object.keys(await stateRead(read($, waitsOn))).length) see('decisions', `${records.map(r => r.id).sort().join(',')}|${[...present].sort().join(',')}`)
   see('work', (await mtimeOf($, stateDir('work.json'))) ?? 0)
   see('runs', await folderTime($, runsDir()))
   // A restart the person asked for (/fleet up --restart-when-idle, an applied roster change)
@@ -8552,7 +8659,7 @@ async function watchForNudge($: any, records: readonly QueueRecord[], present: R
 /** A folder's time (a file added or removed in it moves it): -1 when it isn't there */
 async function folderTime($: any, dir: string): Promise<number> {
   try {
-    const st = await $.fs.stat(dir)
+    const st = await fsStat($, dir)
     return st.kind === 'dir' ? Number(st.mtimeMs) : -1
   } catch {
     return -1
@@ -8582,22 +8689,22 @@ async function nudgeTick($: any) {
   const inst = myInstance
   if (!inst || !jobRef || !root) return
   await maybeSeed($)
-  if (!(await read($, seedSent))) return
+  if (!(await stateRead(read($, seedSent)))) return
   const now = await $.clock.now()
-  if ((await read($, busy)) || (await read($, stopped))) return
+  if ((await stateRead(read($, busy))) || (await stateRead(read($, stopped)))) return
   // Idle less than the 30 s a nudge waits for, or a failed submit's retry not due: looked at again then
-  const idleFor = now - (await read($, idleSince))
-  const retry = await read($, retryAt)
+  const idleFor = now - (await stateRead(read($, idleSince)))
+  const retry = await stateRead(read($, retryAt))
   if (idleFor < 30000 || now < retry) {
     kickNudge($, Math.max(30000 - idleFor, retry - now) + 500)
     return
   }
-  const pending = await read($, nudgeAt)
+  const pending = await stateRead(read($, nudgeAt))
   if (pending && now - pending < 10 * 60000) return
-  if (Object.keys(await read($, inflight)).length) return
+  if (Object.keys(await stateRead(read($, inflight))).length) return
   // A fresh period's hand-off that didn't start its turn (dropped, or failed) goes before anything else: the cleared
   // conversation has nothing else to go on from
-  const handing = await read($, handoff)
+  const handing = await stateRead(read($, handoff))
   if (handing) {
     await touched(update($, nudgeAt, () => now))
     log($, `fresh period for ${inst.name}: its hand-off again`)
@@ -8610,17 +8717,17 @@ async function nudgeTick($: any) {
   // list not ready, a turn that started in between), after RESTART_QUEUED_MS when it queued it and nothing restarted
   const toRestart = await pendingRestart($, inst)
   const restartFor = toRestart?.at ?? 0
-  const askedAt = await read($, restartAskedAt)
-  const again = restartFor === (await read($, restartAsked)) && now - askedAt.at >= (askedAt.queued ? RESTART_QUEUED_MS : RESTART_RETRY_MS)
+  const askedAt = await stateRead(read($, restartAskedAt))
+  const again = restartFor === (await stateRead(read($, restartAsked))) && now - askedAt.at >= (askedAt.queued ? RESTART_QUEUED_MS : RESTART_RETRY_MS)
   // Why it waits goes to the heartbeat at once (/fleet status says it), and the restart is looked at again when it may go
   const waitWas = restartWait
   const waitTold = () => {
     if (restartWait !== waitWas) bg(heartbeat($))
   }
   if (!restartFor) restartWait = null
-  else if (restartFor !== (await read($, restartAsked)) || again) {
-    const bgs = Object.keys(await read($, bgCommands)).length
-    const idleMs = now - (await read($, idleSince))
+  else if (restartFor !== (await stateRead(read($, restartAsked))) || again) {
+    const bgs = Object.keys(await stateRead(read($, bgCommands))).length
+    const idleMs = now - (await stateRead(read($, idleSince)))
     if (bgs) restartWait = `busy: ${bgs} background command(s) running`
     else if (idleMs < 60000) {
       restartWait = 'waits for it to be idle a minute'
@@ -8649,8 +8756,8 @@ async function nudgeTick($: any) {
   // The idle compaction (G22): once per idle episode, idle a while with a large context, before the prompt cache runs
   // out, so the next wake reloads a summary instead of the whole conversation
   // (idle since its last turn ended, or since its fleet started when no turn has ended here yet)
-  const idleFrom = (await read($, idleSince)) || (await read($, startedHere))
-  const compactDue = inst.compact && (lastContextTokens ?? 0) >= inst.compact.minTokens && (await read($, compactedFor)) !== idleFrom ? idleFrom + inst.compact.idleMin * 60000 - now : null
+  const idleFrom = (await stateRead(read($, idleSince))) || (await stateRead(read($, startedHere)))
+  const compactDue = inst.compact && (lastContextTokens ?? 0) >= inst.compact.minTokens && (await stateRead(read($, compactedFor))) !== idleFrom ? idleFrom + inst.compact.idleMin * 60000 - now : null
   if (compactDue !== null && compactDue <= 0) {
     await touched(update($, compactedFor, () => idleFrom))
     log($, `idle compaction for ${inst.name} (${tokensText(lastContextTokens ?? 0)} in context, idle ${Math.round((now - idleFrom) / 60000)} min)`)
@@ -8670,7 +8777,7 @@ async function nudgeTick($: any) {
   // Its routine poll (roster.json's poll), on its own count: not a wake, not the cadence's, kept across restarts
   if (inst.poll) {
     // Its first one a period after its fleet started
-    const last = (await readWire<{ at: number }>($, `${instDir(inst.slug)}/poll.json`))?.at ?? ((await read($, startedHere)) || now)
+    const last = (await readWire<{ at: number }>($, `${instDir(inst.slug)}/poll.json`))?.at ?? ((await stateRead(read($, startedHere))) || now)
     if (now - last >= inst.poll.everyMin * 60000) {
       await touched(update($, nudgeAt, () => now))
       log($, `poll for ${inst.name} (every ${inst.poll.everyMin} min)`)
@@ -8707,8 +8814,8 @@ async function nudgeTick($: any) {
   // A fresh period (decision 4a): a period-old conversation, idle, its journal written since it started. The journal is
   // read (whole: its tail is the hand-off) only once one is due, by its time; journals only grow
   const journalAt = await mtimeOf($, `${root}/${inst.journal}`)
-  const conv = await read($, conversationAt)
-  const freshNow = FRESH_PERIODS && journalAt !== null && (await read($, freshAt)) <= conv && freshDue({ context: inst.context, freshH: inst.freshH, conversationAt: conv, journalAt, now, idleMs: now - (await read($, idleSince)), pending: !!(await pendingRestart($, inst)) })
+  const conv = await stateRead(read($, conversationAt))
+  const freshNow = FRESH_PERIODS && journalAt !== null && (await stateRead(read($, freshAt))) <= conv && freshDue({ context: inst.context, freshH: inst.freshH, conversationAt: conv, journalAt, now, idleMs: now - (await stateRead(read($, idleSince))), pending: !!(await pendingRestart($, inst)) })
   const journal = freshNow ? await readText($, `${root}/${inst.journal}`) : null
   if (freshNow && journal !== null) {
     await touched(update($, freshAt, () => now))
@@ -8732,7 +8839,7 @@ async function nudgeTick($: any) {
   // The cadence: a nudge each period while nothing lands, at most cadence.perDay a day (a negative result, in its
   // journal, counts; not while it owns open board items: then only work landed elsewhere does, and the nudge names them)
   const owns = await ownedOpen($, inst)
-  const c = cadenceOf({ cadenceH: inst.cadenceH, lastLanding: Math.max(carried.lastLanding, await read($, landedAt), journalAt ?? 0) || null, lastWork: Math.max(carried.lastWork, await read($, workLandedAt)) || null, ownsOpen: owns.length, startedAt: carried.startedAt || now, now })
+  const c = cadenceOf({ cadenceH: inst.cadenceH, lastLanding: Math.max(carried.lastLanding, await stateRead(read($, landedAt)), journalAt ?? 0) || null, lastWork: Math.max(carried.lastWork, await stateRead(read($, workLandedAt))) || null, ownsOpen: owns.length, startedAt: carried.startedAt || now, now })
   // Its next period starts before the next pass: looked at then, not up to a minute later
   if (c.nextMs !== null && c.nextMs < NUDGE_PASS_MS) kickNudge($, c.nextMs + 500)
   // One count with the sweeper's cadence wakes, one period key; and no cadence nudge while its way forward is its own
@@ -8740,7 +8847,7 @@ async function nudgeTick($: any) {
   const sweptHere = swept && swept.day === day ? swept.instances[inst.slug] : undefined
   const ownCadence = mine?.cadenceDay === day ? (mine.cadenceCount ?? 0) : 0
   const cadenceToday = ownCadence + (sweptHere?.cadenceCount ?? 0)
-  const waitsOwn = Object.keys(await read($, open)).length > 0
+  const waitsOwn = Object.keys(await stateRead(read($, open))).length > 0
   // The cap: roster.json's cadence.perDay (3 by default, null none), none while it owns open items
   const cadenceCap = cadencePerDayOf(roster?.r ?? null, owns.length)
   if (!urgent && c.due && mine?.cadenceKey !== c.key && sweptHere?.cadenceKey !== c.key && cadenceToday < cadenceCap && !waitsOwn) {
@@ -8756,7 +8863,7 @@ async function nudgeTick($: any) {
   // Its budget's line too: past 80% it's nothing, used up it's never here (no nudge then), raised again it's to resume
   const d = await digestFor($, 'main', true, true)
   // What changed under the paths it watches (a scanner reads them with grep: no read of its own would tell it)
-  const seenFrom = Math.max(await read($, watchTold), await read($, conversationAt))
+  const seenFrom = Math.max(await stateRead(read($, watchTold)), await stateRead(read($, conversationAt)))
   const watched = inst.watch.length ? await watchedLines($, inst, seenFrom) : []
   if (!d.lines.length && !watched.length) return
   await touched(update($, nudgeAt, () => now))
@@ -8809,7 +8916,7 @@ async function watchedEvents($: any, inst: Instance, since: number): Promise<Cha
   const now = await $.clock.now()
   let mark = -1
   try {
-    mark = Number((await $.fs.stat(`${eventsDir()}/latest`)).mtimeMs)
+    mark = Number((await fsStat($, `${eventsDir()}/latest`)).mtimeMs)
   } catch {}
   let c = watchCursors.get(key)
   if (!c || since < c.from) {
@@ -8846,7 +8953,7 @@ function pollText(p: { everyMin: number; prompt: string }): string {
 async function pendingRestart($: any, inst: Instance): Promise<{ at: number; named: boolean } | null> {
   const p = await readWire<{ at: number; named?: boolean }>($, `${instDir(inst.slug)}/restart.json`)
   const at = typeof p?.at === 'number' ? p.at : 0
-  return at && at > (await read($, startedHere)) ? { at, named: p?.named === true } : null
+  return at && at > (await stateRead(read($, startedHere))) ? { at, named: p?.named === true } : null
 }
 /** A refused restart is asked again this long after; one sessions queued and that didn't happen, this long after */
 const RESTART_RETRY_MS = 2 * 60000
@@ -8870,7 +8977,7 @@ function sawClassic($: any, event: string) {
   classicNoted.add(event)
   bg(
     (async () => {
-      if ((await read($, classicSeen))[event]) return
+      if ((await stateRead(read($, classicSeen)))[event]) return
       const now = await $.clock.now()
       await touched(update($, classicSeen, m => ({ ...m, [event]: now })))
     })(),
@@ -8881,7 +8988,7 @@ function sawClassic($: any, event: string) {
  * reach fleet, the next prompt, fleet's or anyone's, carries it): '' otherwise */
 async function identityOwed($: any): Promise<string> {
   const inst = myInstance
-  if (!inst || !jobRef || !root || (await read($, identityTold))) return ''
+  if (!inst || !jobRef || !root || (await stateRead(read($, identityTold)))) return ''
   return instanceContext($, inst)
 }
 
@@ -9071,9 +9178,9 @@ function circularOfChange(rel: string, cur: string | null, result: string, summa
  * their queue: which, numbered when a decision has several, and how an answer typed here takes one off it */
 async function openHereLines($: any, e: any): Promise<string[]> {
   if (e.command || e.turnId || !jobRef || !offered || !root) return []
-  const pp = await read($, pendingPerson)
+  const pp = await stateRead(read($, pendingPerson))
   if (!pp || pp.text !== String(e.text ?? '')) return []
-  const ids = Object.keys(await read($, open))
+  const ids = Object.keys(await stateRead(read($, open)))
   if (!ids.length) return []
   const present = await answerNames($)
   const waiting: string[] = []
@@ -9099,7 +9206,7 @@ async function openHereLines($: any, e: any): Promise<string[]> {
 async function answeredHere($: any, e: any) {
   const id = String(e.id ?? '').trim().toUpperCase()
   if (!isDecisionId(id)) return { deny: 'id: the decision the person just answered here, as D-<n>. Nothing was changed.' }
-  const turn = await read($, personTurn)
+  const turn = await stateRead(read($, personTurn))
   if (!turn) return { deny: `kind answered closes ${id} only in a turn the person started by typing in this session: their words are the answer. Leave it open; it reaches you when they answer with /fleet. Nothing was changed.` }
   const rec = await readQueue($, id)
   if (!rec) return { result: `${id} is closed already: nothing to do.` }
@@ -9161,7 +9268,7 @@ let lastRuling: { key: string; id: string } | null = null
  * saw them typed this turn (never the model's account; about only names it), closed at once. The judges read it as his
  * answer, and the brief lists it with the other answers */
 async function rulingHere($: any, e: any) {
-  const turn = await read($, personTurn)
+  const turn = await stateRead(read($, personTurn))
   if (!turn) return { deny: "kind ruling records the person's ruling only in a turn the person typed in this session: their words are the ruling. Nothing was recorded." }
   if (myInstance) return { deny: `${myInstance.name} is an instance of the roster, not the person's own session: a ruling typed in its window isn't recorded (they can say it in their own session, or write it in the charter). Nothing was recorded.` }
   const about = field(e.about, 300, 'about')
@@ -9387,8 +9494,8 @@ async function newsLines($: any, withApplied = true): Promise<{ lines: string[];
   const keys: string[] = []
   const me = await meNow($)
   if (myInstance && withApplied) {
-    const since = await read($, conversationAt)
-    const told = await read($, ownTold)
+    const since = await stateRead(read($, conversationAt))
+    const told = await stateRead(read($, ownTold))
     const found = new Set<string>()
     const say = (rec: { id: string; asker: Asker; change?: ChangeSpec }, at: number) => {
       if (!rec.change) return
@@ -9400,7 +9507,7 @@ async function newsLines($: any, withApplied = true): Promise<{ lines: string[];
     // In flight: decisions/applied/'s claim, while its drafter hasn't been told yet (it moves only when one is applied)
     let appliedAt = -1
     try {
-      appliedAt = Number((await $.fs.stat(dec('applied'))).mtimeMs)
+      appliedAt = Number((await fsStat($, dec('applied'))).mtimeMs)
     } catch {}
     if (appliedAt !== -1 && appliedAt !== newsSeen.applied) {
       let any = false
@@ -9422,7 +9529,7 @@ async function newsLines($: any, withApplied = true): Promise<{ lines: string[];
     let stamp = ''
     for (const m of months) {
       try {
-        stamp += `${m}:${Number((await $.fs.stat(dec(`register/${m}`))).mtimeMs)};`
+        stamp += `${m}:${Number((await fsStat($, dec(`register/${m}`))).mtimeMs)};`
       } catch {}
     }
     if (stamp && stamp !== newsSeen.register) {
@@ -9451,9 +9558,9 @@ async function newsLines($: any, withApplied = true): Promise<{ lines: string[];
     }
   }
   // What fleet's change dialog came to in this session (closed with no turn of its own)
-  const dialog = await read($, dialogNews)
+  const dialog = await stateRead(read($, dialogNews))
   lines.push(...dialog)
-  const waits = await read($, waitsOn)
+  const waits = await stateRead(read($, waitsOn))
   const closed: string[] = []
   for (const id of Object.keys(waits).sort((a, b) => idNumber(a) - idNumber(b))) {
     const s = await settledWords($, id)
@@ -9535,8 +9642,8 @@ async function fileChange($: any, e: any) {
   const circular = circularOfChange(rel, cur, result, c.summary, diff.text)
   // Who asked for it: the person, typing this turn, in a conversation that read nothing from outside (then it's applied
   // as it's filed: his direct command costs him no tap), or not (it waits for /fleet <n> apply)
-  const mark = await read($, outside)
-  const anyTurn = await read($, personTurn)
+  const mark = await stateRead(read($, outside))
+  const anyTurn = await stateRead(read($, personTurn))
   const turn = anyTurn && anyTurn.origin !== 'bridge' ? anyTurn : null
   // A change to outbound.json (what may leave without asking) always waits for his apply, which shows him the diff
   const verdict = circular ? { ok: false as const, why: 'circular' as const } : rel === OUTBOUND_JSON ? { ok: false as const, why: 'allowlist' as const } : preAnswer({ personTurn: !!turn, mark, mainThread: e.agentId === undefined })
@@ -9555,8 +9662,8 @@ async function fileChange($: any, e: any) {
   }))
   const spec = record.change as ChangeSpec
   await run($, ['mkdir', '-p', dec('drafts')])
-  await $.fs.write(`${fleetDir()}/${spec.draft}`, result)
-  await $.fs.write(`${fleetDir()}/${spec.diff}`, diff.text)
+  await fsWrite($, `${fleetDir()}/${spec.draft}`, result)
+  await fsWrite($, `${fleetDir()}/${spec.diff}`, diff.text)
   await touched(update($, open, m => ({ ...m, [record.id]: 1 })))
   log($, `${record.id} queued: a change to ${rel}${circular ? ` (flagged: its only authority is ${circular.via.join(', ')}, derived from it)` : ''}`)
   // His own turn of a conversation that read outside content goes to the same dialog, labelled, with the diff a tap
@@ -9586,7 +9693,7 @@ async function fileResource($: any, e: any) {
   if (!c.ok) return { deny: `${c.reason}. Nothing was queued: call mcp__fleet__decide again with that fixed.` }
   const asker = await askerNow($)
   const now = await $.clock.now()
-  const mark = await read($, outside)
+  const mark = await stateRead(read($, outside))
   const record = await allocate($, id => ({ format: FORMAT, fleet: version, id, at: now, asker, questions: [], ...(c.blocks ? { blocks: c.blocks } : {}), kind: 'resource', resource: c.resource, ...(mark ? { outside: mark } : {}), ...supOf(e) }))
   await touched(update($, open, m => ({ ...m, [record.id]: 1 })))
   log($, `${record.id} queued: a resource (${c.resource.what.slice(0, 80)})`)
@@ -9627,14 +9734,14 @@ async function fileOutbound($: any, e: any) {
   const draft = draftText(s)
   const asker = await askerNow($)
   const now = await $.clock.now()
-  const mark = await read($, outside)
+  const mark = await stateRead(read($, outside))
   const record = await allocate($, id => {
     const spec: OutboundSpec = { to: s.to, why: s.why, what, how: s.command !== undefined ? 'command' : 'tool', draft: `decisions/drafts/${id}.json`, files, cwd, hash: outboundHash(draft, files, hashText), ...(sources.length ? { sources } : {}) }
     return { format: FORMAT, fleet: version, id, at: now, asker, questions: [], ...(s.blocks ? { blocks: s.blocks } : {}), kind: 'outbound', outbound: spec, ...(mark ? { outside: mark } : {}) }
   })
   const spec = record.outbound as OutboundSpec
   await run($, ['mkdir', '-p', dec('drafts')])
-  await $.fs.write(`${fleetDir()}/${spec.draft}`, draft)
+  await fsWrite($, `${fleetDir()}/${spec.draft}`, draft)
   await touched(update($, open, m => ({ ...m, [record.id]: 1 })))
   log($, `${record.id} queued: an outbound (${what.slice(0, 80)} to ${s.to.slice(0, 60)})`)
   bg(beat($))
@@ -9824,7 +9931,7 @@ async function sourceOf($: any, abs: string): Promise<Source> {
   const pattern = patternOf(abs)
   let st: any = null
   try {
-    st = await $.fs.stat(pattern ? pattern.dir || '/' : abs)
+    st = await fsStat($, pattern ? pattern.dir || '/' : abs)
   } catch {}
   if (!st) return { v: null, text: null, tree: null }
   if (!pattern && st.kind !== 'dir') {
@@ -9839,7 +9946,7 @@ async function sourceOf($: any, abs: string): Promise<Source> {
   const walk = async (rel: string): Promise<void> => {
     let entries: any[] = []
     try {
-      entries = [...(await $.fs.list(rel ? `${base}/${rel}` : base || '/'))].sort(byName)
+      entries = [...(await fsList($, rel ? `${base}/${rel}` : base || '/'))].sort(byName)
     } catch {
       return
     }
@@ -9860,7 +9967,7 @@ async function sourceOf($: any, abs: string): Promise<Source> {
         // A link goes as a link (rsync -a, tar): where it leads is its version
         let to = 'nowhere'
         try {
-          to = String((await $.fs.stat(`${base}/${r}`, { resolve: true })).realPath ?? 'nowhere')
+          to = String((await fsStat($, `${base}/${r}`, { resolve: true })).realPath ?? 'nowhere')
         } catch {}
         rows.push({ path: r, v: `link ${to}` })
       } else rows.push({ path: r, v: (await versionOf($, `${base}/${r}`)).v })
@@ -10168,7 +10275,7 @@ async function allowNow($: any, a: Allow): Promise<{ added: string[]; line: stri
   if (!added.length) return { added: [], line: `outbound.json allows ${list} already.` }
   if (!(await replace($, abs, w.text))) {
     try {
-      await $.fs.write(abs, w.text)
+      await fsWrite($, abs, w.text)
     } catch (err) {
       return { added: [], line: `fleet couldn't write outbound.json (${String(err).slice(0, 160)}): add ${list} yourself, then /fleet accept outbound.json.` }
     }
@@ -10281,7 +10388,7 @@ async function answerChange($: any, it: AnswerItem, rec: QueueRecord, origin: st
   }
   try {
     await run($, ['mkdir', '-p', target.slice(0, target.lastIndexOf('/'))])
-    await $.fs.write(target, draft)
+    await fsWrite($, target, draft)
   } catch (err) {
     await remove($, [claimPath])
     return { line: `${n}: couldn't write ${spec.path}: ${String(err).slice(0, 200)}`, done: false }
@@ -10364,7 +10471,7 @@ async function rosterTakesEffect($: any): Promise<string[]> {
     if (before === null && !running && !stopped) continue
     if (!wrote) await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
     wrote = true
-    await $.fs.write(settingsPath(inst.slug), next)
+    await fsWrite($, settingsPath(inst.slug), next)
     if (!running || down.has(inst.slug)) {
       out.push(`  ${inst.name}: settings rewritten (it takes them when it ${running ? 'restarts' : 'starts or wakes'})`)
       continue
@@ -10766,7 +10873,7 @@ const asksSeen = { queue: -1, answers: -1 }
 async function decisionsMoved($: any): Promise<boolean> {
   const at = async (sub: string) => {
     try {
-      return Number((await $.fs.stat(dec(sub))).mtimeMs)
+      return Number((await fsStat($, dec(sub))).mtimeMs)
     } catch {
       return -1
     }
@@ -10856,7 +10963,7 @@ async function commandOrigin($: any, kind: string, args: string): Promise<string
   if (inheritedJob || (envInstance && !jobRef)) return 'shell'
   // Remote Control from the phone is the person's own channel (it can't be started from a shell)
   if (kind === 'bridge') return kind
-  if (jobRef && (await read($, turns)) === 0) {
+  if (jobRef && (await stateRead(read($, turns))) === 0) {
     let s: any = null
     let readable = true
     try {
@@ -10987,7 +11094,7 @@ async function dropLocalSessions($: any, dir: string): Promise<string> {
   const next = keys.length ? withoutPlugins(text, keys) : null
   if (next === null) return ''
   const backup = `${path}.bak-antes-fleet`
-  if (!(await exists($, backup))) await $.fs.write(backup, text)
+  if (!(await exists($, backup))) await fsWrite($, backup, text)
   if (!(await replace($, path, next))) return `Couldn't rewrite .claude/settings.local.json to take ${keys.join(', ')} out: take it out by hand (your user settings enable it).`
   log($, `plan B: ${keys.join(', ')} taken out of ${path}`)
   return `Took ${keys.join(', ')} out of .claude/settings.local.json (backed up as settings.local.json.bak-antes-fleet): your user settings enable it, and that key would make Claude install a copy pinned to this project that \`claude plugin update\` doesn't reach. Restart the sessions running here (u) to load it from your user settings.`
@@ -11273,7 +11380,7 @@ async function upCommand($: any, c: Extract<Command, { kind: 'up' }>, origin: st
   if (lint.errors.length) return [...out, 'Nothing was started: fix the errors, then /fleet up again.'].join('\n')
   if (!ready) return [...out, 'Nothing was started or woken: update sessions, restart this session (u), then /fleet up again.'].join('\n')
   await run($, ['mkdir', '-p', `${fleetDir()}/instances`])
-  for (const p of plan) if (p.action !== 'down' && p.action !== 'unstarted') await $.fs.write(settingsPath(p.inst.slug), settingsText(settingsFor(p.inst, root as string, deny)))
+  for (const p of plan) if (p.action !== 'down' && p.action !== 'unstarted') await fsWrite($, settingsPath(p.inst.slug), settingsText(settingsFor(p.inst, root as string, deny)))
   if (c.names.length) await setDown($, plan.map(p => p.inst.slug), false)
   // --restart-when-idle: a running instance whose settings changed (or any named one) restarts once idle, by its own
   // fleet (instances/<slug>/restart.json: the time it was asked, and named: asked by name with its settings unchanged;
@@ -11413,14 +11520,14 @@ function armWakes($: any, ms: number) {
  * reload sends what the old module had left */
 async function drainWakes($: any) {
   const now = await $.clock.now()
-  const ws = await read($, pendingWakes)
+  const ws = await stateRead(read($, pendingWakes))
   if (!ws.length) return
   const next = ws.reduce((a, b) => (b.due < a.due ? b : a))
   if (next.due > now) return armWakes($, next.due - now)
   await touched(update($, pendingWakes, xs => xs.filter(x => x !== next && !(x.slug === next.slug && x.due === next.due))))
   const s = await sendWake($, next)
   if (!s?.ok && !(s && !s.ok && s.detail?.startsWith("it's down now"))) $.ui.log(`${next.name} wasn't woken: ${s && !s.ok ? (s.detail ?? s.reason) : "sessions didn't answer"} (u in the panel restarts it)`)
-  const rest = await read($, pendingWakes)
+  const rest = await stateRead(read($, pendingWakes))
   if (rest.length) armWakes($, Math.max(WAKE_GAP_MS, Math.min(...rest.map(x => x.due)) - (await $.clock.now())))
 }
 
@@ -11688,7 +11795,7 @@ async function rosterStatus($: any): Promise<string[]> {
     if (blocks) lines.push(...blocksLines(inst.name, blocks, -new Date(now).getTimezoneOffset()).map((l, i) => `${i ? '      ' : '    '}${l}`))
   }
   if (jobRef) lines.push(myInstance ? `this session: ${myInstance.name} (${myInstance.role})${bound ? '' : `, unbound: ${bindWhy}`}${agentType ? `; runs as ${agentType}` : ''}` : `this session: ${bindWhy}`)
-  lines.push(classicLine(await read($, classicSeen), ownWatchLive, sweep.holding))
+  lines.push(classicLine(await stateRead(read($, classicSeen)), ownWatchLive, sweep.holding))
   const loose = await unstamped($)
   if (loose.length) lines.push(`changed outside fleet (not through a change you applied): ${loose.join(', ')}: /fleet accept <path> stamps your own edit as yours`)
   return lines
@@ -11744,7 +11851,7 @@ async function findTemplate($: any, name: string): Promise<{ dir: string; meta: 
 async function copyTree($: any, from: string, to: string, rel: string, written: string[], kept: string[]) {
   let entries: any[] = []
   try {
-    entries = [...(await $.fs.list(from))].sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)))
+    entries = [...(await fsList($, from))].sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)))
   } catch {
     return
   }
@@ -11762,7 +11869,7 @@ async function copyTree($: any, from: string, to: string, rel: string, written: 
     const text = await readText($, `${from}/${name}`)
     if (text === null) continue
     await run($, ['mkdir', '-p', to])
-    await $.fs.write(`${to}/${name}`, text)
+    await fsWrite($, `${to}/${name}`, text)
     written.push(`${rel}/${name}`)
   }
 }
@@ -11860,7 +11967,7 @@ async function globFiles($: any, glob: string): Promise<string[]> {
     if (depth > 4 || out.length >= 50) return
     let entries: any[] = []
     try {
-      entries = await $.fs.list(rel ? `${root}/${rel}` : (root as string))
+      entries = await fsList($, rel ? `${root}/${rel}` : (root as string))
     } catch {
       return
     }
@@ -12186,13 +12293,13 @@ async function tasteCall($: any, e: any) {
   await ensureWorld($)
   const area = areaOf(c.area, worldTags)
   // His only when what it says is in his own words: his prompt of this turn, or what fleet delivered of his in it
-  const anyTurn = await read($, personTurn)
+  const anyTurn = await stateRead(read($, personTurn))
   const turn = anyTurn && anyTurn.origin !== 'bridge' ? anyTurn : null
-  const delivered = await read($, fleetTurn)
+  const delivered = await stateRead(read($, fleetTurn))
   const typed = !!turn && heardIn(c.said, turn.text ?? turn.quoted)
   const fromAnswer = !typed && !!delivered && heardIn(c.said, delivered.words)
   const quoted = typed ? turn?.quoted : fromAnswer ? cut((delivered?.words ?? '').replace(/\s+/g, ' ').trim(), 300) : turn?.quoted
-  const mark = await read($, outside)
+  const mark = await stateRead(read($, outside))
   const spec: TasteSpec = { said: c.said, about: c.about, principle: c.principle, person: typed || fromAnswer, ...(quoted ? { quoted } : {}), ...(mark ? { outside: mark } : {}) }
   const notHeard = turn ? "what it says isn't in what the person typed this turn" : delivered ? "what it says isn't in the person's words fleet delivered this turn" : "the person didn't type this turn"
   const now = await $.clock.now()
@@ -12245,7 +12352,7 @@ async function confirmCall($: any, e: any) {
   if (asked && (asked.rev < floor || asked.rev > top.rev)) return { deny: `${id} is at v${top.rev}${floor < top.rev ? ` (revised last at v${floor})` : ''}, not v${asked.rev}: read it as it is now, check the files against it, then confirm against ${id}@${top.rev}` }
   const thread = threadOf(e)
   const cur = await versionOf($, `${realRoot}/${rel}`)
-  const mine = (await read($, reads))[thread] ?? {}
+  const mine = (await stateRead(read($, reads)))[thread] ?? {}
   const readV = mine[rel]?.v
   const readRev = readV ? [...revs].reverse().find(r => r.hash === readV)?.rev : undefined
   if (readV !== cur.v && !(cur.v === top.hash && readRev !== undefined && readRev >= floor)) return { deny: `read ${rel} first (the Read tool, or a plain cat): a confirmation says files hold against ${id} as it is now` }
@@ -12508,18 +12615,18 @@ async function deliverOverrules($: any) {
   const list = (await rareNames($, dec('overrules'))).filter(n => /^D-\d+\.json$/.test(n))
   if (!list.length) return
   const now = await $.clock.now()
-  const pending = await read($, overruling)
+  const pending = await stateRead(read($, overruling))
   // One an older copy of the module waited on: its turn shows in the transcript, or it's sent again
   const orphans = Object.keys(pending).filter(id => pending[id]?.epoch !== EPOCH)
-  if (orphans.length && !(await read($, busy)) && now - (await read($, idleSince)) >= ORPHAN_IDLE_MS) {
+  if (orphans.length && !(await stateRead(read($, busy))) && now - (await stateRead(read($, idleSince))) >= ORPHAN_IDLE_MS) {
     const seen = await deliveredInTranscript($, orphans)
     for (const id of orphans) {
       if (seen.has(id)) await overruleDelivered($, id)
       else await touched(update($, overruling, m => omit(m, [id])))
     }
   }
-  if ((await read($, busy)) || (await read($, stopped)) || now < (await read($, retryAt))) return
-  const inFlight = await read($, overruling)
+  if ((await stateRead(read($, busy))) || (await stateRead(read($, stopped))) || now < (await stateRead(read($, retryAt)))) return
+  const inFlight = await stateRead(read($, overruling))
   const mine: OverruleNotice[] = []
   for (const n of list) {
     const x = await readWire<OverruleNotice>($, dec(`overrules/${n}`))
@@ -12539,7 +12646,7 @@ async function deliverOverrules($: any) {
             return
           }
           await $.clock.sleep(1000)
-          const still = await read($, overruling)
+          const still = await stateRead(read($, overruling))
           for (const id of ids) if (still[id]) await overruleDelivered($, id)
         })(),
       ),
@@ -12559,13 +12666,13 @@ async function deliverOverrules($: any) {
  * were on their way, as a prompt of fleet's own ("[D-<n>] The person added a note"), once */
 async function deliverLate($: any) {
   if (!jobRef || delivering) return
-  const late = await read($, lateNotes)
+  const late = await stateRead(read($, lateNotes))
   const ids = Object.keys(late)
   if (!ids.length) return
   const now = await $.clock.now()
   // One an older copy of the module waited on: its turn shows in the transcript, or it's sent again
   const orphans = ids.filter(id => late[id]?.sent && late[id]?.sent?.epoch !== EPOCH)
-  if (orphans.length && !(await read($, busy)) && now - (await read($, idleSince)) >= ORPHAN_IDLE_MS) {
+  if (orphans.length && !(await stateRead(read($, busy))) && now - (await stateRead(read($, idleSince))) >= ORPHAN_IDLE_MS) {
     let said = ''
     try {
       const messages = await $.session.messages()
@@ -12573,8 +12680,8 @@ async function deliverLate($: any) {
     } catch {}
     for (const id of orphans) await touched(update($, lateNotes, m => (said.includes(`[${id}] The person added a note`) ? omit(m, [id]) : m[id] ? { ...m, [id]: { notes: m[id].notes, at: m[id].at } } : m)))
   }
-  if ((await read($, busy)) || (await read($, stopped)) || now < (await read($, retryAt)) || Object.keys(await read($, inflight)).length) return
-  const waiting = await read($, lateNotes)
+  if ((await stateRead(read($, busy))) || (await stateRead(read($, stopped))) || now < (await stateRead(read($, retryAt))) || Object.keys(await stateRead(read($, inflight))).length) return
+  const waiting = await stateRead(read($, lateNotes))
   const ready = Object.keys(waiting).filter(id => !waiting[id]?.sent)
   if (!ready.length) return
   await touched(update($, lateNotes, m => ({ ...m, ...Object.fromEntries(ready.filter(id => m[id]).map(id => [id, { ...(m[id] as FleetLate), sent: { at: now, epoch: EPOCH } }])) })))
@@ -12743,7 +12850,7 @@ async function changeMoved($: any, spec: ChangeSpec): Promise<boolean> {
 
 // The number in the last listing shown here: its decision and question, or each one of a question several asked
 async function itemsOf($: any, n: number): Promise<{ id: string; q: number }[]> {
-  const key = (await read($, listing))[n - 1]
+  const key = (await stateRead(read($, listing)))[n - 1]
   return key ? listedMembers(key) : []
 }
 
@@ -12807,11 +12914,11 @@ let pointerWarned = ''
 
 async function answerCommand($: any, items: AnswerItem[], origin: string, line = ''): Promise<string> {
   // What this session's list showed before this command: an outbound goes only as it was shown here
-  let seen = await read($, listing)
+  let seen = await stateRead(read($, listing))
   // No list shown in this session yet: with one thing waiting, 1 is it; otherwise the list, to answer by its numbers
   if (items.some(it => typeof it.n === 'number') && !seen.length) {
     const list = await listCommand($)
-    const keys = await read($, listing)
+    const keys = await stateRead(read($, listing))
     if (keys.length !== 1 || items.some(it => it.n !== 1)) return keys.length ? `Nothing was answered: these are the numbers to answer by.\n\n${list}` : list
     // The one thing waiting is an outbound to send: it goes only once the list has shown it whole, so here it is
     const only = await readQueue($, (listedMembers(keys[0] as string)[0] as { id: string }).id)
@@ -12926,7 +13033,7 @@ async function answerCommand($: any, items: AnswerItem[], origin: string, line =
       // Words that point at another item of this list reach the asker meaning nothing: warned once
       const k = pointsAtItem(chosen.text)
       const key = `${it.n}|${chosen.text}`
-      if (k !== null && k !== it.n && k <= (await read($, listing)).length && pointerWarned !== key) {
+      if (k !== null && k !== it.n && k <= (await stateRead(read($, listing))).length && pointerWarned !== key) {
         pointerWarned = key
         const said = await itemAnswerWords($, k)
         const i = said?.label !== undefined ? question.options.findIndex(o => o.label === said.label) : -1
@@ -13439,7 +13546,7 @@ async function statusCommand($: any, all = false): Promise<string> {
       `outbound: ${jobRef ? 'a call that would send the project’s content outside is held here, for the person to approve as a draft (mcp__fleet__send)' : gateHolds() ? 'a call that would send the project’s content outside is held here: this session was started from a background session (it inherited CLAUDE_JOB_DIR or FLEET_INSTANCE), and the one that started it drafts it' : "not held in this session (it's yours, whatever its permission mode: what it sends is yours to watch); held in the project's background sessions"}; allowed without asking: ${allowed.length ? allowed.join('; ') : 'nothing but this machine'} (outbound.json${outboundProblem ? `: ${outboundProblem}` : ''}${outboundUnstamped ? ` as it was last stamped: outbound.json changed outside fleet, /fleet accept outbound.json to use it` : ''})`,
     )
     for (const l of callsLint(oc)) lines.push(`  ⚠ ${l}`)
-    const mark = await read($, outside)
+    const mark = await stateRead(read($, outside))
     if (mark) {
       lines.push(`this conversation read outside content (${markText(mark, (await meNow($)).offsetMin, await $.clock.now())}): a change it files waits for /fleet <n> apply (one filed in your own turn: fleet's dialog asks you, with its diff), until /clear`)
       // A connector of his own organisation (his mail, his directory, his chat) needn't mark: the exact line that says so
@@ -13451,7 +13558,7 @@ async function statusCommand($: any, all = false): Promise<string> {
     const waiting = records.filter(r => knownKind(r) && progress(r.id, slots(r), present).complete).length
     lines.push(`project: ${heldCount(records, present, alikeQuestion)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
     lines.push((await sweeperState($)).line)
-    lines.push(liveLine(!!(await read($, classicSeen)).SessionStart, await $.clock.now()))
+    lines.push(liveLine(!!(await stateRead(read($, classicSeen))).SessionStart, await $.clock.now()))
     await ensureWorld($)
     const spent = await judgeLedger($, await $.clock.now())
     const liveAreas = Object.keys((await judgesStateNow($)).live).sort()
@@ -13473,10 +13580,10 @@ async function statusCommand($: any, all = false): Promise<string> {
     }
     if (reviews.length) lines.push(`  ${reviews.length} overrule${reviews.length === 1 ? '' : 's'} of the judge (${reviews.map(x => x.id).join(', ')}) ${reviews.length === 1 ? 'has' : 'have'} waited a day or more for ${judgesCfg.reviewer ? `the reviewer, ${judgesCfg.reviewer} (it hears them at its next step, or woken)` : 'a reviewer world.json no longer names (remove them from .claude/fleet/decisions/overrules/)'}`)
     if (jobRef) {
-      const mine = Object.keys(await read($, open))
-      const pending = Object.keys(await read($, inflight))
+      const mine = Object.keys(await stateRead(read($, open)))
+      const pending = Object.keys(await stateRead(read($, inflight)))
       lines.push(`asked here: ${mine.length ? mine.join(', ') : 'nothing open'}${pending.length ? ` · being delivered: ${pending.join(', ')}` : ''}`)
-      if (await read($, stopped)) lines.push('delivery: waiting for you to type something here (an Esc stopped this session)')
+      if (await stateRead(read($, stopped))) lines.push('delivery: waiting for you to type something here (an Esc stopped this session)')
     }
     lines.push(...(await rosterStatus($)))
     lines.push(...(await codeStatus($)))
@@ -13508,8 +13615,8 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   config = { ...config, template: name, ...(commitRegister ? { commitRegister: true } : {}) }
   const made = await run($, ['mkdir', '-p', ...['queue', 'answers', 'register', 'tmp', 'prune'].map(d => `${dir}/decisions/${d}`), `${dir}/events`, `${dir}/reads`])
   if (made.exitCode !== 0) return `couldn't create ${dir}: ${made.stderr.trim()}`
-  if (before !== configText(config)) await $.fs.write(`${dir}/config.json`, configText(config))
-  await $.fs.write(`${dir}/.gitignore`, gitignoreText(config.commitRegister))
+  if (before !== configText(config)) await fsWrite($, `${dir}/config.json`, configText(config))
+  await fsWrite($, `${dir}/.gitignore`, gitignoreText(config.commitRegister))
   const written: string[] = []
   const kept: string[] = []
   await copyTree($, `${tpl.dir}/fleet`, dir, '.claude/fleet', written, kept)
@@ -13518,22 +13625,22 @@ async function initCommand($: any, template: string, commitRegister: boolean): P
   let worldNow = await readText($, `${dir}/world.json`)
   if (worldNow === null) {
     worldNow = worldText(newWorld())
-    await $.fs.write(`${dir}/world.json`, worldNow)
+    await fsWrite($, `${dir}/world.json`, worldNow)
     written.push('.claude/fleet/world.json')
   }
   // The outbound allowlist: empty (nothing leaves but through a draft the person approves) until he adds his own
   if (!(await exists($, `${dir}/outbound.json`))) {
-    await $.fs.write(`${dir}/outbound.json`, outboundText(newOutbound()))
+    await fsWrite($, `${dir}/outbound.json`, outboundText(newOutbound()))
     written.push('.claude/fleet/outbound.json')
   }
   // The person's principles, which the judges read with the charter: his to write
   if (!(await exists($, `${dir}/principles.md`))) {
-    await $.fs.write(`${dir}/principles.md`, PRINCIPLES_TEXT)
+    await fsWrite($, `${dir}/principles.md`, PRINCIPLES_TEXT)
     written.push('.claude/fleet/principles.md')
   }
   // The scarce resources: none until the interview (or he) says what they are
   if (!(await exists($, `${dir}/slots.json`))) {
-    await $.fs.write(`${dir}/slots.json`, `${JSON.stringify(newSlots(), null, 2)}\n`)
+    await fsWrite($, `${dir}/slots.json`, `${JSON.stringify(newSlots(), null, 2)}\n`)
     written.push('.claude/fleet/slots.json')
   }
   const parsed = parseWorld(worldNow)
@@ -13605,12 +13712,12 @@ const VERB_KINDS: Record<string, { kinds: string[]; one: string; many: string }>
  * only to find the item, doesn't count as shown afterwards; with none or several, the list is shown with the line */
 async function bareVerb($: any, e: any, verb: string, rest: string): Promise<string> {
   const v = VERB_KINDS[verb] as { kinds: string[]; one: string; many: string }
-  const before = await read($, listing)
+  const before = await stateRead(read($, listing))
   let keys = before
   let list = ''
   if (!keys.length) {
     list = await listCommand($)
-    keys = await read($, listing)
+    keys = await stateRead(read($, listing))
   }
   const fits: { n: number; kind: string }[] = []
   for (const [i, k] of keys.entries()) {
@@ -13681,7 +13788,7 @@ async function personPrompt($: any, e: any) {
   const text = String(e.text ?? '')
   let person = isPersonOrigin(kind)
   let launch = false
-  if (person && jobRef && !e.turnId && (await read($, turns)) === 0) {
+  if (person && jobRef && !e.turnId && (await stateRead(read($, turns))) === 0) {
     let s: any = null
     try {
       s = JSON.parse((await readText($, `${jobDir}/state.json`)) ?? 'null')
@@ -13739,10 +13846,10 @@ async function recordDialog($: any, e: any, r: any, askedAt: number) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     found = undefined
-    const r = await next(e)
+    const r = await under(below(), next(e))
     if (!e.isInteractive) return r
     try {
-      if (!(await read($, conversationAt))) {
+      if (!(await stateRead(read($, conversationAt)))) {
         const now = await $.clock.now()
         await touched(update($, conversationAt, () => now))
       }
@@ -13755,7 +13862,7 @@ export const register: Register = on => {
 
   // A /clear keeps this process and its $.state; the open decisions are read again from the files all the same, and the
   // new conversation has read nothing of the world. A session that ends for good gives up the sweeper's lease
-  on('session.end', async ($, e, next) => {
+  on('session.end', ($, e, next) => act('session.end', async () => {
     if (e.reason === 'clear' || e.reason === 'resume') {
       try {
         await touched(update($, identityTold, () => false))
@@ -13768,21 +13875,21 @@ export const register: Register = on => {
       if (e.reason !== 'resume') ending = true
       await Promise.race([Promise.all([releaseLease($).catch(() => {}), flushReads($).catch(() => {})]), $.clock.sleep(500)])
     }
-    return next(e)
-  })
+    return under(below(), next(e))
+  }))
 
   // The engine's own watcher (C9, Q6-bg: it fires in a background session with no viewer, after /clear and compaction)
   // on events/latest, so a landing reaches every session in under a second; the 2 s tick is the fallback
   // And an instance of the roster learns there, every time its conversation starts again (after /clear, compaction,
   // resume), who it is, what it can't write and its budget; fleet learns the role it runs as (agent_type)
-  on('classic.SessionStart', async ($, e, next) => {
+  on('classic.SessionStart', ($, e, next) => act('classic.start', async () => {
     // Each SessionStart notes the classic hooks again (a state read each: in a TEST run, /fleet status said SessionStart
     // hadn't reached fleet after a /clear, though it had)
     classicNoted.clear()
     sawClassic($, 'SessionStart')
     if (typeof e.agent_type === 'string' && e.agent_type) agentType = e.agent_type
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
-    const r = await next(e)
+    const r = await under(below(), next(e))
     try {
       await ensureWorld($)
       if (!root) return r
@@ -13811,65 +13918,65 @@ export const register: Register = on => {
     } catch {
       return r
     }
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
   // A permission prompt an instance waits on, with nobody at it: its heartbeat says so at once, and the sweeper marks
   // its row (it needs the person). Only watched: the prompt is Claude's, and so is its answer
-  on('classic.PermissionRequest', async ($, e, next) => {
+  on('classic.PermissionRequest', ($, e, next) => act('classic.hook', async () => {
     sawClassic($, 'PermissionRequest')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (jobRef && myInstance) {
       permissionWait = { kind: 'permission', tool: String(e.tool_name ?? '').slice(0, 80), at: await $.clock.now() }
       bg(heartbeat($))
     }
-    return next(e)
-  }).catch(($, e, next) => next(e))
+    return under(below(), next(e))
+  })).catch(($, e, next) => next(e))
   // The background work still running at each stop: a Bash command of this session's that's no longer there completed,
   // and what it wrote lands now (bgDone)
-  on('classic.Stop', async ($, e, next) => {
+  on('classic.Stop', ($, e, next) => act('classic.hook', async () => {
     sawClassic($, 'Stop')
-    const r = await next(e)
+    const r = await under(below(), next(e))
     const tasks = (e as any).background_tasks
     if (Array.isArray(tasks)) {
       const live = new Set(tasks.map((t: any) => String(t?.id ?? '')))
       bg(
         (async () => {
-          for (const task of Object.keys(await read($, bgCommands))) if (!live.has(task)) await bgDone($, task)
+          for (const task of Object.keys(await stateRead(read($, bgCommands)))) if (!live.has(task)) await bgDone($, task)
         })(),
       )
     }
     return r
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
   // ... until its tool ran or was refused
-  on('classic.PostToolUse', async ($, e, next) => {
+  on('classic.PostToolUse', ($, e, next) => act('classic.hook', async () => {
     sawClassic($, 'PostToolUse')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (permissionWait) bg(promptAnswered($))
-    return next(e)
-  }).catch(($, e, next) => next(e))
-  on('classic.PostToolUseFailure', async ($, e, next) => {
+    return under(below(), next(e))
+  })).catch(($, e, next) => next(e))
+  on('classic.PostToolUseFailure', ($, e, next) => act('classic.hook', async () => {
     sawClassic($, 'PostToolUseFailure')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (permissionWait) bg(promptAnswered($))
-    return next(e)
-  }).catch(($, e, next) => next(e))
+    return under(below(), next(e))
+  })).catch(($, e, next) => next(e))
   // Auto mode refused a call (it fires only in auto mode): an instance's fleet keeps it, for the brief; nothing is held
-  on('classic.PermissionDenied', async ($, e, next) => {
+  on('classic.PermissionDenied', ($, e, next) => act('classic.hook', async () => {
     sawClassic($, 'PermissionDenied')
     if (permissionWait) bg(promptAnswered($))
     if (jobRef && myInstance) bg(noteBlock($, e))
-    return next(e)
-  }).catch(($, e, next) => next(e))
+    return under(below(), next(e))
+  })).catch(($, e, next) => next(e))
 
   on('classic.FileChanged', async ($, e, next) => {
     sawClassic($, 'FileChanged')
     fileChanged($, String(e.file_path), true)
-    return next(e)
+    return under(below(), next(e))
   }).catch(($, e, next) => next(e))
 
   // What stands in for the classic hooks when a managed plugin sends them on past fleet (B3), by events it can't skip:
   // a permission prompt put to the person (an organisation's ceiling `ask` above all: allow rules don't lift it)...
-  on('tool.check', async ($, e, next) => {
+  on('tool.check', ($, e, next) => act('gate', async () => {
     // A ready post from an instance that would wait at the organisation's prompt with its text frozen: a draft instead
     try {
       const held = await orgAskHold($, e)
@@ -13878,7 +13985,7 @@ export const register: Register = on => {
         return held
       }
     } catch {}
-    const r: any = await next(e)
+    const r: any = await under(below(), next(e))
     // The same post put to the person by a verdict ask (a settings rule, a hook, a mode that asks; no organisation
     // ceiling): it would wait at that prompt with its text frozen just the same. In auto mode a plain ask goes to the
     // classifier, not the person: only a rule's or a hook's ask counts there
@@ -13904,22 +14011,22 @@ export const register: Register = on => {
       }
     } catch {}
     return r
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
   // ... until its tool ran or was refused (the generic tool.call hook below, with the MCP gate)
   // ... and who an instance is, after a compaction its classic.SessionStart doesn't reach fleet for
-  on('session.compact', async ($, e, next) => {
-    const r: any = await next(e)
+  on('session.compact', ($, e, next) => act('compact.hook', async () => {
+    const r: any = await under(below(), next(e))
     try {
       if (e.agentId !== undefined || e.trigger === 'precompute' || !r || !Array.isArray(r.messages) || !myInstance || !jobRef) return r
       // What it had in flight, which a summary may have dropped: said at its next step (G2)
-      const commands = Object.values(await read($, bgCommands))
+      const commands = Object.values(await stateRead(read($, bgCommands)))
         .filter(x => x.thread === 'main' && x.command)
         .map(x => x.command as string)
       // Fleet's own idle compaction (not the engine's mid-turn one): the note waits for its next step
       const own = e.trigger !== 'auto' && selfCompactAt > 0 && (await $.clock.now()) - selfCompactAt < 10 * 60000
       if (own) selfCompactAt = 0
       await setInFlight($, 'compacted', commands, own)
-      if ((await read($, classicSeen)).SessionStart) {
+      if ((await stateRead(read($, classicSeen))).SessionStart) {
         await touched(update($, identityTold, () => false))
         return r
       }
@@ -13929,30 +14036,30 @@ export const register: Register = on => {
     } catch {
       return r
     }
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
   // The world's three hooks (changes.ts). They fail open: a fleet that errs lets the tool run as if it weren't there
-  on('tool.call', { tool: 'Read' }, async ($, e, next) => {
-    const r: any = await next(e)
+  on('tool.call', { tool: 'Read' }, ($, e, next) => act('read.note', async () => {
+    const r: any = await under(below(), next(e))
     if (!r || r.isError || r.deny !== undefined) return r
     await ensureWorld($)
     if (!worldOn()) return r
     const thread = threadOf(e)
     return withLines($, r, thread, await noteRead($, thread, e.file_path))
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
-  on('tool.call', { tool: ['Write', 'Edit', 'NotebookEdit'] }, async ($, e, next) => gate($, e, next)).catch(($, e, next) => next(e))
+  on('tool.call', { tool: ['Write', 'Edit', 'NotebookEdit'] }, ($, e, next) => act('write.land', async () => gate($, e, next))).catch(($, e, next) => next(e))
 
   // A guard that throws is skipped and the tool runs: before the command ran, the one hard line holds one that may reach
   // the network (in a background session); after it, or for any other command, it fails open as the rest of fleet
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => bashHook($, e, next)).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
+  on('tool.call', { tool: 'Bash' }, ($, e, next) => act('bash.scan', async () => bashHook($, e, next))).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
   // sessions' model tool mcp__sessions__wake: an instance of this project's roster isn't a model's to wake (its fleet
   // wakes it when something is for it; the person brings a stopped one back with /fleet up). Anything else passes
-  on('tool.call', { tool: /^mcp__sessions__wake$/ }, async ($, e, next) => {
+  on('tool.call', { tool: /^mcp__sessions__wake$/ }, ($, e, next) => act('wake.guard', async () => {
     const refused = await rosterWakeRefusal($, (e as any).session)
-    return refused ? { deny: refused } : next(e)
-  }).catch(($, e, next) => next(e))
+    return refused ? { deny: refused } : under(below(), next(e))
+  })).catch(($, e, next) => next(e))
 
   // An instance's main-loop requests run the roster's model and effort (B24/G32): a respawn replays the launch's
   // --model whatever the settings file says now, and /model in a background session waits on a dialog nobody answers,
@@ -14006,11 +14113,11 @@ export const register: Register = on => {
     return r
   })
 
-  on('turn.start', async ($, e, next) => {
+  on('turn.start', ($, e, next) => act('turn.start', async () => {
     if (e.agentId === undefined) {
       // Whose turn this is: the person's when his prompt starts it (prompt.submit came just before, and the turn runs
       // with his text: fleet's own prompts never reach its own prompt.submit hook, so the text tells them apart)
-      const p = await read($, pendingPerson)
+      const p = await stateRead(read($, pendingPerson))
       const now = await $.clock.now()
       const his = !!p && now - p.at < 60000 && !!p.text.trim() && String(e.text ?? '').includes(p.text.trim().slice(0, 200))
       if (his || (p && now - p.at >= 60000)) await touched(update($, pendingPerson, () => null))
@@ -14034,11 +14141,11 @@ export const register: Register = on => {
       if (String(e.text ?? '').includes('fleet: this session is ')) await touched(update($, identityTold, () => true))
       if (timersOn) bg(turnStarted($, e.text, e.turnId))
     }
-    return next(e)
-  })
+    return under(below(), next(e))
+  }))
 
-  on('turn.complete', async ($, e, next) => {
-    const r = await next(e)
+  on('turn.complete', ($, e, next) => act('turn.end', async () => {
+    const r = await under(below(), next(e))
     if (e.agentId === undefined) {
       await touched(update($, personTurn, () => null))
       await touched(update($, fleetTurn, () => null))
@@ -14067,22 +14174,22 @@ export const register: Register = on => {
     // A helper that finished takes its reads of the world with it
     if (typeof e.agentId === 'string' && e.agentId) bg(dropThread($, e.agentId))
     return r
-  })
+  }))
 
   // The person typed here: after an Esc, fleet may submit again. And a prompt that starts a turn carries the main
   // thread's digest (prompt.submit's context is in the turn's first request; an append there would not be)
   // A submit from the main prompt box empties it (prompt.change, origin clear): what a /fleet command of the person's
   // needs before it. A launch prompt, a resumed job's prompt or an agent's initialPrompt come with none
-  on('prompt.change', { origin: { kind: 'clear' } }, async ($, e, next) => {
+  on('prompt.change', { origin: { kind: 'clear' } }, ($, e, next) => act('prompt.typed', async () => {
     await noteTypedSubmit($)
-    return next(e)
-  }).catch(($, e, next) => next(e))
+    return under(below(), next(e))
+  })).catch(($, e, next) => next(e))
 
-  on('prompt.submit', async ($, e, next) => {
+  on('prompt.submit', ($, e, next) => act('prompt.submit', async () => {
     if ((e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') && timersOn) {
       bg(
         (async () => {
-          if (!(await read($, stopped))) return
+          if (!(await stateRead(read($, stopped)))) return
           await touched(update($, stopped, () => false))
           if (live) ringHere($, ['deliver'])
         })(),
@@ -14094,7 +14201,7 @@ export const register: Register = on => {
       const text = e.text
       bg(
         (async () => {
-          for (const task of Object.keys(await read($, bgCommands))) if (text.includes(task)) await bgDone($, task)
+          for (const task of Object.keys(await stateRead(read($, bgCommands)))) if (text.includes(task)) await bgDone($, task)
         })(),
       )
     }
@@ -14115,24 +14222,24 @@ export const register: Register = on => {
       id = e.command ? '' : await identityOwed($)
     } catch {}
     const ids = id ? [id] : []
-    if (e.command || (!worldOn() && !myInstance)) return asked.length ? next({ ...e, context: [...(e.context ?? []), ...asked] }) : next(e)
+    if (e.command || (!worldOn() && !myInstance)) return asked.length ? under(below(), next({ ...e, context: [...(e.context ?? []), ...asked] })) : under(below(), next(e))
     const d = await digestFor($, 'main')
-    if (!d.lines.length && !asked.length && !ids.length) return next(e)
-    const r = await next({ ...e, context: [...(e.context ?? []), ...ids, ...asked, ...d.lines] })
+    if (!d.lines.length && !asked.length && !ids.length) return under(below(), next(e))
+    const r = await under(below(), next({ ...e, context: [...(e.context ?? []), ...ids, ...asked, ...d.lines] }))
     if (r && r.drop === undefined && d.lines.length) bg(d.told())
     if (r && r.drop === undefined && ids.length) bg(touched(update($, identityTold, () => true)))
     return r
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
   // fleet's own tools end each result with its clock: a role with no Bash has no other to stamp what it writes (an
   // outer hook, so it sees what each tool's own hook below answered)
-  on('tool.call', { tool: /^mcp__fleet__/ }, async ($, e, next) => {
-    const r: any = await next(e)
+  on('tool.call', { tool: /^mcp__fleet__/ }, ($, e, next) => act('tool.fleet', async () => {
+    const r: any = await under(below(), next(e))
     // Beside its answer, as a line of context (the answer's own text stays as the tool wrote it)
     return r && typeof r.result === 'string' ? { ...r, context: [...(Array.isArray(r.context) ? r.context : []), `fleet's clock: ${await clockStamp($)}`] } : r
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
-  on('tool.call', { tool: 'mcp__fleet__decide' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__fleet__decide' }, ($, e) => act('tool.decide', async () => {
     if (e.agentId !== undefined) return { deny: SUBAGENT_REFUSAL }
     await locate($)
     if (!root) return { deny: "fleet isn't set up in this project any more: ask the person in plain text" }
@@ -14155,7 +14262,7 @@ export const register: Register = on => {
     // Its area (one of the project's tags), the asker's own word on it, and whether this conversation read outside
     // content: what the judges' gates read
     const area = areaOf(checked.area, worldTags)
-    const mark = await read($, outside)
+    const mark = await stateRead(read($, outside))
     const record = await allocate($, id => ({
       format: FORMAT,
       fleet: version,
@@ -14177,86 +14284,86 @@ export const register: Register = on => {
     // The judge: one call of its own, after the ticket (from a timer: the tool's answer doesn't wait for it)
     $.clock.after(0, () => bg(judgeDecision($, record)))
     return superseding($, e, { result: `${ticketText(record.id)}${area.note ? ` (${area.note}.)` : ''}${checked.notes.length ? ` Note: ${checked.notes.join('; ')}.` : ''}` })
-  }).catch(() => ({ result: "fleet couldn't queue this question: ask the person in plain text" }))
+  })).catch(() => ({ result: "fleet couldn't queue this question: ask the person in plain text" }))
 
   // An outbound draft for the person (outbound.ts): what a held call would have sent, kept exactly, until he answers
-  on('tool.call', { tool: 'mcp__fleet__send' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__fleet__send' }, ($, e) => act('tool.send', async () => {
     if (e.agentId !== undefined) return { deny: 'mcp__fleet__send is only for the main thread: put what should go out, where and why in your report to the main thread instead.' }
     await locate($)
     if (!root) return { deny: "fleet isn't set up in this project any more: nothing was sent; say in your reply what should go out" }
     return fileOutbound($, e)
-  }).catch(() => ({ result: "fleet couldn't queue this: nothing was sent. Say in your reply what should go out, where and why." }))
+  })).catch(() => ({ result: "fleet couldn't queue this: nothing was sent. Say in your reply what should go out, where and why." }))
 
   // A scarce resource of the project (slots.ts): a lease, a place in line, or the pools
-  on('tool.call', { tool: 'mcp__fleet__slot' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__fleet__slot' }, ($, e) => act('tool.slot', async () => {
     if (e.agentId !== undefined) return { deny: 'mcp__fleet__slot is only for the main thread: say in your report what you need, and the main thread takes it.' }
     await locate($)
     if (!root) return { deny: "fleet isn't set up in this project any more: there are no slots" }
     return slotCall($, e)
-  }).catch(() => ({ result: "fleet couldn't take or release the slot: try mcp__fleet__slot again in a minute" }))
+  })).catch(() => ({ result: "fleet couldn't take or release the slot: try mcp__fleet__slot again in a minute" }))
 
   // A long run (runs.ts): declared, listed, recorded; the sweeper watches its done-file
-  on('tool.call', { tool: 'mcp__fleet__run' as any }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__fleet__run' as any }, ($, e) => act('tool.run', async () => {
     if (e.agentId !== undefined) return { deny: 'mcp__fleet__run is only for the main thread: say in your report what you launched (where, its done-file), and the main thread declares it.' }
     await locate($)
     if (!root) return { deny: "fleet isn't set up in this project any more: nothing was declared" }
     return runCall($, e)
-  }).catch(() => ({ result: "fleet couldn't keep this run: try mcp__fleet__run again in a minute, and note the run in your journal meanwhile" }))
+  })).catch(() => ({ result: "fleet couldn't keep this run: try mcp__fleet__run again in a minute, and note the run in your journal meanwhile" }))
 
   // The person's taste (judges.ts): a "no" he said, recorded as a principle candidate in the register
-  on('tool.call', { tool: 'mcp__fleet__taste' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__fleet__taste' }, ($, e) => act('tool.taste', async () => {
     if (e.agentId !== undefined) return { deny: 'mcp__fleet__taste is only for the main thread: say in your report what the person said no to, and the main thread records it.' }
     await locate($)
     if (!root) return { deny: "fleet isn't set up in this project any more: nothing was recorded" }
     return tasteCall($, e)
-  }).catch(() => ({ result: "fleet couldn't record this: say it in your journal or your reply instead" }))
+  })).catch(() => ({ result: "fleet couldn't record this: say it in your journal or your reply instead" }))
 
   // Files that still hold against a record as it is now (G19): their flags for it clear with no new version
-  on('tool.call', { tool: 'mcp__fleet__confirm' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__fleet__confirm' }, ($, e) => act('tool.confirm', async () => {
     await locate($)
     if (!root) return { deny: "fleet isn't set up in this project any more: nothing was confirmed" }
     return confirmCall($, e)
-  }).catch(() => ({ result: "fleet couldn't record this: re-pin the files instead (write them citing the record's version now)" }))
+  })).catch(() => ({ result: "fleet couldn't record this: re-pin the files instead (write them citing the record's version now)" }))
 
   // Only fleet's and sessions' code notifies the person: in a background session of the project, the model's own
   // PushNotification (origin engine) is refused; a plugin's own call (from its timer) passes (H3)
   // A message sent in the same batch as a write the gate refused may announce what didn't land (G33): held once
-  on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
+  on('tool.call', { tool: 'SendMessage' }, ($, e, next) => act('send.guard', async () => {
     const held = sameStepHold(threadOf(e))
     if (held) {
       log($, `held once: SendMessage by ${threadOf(e)} in the step of a refused write`)
       return { deny: held }
     }
-    return next(e)
-  }).catch(($, e, next) => next(e))
+    return under(below(), next(e))
+  })).catch(($, e, next) => next(e))
 
-  on('tool.call', { tool: 'PushNotification' }, async ($, e, next) => {
-    if (next.origin?.plugin !== 'engine') return next(e)
+  on('tool.call', { tool: 'PushNotification' }, ($, e, next) => act('push.guard', async () => {
+    if (next.origin?.plugin !== 'engine') return under(below(), next(e))
     await locate($)
-    if (!root || !jobRef) return next(e)
+    if (!root || !jobRef) return under(below(), next(e))
     log($, "refused: the model's PushNotification (only fleet and sessions notify the person)")
     return { deny: "fleet: in this project only fleet notifies the person (in the brief, the band and their channel, within their caps). Ask with mcp__fleet__decide, or write it in your journal; nothing was sent." }
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
   // The main thread's tool call in flight, for an instance's heartbeat: one that never returns (a hung read, a prompt
   // nobody sees) shows on its row past STUCK_MS instead of looking like work (every tool: a matcher that takes any name,
   // since one hook without a matcher is the MCP one below)
-  on('tool.call', { tool: /^/ }, async ($, e, next) => {
-    if (e.agentId !== undefined || !jobRef) return next(e)
+  on('tool.call', { tool: /^/ }, ($, e, next) => act('outbound.check', async () => {
+    if (e.agentId !== undefined || !jobRef) return under(below(), next(e))
     const k = ++callSeq
     callsInFlight.set(k, { tool: String((e as any).tool ?? '').slice(0, 80), since: await $.clock.now() })
     try {
-      return await next(e)
+      return await under(below(), next(e))
     } finally {
       callsInFlight.delete(k)
     }
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
   // Every MCP tool: one that would send the project's content outside is refused in a background session (the one hard
   // line); one whose result is outside content marks the conversation. fleet's own pass untouched
   // And every tool's call settles a permission prompt this instance waited on (it ran or was refused): what
   // classic.PostToolUse says, by an event a managed plugin can't send on past fleet
-  on('tool.call', async ($, e, next) => {
+  on('tool.call', ($, e, next) => act('tool.settle', async () => {
     const tool = String((e as any).tool ?? '')
     // fleet's own call (an approved draft, its push notification): past the gate, as the person approved it, with
     // nobody's answers on it (they'd go where no model reads them); what came back from beneath is kept on its token
@@ -14265,7 +14372,7 @@ export const register: Register = on => {
       const id = typeof (e as any).tool_use_id === 'string' ? ((e as any).tool_use_id as string) : null
       if (id) ownInFlight.add(id)
       try {
-        const r: any = await next(e)
+        const r: any = await under(below(), next(e))
         // The verdict fleet saw beneath it; whether that refusal held, the call's own result says (settle)
         own.refused = !!id && ownRefused.has(id)
         return r
@@ -14280,7 +14387,7 @@ export const register: Register = on => {
     // the world's digest); never on a plugin's own call of fleet's
     const answered = (r: any) => (e.agentId === undefined && next.origin?.plugin !== 'fleet' && !['Read', 'Write', 'Edit', 'NotebookEdit', 'Bash'].includes(tool) ? withAnswers($, r) : r)
     if (!tool.startsWith('mcp__') || tool.startsWith('mcp__fleet__')) {
-      const r = await next(e)
+      const r = await under(below(), next(e))
       if (permissionWait && e.agentId === undefined) bg(promptAnswered($))
       return answered(r)
     }
@@ -14291,15 +14398,15 @@ export const register: Register = on => {
       const stale = await staleSend($, threadOf(e))
       if (stale) return { deny: stale }
     }
-    const r: any = await next(e)
+    const r: any = await under(below(), next(e))
     if (permissionWait && e.agentId === undefined) bg(promptAnswered($))
     if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
     return answered(r)
-  }).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
+  })).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
   // Reading the web is free, and marks the conversation (decision 2b): its changes then wait for the person
-  on('tool.call', { tool: ['WebFetch', 'WebSearch'] }, async ($, e, next) => {
-    const r: any = await next(e)
+  on('tool.call', { tool: ['WebFetch', 'WebSearch'] }, ($, e, next) => act('outside.mark', async () => {
+    const r: any = await under(below(), next(e))
     if (r && !r.isError && r.deny === undefined && OUTSIDE_TOOLS.has(String(e.tool))) {
       bg(
         (async () => {
@@ -14315,24 +14422,24 @@ export const register: Register = on => {
       )
     }
     return r
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
   // An instance over its budget starts no new helper (the one thing the budget refuses: never a turn, never another
   // tool). It fails open: a fleet that errs lets the helper start
-  on('agent.spawn', async ($, e, next) => {
+  on('agent.spawn', ($, e, next) => act('helper.spawn', async () => {
     const refusal = myInstance ? await spawnRefusal($) : null
-    if (!refusal) return next(e)
+    if (!refusal) return under(below(), next(e))
     log($, 'refused a helper: over budget')
     return { deny: refusal }
-  }).catch(($, e, next) => next(e))
+  })).catch(($, e, next) => next(e))
 
   // The model's own AskUserQuestion only: another plugin's $.ui.ask goes by untouched (sessions asks its Stop and
   // Restart there, and the tool has to be in the session for that). In an instance of the roster the model's own is
   // refused: nobody sits at it, a dialog waits for whoever comes by, and decide asks without stopping. Elsewhere (the
   // person's own sessions, background ones too) it only watches: the dialog is the usual one, and what it returns goes
   // back unchanged
-  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    if (next.origin.plugin !== 'engine') return next(e)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => act('ask.guard', async () => {
+    if (next.origin.plugin !== 'engine') return under(below(), next(e))
     await locate($)
     if (root && jobRef && offered && myInstance) {
       log($, "refused: the model's AskUserQuestion in an instance (it asks with decide)")
@@ -14342,10 +14449,10 @@ export const register: Register = on => {
     try {
       askedAt = await $.clock.now()
     } catch {}
-    const r = await next(e)
+    const r = await under(below(), next(e))
     bg(recordDialog($, e, r, askedAt))
     return r
-  })
+  }))
 
   on('command.run', { command: 'fleet' }, async ($, e) => {
     try {
@@ -14358,19 +14465,19 @@ export const register: Register = on => {
   // Above the prompt: how many questions wait for the person in this project, and how many shared files are flagged
   // (suspect, or failing a check), with whatever is drawn there after it. Its first draw starts fleet when
   // session.start didn't come (a draw only draws: the start runs from a timer)
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+  on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => act('band.draw', async () => {
     if (!started && !startScheduled) {
       startScheduled = true
       $.clock.after(0, () => bg(start($)))
     }
-    const beneath = await next(e)
+    const beneath = await under(below(), next(e))
     if (e.props.hasSurvey) return beneath
-    const n = await read($, held)
-    const f = await read($, flags)
-    const o = await read($, overBudget)
-    const note = await read($, bandNote)
-    const behind = await read($, behindBand)
-    const lacking = await read($, needs)
+    const n = await stateRead(read($, held))
+    const f = await stateRead(read($, flags))
+    const o = await stateRead(read($, overBudget))
+    const note = await stateRead(read($, bandNote))
+    const behind = await stateRead(read($, behindBand))
+    const lacking = await stateRead(read($, needs))
     if (n <= 0 && f <= 0 && o <= 0 && !note && !behind && !lacking) return beneath
     const parts = [
       ...(lacking ? [`✗ fleet needs ${lacking}`] : []),
@@ -14388,5 +14495,5 @@ export const register: Register = on => {
         {beneath}
       </Box>
     )
-  })
+  }))
 }
