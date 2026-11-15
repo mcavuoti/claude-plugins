@@ -714,6 +714,65 @@ test('the panel overflows: a "more below" line at the top, and only the rows tha
   expect(text).not.toContain('main moved under 1 file')
 })
 
+// A list taller than the panel, with the keyboard in it: Claude's ↑ and ↓ ask to move its window a row (ui.scroll, from
+// the person, with no pointer) where they'd offer the next element if the list fit. The selected row is the one the
+// panel draws with autoFocus (the mod's own moves of the focus don't land in the kit), and what the mod passes on to
+// Claude is in w.scrolled
+test('a list taller than the panel: ↑ and ↓ go from session to session, and the wheel and the page keys still move the window', async ($, on) => {
+  const many = Array.from({ length: 40 }, (_, i) => {
+    const n = String(i).padStart(2, '0')
+    return { id: `dddddd${n}`, sessionId: `dddddd${n}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', status: 'idle', pid: 5000 + i, name: `session ${n}` }
+  })
+  const w = world(on, { list: [list()[0], ...many] })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  setFocused(w, true)
+  const focused = { ...PANEL, props: { ...PANEL.props, isFocused: true } }
+  let ui = await $.ui.mount(focused)
+  expect(JSON.stringify(await ui.drawn())).toMatch(/↓ \d+ more below · ↑↓ to reach them/)
+  expect(JSON.stringify(await ui.drawn())).toContain('↑↓ Select · Enter Switch · Esc Back')
+  const rows = (await ui.findAll({})).filter((x: any) => x.type === 'Button' && String(x.key).startsWith('s:')).map((x: any) => String(x.key))
+  expect(rows.length).toBe(41)
+  const ring = panelRing($, w, { findAll: q => ui.findAll(q) })
+  // Drawn again: the row the panel would land on now
+  const selected = async () => {
+    await ui.unmount()
+    ui = await $.ui.mount(focused)
+    let found: string | undefined
+    for (const key of rows) if ((await ui.find({ key }))?.props.autoFocus === true) found = key
+    return found
+  }
+  const scroll = async (by: number, more: object = {}) => {
+    await $.ui.scroll({ component: 'Pane', requestId: 'sessions', offset: 0, by, bodyRows: 30, contentRows: 50, origin: { kind: 'person' }, ...more })
+    await w.clock.settle()
+  }
+  expect(await ring.put(rows[1]!)).toBe(rows[1])
+  // An arrow: the next row is selected, and Claude's window isn't asked to move
+  await scroll(1)
+  expect(await selected()).toBe(rows[2])
+  // Two before the focus landed: each goes on from the row the one before it selected
+  await scroll(1)
+  await scroll(1)
+  expect(await selected()).toBe(rows[4])
+  await scroll(-1)
+  expect(await selected()).toBe(rows[3])
+  expect(w.scrolled).toEqual([])
+  // The wheel over the panel and a page key move the window, and the selection stays
+  await scroll(1, { pointer: { column: 3, row: 5 } })
+  await scroll(30)
+  expect(w.scrolled).toEqual([1, 30])
+  expect(await selected()).toBe(rows[3])
+  // Past the first and the last row the window moves (the buttons above, the legend below)
+  expect(await ring.put(rows[0]!)).toBe(rows[0])
+  await scroll(-1)
+  expect(await selected()).toBe(rows[0])
+  expect(await ring.put(rows[40]!)).toBe(rows[40])
+  await scroll(1)
+  expect(await selected()).toBe(rows[40])
+  expect(w.scrolled).toEqual([1, 30, -1, 1])
+  await ui.unmount()
+})
+
 // ---- The dot: whose turn finished unseen ----
 // A turn's end turns the row yellow until the person looks: a full dot (●) when they started that turn, a hollow one
 // (○, unasked) when another session's message, a subagent's or a background task's report, a schedule or a script did
