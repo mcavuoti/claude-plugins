@@ -48,6 +48,10 @@ declare module 'claude-code' {
       /** The debug report this session's meter opened for (sessions' /sessions debug perf), '' when none: a module that
        * came in by a reload inside that window finds it and hands in as partial */
       debugOpen: string
+      /** sessions' debug path, as the list this session's classic.SessionStart handed the engine has it ('' when it went
+       * without): written with `watching`, so a module that comes in by a reload knows which watched path is the
+       * debug window's, with no call of its own */
+      debugPath: string
       /** The section fleet last put this session in ('fleet:asking', 'none'; '' not known yet) */
       section: string
       /** What each thread of this session read of the world: 'main' or a helper's agentId → path → the read */

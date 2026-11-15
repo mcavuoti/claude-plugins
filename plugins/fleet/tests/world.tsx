@@ -122,6 +122,7 @@ export const FAKE_SESSIONS = {
         // writes it), and the hand-ins it was given (logged whole). noDebug: a sessions that doesn't answer for the
         // path; refuseDebug: what it says when it refuses a hand-in
         debugPath: async () => {
+          await note({ debugPath: true })
           if ((await world()).noDebug) throw new Error('sessions has not started')
           return { ok: true, path: '/fake/data/reports/window' }
         },

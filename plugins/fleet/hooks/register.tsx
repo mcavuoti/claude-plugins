@@ -763,6 +763,9 @@ function fileChanged($: any, path: string, engine: boolean) {
     forgetBelled()
     pace($)
     bg(touched(update($, watching, () => FLEET_WATCH_SET)))
+    // sessions' debug path with it (the list Claude watches has it): a module that comes in by a reload finds it here
+    // and so hears a later window, with no call of its own
+    bg(touched(update($, debugPathKept, () => (debugInClaude ? debugFile : ''))))
     stopOwnWatch($)
     if (off) ringHere($, ['deliver', 'beat', 'sweep'])
   }
@@ -828,13 +831,16 @@ function landingSoon($: any, now: number) {
 // came in by a reload inside a window hands in `partial: 'reloaded'` (what its predecessor counted went with it); it
 // knows by $.state's debugOpen, the one thing written at the opening.
 let debugFile = ''
-/** Whether the watch this session has follows sessions' debug path: Claude's (the list its SessionStart handed; null
- * in a module that came in by a reload, which wasn't there to hand it: taken as followed once sessions gives the
- * path), and fleet's own (while it runs). A session whose watch doesn't, or that is on its timers, can't hear a
- * window open: it takes no part in a report, and /fleet status says so (debugDeaf) */
+/** Whether the watch this session has follows sessions' debug path: Claude's (the list its SessionStart handed; a
+ * module that came in by a reload reads it from $.state, where the one before it kept it), and fleet's own (while it
+ * runs). A session whose watch doesn't, or that is on its timers with no list handed, can't hear a window open: it
+ * takes no part in a report, and /fleet status says so (debugDeaf) */
 let debugInClaude: boolean | null = null
 let debugInOwn = false
 const debugOpen = atom({ plugin: 'fleet', key: 'debugOpen' } as const, '')
+/** sessions' debug path as the list this session's SessionStart handed Claude has it ('' when it went without): written
+ * with `watching`, for a module that comes in by a reload */
+const debugPathKept = atom({ plugin: 'fleet', key: 'debugPath' } as const, '')
 /** sessions' longest window: a window file that says more is taken as this (a meter never counts on past it and the grace) */
 const DEBUG_WINDOW_MAX_MS = 600000
 /** How long before a debug call sessions didn't answer is made once more: inside its wait for hand-ins (3 s at least) */
@@ -1807,10 +1813,12 @@ function timers($: any) {
           pace($)
           // What came while no module ran (a reload) raises no event: one pass of everything now
           ringHere($, ['deliver', 'beat', 'sweep'])
-          // Claude still watches what the module before this one handed it, sessions' debug path with it; which path
-          // that is was the other module's to know, so this one asks (once, as a start does): without it a ring of
-          // the window would mean nothing here until the session's next start
-          bg(debugPathNow($).then(p => void (debugInClaude = p ? null : false)))
+          // Claude still watches what the module before this one handed it, sessions' debug path with it. Which path
+          // that is the other module kept in $.state with its proof of the watch: without it a ring of the window
+          // would mean nothing here until the session's next start (every update of the plugin reloads it)
+          const kept = await stateRead(read($, debugPathKept))
+          if (typeof kept === 'string' && kept.startsWith('/')) debugFile ||= kept
+          debugInClaude = !!kept
         }
       })(),
     ),
