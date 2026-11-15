@@ -717,3 +717,27 @@ test("a landing the net's pull listed before its writer rewrote events/latest is
   // (it was taken all the same: once)
   expect(d.holdings.seen.close[0] - d.holdings.seen.open[0]).toBe(3)
 })
+
+// From the second joint run: a session whose fleet takes no part read in the report as a session without fleet. The
+// project's part names the running instances' sessions as labels (sessions 0.21.1 reads the section `running`), so the
+// report can say which of them handed nothing in
+test("the project's part names the running instances' sessions as labels, one key each; one sessions gives no id for isn't named", LONG, async ($, on) => {
+  const { w } = session(on, 'person')
+  const A_ID = 'aaaaaaaa-1111-0000-0000-000000000000'
+  const B_ID = 'bbbbbbbb-1111-0000-0000-000000000000'
+  sessionsSay(w, { rows: { [REF]: { ...row(REF, 'Owner A', 'idle'), sessionId: A_ID }, bbbbbbbb: { ...row('bbbbbbbb', 'Owner B', 'working'), sessionId: B_ID }, cccccccc: row('cccccccc', 'Owner C', 'idle') } })
+  await startSession($, w)
+  await goLive($, w)
+  await idle(w, 3, 'me')
+  await ring($, w, true)
+  await idle(w, 1, 'me')
+  await ring($, w, false)
+  const d = handIns(w)[0].data
+  expect(refusals(d)).toEqual([])
+  const running = d.project.running as Record<string, { label: string; key: string }>
+  expect(Object.keys(running).every(k => /^i[0-9]+$/.test(k))).toBe(true)
+  expect(Object.values(running).every(v => v.label === 'session')).toBe(true)
+  expect(Object.values(running).map(v => v.key).sort()).toEqual([A_ID, B_ID])
+  // No name of an instance in it
+  expect(JSON.stringify(running)).not.toContain('Owner')
+})

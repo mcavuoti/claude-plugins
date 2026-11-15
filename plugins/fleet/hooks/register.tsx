@@ -1051,6 +1051,9 @@ async function projectPart($: any, now: number): Promise<Record<string, Record<s
   const insts = roster?.instances ?? []
   const tally: Record<string, number> = { instances: insts.length }
   const bump = (k: string) => (tally[k] = (tally[k] ?? 0) + 1)
+  // The running instances' sessions, as labels (the id sessions gave for each, which the report maps to its own label and
+  // keeps only in the key file): so the report can say which sessions run fleet and handed nothing in
+  const named: Record<string, Value> = {}
   if (insts.length && (await sessionsReady($))) {
     const st = await race<Status>($, () => $.sessions.status({ names: insts.map(i => i.name) }))
     if (st?.ready) {
@@ -1059,6 +1062,8 @@ async function projectPart($: any, now: number): Promise<Record<string, Record<s
       for (const inst of insts) {
         const { running, stopped: retired } = rowsOf(inst, st.rows)
         if (running) bump(running.state === 'working' ? 'busy' : running.state === 'waiting' ? 'waiting' : 'idle')
+        const sid = (running as { sessionId?: unknown } | null)?.sessionId
+        if (typeof sid === 'string' && sid && sid.length <= 200) named[`i${Object.keys(named).length + 1}`] = { label: 'session', key: sid }
         else if (retired) bump(`stopped.${stopReason(retired) ?? 'unknown'}`)
         else bump('off')
         if (down.has(inst.slug)) bump('down')
@@ -1067,6 +1072,7 @@ async function projectPart($: any, now: number): Promise<Record<string, Record<s
     }
   }
   out.roster = tally
+  out.running = named
   out.landings = { ...(M.notes.get('landings') ?? {}) }
   const { records } = await queueRecords($)
   // (a time as whole minutes, named so: the report prints a number as it is)
