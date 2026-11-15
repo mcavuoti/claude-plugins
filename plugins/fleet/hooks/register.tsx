@@ -894,7 +894,8 @@ async function debugHandIn($: any, report: string) {
     const to = await $.clock.now()
     data = { ...meterSnapshot(to, await debugFacts($), null, undefined, 'reloaded'), from: to }
   }
-  await touched(update($, debugOpen, () => ''))
+  // (the hand-in goes whatever becomes of this write)
+  await touched(update($, debugOpen, () => '')).catch(() => {})
   // Past sessions' limit (it never should be): the parts that can go, go
   if (JSON.stringify(data).length > HAND_IN_MAX) data = { ...data, holdings: {}, project: undefined }
   const r: any = await race($, () => $.sessions.debugReport({ source: 'fleet', report, data }))
