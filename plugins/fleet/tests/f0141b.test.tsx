@@ -460,3 +460,12 @@ test('a session in a project with a world makes runs/ at start, so its beats fin
   await tick(w, 5 * SECOND)
   expect(w.dirs.has(`${FLEET}/runs`)).toBe(true)
 })
+
+// Seen live (0.14.2's check): the sweeper's suspects pass listed state/confirms after every landing, and in a project
+// where nobody confirmed anything yet the folder isn't there: a failed listing per landing. The start makes it
+test('a session in a project with a world makes state/confirms at start, so the sweep after a landing finds the folder', WITH_SESSIONS, async ($, on) => {
+  const { w } = session(on, 'person')
+  await startSession($, w)
+  await tick(w, 5 * SECOND)
+  expect(w.dirs.has(`${STATE}/confirms`)).toBe(true)
+})

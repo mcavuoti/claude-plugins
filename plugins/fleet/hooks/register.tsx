@@ -4796,8 +4796,10 @@ async function startWorld($: any) {
   const named = pulling ? null : parseLatest(await readText($, `${eventsDir()}/latest`))
   await pullEvents($, 25, true)
   if (named) eventCursor = named.last
-  // fleet's own state (versions, suspects, check results, the sweeper's lease) stays out of git whatever .gitignore says
-  await run($, ['mkdir', '-p', stateDir('revs'), stateDir('checks')])
+  // fleet's own state (versions, suspects, check results, the sweeper's lease) stays out of git whatever .gitignore says.
+  // The confirmations' folder is made too: the sweep lists it after every landing, and in a project where nobody
+  // confirmed anything yet that listing would fail each time
+  await run($, ['mkdir', '-p', stateDir('revs'), stateDir('checks'), stateDir('confirms')])
   if (!(await exists($, stateDir('.gitignore')))) {
     try {
       await $.fs.write(stateDir('.gitignore'), '# fleet’s own state: versions, suspects, check results, the sweeper\n*\n')
