@@ -561,9 +561,11 @@ export function snapshot(to: number, facts: Record<string, Value>, holdings: Rec
 }
 
 /** What sessions' checker would refuse in a hand-in, each with where: the same rules as its checkHandIn (a plugin's
- * tests can't import another plugin's file, so fleet's tests hold fleet to them here). The fields its format has and
- * no other; every key and word of the pattern; every number finite and not negative; drivers and labels it knows;
- * a holding with a count and a size at both ends. Empty when it would pass */
+ * tests can't import another plugin's file, so fleet's tests hold fleet to them here; where the two differ, sessions'
+ * is the one that decides). The fields its format has and no other; every key and word of the pattern; every number
+ * finite and not negative; drivers and labels it knows (four drivers at most, a label's key up to 200 characters);
+ * 16 words at most in a list, 400 keys in any map, 400 actions and 400 holdings; a holding with a count and a size at
+ * both ends. Empty when it would pass */
 export function refusals(data: unknown): string[] {
   const out: string[] = []
   const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
@@ -575,6 +577,7 @@ export function refusals(data: unknown): string[] {
   }
   const words = (x: unknown, at: string) => {
     if (!Array.isArray(x)) out.push(`${at}: not a list`)
+    else if (x.length > 16) out.push(`${at}: more than 16 words`)
     else x.forEach((v, i) => word(v, `${at}[${i}]`))
   }
   const fields = (x: unknown, at: string, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> | null => {
@@ -592,6 +595,7 @@ export function refusals(data: unknown): string[] {
       out.push(`${at}: not an object`)
       return
     }
+    if (Object.keys(x).length > 400) out.push(`${at}: more than 400 keys`)
     for (const [k, v] of Object.entries(x)) {
       if (!NAME.test(k)) out.push(`${at}: the key ${JSON.stringify(k)}`)
       each(v, `${at}.${k}`)
@@ -602,7 +606,7 @@ export function refusals(data: unknown): string[] {
     if (typeof x === 'boolean') return
     if (typeof x === 'number') return amount(x, at)
     if (typeof x === 'string') return word(x, at)
-    if (!isRecord(x) || Object.keys(x).length !== 2 || (x.label !== 'session' && x.label !== 'role') || typeof x.key !== 'string' || !x.key) out.push(`${at}: not a label`)
+    if (!isRecord(x) || Object.keys(x).length !== 2 || (x.label !== 'session' && x.label !== 'role') || typeof x.key !== 'string' || !x.key || x.key.length > 200) out.push(`${at}: not a label`)
   }
   const values = (x: unknown, at: string) => named(x, at, value)
   const WORK = ['work', 'failed', 'sent', 'started', 'bytesRead', 'bytesWritten']
@@ -630,7 +634,7 @@ export function refusals(data: unknown): string[] {
   named(d.actions, 'data.actions', (v, at) => {
     const a = fields(v, at, ['drivers', 'grows', 'runs', 'ms', 'slowest', 'mostWork', ...WORK], ['within'])
     if (!a) return
-    if (!Array.isArray(a.drivers) || a.drivers.some(x => x !== 'clock' && x !== 'self' && x !== 'person' && x !== 'peer')) out.push(`${at}.drivers: ${JSON.stringify(a.drivers)}`)
+    if (!Array.isArray(a.drivers) || a.drivers.length > 4 || a.drivers.some(x => x !== 'clock' && x !== 'self' && x !== 'person' && x !== 'peer')) out.push(`${at}.drivers: ${JSON.stringify(a.drivers)}`)
     words(a.grows, `${at}.grows`)
     if (a.within !== undefined) word(a.within, `${at}.within`)
     for (const k of ['runs', 'ms', 'slowest', 'mostWork']) amount(a[k], `${at}.${k}`)
@@ -646,7 +650,6 @@ export function refusals(data: unknown): string[] {
     tuple(h.close, `${at}.close`)
   })
   if (d.project !== undefined) named(d.project, 'data.project', values)
-  if (isRecord(d.actions) && Object.keys(d.actions).length > 400) out.push('data.actions: more than 400')
-  if (isRecord(d.holdings) && Object.keys(d.holdings).length > 400) out.push('data.holdings: more than 400')
+  if (JSON.stringify(data).length > HAND_IN_MAX) out.push(`data: more than ${HAND_IN_MAX} characters`)
   return out
 }

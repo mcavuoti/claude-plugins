@@ -998,7 +998,7 @@ async function debugFacts($: any): Promise<Record<string, Value>> {
     sweeps: sweep.holding,
     live: !live ? 'timers' : ownWatchLive ? 'own' : 'claude',
     world: !worldOn() ? 'off' : tooBig ? 'too-big' : 'on',
-    ...(inst ? { role: { label: 'role' as const, key: inst.role } } : {}),
+    ...(inst ? { role: { label: 'role' as const, key: inst.role.slice(0, 200) } } : {}),
   }
 }
 

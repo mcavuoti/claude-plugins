@@ -652,3 +652,68 @@ test('a working instance in a window: each thing it does is counted under its de
   // And nothing it reports is outside the declared table
   for (const name of names) expect(Object.keys(ACTIONS)).toContain(name)
 })
+
+// ---- A landing no chain named (the two-writers race): counted only when the next read of events/latest doesn't name it ----
+
+// An event file in the hour's folder that events/latest's chain doesn't name: its writer's rewrite of latest was
+// replaced by another's (or hasn't happened yet)
+function landUnnamed(w: World, path: string, text: string): string {
+  const before = w.files.get(path) ?? ''
+  w.touch(path, text)
+  const at = w.clock.now()
+  const name = `${at}-bbbbbbbb-${++eventN}.json`
+  w.touch(`${FLEET}/events/${hourFolder(at)}/${name}`, JSON.stringify({ format: 1, at, path: path.slice(ROOT.length + 1), from: hashText(before), to: hashText(text), via: 'tool', tool: 'Edit', blind: false, by: { sessionId: B_SID, agentId: null, ref: 'bbbbbbbb', name: 'Owner B' } }))
+  return name
+}
+
+test("a landing the net's own pull found and no chain names afterwards is counted as landing.net-found", LONG, async ($, on) => {
+  const { w } = session(on, 'instance')
+  otherSweeps(w)
+  await startSession($, w)
+  await goLive($, w)
+  await idle(w, 2, 'other')
+  await ring($, w, true)
+  // (a first landing: from it on this session holds the chain's last name, and reads by chain)
+  land(w, `${ROOT}/notes/n0.md`, 'zero\n')
+  await changed($, LATEST)
+  await idle(w, 2, 'other')
+  // One landing never named, then one read by chain (which is what makes the net pull whole within the minute)
+  landUnnamed(w, `${ROOT}/notes/n1.md`, 'one\n')
+  land(w, `${ROOT}/notes/n2.md`, 'two\n')
+  await changed($, LATEST)
+  await idle(w, 3, 'other')
+  // The next landing's chain doesn't name it either
+  land(w, `${ROOT}/notes/n3.md`, 'three\n')
+  await changed($, LATEST)
+  await idle(w, 1, 'other')
+  await ring($, w, false)
+  const d = handIns(w)[0].data
+  expect(d.actions['landing.net-found']?.runs).toBe(1)
+})
+
+test("a landing the net's pull listed before its writer rewrote events/latest isn't one: the chain names it a moment later", LONG, async ($, on) => {
+  const { w } = session(on, 'instance')
+  otherSweeps(w)
+  await startSession($, w)
+  await goLive($, w)
+  await idle(w, 2, 'other')
+  await ring($, w, true)
+  land(w, `${ROOT}/notes/n2.md`, 'two\n')
+  await changed($, LATEST)
+  await idle(w, 1, 'other')
+  // Its event is linked; the net's pull lists the folder before its writer has rewritten events/latest ...
+  const early = landUnnamed(w, `${ROOT}/notes/n1.md`, 'one\n')
+  land(w, `${ROOT}/notes/n4.md`, 'four\n')
+  await changed($, LATEST)
+  await idle(w, 2, 'other')
+  // ... which it then does, naming it
+  const cur = JSON.parse(w.files.get(LATEST) ?? '{}')
+  w.touch(LATEST, JSON.stringify({ format: 1, last: early, chain: [...cur.chain, early] }))
+  await changed($, LATEST)
+  await idle(w, 1, 'other')
+  await ring($, w, false)
+  const d = handIns(w)[0].data
+  expect(d.actions['landing.net-found']).toBe(undefined)
+  // (it was taken all the same: once)
+  expect(d.holdings.seen.close[0] - d.holdings.seen.open[0]).toBe(3)
+})
