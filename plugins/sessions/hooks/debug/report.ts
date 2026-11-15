@@ -473,6 +473,21 @@ function gather(input: ReportInput): { report: Report; key: ReportKey; digest: D
     hostPlugins[to] = own(hostPlugins, to) === undefined ? cleanVersion(version) : 'unknown'
   }
 
+  // A plugin's project part may say which sessions run it: a section named `running`, each value a session label. One
+  // of those that handed nothing in is a session that didn't answer, not a session without the plugin
+  const runs = new Map<string, Set<string>>()
+  for (const perSession of Object.values(isRecord(input.handIns) ? input.handIns : {})) {
+    for (const [name, data] of Object.entries(isRecord(perSession) ? perSession : {})) {
+      const checked = checkHandIn(data)
+      if (!checked.ok) continue
+      for (const v of Object.values(checked.handIn.project?.running ?? {})) {
+        if (!isRecord(v) || v.label !== 'session') continue
+        const id = String(v.key)
+        runs.set(id, (runs.get(id) ?? new Set<string>()).add(name))
+      }
+    }
+  }
+
   const rows: Row[] = []
   const out: Report['sessions'] = []
   sessions.forEach((s, i) => {
@@ -489,7 +504,7 @@ function gather(input: ReportInput): { report: Report; key: ReportKey; digest: D
     // Its plugins: those its heartbeat shows and those that handed in, by name
     const handed = isRecord(input.handIns) ? own(input.handIns, s.sessionId) : undefined
     const handedIn = isRecord(handed) ? handed : {}
-    const plugins = [...new Set([...(Array.isArray(s.plugins) ? s.plugins : []), ...Object.keys(handedIn)].map(cleanPlugin))].sort()
+    const plugins = [...new Set([...(Array.isArray(s.plugins) ? s.plugins : []), ...Object.keys(handedIn), ...(runs.get(String(s.sessionId)) ?? [])].map(cleanPlugin))].sort()
     const meters: Record<string, HandIn | null> = {}
     const taken: Record<string, Meter> = {}
     const refused: string[] = []
@@ -1052,7 +1067,10 @@ function cpuSection(d: Digest): string[] {
   if (inside.length) {
     const parts = inside.map((x, i) => `about ${ms(x.ms, x.ran)} ms inside ${possessive(x.plugin)}${i === 0 ? ' actions' : ''}`)
     const outside = inside.length === 1 ? 'it' : inside.length === 2 ? 'both' : 'them'
-    lines.push(...wrap(`of an idle session's ${num(mid(idleRows.map(r => r.cpuMs)))} ms of CPU a minute: ${parts.join(', ')}, the rest outside ${outside}`, '  '))
+    const cpu = mid(idleRows.map(r => r.cpuMs))
+    // An action's time is the clock's, with what it waits for: it can pass the CPU the process used
+    const over = sum(inside.map(x => x.ms)) > cpu
+    lines.push(...wrap(`of an idle session's ${num(cpu)} ms of CPU a minute: ${parts.join(', ')}${over ? ". That's more than its CPU: an action's time includes what it waits for (a command, a file), which isn't CPU" : `, the rest outside ${outside}`}`, '  '))
   }
   return [...lines, ...across]
 }
@@ -1253,59 +1271,66 @@ function pluginSection(d: Digest, plugin: string, flagged: ReadonlySet<string>):
   const facts = main[0]?.m.handIn.facts ?? {}
   const rest: { set: typeof withMeter; who: string }[] = [...sets.slice(1).map(set => ({ set, who: idleOnes.length ? 'idle session' : 'session' })), ...(idleOnes.length ? busySets.map(set => ({ set, who: 'busy session' })) : [])]
 
+  // What goes under a group's table: its exact totals, what failed, what it sent, its heaviest run and what it holds
+  const under = (group: Meter[]): string[] => {
+    const out: string[] = []
+    // The exact totals, whichever action each call fell in
+    const work = perMinute(group, h => h.totals.work).filter(k => k.median > 0)
+    const read = mid(group.map(m => m.handIn.totals.bytesRead / m.minutes))
+    const written = mid(group.map(m => m.handIn.totals.bytesWritten / m.minutes))
+    const startedBy = perMinute(group, h => foldCounts(h.totals.started, programOf)).filter(k => k.median > 0)
+    const moved = (kind: string) => (kind === 'read' && read > 0 ? ` (${bytes(read)})` : kind === 'write' && written > 0 ? ` (${bytes(written)})` : '')
+    const exact = workWords(work.map(k => [k.kind, k.median] as [string, number]), work.length, ' entries').map(([kind, text]) => text + moved(kind))
+    if (read > 0 && !work.some(k => k.kind === 'read')) exact.push(`${bytes(read)} read`)
+    if (written > 0 && !work.some(k => k.kind === 'write')) exact.push(`${bytes(written)} written`)
+    const startedAll = mid(group.map(m => sum(Object.values(m.handIn.totals.started)) / m.minutes))
+    out.push(...wrap(`work in all, exact: ${exact.length ? `${exact.join(', ')} a minute` : 'none'} · processes started: ${num(startedAll)}${startedBy.length ? ` (${startedBy.map(k => `${k.kind} ${num(k.median)}`).join(', ')})` : ''}`, '', '  '))
+
+    const failed = perMinute(group, h => h.totals.failed)
+    out.push(...wrap(`failed: ${failed.length ? failed.map(k => counted(k.kind, k.median) + (k.most > k.median ? ` (${num(k.most)} at most)` : '')).join(' · ') + ' a minute' : 'nothing'}`, '', '  '))
+    const sent = perMinute(group, h => h.totals.sent)
+    if (sent.length) out.push(...wrap(`it sent, for others to react to: ${sent.map(k => counted(k.kind, k.median, SENT)).join(' · ')} a minute`, '', '  '))
+    const most = group.flatMap(m => Object.entries(m.handIn.actions).map(([name, a]) => ({ name, n: a.mostWork }))).sort((a, b) => b.n - a.n)[0]
+    if (most && most.n > 0) out.push(`most work in one run: ${counted('call', most.n)} (${most.name})`)
+
+    // What it holds: how many and about how many bytes at the close, the largest first, and what grew in the window
+    const holdings = [...new Set(group.flatMap(m => Object.keys(m.handIn.holdings)))]
+      .map(name => {
+        const of = group.flatMap(m => own(m.handIn.holdings, name) ?? [])
+        const sizes = of.flatMap(h => h.close[1] ?? [])
+        return { name, n: mid(of.map(h => h.close[0])), size: median(sizes), grew: Math.max(...of.map(h => h.close[0] - h.open[0])), grewBytes: Math.max(0, ...of.map(h => (h.close[1] ?? 0) - (h.open[1] ?? 0))) }
+      })
+      .sort((a, b) => (b.size ?? 0) - (a.size ?? 0) || b.n - a.n || a.name.localeCompare(b.name))
+    if (holdings.length) {
+      const size = sum(holdings.map(h => h.size ?? 0))
+      const items = holdings.slice(0, HOLDING_ITEMS).map(h => `${h.name} ${count(h.n)}${h.size ? `, about ${bytes(h.size)}` : ''}`)
+      if (holdings.length > HOLDING_ITEMS) items.push(`${count(holdings.length - HOLDING_ITEMS)} more`)
+      out.push(...wrap(`it holds${size ? `, about ${bytes(size)} in all` : ''}: ${items.join(' · ')}`, '', '  '))
+      const grew = holdings.filter(h => h.grew > 0).sort((a, b) => b.grew - a.grew)
+      if (grew.length) out.push(...wrap(`grew in this window, at most: ${grew.map(h => `${h.name} +${count(h.grew)}${h.grewBytes > 0 ? ` (about +${bytes(h.grewBytes)})` : ''}`).join(' · ')}`, '', '  '))
+    }
+    return out
+  }
+
   const lines = [ruled(`${plugin}: ${idleOnes.length ? 'an idle session' : 'a session (none is idle)'}, per minute`)]
   lines.push(...wrap(`the median of ${main.length === pool.length ? (main.length === 1 ? 'the one' : `all ${count(main.length)}`) : `these ${count(main.length)} of ${count(pool.length)}`}: ${factsText(facts) || 'no facts handed in'}`, '', '  '))
   lines.push(...actionTable(plugin, group, flagged))
+  lines.push(...under(group))
   let tables = 1
   for (const { set, who } of rest) {
     const theirs = set[0]?.m.handIn.facts ?? {}
-    const differ = Object.fromEntries([...new Set([...Object.keys(theirs), ...Object.keys(facts)])].filter(k => own(theirs, k) !== own(facts, k)).map(k => [k, own(theirs, k) ?? 'unset']))
+    const differ = Object.fromEntries(Object.keys(theirs).filter(k => own(theirs, k) !== own(facts, k)).map(k => [k, own(theirs, k) as Value]))
     const same = who !== 'busy session'
     const told = factsText(same ? differ : theirs)
     lines.push(...wrap(`${count(set.length)} ${same ? 'other ' : ''}${set.length === 1 ? who : `${who}s`}${told ? ` with ${told}` : ''}: ${num(mid(set.map(x => x.m.ms)))} ms a minute inside its actions`, '', '  '))
     if (tables < GROUP_TABLES) {
       lines.push(...actionTable(plugin, set.map(x => x.m), flagged))
+      lines.push(...under(set.map(x => x.m)))
       tables++
     }
   }
   const partial = withMeter.filter(x => x.m.handIn.partial).length
   if (partial) lines.push(`counted for part of the window only (reloaded inside it): ${count(partial)} ${partial === 1 ? 'session' : 'sessions'}`)
-
-  // The exact totals, whichever action each call fell in
-  const work = perMinute(group, h => h.totals.work).filter(k => k.median > 0)
-  const read = mid(group.map(m => m.handIn.totals.bytesRead / m.minutes))
-  const written = mid(group.map(m => m.handIn.totals.bytesWritten / m.minutes))
-  const startedBy = perMinute(group, h => foldCounts(h.totals.started, programOf)).filter(k => k.median > 0)
-  const moved = (kind: string) => (kind === 'read' && read > 0 ? ` (${bytes(read)})` : kind === 'write' && written > 0 ? ` (${bytes(written)})` : '')
-  const exact = workWords(work.map(k => [k.kind, k.median] as [string, number]), work.length, ' entries').map(([kind, text]) => text + moved(kind))
-  if (read > 0 && !work.some(k => k.kind === 'read')) exact.push(`${bytes(read)} read`)
-  if (written > 0 && !work.some(k => k.kind === 'write')) exact.push(`${bytes(written)} written`)
-  const startedAll = mid(group.map(m => sum(Object.values(m.handIn.totals.started)) / m.minutes))
-  lines.push(...wrap(`work in all, exact: ${exact.length ? `${exact.join(', ')} a minute` : 'none'} · processes started: ${num(startedAll)}${startedBy.length ? ` (${startedBy.map(k => `${k.kind} ${num(k.median)}`).join(', ')})` : ''}`, '', '  '))
-
-  const failed = perMinute(group, h => h.totals.failed)
-  lines.push(...wrap(`failed: ${failed.length ? failed.map(k => counted(k.kind, k.median) + (k.most > k.median ? ` (${num(k.most)} at most)` : '')).join(' · ') + ' a minute' : 'nothing'}`, '', '  '))
-  const sent = perMinute(group, h => h.totals.sent)
-  if (sent.length) lines.push(...wrap(`it sent, for others to react to: ${sent.map(k => counted(k.kind, k.median, SENT)).join(' · ')} a minute`, '', '  '))
-  const most = group.flatMap(m => Object.entries(m.handIn.actions).map(([name, a]) => ({ name, n: a.mostWork }))).sort((a, b) => b.n - a.n)[0]
-  if (most && most.n > 0) lines.push(`most work in one run: ${counted('call', most.n)} (${most.name})`)
-
-  // What it holds: how many and about how many bytes at the close, the largest first, and what grew in the window
-  const holdings = [...new Set(group.flatMap(m => Object.keys(m.handIn.holdings)))]
-    .map(name => {
-      const of = group.flatMap(m => own(m.handIn.holdings, name) ?? [])
-      const sizes = of.flatMap(h => h.close[1] ?? [])
-      return { name, n: mid(of.map(h => h.close[0])), size: median(sizes), grew: Math.max(...of.map(h => h.close[0] - h.open[0])), grewBytes: Math.max(0, ...of.map(h => (h.close[1] ?? 0) - (h.open[1] ?? 0))) }
-    })
-    .sort((a, b) => (b.size ?? 0) - (a.size ?? 0) || b.n - a.n || a.name.localeCompare(b.name))
-  if (holdings.length) {
-    const size = sum(holdings.map(h => h.size ?? 0))
-    const items = holdings.slice(0, HOLDING_ITEMS).map(h => `${h.name} ${count(h.n)}${h.size ? `, about ${bytes(h.size)}` : ''}`)
-    if (holdings.length > HOLDING_ITEMS) items.push(`${count(holdings.length - HOLDING_ITEMS)} more`)
-    lines.push(...wrap(`it holds${size ? `, about ${bytes(size)} in all` : ''}: ${items.join(' · ')}`, '', '  '))
-    const grew = holdings.filter(h => h.grew > 0).sort((a, b) => b.grew - a.grew)
-    if (grew.length) lines.push(...wrap(`grew in this window, at most: ${grew.map(h => `${h.name} +${count(h.grew)}${h.grewBytes > 0 ? ` (about +${bytes(h.grewBytes)})` : ''}`).join(' · ')}`, '', '  '))
-  }
 
   // The project's part, from the session that does its shared work: one per project. Where nobody does that work,
   // several sessions may hand one in: the first is printed, and the rest are said (they're in the report)

@@ -1126,3 +1126,43 @@ test("a table for each group of a plugin's sessions: the largest idle one, the o
   expect(all.some(l => l.startsWith('roster ('))).toBe(false)
   expect(all.some(l => l.startsWith('health ('))).toBe(true)
 })
+
+test("each group's own lines under its table; a fact a group didn't send isn't printed; time inside the actions past the CPU is said in words", () => {
+  const built = buildReport(
+    input({
+      sessions: [session(0, { plugins: ['sessions'] }), session(1, { plugins: ['sessions'] }), session(2, { status: 'busy', plugins: ['sessions'] })],
+      sampler: sampler({ 0: proc({ cpuMs: 1 }), 1: proc({ cpuMs: 1 }), 2: proc({ cpuMs: 30000 }) }),
+      handIns: {
+        [ID(0)]: { sessions: handIn({ facts: { live: 'own-watch', role: 'lead' }, actions: { seen: action({ runs: 4, ms: 600, slowest: 170 }) } }) },
+        [ID(1)]: { sessions: handIn({ facts: { live: 'own-watch', role: 'lead' }, actions: { seen: action({ runs: 4, ms: 600, slowest: 170 }) } }) },
+        [ID(2)]: { sessions: handIn({ facts: { live: 'own-watch' } }) },
+      },
+    }),
+  )
+  const all = lines(built.plain)
+  // The idle group's table and the busy one's, each with its own totals, failures and holdings under it
+  expect(all.filter(l => l.startsWith('action ')).length).toBe(2)
+  expect(all.filter(l => l.startsWith('work in all, exact:')).length).toBe(2)
+  expect(all.filter(l => l.startsWith('failed:')).length).toBe(2)
+  // The busy session sent no `role`: its line names what it has, never `unset`
+  expect(built.plain).not.toContain('unset')
+  expect(all.some(l => l.startsWith('1 busy session with live=own-watch:'))).toBe(true)
+  expect(flat(built.plain)).toContain("That's more than its CPU: an action's time includes what it waits for")
+  expect(built.plain).not.toContain('the rest outside it')
+})
+
+test("a plugin's project part names the sessions that run it: one of them that handed nothing in reads as not answering", () => {
+  const running = { i1: { label: 'session', key: ID(0) }, i2: { label: 'session', key: ID(1) }, i3: { label: 'session', key: ID(2) } }
+  const built = buildReport(
+    input({
+      sessions: [session(0), session(1), session(2)],
+      handIns: { [ID(0)]: { fleet: handIn({ project: { running } }) }, [ID(1)]: { fleet: handIn() } },
+    }),
+  )
+  expect(built.report.sessions.map(x => x.plugins)).toEqual([['fleet'], ['fleet'], ['fleet']])
+  expect(built.report.sessions[2]?.meters).toEqual({ fleet: null })
+  expect(built.report.missing).toContainEqual({ what: 'session', plugin: 'fleet', count: 1, why: 'no-answer' })
+  expect(built.report.off.some(o => o.rule === 'no-answer' && o.about === 'S3')).toBe(true)
+  // The labels are the report's own, in the file too
+  expect(JSON.stringify(built.report)).not.toContain(ID(2))
+})
