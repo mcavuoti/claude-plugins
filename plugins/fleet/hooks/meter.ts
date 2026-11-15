@@ -42,7 +42,6 @@ export const ACTIONS = table({
   'answers.changed': { drivers: P, grows: NONE },
   'overrules.changed': { drivers: P, grows: NONE },
   'inbox.changed': { drivers: P, grows: NONE },
-  'debug.changed': { drivers: H, grows: NONE },
   'bell:work': { drivers: P, grows: NONE },
   'bell:runs': { drivers: P, grows: NONE },
   'bell:restart': { drivers: P, grows: NONE },

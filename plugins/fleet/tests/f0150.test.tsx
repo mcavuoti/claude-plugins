@@ -196,7 +196,8 @@ test('a window opens and closes: one hand-in, in the shape sessions takes; a sec
   expect(d.partial).toBe(undefined)
   expect(d.to - d.from).toBe(3 * MIN)
   expect(refusals(d)).toEqual([])
-  expect(d.facts).toMatchObject({ version: 'v0.1.0', kind: 'instance', sweeps: false, live: 'claude', pace: 'quiet', wakes: 'open', world: 'on', turn: false, role: { label: 'role', key: 'owner' } })
+  // The facts are the few that explain a rate, the same for every instance alike (the report groups sessions by them)
+  expect(d.facts).toEqual({ version: 'v0.1.0', kind: 'instance', sweeps: false, live: 'claude', wakes: 'open', world: 'on', role: { label: 'role', key: 'owner' } })
   // The fields sessions' format has, and no other
   expect(Object.keys(d).sort()).toEqual(['actions', 'facts', 'format', 'from', 'holdings', 'loadedAt', 'to', 'totals'])
   // The actions of an idle instance, each under its declared name, with what makes it run and what it grows with
@@ -511,7 +512,7 @@ test("the project's part comes from the session that sweeps: the roster by state
   await idle(w, 2, 'me')
   await ring($, w, false)
   const d = handIns(w)[0].data
-  expect(d.facts).toMatchObject({ kind: 'person', sweeps: true, pace: 'sweeper' })
+  expect(d.facts).toEqual({ version: 'v0.1.0', kind: 'person', sweeps: true, live: 'claude', world: 'on' })
   expect(refusals(d)).toEqual([])
   expect(Object.keys(d.project).sort()).toEqual(['disk', 'health', 'landings', 'roster', 'waiting', 'wakes'])
   expect(d.project.landings).toEqual({ tool: 1, command: 1 })
@@ -627,8 +628,10 @@ test('a working instance in a window: each thing it does is counted under its de
     // its own turn and tools
     'prompt.typed', 'prompt.submit', 'turn.start', 'turn.end', 'gate', 'read.note', 'write.land', 'bash.scan', 'outbound.check', 'tool.settle', 'tool.fleet', 'tool.decide', 'reads.save', 'classic.hook', 'nudge.pass:landing',
     // the person
-    'command:list', 'command:status', 'command:other', 'band.draw', 'debug.changed',
+    'command:list', 'command:status', 'command:other', 'band.draw',
   ]
+  // The window's own ring isn't the session's work
+  expect([...names]).not.toContain('debug.changed')
   for (const name of want) expect([...names]).toContain(name)
   // And nothing it reports is outside the declared table
   for (const name of names) expect(Object.keys(ACTIONS)).toContain(name)

@@ -720,13 +720,14 @@ function changedAction(path: string): ActionName {
     const name = `bell:${path.slice(at + '/.claude/fleet/bell/'.length)}`
     return name in ACTIONS ? (name as ActionName) : 'bell:other'
   }
-  return path === debugFile ? 'debug.changed' : 'bell:other'
+  return 'bell:other'
 }
 /** A watched path changed: Claude said so (engine) or fleet's own watch did. The same code the timers run */
 function fileChanged($: any, path: string, engine: boolean) {
-  if (M.on) mMark(changedAction(path))
-  // sessions' debug path: a window opened or closed (/sessions debug perf). The one thing that turns the meter on
+  // sessions' debug path: a window opened or closed (/sessions debug perf). The one thing that turns the meter on;
+  // its own change isn't counted as the session's work
   if (debugFile && path === debugFile) bg(debugRing($))
+  else if (M.on) mMark(changedAction(path))
   digestGen++
   const bellAt = path.lastIndexOf('/.claude/fleet/bell/')
   if (bellAt !== -1) bellRang(path.slice(bellAt + '/.claude/fleet/bell/'.length))
@@ -907,23 +908,19 @@ async function debugHandIn($: any, report: string) {
   else log($, `debug: the hand-in for report ${report} wasn't taken (${r ? (r.detail ?? r.reason ?? 'refused') : 'sessions did not answer'})`)
 }
 
-/** The facts that explain a session's rates: what it is, how it hears of changes, whether it sweeps */
+/** The facts that explain a session's rates, and nothing else: the report groups a plugin's sessions by their facts
+ * as a whole, so a value that differs from one instance to the next without explaining a rate (a count, an age) would
+ * make every instance a group of its own. What it is, how it hears of changes, whether it sweeps, its wakes, the world */
 async function debugFacts($: any): Promise<Record<string, Value>> {
   const inst = myInstance
   const now = await $.clock.now()
-  const threads = await read($, reads)
   return {
     ...(version && NAME.test(`v${version}`) ? { version: `v${version}` } : {}),
     kind: inst ? 'instance' : jobRef ? 'background' : 'person',
     sweeps: sweep.holding,
     live: !live ? 'timers' : ownWatchLive ? 'own' : 'claude',
-    pace: paceSet ?? 'none',
-    wakes: !inst ? 'none' : now < nudgeShutUntil ? 'shut' : 'open',
-    world: !worldOn() ? 'off' : tooBig ? 'big' : 'on',
-    turn: turnRunning,
-    instances: roster?.instances.length ?? 0,
-    files: known.size,
-    threads: Object.keys(threads).length,
+    ...(inst ? { wakes: now < nudgeShutUntil ? 'shut' : 'open' } : {}),
+    world: !worldOn() ? 'off' : tooBig ? 'too-big' : 'on',
     ...(inst ? { role: { label: 'role' as const, key: inst.role } } : {}),
   }
 }
@@ -1374,7 +1371,7 @@ function fsRead($: any, ...a: any[]): Promise<any> {
     },
   )
 }
-function fsWrite($: any, path: string, text: string): Promise<void> {
+function fsWrite($: any, path: string, text: any): Promise<void> {
   if (!M.on) return $.fs.write(path, text)
   mWork('write')
   return $.fs.write(path, text).then(
