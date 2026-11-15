@@ -183,6 +183,7 @@ export const macos: Platform = {
   },
 
   fileWatch: 'kqueue',
+  processStats: 'libproc',
 
   text: {
     switchNeedsWindow: 'To switch, use the panel from the Terminal window showing this session',

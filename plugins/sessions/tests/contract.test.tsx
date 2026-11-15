@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { heartbeatText, keepPluginPins, pluginPinChange, showingText } from '../hooks/state'
+import { FORMAT, heartbeatText, keepPluginPins, pluginPinChange, showingText } from '../hooks/state'
 import { WATCH_SET } from '../hooks/watch'
 import { COMMAND, DATA, ROOT, SID, startSession, world } from './world'
 
@@ -26,6 +26,9 @@ const PROBE = {
         else if (m === 'pin') out = await $.sessions.pin(input)
         else if (m === 'restart') out = await $.sessions.restart(input)
         else if (m === 'watchCommand') out = await $.sessions.watchCommand(input)
+        else if (m === 'debugPath') out = await $.sessions.debugPath()
+        else if (m === 'debugWindow') out = await $.sessions.debugWindow()
+        else if (m === 'debugReport') out = await $.sessions.debugReport(input)
         return { text: JSON.stringify({ out }) }
       } catch (err) {
         return { text: JSON.stringify({ threw: String(err) }) }
@@ -61,7 +64,7 @@ test('contract: api 1 and its methods, also before the mod has started here', WI
   expect(c.api).toBe(1)
   expect(c.format).toBe(3)
   expect(typeof c.version).toBe('string')
-  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'watchCommand'])
+  expect(c.methods).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'watchCommand', 'debugPath', 'debugWindow', 'debugReport'])
 })
 
 // watchCommand only builds the command for sessions' watcher (watcher.py watch-paths): the caller runs it and reads it
@@ -1045,4 +1048,63 @@ test("a plugin's pins: it unpins only what it pinned, Remote Control's own pin s
   expect(keepPluginPins({ pins: ['a'], toUnpin: ['b', 'c'] }, { ids: ['b'], added: [] }, new Set(['a', 'b', 'c']))).toEqual({ pins: ['a', 'b'], toUnpin: ['c'], plugin: { ids: ['b'], added: ['b'] } })
   // Gone from the list: the record forgets them, and the pin a plugin added goes (never the person's)
   expect(keepPluginPins({ pins: ['a', 'd'], toUnpin: [] }, { ids: ['a', 'd'], added: ['d'] }, new Set())).toEqual({ pins: ['a'], toUnpin: ['d'], plugin: none })
+})
+
+// /sessions debug for another plugin: the path it watches, what the window says, and its totals at the close. The
+// plugin never reads the file itself, and what it hands in holds names, numbers and labels only
+const DEBUG_WINDOW = `${DATA}/reports/window`
+const windowFile = (report: string, phase: 'open' | 'close', until: number) => `format=${FORMAT}\nreport=${report}\nprofile=perf\nphase=${phase}\nuntil=${until}\nat=1\nfrom=${SID}\n`
+const handIn = (extra: object = {}) => ({
+  format: 1,
+  loadedAt: 1,
+  from: 2,
+  to: 3,
+  facts: { role: { label: 'role', key: 'made-up role' }, version: 'v0.15.0' },
+  actions: { 'landing.chain': { drivers: ['peer'], grows: ['landings'], runs: 20, ms: 8, slowest: 2, mostWork: 3, work: { read: 40 }, failed: {}, sent: {}, started: { 'mv:heartbeat': 1 }, bytesRead: 100, bytesWritten: 0 } },
+  totals: { work: { read: 40 }, failed: {}, sent: {}, started: { 'mv:heartbeat': 1 }, bytesRead: 100, bytesWritten: 0 },
+  holdings: { latest: { grows: ['files'], open: [3, 900], close: [3, 900] } },
+  ...extra,
+})
+
+test('debugPath: the window file, made empty when it is not there, before the start and after; debugWindow says what it holds', WITH_PROBE, async ($, on) => {
+  const w = world(on, { list: list() })
+  // Before sessions has started in the session
+  expect(await call($, 'debugPath')).toEqual({ ok: true, path: DEBUG_WINDOW })
+  expect(w.files.get(DEBUG_WINDOW)).toBe('')
+  expect(await call($, 'debugWindow')).toEqual({ ok: true, window: null })
+  await startSession($, w)
+  w.write(DEBUG_WINDOW, windowFile('r-0a1b2c', 'open', 61000))
+  expect(await call($, 'debugPath')).toEqual({ ok: true, path: DEBUG_WINDOW })
+  // A file that's there is left as it is
+  expect(await call($, 'debugWindow')).toEqual({ ok: true, window: { report: 'r-0a1b2c', profile: 'perf', open: true, until: 61000 } })
+  w.write(DEBUG_WINDOW, windowFile('r-0a1b2c', 'close', 61000))
+  expect((await call($, 'debugWindow')).window).toMatchObject({ open: false })
+  w.write(DEBUG_WINDOW, windowFile('r-0a1b2c', 'close', 61000).replace(`format=${FORMAT}`, 'format=999'))
+  expect(await call($, 'debugWindow')).toEqual({ ok: true, window: null })
+})
+
+test("debugReport: a plugin's totals go under the calling session in the report's folder; anything that isn't a name, a number or a label is refused whole", WITH_PROBE, async ($, on) => {
+  const w = world(on, { list: list() })
+  await startSession($, w)
+  const filed = `${DATA}/reports/r-0a1b2c/${SID}.probe.json`
+  // No window of that report
+  expect(await call($, 'debugReport', { source: 'probe', report: 'r-0a1b2c', data: handIn() })).toMatchObject({ ok: false, reason: 'closed' })
+  w.write(DEBUG_WINDOW, windowFile('r-0a1b2c', 'close', 61000))
+  expect(await call($, 'debugReport', { source: 'probe', report: 'r-0a1b2c', data: handIn() })).toEqual({ ok: true })
+  expect(JSON.parse(w.files.get(filed)!).actions['landing.chain'].runs).toBe(20)
+  w.files.delete(filed)
+  // Who hands in and for which report, as plain names
+  expect(await call($, 'debugReport', { source: 'Probe', report: 'r-0a1b2c', data: handIn() })).toMatchObject({ ok: false, reason: 'invalid' })
+  expect(await call($, 'debugReport', { source: 'sessions', report: 'r-0a1b2c', data: handIn() })).toMatchObject({ ok: false, reason: 'invalid' })
+  expect(await call($, 'debugReport', { source: 'probe', report: '../x', data: handIn() })).toMatchObject({ ok: false, reason: 'invalid' })
+  expect(await call($, 'debugReport', { source: 'probe', report: 'r-ffffff', data: handIn() })).toMatchObject({ ok: false, reason: 'closed' })
+  // Free text anywhere: refused, and the reason doesn't repeat it
+  for (const bad of [handIn({ facts: { where: '/Users/x/secret project' } }), handIn({ actions: { 'made up name': handIn().actions['landing.chain'] } }), handIn({ format: 2 }), handIn({ holdings: { latest: { grows: ['files'], open: [3, 'many'], close: [3, 900] } } })]) {
+    const r = await call($, 'debugReport', { source: 'probe', report: 'r-0a1b2c', data: bad })
+    expect(r).toMatchObject({ ok: false, reason: 'invalid' })
+    expect(JSON.stringify(r)).not.toContain('secret')
+    expect(JSON.stringify(r)).not.toContain('made up')
+  }
+  expect(await call($, 'debugReport', { source: 'probe', report: 'r-0a1b2c', data: handIn({ project: { roster: Object.fromEntries(Array.from({ length: 30000 }, (_, i) => [`k${i}`, i])) } }) })).toMatchObject({ ok: false })
+  expect(w.files.has(filed)).toBe(false)
 })
