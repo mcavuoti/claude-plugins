@@ -21,7 +21,9 @@ export const BAND = { plugin: 'fleet', component: 'AbovePrompt', requestId: 'ban
 export const COMPOSER = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
 
 // The golden list of what sessions api 1 serves (plugins/sessions/tests/contract.test.tsx has the same one)
-export const GOLDEN = ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'watchCommand']
+export const GOLDEN = ['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'watchCommand', 'debugPath', 'debugWindow', 'debugReport']
+// sessions' debug path in the tests: the file it rings when a window of /sessions debug perf opens or closes
+export const DEBUG_PATH = '/fake/data/reports/window'
 // Where the tests' templates are (FLEET_TEMPLATES_DIR), and the blank one every test has
 export const TEMPLATES = '/fake/templates'
 export const BLANK = {
@@ -58,7 +60,7 @@ export const FAKE_SESSIONS = {
         contract: async () => {
           const w = await world()
           if (w.gone) throw new Error('sessions is not loaded')
-          return { api: w.api ?? 1, version: w.version ?? '0.18.0', format: 3, methods: ['watchCommand', 'contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart'] }
+          return { api: w.api ?? 1, version: w.version ?? '0.21.0', format: 3, methods: ['watchCommand', 'contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'debugPath', 'debugWindow', 'debugReport'] }
         },
         // fleet's own watch: no watcher unless a test says which kernel watch it has (world.watch)
         watchCommand: async input => {
@@ -117,7 +119,29 @@ export const FAKE_SESSIONS = {
           return refuse ? { ok: false, reason: 'refused', detail: refuse } : { ok: true, state: 'queued' }
         },
       }
-      return { ...$, sessions: api }
+      // The debug window (sessions 0.21.0): the path it rings, what the window is now (the file's own text, as sessions
+      // writes it), and the hand-ins it was given (logged whole). noDebug: a sessions that doesn't answer for the path
+      const debug = {
+        debugPath: async () => {
+          if ((await world()).noDebug) throw new Error('sessions has not started')
+          return { ok: true, path: '/fake/data/reports/window' }
+        },
+        debugWindow: async () => {
+          let window: unknown = null
+          try {
+            const v = JSON.parse(await $.fs.read('/fake/data/reports/window'))
+            if (v && typeof v.report === 'string') window = v
+          } catch {}
+          return { ok: true, window }
+        },
+        debugReport: async (input: { source: string; report: string; data: unknown }) => {
+          const refuse = (await world()).refuseDebug
+          if (refuse) return { ok: false, reason: refuse, detail: `refused: ${refuse}` }
+          await note({ debugReport: input })
+          return { ok: true }
+        },
+      }
+      return { ...$, sessions: { ...api, ...debug } as EngineInterface['sessions'] }
     })
   },
 }
@@ -532,7 +556,7 @@ export function under(w: World, dir: string): string[] {
 }
 
 // The fake sessions' answers: this session as current, and the others by ref
-export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; refuseRestart?: string; version?: string; api?: number; gone?: boolean; watch?: string }) {
+export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; refuseRestart?: string; version?: string; api?: number; gone?: boolean; watch?: string; noDebug?: boolean; refuseDebug?: string }) {
   w.files.set(FAKE, JSON.stringify(say))
 }
 

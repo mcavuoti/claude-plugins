@@ -45,6 +45,9 @@ declare module 'claude-code' {
        * A module that finds its own set here gets fleet's files' changes by FileChanged (live updates); one that
        * doesn't reads them on timers */
       watching: number
+      /** The debug report this session's meter opened for (sessions' /sessions debug perf), '' when none: a module that
+       * came in by a reload inside that window finds it and hands in as partial */
+      debugOpen: string
       /** The section fleet last put this session in ('fleet:asking', 'none'; '' not known yet) */
       section: string
       /** What each thread of this session read of the world: 'main' or a helper's agentId → path → the read */

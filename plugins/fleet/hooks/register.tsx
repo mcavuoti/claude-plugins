@@ -381,7 +381,7 @@ import {
   type WakeCount,
   type WaveFacts,
 } from './roster'
-import { ACTIONS, HAND_IN_MAX, M, NAME, below, bytesRead as mBytesRead, bytesWritten as mBytesWritten, failed as mFailed, mark as mMark, meterOff, meterOpen, note as mNote, purposeOf, run as runAction, sent as mSent, signalOf, sized, snapshot as meterSnapshot, started as mStarted, work as mWork, under, type ActionName, type Holding, type Value } from './meter'
+import { ACTIONS, HAND_IN_MAX, M, NAME, below, bytesRead as mBytesRead, bytesWritten as mBytesWritten, failed as mFailed, mark as mMark, meterHold, meterOff, meterOpen, note as mNote, noteSet as mNoteSet, purposeOf, run as runAction, sent as mSent, signalOf, sized, snapshot as meterSnapshot, started as mStarted, work as mWork, under, type ActionName, type Holding, type Value } from './meter'
 import { dateLine, groupedLines, localFleetLine, localFleetRecords, modelDiffers } from './roster'
 import {
   CONFIRM_DESCRIPTION,
@@ -499,7 +499,7 @@ async function processNow($: any): Promise<string> {
 // correctness): answers every 60 s instead of 2 s, the band and the rest of the beat every 60 s instead of 10 s (10 s
 // still in the sweeping session, whose beat scans the world for outside changes), the world every 60 s and the lease
 // every 30 s in a session that doesn't sweep, and no timer every 2 s (pace, 0.14.1).
-const FLEET_WATCH_SET = 1
+const FLEET_WATCH_SET = 2
 const watching = atom({ plugin: 'fleet', key: 'watching' } as const, 0)
 let live = false
 // This process's SessionStart handed the engine the set (live waits for its proof)
@@ -620,7 +620,9 @@ async function startOwnWatch($: any) {
     await ensureWorld($)
     if (!root) throw new Error('no fleet in this project')
     const w = watchedPaths()
-    const c: any = await race($, () => $.sessions.watchCommand!({ paths: [...w.files, ...w.folders] }))
+    const debug = await debugPathNow($)
+    debugUnwatched = !debug
+    const c: any = await race($, () => $.sessions.watchCommand!({ paths: [...w.files, ...w.folders, ...(debug ? [debug] : [])] }))
     if (!c) throw new Error('sessions did not answer')
     if (!c.ok) throw new Error(c.detail || c.reason || 'sessions could not build it')
     await makeWatched($, w)
@@ -723,6 +725,8 @@ function changedAction(path: string): ActionName {
 /** A watched path changed: Claude said so (engine) or fleet's own watch did. The same code the timers run */
 function fileChanged($: any, path: string, engine: boolean) {
   if (M.on) mMark(changedAction(path))
+  // sessions' debug path: a window opened or closed (/sessions debug perf). The one thing that turns the meter on
+  if (debugFile && path === debugFile) bg(debugRing($))
   digestGen++
   const bellAt = path.lastIndexOf('/.claude/fleet/bell/')
   if (bellAt !== -1) bellRang(path.slice(bellAt + '/.claude/fleet/bell/'.length))
@@ -807,6 +811,217 @@ function landingSoon($: any, now: number) {
     )
   }
   wait(LANDING_QUIET_MS)
+}
+
+// ---- The debug window (0.15.0): `/sessions debug perf` ----
+// sessions measures every session's process and writes one report; fleet accounts for its share (meter.ts). Nothing of
+// this runs until the person asks: sessions rings its debug path (a file of its own, which fleet only adds to the
+// paths it watches), fleet asks `debugWindow()` what it means, and
+//   - a window opened: the meter counts from zero, until the window's end at the latest (by itself, at the first count
+//     past it, with no timer: the asking session may have died);
+//   - a window closed: one hand-in (`debugReport`), and the meter is off again.
+// A session that starts while a window is open isn't counted: it never looks at the path at its start. A module that
+// came in by a reload inside a window hands in `partial: 'reloaded'` (what its predecessor counted went with it); it
+// knows by $.state's debugOpen, the one thing written at the opening.
+let debugFile = ''
+/** The watch this session has was handed without sessions' debug path (sessions didn't answer in time): it takes no
+ * part in a report until its next start, and /fleet status says so */
+let debugUnwatched = false
+const debugOpen = atom({ plugin: 'fleet', key: 'debugOpen' } as const, '')
+
+/** sessions' debug path: asked once it's needed for a watch, kept from then on. '' when sessions didn't give it */
+async function debugPathNow($: any): Promise<string> {
+  if (debugFile) return debugFile
+  const r: any = await race($, () => $.sessions.debugPath())
+  if (r?.ok && typeof r.path === 'string' && r.path.startsWith('/')) debugFile = r.path
+  else log($, "debug: sessions didn't give its debug path: this session takes no part in a /sessions debug report until its next start")
+  return debugFile
+}
+
+/** The debug path changed: what sessions says the window is now */
+let debugRinging: Promise<void> | null = null
+function debugRing($: any): Promise<void> {
+  // One at a time, in the order they came (an open and a close a moment apart)
+  const before = debugRinging ?? Promise.resolve()
+  const mine: Promise<void> = before.then(() => debugRung($)).catch(err => log($, `debug: ${String(err).slice(0, 200)}`))
+  debugRinging = mine
+  void mine.then(() => {
+    if (debugRinging === mine) debugRinging = null
+  })
+  return mine
+}
+async function debugRung($: any) {
+  const w: any = await race($, () => $.sessions.debugWindow())
+  const win = w?.ok ? w.window : null
+  // Nothing sessions calls a window (an empty file, another format, a profile fleet doesn't know): nothing to do
+  if (!win || win.profile !== 'perf' || typeof win.report !== 'string' || !win.report) return
+  if (win.open) {
+    if (M.on && M.report === win.report) return
+    const held = await holdingsNow($)
+    const now = await $.clock.now()
+    const left = Number(win.until) - now
+    if (!(left > 0)) return
+    // (written before the counting starts: it isn't the window's work)
+    await touched(update($, debugOpen, () => String(win.report)))
+    meterOpen(win.report, now, left)
+    M.holdingsAtOpen = held
+    log($, `debug: counting for report ${win.report}, ${Math.round(left / 1000)} s at most`)
+    return
+  }
+  await debugHandIn($, String(win.report))
+}
+
+/** The window closed: what this session counted, once, and the meter off */
+async function debugHandIn($: any, report: string) {
+  const counted = M.on && M.report === report
+  let data: ReturnType<typeof meterSnapshot>
+  if (counted) {
+    // Counting stops first: what the hand-in itself reads (holdings, the project's part) isn't the window's work
+    meterHold()
+    const to = await $.clock.now()
+    const facts = await debugFacts($)
+    const held = await holdingsNow($)
+    const project = (await handsInProject($)) ? await projectPart($, to) : undefined
+    data = meterSnapshot(to, facts, held, project)
+    meterOff()
+  } else {
+    // Another report's window still counting here ends too (its close never came)
+    if (M.on) meterOff()
+    // Not counted in this module: a module that came in by a reload inside this window says so; a session that started
+    // inside it, or that the opening ring never reached, hands in nothing (sessions lists it)
+    if ((await stateRead(read($, debugOpen))) !== report) return
+    const to = await $.clock.now()
+    data = { ...meterSnapshot(to, await debugFacts($), null, undefined, 'reloaded'), from: to }
+  }
+  await touched(update($, debugOpen, () => ''))
+  // Past sessions' limit (it never should be): the parts that can go, go
+  if (JSON.stringify(data).length > HAND_IN_MAX) data = { ...data, holdings: {}, project: undefined }
+  const r: any = await race($, () => $.sessions.debugReport({ source: 'fleet', report, data }))
+  if (r?.ok) log($, `debug: handed in for report ${report}${data.partial ? ' (partial: reloaded)' : ''}`)
+  else log($, `debug: the hand-in for report ${report} wasn't taken (${r ? (r.detail ?? r.reason ?? 'refused') : 'sessions did not answer'})`)
+}
+
+/** The facts that explain a session's rates: what it is, how it hears of changes, whether it sweeps */
+async function debugFacts($: any): Promise<Record<string, Value>> {
+  const inst = myInstance
+  const now = await $.clock.now()
+  const threads = await read($, reads)
+  return {
+    kind: inst ? 'instance' : jobRef ? 'background' : 'person',
+    sweeps: sweep.holding,
+    live: !live ? 'timers' : ownWatchLive ? 'own' : 'claude',
+    pace: paceSet ?? 'none',
+    wakes: !inst ? 'none' : now < nudgeShutUntil ? 'shut' : 'open',
+    world: !worldOn() ? 'off' : tooBig ? 'big' : 'on',
+    turn: turnRunning,
+    instances: roster?.instances.length ?? 0,
+    files: known.size,
+    threads: Object.keys(threads).length,
+    ...(inst ? { role: { label: 'role' as const, key: inst.role } } : {}),
+  }
+}
+
+/** What this session holds in memory, by name: a count and a rough size each (meter.ts sized), never a whole map read */
+async function holdingsNow($: any): Promise<Record<string, Holding>> {
+  const sum = (grows: readonly string[], ...parts: Holding[]): Holding => ({ grows, count: parts.reduce((n, x) => n + x.count, 0), bytes: parts.some(x => x.bytes === null) ? null : parts.reduce((n, x) => n + (x.bytes ?? 0), 0) })
+  const threads = await read($, reads)
+  const files = Object.values(threads).reduce((n, t) => n + Object.keys(t).length, 0)
+  const first = Object.values(threads)[0]
+  const sample = first ? Object.entries(first).slice(0, 8) : []
+  const each = sample.length ? JSON.stringify(sample).length / sample.length : 0
+  return {
+    latest: sized(latest, ['files']),
+    seen: sized(seen, ['landings']),
+    known: sized(known, ['files']),
+    revs: sum(['records'], sized(revCache, []), sized(idIndex, [])),
+    queue: sized(queueCache, ['questions']),
+    register: sized(registerCache, ['records'], 4),
+    intake: sized(intakeEvents, ['items']),
+    board: sized(boardCache, ['items']),
+    proofs: sum(['records'], sized(proofCache, []), sized(confCache, [])),
+    folders: sum([], sized(folderMarks, []), sized(folderNamesCache, []), sized(absentUntil, []), sized(belledAbsent, [])),
+    told: sum(['threads'], sized(toldHere, []), sized(digestSeen, []), sized(laterLines, []), sized(lineChains, [])),
+    calls: sum([], sized(callsInFlight, []), sized(ownInFlight, []), sized(ownCalls, []), sized(ownRefused, []), sized(stepOf, []), sized(refusedIn, []), sized(refusedWrites, []), sized(fgRunning, [])),
+    reads: { grows: ['files'], count: files, bytes: Math.round(each * files) },
+    timers: { grows: [], count: paceTimers.length + nudgeKicks.length + (ownWatchRetry ? 1 : 0), bytes: null },
+  }
+}
+
+/** Whether this session hands in the project's part: the one that sweeps; or, when no session holds the lease (none
+ * has run fleet's timers long enough to take it), any session that finds none */
+async function handsInProject($: any): Promise<boolean> {
+  if (!root) return false
+  if (sweep.holding) return true
+  const l = parseLease(await readText($, stateDir('sweeper.json')))
+  return !l || (await $.clock.now()) - l.at > LEASE_MS
+}
+
+/** The project's part of a hand-in: the roster by state, what landed in the window and how, who waits on the person,
+ * the wakes by reason, and what every session reads from disk. Numbers and fixed words only */
+async function projectPart($: any, now: number): Promise<Record<string, Record<string, Value>>> {
+  const out: Record<string, Record<string, Value>> = {}
+  await loadRoster($)
+  const insts = roster?.instances ?? []
+  const tally: Record<string, number> = { instances: insts.length }
+  const bump = (k: string) => (tally[k] = (tally[k] ?? 0) + 1)
+  if (insts.length && (await sessionsReady($))) {
+    const st = await race<Status>($, () => $.sessions.status({ names: insts.map(i => i.name) }))
+    if (st?.ready) {
+      const down = await downSet($)
+      const list = await budgets($)
+      for (const inst of insts) {
+        const { running, stopped: retired } = rowsOf(inst, st.rows)
+        if (running) bump(running.state === 'working' ? 'busy' : running.state === 'waiting' ? 'waiting' : 'idle')
+        else if (retired) bump(`stopped.${stopReason(retired) ?? 'unknown'}`)
+        else bump('off')
+        if (down.has(inst.slug)) bump('down')
+        if (list.find(x => x.inst.slug === inst.slug)?.state === 'over') bump('over')
+      }
+    }
+  }
+  out.roster = tally
+  out.landings = { ...(M.notes.get('landings') ?? {}) }
+  const { records } = await queueRecords($)
+  out.waiting = { questions: records.length, oldestMs: records.length ? Math.max(0, now - (records[0] as QueueRecord).at) : 0, askers: new Set(records.map(r => r.asker.ref ?? '')).size, ...(M.notes.get('marks') ?? {}) }
+  out.wakes = { ...(M.notes.get('wakes') ?? {}) }
+  // What every session reads from disk: entries and bytes, by a few listings made only here
+  const disk: Record<string, number> = {}
+  const entries = async (dir: string): Promise<any[]> => {
+    try {
+      return await fsList($, dir)
+    } catch {
+      return []
+    }
+  }
+  const [thisHour, lastHour] = windowFolders(now, 2)
+  disk['events.hour'] = (await entries(eventsDir(thisHour))).length
+  disk['events.last'] = lastHour ? (await entries(eventsDir(lastHour))).length : 0
+  disk['queue.entries'] = (await entries(dec('queue'))).length
+  const readsFiles = await entries(`${fleetDir()}/reads`)
+  disk['reads.files'] = readsFiles.length
+  disk['reads.bytes'] = readsFiles.reduce((n, x) => n + Number(x.size ?? 0), 0)
+  disk['instances.entries'] = (await entries(`${fleetDir()}/instances`)).filter(x => x.kind === 'dir').length
+  const state = await entries(stateDir())
+  disk['state.entries'] = state.length
+  for (const name of ['suspects', 'work', 'spends', 'wakes']) {
+    const f = state.find(x => x.name === `${name}.json`)
+    if (f) disk[`state.${name}.bytes`] = Number(f.size ?? 0)
+  }
+  const months = (await entries(dec('register'))).filter(x => x.kind === 'dir')
+  let registered = 0
+  let registeredBytes = 0
+  for (const m of months.slice(-24)) {
+    const list = await entries(dec(`register/${m.name}`))
+    registered += list.length
+    registeredBytes += list.reduce((n, x) => n + Number(x.size ?? 0), 0)
+  }
+  disk['register.records'] = registered
+  disk['register.bytes'] = registeredBytes
+  disk['world.files'] = known.size
+  out.disk = disk
+  const l = parseLease(await readText($, stateDir('sweeper.json')))
+  out.health = { sweeper: sweep.holding ? 'here' : l && now - l.at <= LEASE_MS ? 'other' : 'none', sweeperForMs: sweep.holding && sweep.bornAt ? Math.max(0, now - sweep.bornAt) : 0, otherFormats: otherEvents }
+  return out
 }
 
 /** /fleet status's line on live updates; sessionStart: whether classic.SessionStart reached fleet in this session */
@@ -974,7 +1189,7 @@ const SESSIONS_API = 1
 // What fleet needs (CONTRIBUTING.md, "Dependencies, not fallbacks"): sessions at this version or later, python3 (a .py
 // draft's parse check, the proposal template's proofs check), and Claude Code at this version or later. A missing one
 // is said once, in the band, /fleet status and the commands that need it; there's no second way to do without it
-const SESSIONS_MIN = '0.18.0'
+const SESSIONS_MIN = '0.21.0'
 const CLAUDE_MIN = '2.1.319'
 // /fleet up's wakes, one this far apart (sessions' own bring-back after its service died paces its respawns 3 s apart)
 const WAKE_GAP_MS = 3000
@@ -2699,6 +2914,10 @@ async function takeEvent($: any, name: string, v: any, now: number) {
     if (v && v.format !== FORMAT) otherEvents++
     return
   }
+  if (M.on) {
+    mNote('landings', v.via === 'bash' ? 'command' : v.via === 'tool' || v.via === 'outside' || v.via === 'fleet' ? v.via : 'other')
+    if (netPulling) mMark('landing.net-found')
+  }
   const prev = latest.get(v.path)
   if (newer(prev, v)) {
     latest.set(v.path, v)
@@ -2884,11 +3103,18 @@ async function eventsTick($: any, fromPoll = false) {
     const now = await $.clock.now()
     if (now - chainVerifiedAt >= EVENTS_VERIFY_MS) {
       chainVerifiedAt = now
-      await pullWhole($)
+      netPulling = true
+      try {
+        await pullWhole($)
+      } finally {
+        netPulling = false
+      }
     }
   }
 }
 
+/** The net's whole pull runs now (for the meter: an event it takes is one no chain named) */
+let netPulling = false
 /** A whole pull that began after this call: one in flight may have listed before what brought the call */
 async function pullWhole($: any) {
   if (pulling) {
@@ -10805,6 +11031,7 @@ async function rosterTick($: any) {
           swept.instances[inst.slug] = { ...base, notWoken: { at: now, why: capped } }
           woke = true
         }
+        if (M.on) mNote('wakes', 'held.restart-cap')
         continue
       }
       const reason = why === 'memory' ? 'fleet: closed for lack of memory, memory is back' : 'fleet: a restart stopped it'
@@ -10815,7 +11042,9 @@ async function rosterTick($: any) {
         swept.instances[inst.slug] = { ...kept, restartFor: episode, restartAt: now, restartCount: (had?.restartCount ?? 0) + 1 }
         woke = true
         log($, `woke ${inst.name} (${reason})`)
+        if (M.on) mNote('wakes', 'sent.restart')
       } else if (r) {
+        if (M.on) mNote('wakes', 'held.sessions')
         const said = `sessions: ${r.detail ?? r.reason}`
         if (had?.notWoken?.why !== said) {
           log($, `${inst.name} not woken after a restart: ${r.detail ?? r.reason}`)
@@ -10867,6 +11096,7 @@ async function rosterTick($: any) {
     // A poll due wakes it on the poll's own count, whatever the wakes' caps hold (it isn't counted among them)
     const asPoll = pollDue && (!some || verdict !== 'ok')
     if (verdict !== 'ok' && !asPoll) {
+      if (M.on) mNote('wakes', verdict === 'cap' ? 'held.cap' : 'held.window')
       notWoken(verdict === 'cap' ? `wakes ${(had && had.day === day ? had.count : 0) + others}/${perDayText(wakes.perDay)} today` : `wakes: one every ${wakes.everyMin} min`)
       continue
     }
@@ -10878,7 +11108,11 @@ async function rosterTick($: any) {
         swept.instances[inst.slug] = { ...kept, pollFor: lastPoll }
         woke = true
         log($, `woke ${inst.name} (its routine poll is due)`)
-      } else if (r) notWoken(`sessions: ${r.detail ?? r.reason}`)
+        if (M.on) mNote('wakes', 'sent.poll')
+      } else if (r) {
+        if (M.on) mNote('wakes', 'held.sessions')
+        notWoken(`sessions: ${r.detail ?? r.reason}`)
+      }
       continue
     }
     const reason = answered
@@ -10917,12 +11151,15 @@ async function rosterTick($: any) {
       }
       woke = true
       log($, `woke ${inst.name} (${reason})`)
+      if (M.on) mNote('wakes', `sent.${answered ? 'answer' : slot ? 'slot' : runsDone.length ? 'run' : resumed ? 'budget' : offeredNow.length || laterNow.length ? 'offer' : quiet ? 'cadence' : stale ? 'derived' : pointed ? 'intake' : review ? 'review' : watched ? 'watch' : 'read'}`)
     } else if (r) {
+      if (M.on) mNote('wakes', 'held.sessions')
       log($, `${inst.name} not woken: ${r.detail ?? r.reason}`)
       notWoken(`sessions: ${r.detail ?? r.reason}`)
     }
   }
   for (const name of [...noFleetNames.keys()]) if (!named.has(name)) noFleetNames.delete(name)
+  if (M.on) mNoteSet('marks', 'needs', Object.values(marks).filter(m => m.needsPerson).length)
   if (woke) {
     await replace($, stateDir('wakes.json'), json(swept))
     // The band's restart line says what this sweep woke at once, not at the next one
@@ -13633,6 +13870,7 @@ async function statusCommand($: any, all = false): Promise<string> {
     lines.push(`project: ${heldCount(records, present, alikeQuestion)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
     lines.push((await sweeperState($)).line)
     lines.push(liveLine(!!(await stateRead(read($, classicSeen))).SessionStart, await $.clock.now()))
+    if (debugUnwatched) lines.push("debug: this session takes no part in a /sessions debug report until its next start (sessions didn't give its debug path in time)")
     await ensureWorld($)
     const spent = await judgeLedger($, await $.clock.now())
     const liveAreas = Object.keys((await judgesStateNow($)).live).sort()
@@ -13981,7 +14219,10 @@ export const register: Register = on => {
       await makeWatched($, w)
       watchingLatest = true
       watchMisses = 0
-      const watched = [...w.files, ...w.folders]
+      // sessions' debug path (it's sessions' file: fleet only watches it, and makes nothing there)
+      const debug = await debugPathNow($)
+      debugUnwatched = !debug
+      const watched = [...w.files, ...w.folders, ...(debug ? [debug] : [])]
       // Live once the engine brings a ring under bell/ back (the list is set once this hook returns; it replaces the one
       // before, so live waits for that proof again)
       live = false

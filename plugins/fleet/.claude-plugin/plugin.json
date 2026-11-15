@@ -5,5 +5,5 @@
   "author": { "name": "mcavuoti" },
   "license": "MIT",
   "types": "./types/index.d.ts",
-  "dependencies": [{ "name": "sessions", "version": ">=0.18.0" }]
+  "dependencies": [{ "name": "sessions", "version": ">=0.21.0" }]
 }

@@ -195,7 +195,7 @@ test('F2 control: the same poll, nothing held: once in those 5 min', WITH_RACER,
 test('F3: a reload within a second of the outside mark leaves the mark out of the reads file (a restart then forgets it)', WITH_SESSIONS, async ($, on) => {
   const at = Date.UTC(2026, 10, 2, 11, 59, 59)
   const threads = { main: { 'notes/a.md': { v: hashText('a\n'), at: Date.UTC(2026, 10, 2, 11, 59, 0), told: hashText('a\n') } } }
-  const kept: Record<string, unknown> = { watching: 1, reads: threads, outside: { at, what: 'WebFetch of example.invalid' } }
+  const kept: Record<string, unknown> = { watching: 2, reads: threads, outside: { at, what: 'WebFetch of example.invalid' } }
   on('state.get' as any, (_x: any, e: any, next: any) => {
     const key = e?.ref?.key ?? e?.key
     if (key in kept) return { value: { value: kept[key], version: 1 } }

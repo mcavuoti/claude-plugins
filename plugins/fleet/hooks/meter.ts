@@ -376,6 +376,19 @@ export function note(section: string, name: string, n = 1) {
   add(c, name, n)
 }
 
+/** A number for the project's part that isn't a count over the window but what was last seen (rows that need the person) */
+export function noteSet(section: string, name: string, value: number) {
+  if (!counting()) return
+  let c = M.notes.get(section)
+  if (!c) M.notes.set(section, (c = {}))
+  c[name] = value
+}
+
+/** Counting stops and what was counted stays, for the hand-in: what the hand-in itself reads isn't the window's work */
+export function meterHold() {
+  M.on = false
+}
+
 /** What a path is for, when a process is started over it: so `mv` reads as the heartbeat's, the lease's, a landing's */
 export function purposeOf(path: string): string {
   const at = path.lastIndexOf('/.claude/fleet/')
