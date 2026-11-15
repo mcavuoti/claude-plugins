@@ -359,6 +359,8 @@ type Meter = { handIn: HandIn; minutes: number; ms: number; peerRuns: number }
 
 type Row = {
   id: string
+  // Its project's label (P1)
+  project: string
   status: ReportSession['status']
   ageHours: number | null
   plugins: string[]
@@ -516,6 +518,7 @@ function gather(input: ReportInput): { report: Report; key: ReportKey; digest: D
     const wakeups = sampled?.wakeups
     rows.push({
       id: label,
+      project,
       status,
       ageHours,
       plugins,
@@ -1285,13 +1288,23 @@ function pluginSection(d: Digest, plugin: string, flagged: ReadonlySet<string>):
     if (grew.length) lines.push(...wrap(`grew in this window, at most: ${grew.map(h => `${h.name} +${count(h.grew)}${h.grewBytes > 0 ? ` (about +${bytes(h.grewBytes)})` : ''}`).join(' · ')}`, '', '  '))
   }
 
-  // The project's part, from the session that does its shared work
+  // The project's part, from the session that does its shared work: one per project. Where nobody does that work,
+  // several sessions may hand one in: the first is printed, and the rest are said (they're in the report)
+  const printed = new Set<string>()
+  const others = new Map<string, number>()
   for (const { r, m } of withMeter) {
-    for (const [section, of] of Object.entries(m.handIn.project ?? {})) {
+    if (!m.handIn.project) continue
+    if (printed.has(r.project)) {
+      others.set(r.project, (others.get(r.project) ?? 0) + 1)
+      continue
+    }
+    printed.add(r.project)
+    for (const [section, of] of Object.entries(m.handIn.project)) {
       lines.push(`${section} (the project's part, from ${r.id}):`)
       for (const name of Object.keys(of)) lines.push(`  ${name}: ${said(of[name] as Value)}`)
     }
   }
+  for (const [project, n] of others) lines.push(`${count(n)} other session${n === 1 ? '' : 's'} of ${project} handed the project's part in too (in the report)`)
   return lines
 }
 

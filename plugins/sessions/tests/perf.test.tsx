@@ -219,7 +219,7 @@ test('/sessions debug perf: the window opens, the sampler runs for it, the windo
   await startSession($, w)
   await w.clock.advance(5000)
   const asked = sessions($, 'debug perf 5')
-  for (let i = 0; i < 12; i++) await w.clock.advance(1000)
+  for (let i = 0; i < 20; i++) await w.clock.advance(1000)
   const text = await asked
   // The sampler was told how to read this system, for how long, which processes, and which programs it may name
   expect(samplerRuns.length).toBe(1)

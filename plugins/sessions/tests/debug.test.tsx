@@ -1091,3 +1091,16 @@ test('debug report: the file and the plain text are the same whatever the names 
   expect(a.text === b.text).toBe(false)
   expect(fragments(SECRETS_B).filter(part => JSON.stringify(a.report).toLowerCase().includes(part.toLowerCase()) || a.plain.toLowerCase().includes(part.toLowerCase()))).toEqual([])
 })
+
+test("several sessions hand in a project's part (nobody does its shared work): the first is printed and the rest are said", () => {
+  const built = buildReport(
+    input({
+      sessions: [0, 1, 2].map(i => session(i, { plugins: ['sessions'] })),
+      handIns: Object.fromEntries([0, 1, 2].map(i => [ID(i), { sessions: handIn({ project: { roster: { idle: 2 } } }) }])),
+    }),
+  )
+  expect(lines(built.plain).filter(l => l.includes("the project's part, from"))).toEqual(["roster (the project's part, from S1):"])
+  expect(lines(built.plain).filter(l => l.includes('handed the project'))).toEqual(["2 other sessions of P1 handed the project's part in too (in the report)"])
+  // All three stay in the report's file
+  expect(built.report.sessions.filter(s => s.meters.sessions?.project).length).toBe(3)
+})

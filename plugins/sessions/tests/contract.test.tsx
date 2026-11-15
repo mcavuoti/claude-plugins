@@ -1060,7 +1060,14 @@ const handIn = (extra: object = {}) => ({
   from: 2,
   to: 3,
   facts: { role: { label: 'role', key: 'made-up role' }, version: 'v0.15.0' },
-  actions: { 'landing.chain': { drivers: ['peer'], grows: ['landings'], runs: 20, ms: 8, slowest: 2, mostWork: 3, work: { read: 40 }, failed: {}, sent: {}, started: { 'mv:heartbeat': 1 }, bytesRead: 100, bytesWritten: 0 } },
+  actions: {
+    'landing.chain': { drivers: ['peer'], grows: ['landings'], runs: 20, ms: 8, slowest: 2, mostWork: 3, work: { read: 40 }, failed: {}, sent: {}, started: { 'mv:heartbeat': 1 }, bytesRead: 100, bytesWritten: 0 },
+    // The shapes another plugin relies on: a whole and its parts, an action split by what kicked it, work kinds of its own
+    sweep: { drivers: ['peer', 'clock'], grows: ['instances', 'files'], runs: 6, ms: 230, slowest: 60, mostWork: 40, work: { stat: 30, tokens: 900, prompt: 1 }, failed: { model: 1 }, sent: { landing: 2 }, started: { 'other:check': 1 }, bytesRead: 0, bytesWritten: 0 },
+    'sweep.outside': { drivers: ['clock'], grows: ['files'], within: 'sweep', runs: 6, ms: 50, slowest: 12, mostWork: 30, work: { stat: 30 }, failed: {}, sent: {}, started: {}, bytesRead: 0, bytesWritten: 0 },
+    'nudge.pass:minute': { drivers: ['clock'], grows: ['files'], runs: 1, ms: 6, slowest: 6, mostWork: 26, work: { call: 1 }, failed: {}, sent: {}, started: {}, bytesRead: 0, bytesWritten: 0 },
+  },
+  project: { roster: { 'roster.idle': 5, 'roster.busy': 3 }, health: { sweeper: { label: 'session', key: SID }, live: 'own' } },
   totals: { work: { read: 40 }, failed: {}, sent: {}, started: { 'mv:heartbeat': 1 }, bytesRead: 100, bytesWritten: 0 },
   holdings: { latest: { grows: ['files'], open: [3, 900], close: [3, 900] } },
   ...extra,

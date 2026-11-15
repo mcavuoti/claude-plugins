@@ -5880,8 +5880,10 @@ async function statusText($: any): Promise<string> {
 // to make isn't counted as the session's work.
 const SAMPLER = `${(import.meta as any).dir}/debug/sampler.py`
 const DEBUG_BELL = 'debug'
-// How long the asking session waits after the close for every session's totals
-const HAND_IN_WAIT_MS = 4000
+// How long the asking session waits after the close for every session's totals: this long at least, then until no new
+// one came for two looks a second apart (a plugin may read a few things before it hands in), and never past the most
+const HAND_IN_WAIT_MS = 3000
+const HAND_IN_MOST_MS = 12000
 const DEBUG_USAGE = `/sessions debug perf [seconds]: measures every session's CPU and memory for a minute (${PERF_MIN_S} to ${PERF_MAX_S} s) and what the plugins did meanwhile; /sessions debug show: the last report again`
 
 async function reportsFolder($: any): Promise<string> {
@@ -6052,6 +6054,13 @@ async function runPerf($: any, seconds: number): Promise<string> {
   if (now < until) await $.clock.sleep(until - now)
   await ringDebug($, report, false, until)
   await $.clock.sleep(HAND_IN_WAIT_MS)
+  let handed = await entryCount($, folder)
+  for (let waited = HAND_IN_WAIT_MS, quiet = 0; waited < HAND_IN_MOST_MS && quiet < 2; waited += 1000) {
+    await $.clock.sleep(1000)
+    const now = await entryCount($, folder)
+    quiet = now === handed ? quiet + 1 : 0
+    handed = now
+  }
 
   let sampler: SamplerOutput | null = null
   try {
