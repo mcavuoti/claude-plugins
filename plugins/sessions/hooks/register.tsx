@@ -6010,6 +6010,12 @@ function runningSessions(): any[] {
   return list.filter((x: any) => Number(x.pid) > 0 && /^[A-Za-z0-9-]{1,64}$/.test(String(x.sessionId ?? '')))
 }
 
+// The turns a session's own hand-in counted (their starts and ends), 0 when it has none
+function turnsIn(handIn: unknown): number {
+  const actions: any = (handIn as any)?.actions ?? {}
+  return Number(actions['hook.turn-start']?.runs ?? 0) + Number(actions['hook.turn-end']?.runs ?? 0)
+}
+
 // One report at a time from a session; the last one stays for /sessions debug show
 let perfRunning: Promise<string> | null = null
 let lastReport: { report: string; text: string } | null = null
@@ -6097,7 +6103,8 @@ async function runPerf($: any, seconds: number): Promise<string> {
       root: String(x.cwd ?? ''),
       title: String(x.name || x.id || ''),
       kind: x.kind === 'background' || x.kind === 'bg' ? 'background' : 'regular',
-      status: x.status === 'busy' ? 'busy' : x.status === 'waiting' ? 'waiting' : 'idle',
+      // Busy at the close, or it ran a turn inside the window (its own count of turn hooks says so)
+      status: x.status === 'busy' || turnsIn(handIns[id]?.sessions) > 0 ? 'busy' : x.status === 'waiting' ? 'waiting' : 'idle',
       ageHours: started > 0 ? Math.round(((at - started) / 3600000) * 10) / 10 : null,
       plugins: [...plugins].sort(),
     }

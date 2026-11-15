@@ -293,7 +293,9 @@ export type SessionsDebugHandIn = {
   /** Exact, whichever action each call fell in */
   totals: { work: SessionsDebugCounts; failed: SessionsDebugCounts; sent: SessionsDebugCounts; started: SessionsDebugCounts; bytesRead: number; bytesWritten: number }
   holdings: Record<string, SessionsDebugHolding>
-  /** From the one session that does a project's shared work: sections of name → value, printed as they are */
+  /** From the one session that does a project's shared work: sections of name → value, printed as they are. One
+   * section's name has a meaning (0.21.1): `running`, whose values are session labels, names the sessions that run
+   * the plugin, so one of them that handed nothing in reads as not answering */
   project?: Record<string, Record<string, SessionsDebugValue>>
 }
 export type SessionsMethod = keyof Sessions
