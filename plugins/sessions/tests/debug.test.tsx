@@ -1104,3 +1104,25 @@ test("several sessions hand in a project's part (nobody does its shared work): t
   // All three stay in the report's file
   expect(built.report.sessions.filter(s => s.meters.sessions?.project).length).toBe(3)
 })
+
+test("a table for each group of a plugin's sessions: the largest idle one, the one doing the shared work, and the busy ones; an empty project section prints nothing", () => {
+  const built = buildReport(
+    input({
+      sessions: [session(0, { plugins: ['sessions'] }), session(1, { plugins: ['sessions'] }), session(2, { plugins: ['sessions'] }), session(3, { status: 'busy', plugins: ['sessions'] })],
+      handIns: {
+        [ID(0)]: { sessions: handIn({ facts: { sweeps: false } }) },
+        [ID(1)]: { sessions: handIn({ facts: { sweeps: false } }) },
+        [ID(2)]: { sessions: handIn({ facts: { sweeps: true }, project: { roster: {}, health: { live: true } } }) },
+        [ID(3)]: { sessions: handIn({ facts: { sweeps: false } }) },
+      },
+    }),
+  )
+  const all = lines(built.plain)
+  expect(built.plain).toContain('the median of these 2 of 3: sweeps=no')
+  expect(all.some(l => l.startsWith('1 other idle session with sweeps=yes:'))).toBe(true)
+  expect(all.some(l => l.startsWith('1 busy session with sweeps=no:'))).toBe(true)
+  // Each of the three groups has its actions' table
+  expect(all.filter(l => l.startsWith('action ')).length).toBe(3)
+  expect(all.some(l => l.startsWith('roster ('))).toBe(false)
+  expect(all.some(l => l.startsWith('health ('))).toBe(true)
+})
