@@ -627,11 +627,11 @@ function gather(input: ReportInput): { report: Report; key: ReportKey; digest: D
 
 // What a rule found: what it's about (a label or a word) and the value to set against the rule's limit. A finding about
 // one action of one plugin says which, so that plugin's table can point at the row
-type Hit = { about: string; value: number; plugin?: string; action?: string }
+type Hit = { about: string; value: number; plugin?: string; action?: string; session?: string }
 
 // A rule of "Looks off": a fixed name, a limit, what it reads from the report's numbers, and how its line reads. A
 // finding is a value over the limit. A later rule is one more entry here
-export type Rule = { name: string; limit: number; values: (d: Digest) => Hit[]; line: (about: string, value: number, limit: number) => string }
+export type Rule = { name: string; limit: number; values: (d: Digest) => Hit[]; line: (about: string, value: number, limit: number, hit?: Hit) => string }
 
 // The largest value per action (of a plugin) across the sessions given
 function worstByAction(rows: readonly Row[], of: (a: ActionTotals, m: Meter, name: string) => number | null): Hit[] {
@@ -771,13 +771,13 @@ export const RULES: readonly Rule[] = [
           for (const [name, h] of Object.entries(m.handIn.holdings)) {
             if (h.grows.some(g => g !== 'sessions') || (h.grows.includes('sessions') && d.newSessions)) continue
             const by = h.close[0] - h.open[0]
-            if (by > (worst.get(`${plugin} ${name}`)?.value ?? 0)) worst.set(`${plugin} ${name}`, { about: name, value: by, plugin })
+            if (by > (worst.get(`${plugin} ${name}`)?.value ?? 0)) worst.set(`${plugin} ${name}`, { about: `${plugin}:${name}`, value: by, plugin, session: r.id })
           }
         }
       }
       return [...worst.values()]
     },
-    line: (about, v) => `${about}: a holding that grew by ${count(v)} in the window with nothing new to hold`,
+    line: (about, v, _limit, hit) => `${about}: a holding that grew by ${count(v)} in the window with nothing new to hold${hit?.session ? ` (the most in ${hit.session})` : ''}`,
   },
   {
     name: 'unavailable',
@@ -851,7 +851,7 @@ function offLines(found: readonly Finding[], rules: readonly Rule[], name: (line
   const lines: string[] = []
   for (const rule of rules) {
     const mine = found.filter(f => f.rule === rule.name)
-    for (const f of mine.slice(0, OFF_LINES)) lines.push(...wrap(`- ${name(rule.line(f.about, f.value, f.limit))}`, '  ', '    '))
+    for (const f of mine.slice(0, OFF_LINES)) lines.push(...wrap(`- ${name(rule.line(f.about, f.value, f.limit, f))}`, '  ', '    '))
     if (mine.length > OFF_LINES) lines.push(`  - and ${count(mine.length - OFF_LINES)} more like it (${rule.name}, in the report)`)
   }
   return ['Looks off:', ...(lines.length ? lines : ['  - none'])]
@@ -1225,29 +1225,48 @@ function perMinute(group: readonly Meter[], pick: (h: HandIn) => Counts): { kind
     .sort((a, b) => b.median - a.median || a.kind.localeCompare(b.kind))
 }
 
+// How many groups of a plugin's sessions get their actions' table (the rest get one line each)
+const GROUP_TABLES = 4
+
 function pluginSection(d: Digest, plugin: string, flagged: ReadonlySet<string>): string[] {
   const withMeter = d.rows.flatMap(r => {
     const m = own(r.meters, plugin)
     return m ? [{ r, m }] : []
   })
   if (!withMeter.length) return []
+  // Sessions with the same status (idle, or not) and the same facts are one group: the largest idle group's table
+  // comes first, then the other groups' (the one session that does a project's shared work is a group of its own, and
+  // so are the busy ones), up to GROUP_TABLES in all; past that a group gets its line only
   const idleOnes = withMeter.filter(x => x.r.status === 'idle')
+  const busyOnes = withMeter.filter(x => x.r.status !== 'idle')
+  const grouped = (of: typeof withMeter) => {
+    const groups = new Map<string, typeof withMeter>()
+    for (const x of of) groups.set(JSON.stringify(x.m.handIn.facts), [...(groups.get(JSON.stringify(x.m.handIn.facts)) ?? []), x])
+    return [...groups.values()].sort((a, b) => b.length - a.length)
+  }
+  const idleSets = grouped(idleOnes)
+  const busySets = grouped(busyOnes)
   const pool = idleOnes.length ? idleOnes : withMeter
-  const who = idleOnes.length ? 'idle session' : 'session'
-  const groups = new Map<string, typeof pool>()
-  for (const x of pool) groups.set(JSON.stringify(x.m.handIn.facts), [...(groups.get(JSON.stringify(x.m.handIn.facts)) ?? []), x])
-  const sets = [...groups.values()].sort((a, b) => b.length - a.length)
+  const sets = idleOnes.length ? idleSets : busySets
   const main = sets[0] ?? []
   const group = main.map(x => x.m)
   const facts = main[0]?.m.handIn.facts ?? {}
+  const rest: { set: typeof withMeter; who: string }[] = [...sets.slice(1).map(set => ({ set, who: idleOnes.length ? 'idle session' : 'session' })), ...(idleOnes.length ? busySets.map(set => ({ set, who: 'busy session' })) : [])]
 
   const lines = [ruled(`${plugin}: ${idleOnes.length ? 'an idle session' : 'a session (none is idle)'}, per minute`)]
   lines.push(...wrap(`the median of ${main.length === pool.length ? (main.length === 1 ? 'the one' : `all ${count(main.length)}`) : `these ${count(main.length)} of ${count(pool.length)}`}: ${factsText(facts) || 'no facts handed in'}`, '', '  '))
   lines.push(...actionTable(plugin, group, flagged))
-  for (const other of sets.slice(1)) {
-    const theirs = other[0]?.m.handIn.facts ?? {}
+  let tables = 1
+  for (const { set, who } of rest) {
+    const theirs = set[0]?.m.handIn.facts ?? {}
     const differ = Object.fromEntries([...new Set([...Object.keys(theirs), ...Object.keys(facts)])].filter(k => own(theirs, k) !== own(facts, k)).map(k => [k, own(theirs, k) ?? 'unset']))
-    lines.push(...wrap(`${count(other.length)} other ${other.length === 1 ? who : `${who}s`} with ${factsText(differ)}: ${num(mid(other.map(x => x.m.ms)))} ms a minute inside its actions`, '', '  '))
+    const same = who !== 'busy session'
+    const told = factsText(same ? differ : theirs)
+    lines.push(...wrap(`${count(set.length)} ${same ? 'other ' : ''}${set.length === 1 ? who : `${who}s`}${told ? ` with ${told}` : ''}: ${num(mid(set.map(x => x.m.ms)))} ms a minute inside its actions`, '', '  '))
+    if (tables < GROUP_TABLES) {
+      lines.push(...actionTable(plugin, set.map(x => x.m), flagged))
+      tables++
+    }
   }
   const partial = withMeter.filter(x => x.m.handIn.partial).length
   if (partial) lines.push(`counted for part of the window only (reloaded inside it): ${count(partial)} ${partial === 1 ? 'session' : 'sessions'}`)
@@ -1300,6 +1319,7 @@ function pluginSection(d: Digest, plugin: string, flagged: ReadonlySet<string>):
     }
     printed.add(r.project)
     for (const [section, of] of Object.entries(m.handIn.project)) {
+      if (!Object.keys(of).length) continue
       lines.push(`${section} (the project's part, from ${r.id}):`)
       for (const name of Object.keys(of)) lines.push(`  ${name}: ${said(of[name] as Value)}`)
     }
