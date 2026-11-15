@@ -86,6 +86,7 @@ import {
   wakeStagger,
   afterTick,
   rowsBelow,
+  wrappedLines,
   shellQuote,
   isRef,
   recordBehind,
@@ -6480,6 +6481,34 @@ export const register: Register = (on, options) => {
     return r
   })
 
+  // A list taller than the panel: Claude's ↑ and ↓ then move its window a row (ui.scroll) and leave the focus where it
+  // is, so only Tab went through the sessions. The panel takes those presses and moves the selection as the arrows do
+  // while the list fits: the next session or folded section's line, brought into view. The row is selected at once (a
+  // press that comes before the focus landed goes on from it) and the focus follows. Past the list's first and last
+  // row the window moves, which is how the buttons above and the legend below are reached. The wheel (it carries a
+  // pointer), the page keys, Home and End (more than a row) and the mod's own moves stay Claude's
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    if (e.origin.kind !== 'person' || e.pointer || Math.abs(e.by) !== 1) return next(e)
+    // With the New or Rename field open the keys are the field's
+    if ((await read($, askingName)) || (await read($, renaming))) return next(e)
+    const ring = ringKeys(await rowsNow($))
+    const from = selectedRow && ring.includes(selectedRow) ? selectedRow : currentFocus && ring.includes(currentFocus) ? currentFocus : undefined
+    const target = from === undefined ? ring[0] : ring[ring.indexOf(from) + e.by]
+    if (!target) return next(e)
+    personMoves++
+    // Keys in this session's panel: the person is at this session
+    bg(arrived($))
+    bg(seenNow($))
+    selectedRow = target
+    bg(
+      (async () => {
+        await focusElement($, target)
+        if (selectedRow === target) await $.ui.scroll({ to: { key: target }, in: PANE })
+      })(),
+    )
+    return {}
+  })
+
   // The line above the prompt: how many sessions wait for you (red), have an answer to you unseen (yellow) or finished
   // unseen a turn you didn't start (a hollow yellow dot), why the panel
   // isn't shown (with a button that opens it: shift+→ then Enter, or a click), the account's windows on a subscription,
@@ -6558,7 +6587,8 @@ export const register: Register = (on, options) => {
     const note = await read($, notice)
     // Jumping and creating only make sense in Terminal; on the phone, VS Code or the app the list is read-only
     const inTerminal = e.surface === 'terminal'
-    // One line per session. If it still doesn't fit, Claude uses ↑↓ to scroll instead of moving the focus: say so
+    // One line per session. If it still doesn't fit, Claude's ↑↓ move its window instead of the focus, and the panel
+    // moves the selection itself (its ui.scroll hook)
     const height = (e.viewport?.rows ?? 40) - 6
     // Window width = conversation (viewport.columns) + panel + border. With no requested width, the panel has "the
     // default one", the cap. What this draw saw is noted, and a change has adjustWidth work the width out again
@@ -6610,10 +6640,27 @@ export const register: Register = (on, options) => {
       lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.unasked) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
     // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
     const usageData = showUsage ? await read($, usage) : null
-    const help = e.props.isFocused ? (overflows ? 'Tab Next · ↑↓ Scroll · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
+    const help = e.props.isFocused ? (overflows ? '↑↓ Select · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
     // How many sessions (or folded sections) don't fit below: said at the top, where it's always in view, so a running
     // session past the bottom edge isn't taken for a missing one
-    const above = (inTerminal ? 1 : 0) + 1 + 1 + (note !== '' ? 1 : 0) + (about.waitingOnly ? 1 : 0)
+    // The line of actions at the top, in the order drawn: each letter is a button (its key, or a click)
+    const actions: { key: string; hotkey: string; label: string; bright?: boolean; press: () => void }[] = [
+      { key: 'stop', hotkey: 's', label: 'Stop', press: () => bg(stopSelected($)) },
+      { key: 'restart', hotkey: 'u', label: 'Restart', press: () => bg(restartSelected($)) },
+      { key: 'rename', hotkey: 'r', label: 'Rename', press: () => bg(toggleRename($)) },
+      { key: 'new', hotkey: 'n', label: 'New', press: () => { toggleNew($) } },
+      { key: 'agents', hotkey: 'a', label: 'Agents', press: () => bg(openAgentsView($)) },
+      // f: only the sessions waiting for you (drawn bright while it's on)
+      { key: 'waiting', hotkey: 'f', label: 'Waiting', bright: about.waitingOnly, press: () => bg(toggleWaiting($)) },
+      // c: fold the selected session's section into one line, or unfold the one selected
+      { key: 'fold', hotkey: 'c', label: 'Collapse', press: () => bg(toggleFold($)) },
+    ]
+    // The lines it takes: the row wraps between its items in the panel's width (Claude draws a button as "s: Stop"; the
+    // keyboard help after the last one is an item too)
+    const actionLines = inTerminal
+      ? wrappedLines([...actions.flatMap((a, i) => [...(i > 0 ? [3] : []), displayWidth(`${a.hotkey}: ${a.label}`)]), displayWidth(` · ${help}`)], e.props.bodyColumns ?? 48)
+      : 0
+    const above = actionLines + 1 + 1 + (note !== '' ? 1 : 0) + (about.waitingOnly ? 1 : 0)
     const below = overflows
       ? rowsBelow(
           plan.map(it => (it.kind === 'header' ? { lines: 1, counts: false } : it.kind === 'fold' ? { lines: 1, counts: true } : { lines: keepsLine(it.row) ? 2 : 1, counts: true })),
@@ -6708,30 +6755,19 @@ export const register: Register = (on, options) => {
     }
     return (
       <Box flexDirection="column" height={showUsage && bodyRows ? bodyRows : undefined}>
-        {/* A single line of actions at the top: the letters are buttons (key or click), followed by the keyboard help */}
+        {/* The actions at the top, followed by the keyboard help: one row, which wraps where the panel is narrower than it */}
         {inTerminal && (
           <Box flexDirection="row" flexWrap="wrap">
-            <Button key="stop" plain dimColor hotkey="s" label="Stop" onPress={() => { bg(stopSelected($)) }} />
-            <Text dimColor> · </Text>
-            <Button key="restart" plain dimColor hotkey="u" label="Restart" onPress={() => { bg(restartSelected($)) }} />
-            <Text dimColor> · </Text>
-            <Button key="rename" plain dimColor hotkey="r" label="Rename" onPress={() => { bg(toggleRename($)) }} />
-            <Text dimColor> · </Text>
-            <Button key="new" plain dimColor hotkey="n" label="New" onPress={() => toggleNew($)} />
-            <Text dimColor> · </Text>
-            <Button key="agents" plain dimColor hotkey="a" label="Agents" onPress={() => { bg(openAgentsView($)) }} />
-            <Text dimColor> · </Text>
-            {/* f: only the sessions waiting for you (drawn bright while it's on) */}
-            <Button key="waiting" plain dimColor={about.waitingOnly ? undefined : true} hotkey="f" label="Waiting" onPress={() => { bg(toggleWaiting($)) }} />
-            <Text dimColor> · </Text>
-            {/* c: fold the selected session's section into one line, or unfold the one selected */}
-            <Button key="fold" plain dimColor hotkey="c" label="Collapse" onPress={() => { bg(toggleFold($)) }} />
+            {actions.flatMap((a, i) => [
+              ...(i > 0 ? [<Text key={`dot:${a.key}`} dimColor> · </Text>] : []),
+              <Button key={a.key} plain dimColor={a.bright ? undefined : true} hotkey={a.hotkey} label={a.label} onPress={() => { a.press() }} />,
+            ])}
             <Text dimColor>{` · ${help}`}</Text>
           </Box>
         )}
         <Text> </Text>
         {below > 0 && (
-          <Text dimColor>{truncate(`↓ ${below} more below · ${e.props.isFocused ? '↑↓ scroll' : 'shift+→, then ↑↓'}`, total)}</Text>
+          <Text dimColor>{truncate(`↓ ${below} more below · ${e.props.isFocused ? '↑↓ to reach them' : 'shift+→, then ↑↓'}`, total)}</Text>
         )}
         {note !== '' && <Text color="warning">{note}</Text>}
         {about.waitingOnly && <Text dimColor>{truncate(`Waiting for you · ${list.length} of ${about.sessions}${inTerminal ? ' · f: all' : ''}`, total)}</Text>}

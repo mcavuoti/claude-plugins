@@ -153,6 +153,26 @@ export function rowsBelow(items: readonly { lines: number; counts: boolean }[], 
   return hidden
 }
 
+// How many lines a row that wraps between its items takes (the panel's line of actions), from each item's width in the
+// order drawn: an item goes on the line while it fits and starts the next one when it doesn't; one wider than the line
+// wraps by itself
+export function wrappedLines(widths: readonly number[], columns: number): number {
+  const room = Math.max(1, columns)
+  let lines = 1
+  let used = 0
+  for (const width of widths) {
+    if (used > 0 && used + width > room) {
+      lines++
+      used = 0
+    }
+    if (width > room) {
+      lines += Math.ceil(width / room) - 1
+      used = width % room || room
+    } else used += width
+  }
+  return lines
+}
+
 // A timer tick of a session's list-reading jobs: a gap since the last tick longer than gapMs is a sleep (every session's
 // timers fire at once after one), and the jobs keep quiet until this session's stagger has passed
 export function afterTick(t: { last: number; quietUntil: number }, now: number, stagger: number, gapMs = 30000): { last: number; quietUntil: number; quiet: boolean } {

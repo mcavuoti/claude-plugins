@@ -99,6 +99,8 @@ export type World = {
   notifyAnswer: { value: any }
   // The element the last move of the panel's focus that reached Claude landed on (panelRing)
   focusLanded: { value: string | undefined }
+  // The rows each move of the panel's window that reached Claude asked for (a ui.scroll the mod passed on)
+  scrolled: number[]
 }
 
 export type WorldOptions = {
@@ -388,6 +390,11 @@ export function world(on: On, options: WorldOptions = {}): World {
     focusLanded.value = e.element
     return {}
   })
+  const scrolled: number[] = []
+  on('ui.scroll', (_, e) => {
+    scrolled.push(e.by)
+    return {}
+  })
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
     return { value: undefined }
@@ -405,7 +412,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     notifies.push(String(e.text))
     return { value: notifyAnswer.value }
   })
-  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, storeLock, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer, focusLanded }
+  return { files, write, opens, registered, clock, id, panes, store, storeKeys, namespace, storeLock, runs, runAt, cwds, envs, dirs, made, root, cwd, toasts, usage, band, transcript, readsHeld, starts, bgError, memory, ps, terminal, terminalLate, frontApp, idle, locked, xprop, gone, startedAt, agentsGate, agentsFail, plugins, installedFail, installedLate, pushes, notifies, pushAnswer, notifyAnswer, focusLanded, scrolled }
 }
 
 // The panel's focus ring as Claude keeps it, for a test that presses the arrows in a mounted panel: by position, not by
