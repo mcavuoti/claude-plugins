@@ -127,6 +127,8 @@ export const FAKE_SESSIONS = {
         },
         debugWindow: async () => {
           await note({ debugWindow: true })
+          // (the review's one switch: a sessions that doesn't answer debugWindow in time, as a lost race reads)
+          if ((await world()).noWindow) throw new Error('sessions did not answer in time')
           let window = null
           try {
             const v = JSON.parse(await $.fs.read('/fake/data/reports/window'))
@@ -556,7 +558,7 @@ export function under(w: World, dir: string): string[] {
 }
 
 // The fake sessions' answers: this session as current, and the others by ref
-export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; refuseRestart?: string; version?: string; api?: number; gone?: boolean; watch?: string; noDebug?: boolean; refuseDebug?: 'invalid' | 'closed' | 'too-big' }) {
+export function sessionsSay(w: World, say: { current?: unknown; rows?: Record<string, unknown>; refuseSections?: boolean; refuseRestart?: string; version?: string; api?: number; gone?: boolean; watch?: string; noDebug?: boolean; noWindow?: boolean; refuseDebug?: 'invalid' | 'closed' | 'too-big' }) {
   w.files.set(FAKE, JSON.stringify(say))
 }
 

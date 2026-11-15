@@ -14,10 +14,15 @@
 // - Time is how long an action took by the clock (`Date.now()`, in milliseconds), its waits on files and commands
 //   included, the plugins beneath a hook excluded (the hook's `next`). It isn't CPU. An action under a millisecond
 //   reads as 0, and is judged by its runs and its work.
-// - Work is exact in the totals. Which action it belongs to is "the one running now": the newest run still going. Two
-//   that overlap (a timer's pass during a tool hook) can take each other's.
-// - An action that runs inside another gives its time back to the outer one, except a part (`within`), whose time
-//   stays in the whole it names: the report prints a part under its whole and leaves it out of the plugin's total.
+// - A hook stops its own run's clock before it calls `next` (`below(r)`, with the run its `act` gave it), whatever
+//   else started meanwhile: the plugins beneath and the tool are never a hook's time.
+// - Work is exact in the totals. Which action it belongs to is "the one running now": the newest run still going that
+//   isn't waiting beneath. Two that overlap (a timer's pass during a tool hook) can take each other's work.
+// - An action that starts while another is going is taken as running inside it, and gives its time back to that one,
+//   except a part (`within`), whose time stays in the whole it names: the report prints a part under its whole and
+//   leaves it out of the plugin's total (so what runs inside a part comes off the part and off its whole). A mod has
+//   no way to tell "inside" from "beside": two actions that merely overlap read a little low between them, never high.
+// - A run belongs to the window it began in: one still going when its window closes adds nothing to the next.
 
 export type Driver = 'clock' | 'self' | 'person' | 'peer'
 export type Declared = { readonly drivers: readonly Driver[]; readonly grows: readonly string[]; readonly within?: string }
@@ -64,8 +69,10 @@ export const ACTIONS = table({
   'read.note': { drivers: S, grows: ['files'] },
   'write.land': { drivers: S, grows: ['pins'] },
   'bash.scan': { drivers: S, grows: ['files'] },
+  // (every tool call noted while it's in flight, for an instance's heartbeat)
+  'call.flight': { drivers: S, grows: NONE },
+  // (every tool call that isn't one of the above: an MCP send held or let through, a permission prompt settled)
   'outbound.check': { drivers: S, grows: NONE },
-  'tool.settle': { drivers: S, grows: NONE },
   'outside.mark': { drivers: S, grows: NONE },
   'wake.guard': { drivers: S, grows: NONE },
   'send.guard': { drivers: S, grows: NONE },
@@ -139,7 +146,7 @@ const NOT_CALLS = new Set(['listed', 'tokens'])
 type Counts = Record<string, number>
 type Totals = { runs: number; ms: number; slowest: number; mostWork: number; work: Counts; failed: Counts; sent: Counts; started: Counts; bytesRead: number; bytesWritten: number }
 /** One run of an action, while it's going */
-export type Run = { name: ActionName; t0: number; out: number; paused: number; calls: number; gives: Run | null; done: boolean }
+export type Run = { name: ActionName; t0: number; out: number; paused: number; calls: number; gives: Run | null; whole: Run | null; gen: number; done: boolean }
 export type Value = number | boolean | string | { label: 'role' | 'session'; key: string }
 export type Holding = { grows: readonly string[]; count: number; bytes: number | null }
 export type HandIn = {
@@ -169,6 +176,10 @@ export const M = {
   report: '',
   from: 0,
   deadline: 0,
+  /** When the counting ends by itself, by the caller's clock (as `from` is): what a window that ran out hands in as its end */
+  endsAt: 0,
+  /** Which window this is, counted up at every opening: a run keeps the one it began in */
+  gen: 0,
   actions: new Map<string, Totals>(),
   totals: fresh(),
   stack: [] as Run[],
@@ -190,7 +201,9 @@ export function meterOpen(report: string, from: number, msLeft: number) {
   M.report = report
   M.from = from
   M.deadline = Date.now() + Math.max(0, msLeft)
+  M.endsAt = from + Math.max(0, msLeft)
   M.expired = false
+  M.gen++
   M.on = true
 }
 
@@ -224,10 +237,13 @@ function of(name: string): Totals {
   return t
 }
 
-/** The run work belongs to now: the newest one still going, unless it waits on the plugins beneath it */
+/** The run work belongs to now: the newest one still going that isn't waiting on the plugins beneath it */
 function current(): Run | null {
-  const r = M.stack[M.stack.length - 1]
-  return r && r.paused === 0 ? r : null
+  for (let i = M.stack.length - 1; i >= 0; i--) {
+    const r = M.stack[i] as Run
+    if (r.paused === 0) return r
+  }
+  return null
 }
 
 function add(c: Counts, k: string, n: number) {
@@ -235,10 +251,12 @@ function add(c: Counts, k: string, n: number) {
 }
 
 function enter(name: ActionName): Run {
-  const top = M.stack[M.stack.length - 1] ?? null
-  // Its time goes back to the action it runs inside, unless it's a part of it (within), or that one waits beneath
-  const gives = top && top.paused === 0 && (ACTIONS[name] as Declared).within !== top.name ? top : null
-  const r: Run = { name, t0: Date.now(), out: 0, paused: 0, calls: 0, gives, done: false }
+  // The action it runs inside: the newest one going that isn't waiting beneath (never another run of itself: two tool
+  // calls of one batch are beside each other). Its time goes back to that one, unless it's a part of it (within)
+  const top = current()
+  const outer = top && top.name !== name ? top : null
+  const part = !!outer && (ACTIONS[name] as Declared).within === outer.name
+  const r: Run = { name, t0: Date.now(), out: 0, paused: 0, calls: 0, gives: part ? null : outer, whole: part ? outer : null, gen: M.gen, done: false }
   of(name).runs++
   M.stack.push(r)
   return r
@@ -249,20 +267,27 @@ function leave(r: Run) {
   r.done = true
   const i = M.stack.lastIndexOf(r)
   if (i !== -1) M.stack.splice(i, 1)
-  // A window that closed (or ran out) while it ran: nothing to add to
+  // A window that closed (or ran out) while it ran, or a run that began in the window before: nothing to add to
   const t = M.actions.get(r.name)
-  if (!M.on || !t) return
+  if (!M.on || !t || r.gen !== M.gen) return
   const whole = Date.now() - r.t0
   const ms = Math.max(0, whole - r.out)
   t.ms += ms
   if (ms > t.slowest) t.slowest = ms
   if (r.calls > t.mostWork) t.mostWork = r.calls
-  if (r.gives && !r.gives.done) r.gives.out += whole
+  // Its time comes off the action it ran inside; and when that one is a part, off the part's whole too (a whole keeps
+  // its parts' time, so what ran inside a part would be counted in the whole and in itself). Not while that action
+  // waits beneath: the wait already comes off it whole
+  const g = r.gives
+  if (g && !g.done && g.paused === 0) {
+    g.out += whole
+    for (let w = g.whole; w && !w.done; w = w.whole) w.out += whole
+  }
 }
 
 /** One run of an action: counted as it's entered, whatever it then finds to do; timed until what it returns settles */
 export function run<T>(name: ActionName, fn: (r: Run) => T): T {
-  if (!counting()) return fn({ name, t0: 0, out: 0, paused: 0, calls: 0, gives: null, done: true })
+  if (!counting()) return fn({ name, t0: 0, out: 0, paused: 0, calls: 0, gives: null, whole: null, gen: -1, done: true })
   const r = enter(name)
   let out: T
   try {
@@ -287,12 +312,11 @@ export function run<T>(name: ActionName, fn: (r: Run) => T): T {
   return out
 }
 
-/** Before a hook calls `next`: the running action's clock stops (what the plugins beneath and the tool take isn't its
- * own). Null while no window is open, or with no action running */
-export function below(): { r: Run; t: number } | null {
-  if (!counting()) return null
-  const r = M.stack[M.stack.length - 1]
-  if (!r) return null
+/** Before a hook calls `next`: its own run's clock stops (what the plugins beneath and the tool take isn't its own).
+ * The run is the one `run` gave the hook's function, whatever else started since. Null with no run (no window is
+ * open), or one that is over or of a window before */
+export function below(r?: Run | null): { r: Run; t: number } | null {
+  if (!r || r.done || r.gen !== M.gen || !counting()) return null
   r.paused++
   return { r, t: Date.now() }
 }
@@ -302,7 +326,7 @@ export function under<T>(stopped: { r: Run; t: number } | null, p: T): T {
   if (!stopped) return p
   const back = () => {
     stopped.r.paused--
-    stopped.r.out += Date.now() - stopped.t
+    if (stopped.r.gen === M.gen) stopped.r.out += Date.now() - stopped.t
   }
   if (p && typeof (p as any).then === 'function') {
     return (p as any).then(
@@ -438,18 +462,60 @@ export function signalOf(path: string): string {
   return ''
 }
 
-/** A count and a rough size of a map or a set: the entries, and a few of them measured (never all of a large one) */
-export function sized(m: { size: number; entries?: () => IterableIterator<any>; values: () => IterableIterator<any> } | null | undefined, grows: readonly string[], sample = 8): Holding {
+/** About how many characters a value holds, to a few levels down: strings by their length, a Map, a Set, an array or
+ * an object by a few of its entries times how many it has (never all of a large one). What can't be seen into (a
+ * promise, a function) counts for nothing */
+function weigh(v: unknown, depth: number, sample: number): number {
+  if (v === null || v === undefined) return 4
+  if (typeof v === 'string') return v.length + 2
+  if (typeof v === 'number' || typeof v === 'boolean') return 8
+  if (typeof v !== 'object' || depth <= 0) return 0
+  if (typeof (v as { then?: unknown }).then === 'function') return 0
+  // (a few entries measured, taken as what the others are like)
+  const scaled = (n: number, chars: number, size: number) => 2 + (n ? Math.round((chars / n) * size) : 0)
+  let n = 0
+  let chars = 0
+  if (v instanceof Map) {
+    for (const [k, x] of v) {
+      chars += weigh(k, depth - 1, sample) + weigh(x, depth - 1, sample)
+      if (++n >= sample) break
+    }
+    return scaled(n, chars, v.size)
+  }
+  if (v instanceof Set || Array.isArray(v)) {
+    for (const x of v) {
+      chars += weigh(x, depth - 1, sample)
+      if (++n >= sample) break
+    }
+    return scaled(n, chars, v instanceof Set ? v.size : v.length)
+  }
+  const keys = Object.keys(v as object)
+  for (const k of keys) {
+    chars += k.length + 2 + weigh((v as Record<string, unknown>)[k], depth - 1, sample)
+    if (++n >= sample) break
+  }
+  return scaled(n, chars, keys.length)
+}
+
+/** A count and a rough size of a map or a set: the entries, and a few of them measured (never all of a large one), a
+ * Map or a Set inside an entry included */
+export function sized(m: Map<unknown, unknown> | Set<unknown> | null | undefined, grows: readonly string[], sample = 8): Holding {
   if (!m) return { grows, count: 0, bytes: 0 }
   const count = m.size
   if (!count) return { grows, count: 0, bytes: 0 }
   let n = 0
   let chars = 0
   try {
-    for (const e of m.entries ? m.entries() : m.values()) {
-      const s = JSON.stringify(e)
-      chars += s === undefined ? 0 : s.length
-      if (++n >= sample) break
+    if (m instanceof Map) {
+      for (const [k, x] of m) {
+        chars += weigh(k, 6, sample) + weigh(x, 6, sample)
+        if (++n >= sample) break
+      }
+    } else {
+      for (const x of m) {
+        chars += weigh(x, 6, sample)
+        if (++n >= sample) break
+      }
     }
   } catch {
     return { grows, count, bytes: null }

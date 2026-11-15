@@ -381,7 +381,7 @@ import {
   type WakeCount,
   type WaveFacts,
 } from './roster'
-import { ACTIONS, HAND_IN_MAX, M, NAME, WINDOW_GRACE_MS, below, bytesRead as mBytesRead, bytesWritten as mBytesWritten, failed as mFailed, mark as mMark, meterHold, meterOff, meterOpen, note as mNote, noteSet as mNoteSet, purposeOf, run as runAction, sent as mSent, signalOf, sized, snapshot as meterSnapshot, started as mStarted, work as mWork, under, type ActionName, type Holding, type Value } from './meter'
+import { ACTIONS, HAND_IN_MAX, M, NAME, WINDOW_GRACE_MS, below, bytesRead as mBytesRead, bytesWritten as mBytesWritten, failed as mFailed, mark as mMark, meterHold, meterOff, meterOpen, note as mNote, noteSet as mNoteSet, purposeOf, run as runAction, sent as mSent, signalOf, sized, snapshot as meterSnapshot, started as mStarted, work as mWork, under, type ActionName, type Holding, type Run, type Value } from './meter'
 import { dateLine, groupedLines, localFleetLine, localFleetRecords, modelDiffers } from './roster'
 import {
   CONFIRM_DESCRIPTION,
@@ -621,10 +621,11 @@ async function startOwnWatch($: any) {
     if (!root) throw new Error('no fleet in this project')
     const w = watchedPaths()
     const debug = await debugPathNow($)
-    debugUnwatched = !debug
     const c: any = await race($, () => $.sessions.watchCommand!({ paths: [...w.files, ...w.folders, ...(debug ? [debug] : [])] }))
     if (!c) throw new Error('sessions did not answer')
     if (!c.ok) throw new Error(c.detail || c.reason || 'sessions could not build it')
+    // (said only of a watch that was built: whether it follows sessions' debug path)
+    debugInOwn = !!debug
     await makeWatched($, w)
     h.how = String(c.how)
     if (h.stopping) return
@@ -681,6 +682,7 @@ async function ownWatchGone($: any, h: OwnWatch, why: string) {
   ownWatch = null
   const wasLive = ownWatchLive
   ownWatchLive = false
+  debugInOwn = false
   if (h.stopping) return
   const now = await $.clock.now()
   if (wasLive && now - h.readyAt >= OWN_WATCH_STEADY_MS) ownWatchFailures = 0
@@ -726,8 +728,9 @@ function changedAction(path: string): ActionName {
 function fileChanged($: any, path: string, engine: boolean) {
   // sessions' debug path: a window opened or closed (/sessions debug perf). The one thing that turns the meter on;
   // its own change isn't counted as the session's work
-  if (debugFile && path === debugFile) bg(debugRing($))
-  else if (M.on) mMark(changedAction(path))
+  // (and nothing else of fleet's: no digest reckoned again, no bell, no landing)
+  if (debugFile && path === debugFile) return void bg(debugRing($))
+  if (M.on) mMark(changedAction(path))
   digestGen++
   const bellAt = path.lastIndexOf('/.claude/fleet/bell/')
   if (bellAt !== -1) bellRang(path.slice(bellAt + '/.claude/fleet/bell/'.length))
@@ -825,18 +828,54 @@ function landingSoon($: any, now: number) {
 // came in by a reload inside a window hands in `partial: 'reloaded'` (what its predecessor counted went with it); it
 // knows by $.state's debugOpen, the one thing written at the opening.
 let debugFile = ''
-/** The watch this session has was handed without sessions' debug path (sessions didn't answer in time): it takes no
- * part in a report until its next start, and /fleet status says so */
-let debugUnwatched = false
+/** Whether the watch this session has follows sessions' debug path: Claude's (the list its SessionStart handed; null
+ * in a module that came in by a reload, which wasn't there to hand it: taken as followed once sessions gives the
+ * path), and fleet's own (while it runs). A session whose watch doesn't, or that is on its timers, can't hear a
+ * window open: it takes no part in a report, and /fleet status says so (debugDeaf) */
+let debugInClaude: boolean | null = null
+let debugInOwn = false
 const debugOpen = atom({ plugin: 'fleet', key: 'debugOpen' } as const, '')
+/** sessions' longest window: a window file that says more is taken as this (a meter never counts on past it and the grace) */
+const DEBUG_WINDOW_MAX_MS = 600000
+/** How long before a debug call sessions didn't answer is made once more: inside its wait for hand-ins (3 s at least) */
+const DEBUG_RETRY_MS = 1000
 
 /** sessions' debug path: asked once it's needed for a watch, kept from then on. '' when sessions didn't give it */
-async function debugPathNow($: any): Promise<string> {
-  if (debugFile) return debugFile
-  const r: any = await race($, () => $.sessions.debugPath())
-  if (r?.ok && typeof r.path === 'string' && r.path.startsWith('/')) debugFile = r.path
-  else log($, "debug: sessions didn't give its debug path: this session takes no part in a /sessions debug report until its next start")
-  return debugFile
+let debugPathAsking: Promise<string> | null = null
+function debugPathNow($: any): Promise<string> {
+  if (debugFile) return Promise.resolve(debugFile)
+  // (one call, whoever asks meanwhile)
+  debugPathAsking ??= (async () => {
+    try {
+      const r: any = await race($, () => $.sessions.debugPath())
+      if (r?.ok && typeof r.path === 'string' && r.path.startsWith('/')) debugFile = r.path
+      else log($, "debug: sessions didn't give its debug path: this session takes no part in a /sessions debug report until its next start")
+      return debugFile
+    } finally {
+      debugPathAsking = null
+    }
+  })()
+  return debugPathAsking
+}
+
+/** Why this session can't hear a debug window open, or '': it's on its timers (nothing brings it a file's change), or
+ * the watch it has was handed without sessions' debug path */
+function debugDeaf(): '' | 'timers' | 'path' {
+  if (!root) return ''
+  // Not live: on its timers. With a list its SessionStart handed Claude it may still hear (Claude brings the changes
+  // before fleet takes its watch as proved), so only a session with none is said to be deaf
+  if (!live) return handedSet ? (debugInClaude === false ? 'path' : '') : 'timers'
+  const has = ownWatchLive ? debugInOwn : debugInClaude
+  return has === false || !debugFile ? 'path' : ''
+}
+
+/** A debug call to sessions, raced like any other and never counted: it's the report's own, not the window's work */
+async function debugCall<T>($: any, call: () => Promise<T>): Promise<T | null> {
+  try {
+    return await Promise.race([call(), $.clock.sleep(500).then(() => null)])
+  } catch {
+    return null
+  }
 }
 
 /** The debug path changed: what sessions says the window is now */
@@ -852,7 +891,15 @@ function debugRing($: any): Promise<void> {
   return mine
 }
 async function debugRung($: any) {
-  const w: any = await race($, () => $.sessions.debugWindow())
+  let w: any = await debugCall($, () => $.sessions.debugWindow())
+  if (!w) {
+    // Not answered (a loaded machine is when a report is asked for): once more a moment later, which is still inside
+    // sessions' wait for the hand-ins. sessions rings once at each end, so nothing else would bring this back
+    log($, "debug: sessions didn't say what the window is: asking once more")
+    await $.clock.sleep(DEBUG_RETRY_MS)
+    w = await debugCall($, () => $.sessions.debugWindow())
+    if (!w) return log($, `debug: sessions didn't say what the window is, twice: nothing opened and nothing handed in for this ring${M.on ? " (what's counting stops at its window's end)" : ''}`)
+  }
   const win = w?.ok ? w.window : null
   // Nothing sessions calls a window (an empty file, another format, a profile fleet doesn't know): nothing to do
   if (!win || win.profile !== 'perf' || typeof win.report !== 'string' || !win.report) return
@@ -860,11 +907,13 @@ async function debugRung($: any) {
     if (M.report === win.report && (M.on || M.expired)) return
     const held = await holdingsNow($)
     const now = await $.clock.now()
-    // (its end, and the grace a late close gets, as sessions' own meter gives it)
-    const left = Number(win.until) + WINDOW_GRACE_MS - now
+    // Its end (never further off than sessions' longest window: a file that says more isn't believed), and the grace a
+    // late close gets, as sessions' own meter gives it
+    const left = Math.min(Number(win.until) - now, DEBUG_WINDOW_MAX_MS) + WINDOW_GRACE_MS
     if (!(left > 0)) return
     // (written before the counting starts: it isn't the window's work)
     await touched(update($, debugOpen, () => String(win.report)))
+    netTaken.clear()
     meterOpen(win.report, now, left)
     M.holdingsAtOpen = held
     log($, `debug: counting for report ${win.report}, ${Math.round(left / 1000)} s at most`)
@@ -873,29 +922,44 @@ async function debugRung($: any) {
   await debugHandIn($, String(win.report))
 }
 
-/** The window closed: what this session counted, once, and the meter off */
+/** The window closed: what this session counted, once, and the meter off, whatever becomes of the hand-in */
 async function debugHandIn($: any, report: string) {
   // (counted here, to its end at least: a window that ran out before its close still hands in what it had)
   const counted = M.report === report && (M.on || M.expired)
-  let data: ReturnType<typeof meterSnapshot>
-  if (counted) {
-    // Counting stops first: what the hand-in itself reads (holdings, the project's part) isn't the window's work
-    meterHold()
-    const to = await $.clock.now()
-    const facts = await debugFacts($)
-    const held = await holdingsNow($)
-    const project = (await handsInProject($)) ? await projectPart($, to) : undefined
-    data = meterSnapshot(to, facts, held, project)
-    meterOff()
-  } else {
-    // Another report's window still counting here ends too (its close never came)
-    if (M.on || M.expired) meterOff()
-    // Not counted in this module: a module that came in by a reload inside this window says so; a session that started
-    // inside it, or that the opening ring never reached, hands in nothing (sessions lists it)
-    if ((await stateRead(read($, debugOpen))) !== report) return
-    const to = await $.clock.now()
-    data = { ...meterSnapshot(to, await debugFacts($), null, undefined, 'reloaded'), from: to }
+  let data: ReturnType<typeof meterSnapshot> | null = null
+  try {
+    if (counted) {
+      const ranOut = M.expired
+      // (what the net took and no chain named since is found by the net: counted before the counting stops)
+      netSettle(null)
+      // Counting stops first: what the hand-in itself reads (holdings, the project's part) isn't the window's work
+      meterHold()
+      const now = await $.clock.now()
+      // A window that ran out stopped counting at its end, not at this late close
+      const to = ranOut ? Math.min(now, M.endsAt) : now
+      const facts = await debugFacts($)
+      const held = await holdingsNow($)
+      let project: Record<string, Record<string, Value>> | undefined
+      try {
+        if (await handsInProject($)) project = await projectPart($, now)
+      } catch (err) {
+        log($, `debug: the project's part couldn't be put together (${String(err).slice(0, 120)}): handed in without it`)
+      }
+      data = meterSnapshot(to, facts, held, project)
+    } else if ((await stateRead(read($, debugOpen))) === report) {
+      // Not counted in this module: one that came in by a reload inside this window says so (a session that started
+      // inside it, or that the opening ring never reached, hands in nothing: sessions lists it)
+      const to = await $.clock.now()
+      data = { ...meterSnapshot(to, await debugFacts($), null, undefined, 'reloaded'), from: to }
+    }
+  } catch (err) {
+    log($, `debug: the hand-in for report ${report} couldn't be put together (${String(err).slice(0, 200)}): nothing handed in`)
+  } finally {
+    // Off whatever happened, another report's window still counting here too (its close never came)
+    if (M.on || M.expired || M.report) meterOff()
+    netTaken.clear()
   }
+  if (!data) return
   // (the hand-in goes whatever becomes of this write)
   await touched(update($, debugOpen, () => '')).catch(() => {})
   // Past sessions' limit (it never should be): the parts that can go, go
@@ -903,23 +967,30 @@ async function debugHandIn($: any, report: string) {
     const { project: _dropped, ...rest } = data
     data = { ...rest, holdings: {} }
   }
-  const r: any = await race($, () => $.sessions.debugReport({ source: 'fleet', report, data }))
-  if (r?.ok) log($, `debug: handed in for report ${report}${data.partial ? ' (partial: reloaded)' : ''}`)
-  else log($, `debug: the hand-in for report ${report} wasn't taken (${r ? (r.detail ?? r.reason ?? 'refused') : 'sessions did not answer'})`)
+  const handed = data
+  const send = () => $.sessions.debugReport({ source: 'fleet', report, data: handed })
+  let r: any = await debugCall($, send)
+  if (!r) {
+    // Not answered: once more (sessions may have taken the first; the same hand-in twice is the same hand-in)
+    log($, `debug: sessions didn't answer the hand-in for report ${report}: sending it once more`)
+    await $.clock.sleep(DEBUG_RETRY_MS)
+    r = await debugCall($, send)
+  }
+  if (r?.ok) log($, `debug: handed in for report ${report}${handed.partial ? ' (partial: reloaded)' : ''}`)
+  else log($, `debug: the hand-in for report ${report} wasn't taken (${r ? (r.detail ?? r.reason ?? 'refused') : 'sessions did not answer, twice'})`)
 }
 
 /** The facts that explain a session's rates, and nothing else: the report groups a plugin's sessions by their facts
- * as a whole, so a value that differs from one instance to the next without explaining a rate (a count, an age) would
- * make every instance a group of its own. What it is, how it hears of changes, whether it sweeps, its wakes, the world */
+ * as a whole, so a value that differs from one instance to the next without explaining a rate (a count, an age), or
+ * that flips from minute to minute (whether its wakes are shut: seen live, it put two instances alike in two groups),
+ * would make every instance a group of its own. What it is, how it hears of changes, whether it sweeps, the world */
 async function debugFacts($: any): Promise<Record<string, Value>> {
   const inst = myInstance
-  const now = await $.clock.now()
   return {
     ...(version && NAME.test(`v${version}`) ? { version: `v${version}` } : {}),
     kind: inst ? 'instance' : jobRef ? 'background' : 'person',
     sweeps: sweep.holding,
     live: !live ? 'timers' : ownWatchLive ? 'own' : 'claude',
-    ...(inst ? { wakes: now < nudgeShutUntil ? 'shut' : 'open' } : {}),
     world: !worldOn() ? 'off' : tooBig ? 'too-big' : 'on',
     ...(inst ? { role: { label: 'role' as const, key: inst.role } } : {}),
   }
@@ -943,11 +1014,15 @@ async function holdingsNow($: any): Promise<Record<string, Holding>> {
     intake: sized(intakeEvents, ['items']),
     board: sized(boardCache, ['items']),
     proofs: sum(['records'], sized(proofCache, []), sized(confCache, [])),
-    folders: sum([], sized(folderMarks, []), sized(folderNamesCache, []), sized(absentUntil, []), sized(belledAbsent, [])),
+    folders: sum(['folders'], sized(folderMarks, []), sized(folderNamesCache, []), sized(absentUntil, []), sized(belledAbsent, [])),
     told: sum(['threads'], sized(toldHere, []), sized(digestSeen, []), sized(laterLines, []), sized(lineChains, [])),
-    calls: sum([], sized(callsInFlight, []), sized(ownInFlight, []), sized(ownCalls, []), sized(ownRefused, []), sized(stepOf, []), sized(refusedIn, []), sized(refusedWrites, []), sized(fgRunning, [])),
+    // (the tool calls in flight and what was noted of them: they come and go with the session's own turns)
+    calls: sum(['calls'], sized(callsInFlight, []), sized(ownInFlight, []), sized(ownCalls, []), sized(ownRefused, []), sized(stepOf, []), sized(refusedIn, []), sized(refusedWrites, []), sized(fgRunning, [])),
     reads: { grows: ['files'], count: files, bytes: Math.round(each * files) },
-    timers: { grows: [], count: paceTimers.length + nudgeKicks.length + (ownWatchRetry ? 1 : 0), bytes: null },
+    // The timers that repeat (the set its state calls for: pace) grow with nothing, so a leak of them shows; the
+    // ones set once and waiting (a nudge's kick, the own watch's retry) come and go with what happens
+    timers: { grows: [], count: paceTimers.length, bytes: null },
+    'timers.pending': { grows: ['events'], count: nudgeKicks.length + (ownWatchRetry ? 1 : 0), bytes: null },
   }
 }
 
@@ -986,7 +1061,8 @@ async function projectPart($: any, now: number): Promise<Record<string, Record<s
   out.roster = tally
   out.landings = { ...(M.notes.get('landings') ?? {}) }
   const { records } = await queueRecords($)
-  out.waiting = { questions: records.length, oldestMs: records.length ? Math.max(0, now - (records[0] as QueueRecord).at) : 0, askers: new Set(records.map(r => r.asker.ref ?? '')).size, ...(M.notes.get('marks') ?? {}) }
+  // (a time as whole minutes, named so: the report prints a number as it is)
+  out.waiting = { questions: records.length, oldestMin: records.length ? Math.floor(Math.max(0, now - (records[0] as QueueRecord).at) / 60000) : 0, askers: new Set(records.map(r => r.asker.ref ?? '')).size, ...(M.notes.get('marks') ?? {}) }
   out.wakes = { ...(M.notes.get('wakes') ?? {}) }
   // What every session reads from disk: entries and bytes, by a few listings made only here
   const disk: Record<string, number> = {}
@@ -1024,7 +1100,9 @@ async function projectPart($: any, now: number): Promise<Record<string, Record<s
   disk['world.files'] = known.size
   out.disk = disk
   const l = parseLease(await readText($, stateDir('sweeper.json')))
-  out.health = { sweeper: sweep.holding ? 'here' : l && now - l.at <= LEASE_MS ? 'other' : 'none', sweeperForMs: sweep.holding && sweep.bornAt ? Math.max(0, now - sweep.bornAt) : 0, otherFormats: otherEvents }
+  out.health = { sweeper: sweep.holding ? 'here' : l && now - l.at <= LEASE_MS ? 'other' : 'none', sweeperForMin: sweep.holding && sweep.bornAt ? Math.floor(Math.max(0, now - sweep.bornAt) / 60000) : 0, otherFormats: otherEvents }
+  // A section with nothing in it isn't handed in (the report would print its bare heading)
+  for (const name of Object.keys(out)) if (!Object.keys(out[name] as object).length) delete out[name]
   return out
 }
 
@@ -1418,8 +1496,9 @@ function stateRead<T>(p: T): T {
   if (M.on) mWork('state')
   return p
 }
-/** One run of an action (meter.ts), when a debug window is open; else just the work */
-function act<T>(name: ActionName, fn: () => T): T {
+/** One run of an action (meter.ts), when a debug window is open; else just the work. The function gets its run, which
+ * a hook hands to `below` before it calls `next` (no run while no window is open) */
+function act<T>(name: ActionName, fn: (r?: Run) => T): T {
   return M.on ? runAction(name, fn) : fn()
 }
 /** A timer's tick as an action: counted as it fires, even when it then finds nothing to do */
@@ -1427,9 +1506,10 @@ function tick(name: ActionName, fn: () => Promise<unknown> | void | undefined) {
   const p = M.on ? runAction(name, fn) : fn()
   if (p) bg(p)
 }
-/** What the plugins beneath a hook take (and the tool itself) isn't the hook's own time: `under(below(), next(e))`
- * stops the running action's clock before `next` is called and starts it again once what it returned settles. Off,
- * `below()` is null and `under` gives the engine's promise back as it is */
+/** What the plugins beneath a hook take (and the tool itself) isn't the hook's own time: `under(below(mr), next(e))`
+ * stops the clock of the hook's own run (the `r` its `act` gave it, whatever else started since) before `next` is
+ * called and starts it again once what it returned settles. Off, there's no run, `below` is null and `under` gives the
+ * engine's promise back as it is */
 
 async function exists($: any, path: string): Promise<boolean> {
   try {
@@ -1727,6 +1807,10 @@ function timers($: any) {
           pace($)
           // What came while no module ran (a reload) raises no event: one pass of everything now
           ringHere($, ['deliver', 'beat', 'sweep'])
+          // Claude still watches what the module before this one handed it, sessions' debug path with it; which path
+          // that is was the other module's to know, so this one asks (once, as a start does): without it a ring of
+          // the window would mean nothing here until the session's next start
+          bg(debugPathNow($).then(p => void (debugInClaude = p ? null : false)))
         }
       })(),
     ),
@@ -2824,7 +2908,7 @@ async function refreshName($: any) {
 // The event files of the trailing window not seen yet (the current hour and the one before; 25 hours at the start:
 // there, each hour older than the two newest is taken from its index, when the sweeper wrote one, plus any file the
 // index doesn't list, so a restart reads about two hours of files, not twenty-five)
-function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
+function pullEvents($: any, hours = 2, indexed = false, net = false): Promise<void> {
   // One at a time; a call that comes while one runs gets one more after it (its trigger may name a file the running
   // one listed too early to see)
   if (pulling) {
@@ -2866,7 +2950,7 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
             const [name, v] = entry as [string, unknown]
             covered.add(name)
             if (seen.has(name) || v === null) continue
-            await takeEvent($, name, v, now)
+            await takeEvent($, name, v, now, net)
           }
         }
       }
@@ -2884,7 +2968,7 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
           whole = false
           continue
         }
-        await takeEvent($, name, v, now)
+        await takeEvent($, name, v, now, net)
       }
       if (whole && now - m >= FOLDER_SETTLE_MS) folderMarks.set(dir, { m, at: now })
     }
@@ -2909,8 +2993,9 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
   return pulling
 }
 
-/** One event file, as read (or as an hour's index has it); once per name */
-async function takeEvent($: any, name: string, v: any, now: number) {
+/** One event file, as read (or as an hour's index has it); once per name. `net`: taken by the net's own whole pull
+ * (for the meter: maybe one no chain named; the next read of events/latest says, netSettle) */
+async function takeEvent($: any, name: string, v: any, now: number, net = false) {
   if (seen.has(name)) return
   seen.set(name, now)
   digestGen++
@@ -2920,7 +3005,7 @@ async function takeEvent($: any, name: string, v: any, now: number) {
   }
   if (M.on) {
     mNote('landings', v.via === 'bash' ? 'command' : v.via === 'tool' || v.via === 'outside' || v.via === 'fleet' ? v.via : 'other')
-    if (netPulling) mMark('landing.net-found')
+    if (net) netTaken.add(name)
   }
   const prev = latest.get(v.path)
   if (newer(prev, v)) {
@@ -3107,27 +3192,30 @@ async function eventsTick($: any, fromPoll = false) {
     const now = await $.clock.now()
     if (now - chainVerifiedAt >= EVENTS_VERIFY_MS) {
       chainVerifiedAt = now
-      netPulling = true
-      try {
-        await pullWhole($)
-      } finally {
-        netPulling = false
-      }
+      await pullWhole($, true)
     }
   }
 }
 
-/** The net's whole pull runs now (for the meter: an event it takes is one no chain named) */
-let netPulling = false
-/** A whole pull that began after this call: one in flight may have listed before what brought the call */
-async function pullWhole($: any) {
+/** The events the net's own whole pull took while a debug window is open (never otherwise): each is one no chain had
+ * named when it was listed. Its writer may have linked the file and not yet rewritten events/latest, so it counts as
+ * found by the net only if the next read of events/latest doesn't name it either (or the window closes first) */
+const netTaken = new Set<string>()
+function netSettle(chain: readonly string[] | null | undefined) {
+  if (!netTaken.size) return
+  for (const name of netTaken) if (M.on && !chain?.includes(name)) mMark('landing.net-found')
+  netTaken.clear()
+}
+/** A whole pull that began after this call: one in flight may have listed before what brought the call. `net`: the
+ * net's own (only a pull it starts itself counts for the meter: one it merely waits for was someone else's) */
+async function pullWhole($: any, net = false) {
   if (pulling) {
     pullAgain = true
     await pulling
     if (pulling) await pulling
     return
   }
-  await pullEvents($)
+  await pullEvents($, 2, false, net)
 }
 
 /** events/latest moved: the events its chain names after the one this session held, read one by one; a whole pull
@@ -3137,6 +3225,7 @@ function pullLatest($: any): Promise<void> {
 }
 async function pullLatestNow($: any) {
   const cur = parseLatest(await readText($, `${eventsDir()}/latest`))
+  if (netTaken.size) netSettle(cur?.chain)
   const from = cur?.chain && eventCursor !== null ? (cur.last === eventCursor ? cur.chain.length - 1 : cur.chain.lastIndexOf(eventCursor)) : -1
   if (!cur || !cur.chain || from === -1) {
     await pullWhole($)
@@ -4181,7 +4270,7 @@ function markText(m: OutsideMark, offsetMin: number, now: number): string {
 // ---- The gate: a Write, Edit or NotebookEdit of a world file this thread didn't read as it is now, or whose pins it
 // didn't read as they are ----
 
-async function gate($: any, e: any, next: any) {
+async function gate($: any, e: any, next: any, mr?: Run) {
   // An instance's own tools never write a command-level file (its settings deny it too): it files a change instead
   const refusal = await commandRefusal($, e.file_path ?? e.notebook_path)
   if (refusal) {
@@ -4189,9 +4278,9 @@ async function gate($: any, e: any, next: any) {
     return { deny: refusal }
   }
   const w = await worldFile($, e.file_path ?? e.notebook_path)
-  if (!w) return under(below(), next(e))
+  if (!w) return under(below(mr), next(e))
   const thread = threadOf(e)
-  if (w.copy) return copyGate($, e, next, w, thread)
+  if (w.copy) return copyGate($, e, next, w, thread, mr)
   const cur = await versionOf($, w.abs)
   const mine = (await stateRead(read($, reads)))[thread]?.[w.rel]
   const told = (await stateRead(read($, warned)))[thread] ?? {}
@@ -4255,7 +4344,7 @@ async function gate($: any, e: any, next: any) {
   const mark = await inFlight($, w.rel, thread, text === null ? null : hashText(text))
   let r: any
   try {
-    r = await under(below(), next(e))
+    r = await under(below(mr), next(e))
   } finally {
     if (!r || r.deny !== undefined || r.isError) await mark.done()
   }
@@ -4465,14 +4554,14 @@ function mustProve(rel: string): boolean {
 // A write of a worktree's copy of a shared file: told once per thread and path that the shared one is the main
 // checkout's (a session isolated in its worktree can't write that one: it keeps its change in the worktree, or reports
 // it), not again at each new version of the copy its own writes make. Nothing lands
-async function copyGate($: any, e: any, next: any, w: Placed, thread: string) {
+async function copyGate($: any, e: any, next: any, w: Placed, thread: string, mr?: Run) {
   const key = `copy:${w.rel}`
   if ((await stateRead(read($, warned)))[thread]?.[key] !== 'told') {
     await touched(update($, warned, m => ({ ...m, [thread]: { ...(m[thread] ?? {}), [key]: 'told' } })))
     log($, `refused once: ${e.tool} of a worktree copy of ${w.rel} by ${thread} (${w.copy})`)
     return { deny: copyWriteText(String(e.file_path ?? e.notebook_path), w.rel, `${realRoot}/${w.rel}`) }
   }
-  const r = await under(below(), next(e))
+  const r = await under(below(mr), next(e))
   if (r && r.deny === undefined && !r.isError) log($, `${w.rel}: written in the worktree ${w.copy} only`)
   return r
 }
@@ -4806,7 +4895,7 @@ async function othersRunning($: any): Promise<Running[]> {
   return out
 }
 
-async function bashHook($: any, e: any, next: any) {
+async function bashHook($: any, e: any, next: any, mr?: Run) {
   await locate($)
   // The one hard line first: a command that sends the project's content outside isn't run (outbound.ts)
   const gate = await outboundGate($, e)
@@ -4814,7 +4903,7 @@ async function bashHook($: any, e: any, next: any) {
   await ensureWorld($)
   if (!worldOn()) {
     const at = await $.clock.now()
-    const r = await under(below(), next(e))
+    const r = await under(below(mr), next(e))
     if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
     // An instance's command in the background, kept with its text: told after a restart or a compaction (G2)
     const task = typeof r?.result?.backgroundTaskId === 'string' && r.result.backgroundTaskId ? (r.result.backgroundTaskId as string) : null
@@ -4859,7 +4948,7 @@ async function bashHook($: any, e: any, next: any) {
   })
   let r: any
   try {
-    r = await under(below(), next(e))
+    r = await under(below(mr), next(e))
   } finally {
     if (fgRunning.get(n)?.shown) saveReadsSoon($, true)
     fgRunning.delete(n)
@@ -8886,7 +8975,7 @@ function kickNudge($: any, delayMs = 0, why: 'landing' | 'bell' | 'window' | 'ow
       $.clock.after(at - now, () => {
         const i = nudgeKicks.indexOf(at)
         if (i !== -1) nudgeKicks.splice(i, 1)
-        tick(`nudge.pass:${why}`, () => runNudge($))
+        tick(M.on ? (`nudge.pass:${why}` as ActionName) : 'nudge.pass:minute', () => runNudge($))
       })
     })(),
   )
@@ -13874,7 +13963,9 @@ async function statusCommand($: any, all = false): Promise<string> {
     lines.push(`project: ${heldCount(records, present, alikeQuestion)} question(s) for you, ${waiting} decision(s) answered and not delivered yet${other ? `, ${other} from a fleet with another format` : ''}`)
     lines.push((await sweeperState($)).line)
     lines.push(liveLine(!!(await stateRead(read($, classicSeen))).SessionStart, await $.clock.now()))
-    if (debugUnwatched) lines.push("debug: this session takes no part in a /sessions debug report until its next start (sessions didn't give its debug path in time)")
+    const deaf = debugDeaf()
+    if (deaf === 'path') lines.push("debug: this session takes no part in a /sessions debug report until its next start (sessions didn't give its debug path in time)")
+    else if (deaf === 'timers') lines.push("debug: this session takes no part in a /sessions debug report while live updates are off (on its timers, nothing tells it a window opened)")
     await ensureWorld($)
     const spent = await judgeLedger($, await $.clock.now())
     const liveAreas = Object.keys((await judgesStateNow($)).live).sort()
@@ -14172,7 +14263,7 @@ async function recordDialog($: any, e: any, r: any, askedAt: number) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     found = undefined
-    const r = await under(below(), next(e))
+    const r = await next(e)
     if (!e.isInteractive) return r
     try {
       if (!(await stateRead(read($, conversationAt)))) {
@@ -14188,7 +14279,7 @@ export const register: Register = on => {
 
   // A /clear keeps this process and its $.state; the open decisions are read again from the files all the same, and the
   // new conversation has read nothing of the world. A session that ends for good gives up the sweeper's lease
-  on('session.end', ($, e, next) => act('session.end', async () => {
+  on('session.end', ($, e, next) => act('session.end', async mr => {
     if (e.reason === 'clear' || e.reason === 'resume') {
       try {
         await touched(update($, identityTold, () => false))
@@ -14201,21 +14292,25 @@ export const register: Register = on => {
       if (e.reason !== 'resume') ending = true
       await Promise.race([Promise.all([releaseLease($).catch(() => {}), flushReads($).catch(() => {})]), $.clock.sleep(500)])
     }
-    return under(below(), next(e))
+    return under(below(mr), next(e))
   }))
 
   // The engine's own watcher (C9, Q6-bg: it fires in a background session with no viewer, after /clear and compaction)
   // on events/latest, so a landing reaches every session in under a second; the 2 s tick is the fallback
   // And an instance of the roster learns there, every time its conversation starts again (after /clear, compaction,
   // resume), who it is, what it can't write and its budget; fleet learns the role it runs as (agent_type)
-  on('classic.SessionStart', ($, e, next) => act('classic.start', async () => {
+  on('classic.SessionStart', ($, e, next) => act('classic.start', async mr => {
     // Each SessionStart notes the classic hooks again (a state read each: in a TEST run, /fleet status said SessionStart
     // hadn't reached fleet after a /clear, though it had)
     classicNoted.clear()
     sawClassic($, 'SessionStart')
     if (typeof e.agent_type === 'string' && e.agent_type) agentType = e.agent_type
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
-    const r = await under(below(), next(e))
+    const r = await under(below(mr), next(e))
+    // sessions' debug path (it's sessions' file: fleet only watches it, and makes nothing there). It has to be in the
+    // list this hook returns, so the hook can't go without it; asked now, beside the hook's own reads, so a sessions
+    // slow to answer (500 ms at most, and only until the path is known) doesn't add its wait to theirs
+    const asked = debugPathNow($).catch(() => '')
     try {
       await ensureWorld($)
       if (!root) return r
@@ -14223,9 +14318,8 @@ export const register: Register = on => {
       await makeWatched($, w)
       watchingLatest = true
       watchMisses = 0
-      // sessions' debug path (it's sessions' file: fleet only watches it, and makes nothing there)
-      const debug = await debugPathNow($)
-      debugUnwatched = !debug
+      const debug = await asked
+      debugInClaude = !!debug
       const watched = [...w.files, ...w.folders, ...(debug ? [debug] : [])]
       // Live once the engine brings a ring under bell/ back (the list is set once this hook returns; it replaces the one
       // before, so live waits for that proof again)
@@ -14251,20 +14345,20 @@ export const register: Register = on => {
 
   // A permission prompt an instance waits on, with nobody at it: its heartbeat says so at once, and the sweeper marks
   // its row (it needs the person). Only watched: the prompt is Claude's, and so is its answer
-  on('classic.PermissionRequest', ($, e, next) => act('classic.hook', async () => {
+  on('classic.PermissionRequest', ($, e, next) => act('classic.hook', async mr => {
     sawClassic($, 'PermissionRequest')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (jobRef && myInstance) {
       permissionWait = { kind: 'permission', tool: String(e.tool_name ?? '').slice(0, 80), at: await $.clock.now() }
       bg(heartbeat($))
     }
-    return under(below(), next(e))
+    return under(below(mr), next(e))
   })).catch(($, e, next) => next(e))
   // The background work still running at each stop: a Bash command of this session's that's no longer there completed,
   // and what it wrote lands now (bgDone)
-  on('classic.Stop', ($, e, next) => act('classic.hook', async () => {
+  on('classic.Stop', ($, e, next) => act('classic.hook', async mr => {
     sawClassic($, 'Stop')
-    const r = await under(below(), next(e))
+    const r = await under(below(mr), next(e))
     const tasks = (e as any).background_tasks
     if (Array.isArray(tasks)) {
       const live = new Set(tasks.map((t: any) => String(t?.id ?? '')))
@@ -14277,35 +14371,35 @@ export const register: Register = on => {
     return r
   })).catch(($, e, next) => next(e))
   // ... until its tool ran or was refused
-  on('classic.PostToolUse', ($, e, next) => act('classic.hook', async () => {
+  on('classic.PostToolUse', ($, e, next) => act('classic.hook', async mr => {
     sawClassic($, 'PostToolUse')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (permissionWait) bg(promptAnswered($))
-    return under(below(), next(e))
+    return under(below(mr), next(e))
   })).catch(($, e, next) => next(e))
-  on('classic.PostToolUseFailure', ($, e, next) => act('classic.hook', async () => {
+  on('classic.PostToolUseFailure', ($, e, next) => act('classic.hook', async mr => {
     sawClassic($, 'PostToolUseFailure')
     if (typeof e.permission_mode === 'string' && e.permission_mode) permissionMode = e.permission_mode
     if (permissionWait) bg(promptAnswered($))
-    return under(below(), next(e))
+    return under(below(mr), next(e))
   })).catch(($, e, next) => next(e))
   // Auto mode refused a call (it fires only in auto mode): an instance's fleet keeps it, for the brief; nothing is held
-  on('classic.PermissionDenied', ($, e, next) => act('classic.hook', async () => {
+  on('classic.PermissionDenied', ($, e, next) => act('classic.hook', async mr => {
     sawClassic($, 'PermissionDenied')
     if (permissionWait) bg(promptAnswered($))
     if (jobRef && myInstance) bg(noteBlock($, e))
-    return under(below(), next(e))
+    return under(below(mr), next(e))
   })).catch(($, e, next) => next(e))
 
   on('classic.FileChanged', async ($, e, next) => {
     sawClassic($, 'FileChanged')
     fileChanged($, String(e.file_path), true)
-    return under(below(), next(e))
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   // What stands in for the classic hooks when a managed plugin sends them on past fleet (B3), by events it can't skip:
   // a permission prompt put to the person (an organisation's ceiling `ask` above all: allow rules don't lift it)...
-  on('tool.check', ($, e, next) => act('gate', async () => {
+  on('tool.check', ($, e, next) => act('gate', async mr => {
     // A ready post from an instance that would wait at the organisation's prompt with its text frozen: a draft instead
     try {
       const held = await orgAskHold($, e)
@@ -14314,7 +14408,7 @@ export const register: Register = on => {
         return held
       }
     } catch {}
-    const r: any = await under(below(), next(e))
+    const r: any = await under(below(mr), next(e))
     // The same post put to the person by a verdict ask (a settings rule, a hook, a mode that asks; no organisation
     // ceiling): it would wait at that prompt with its text frozen just the same. In auto mode a plain ask goes to the
     // classifier, not the person: only a rule's or a hook's ask counts there
@@ -14343,8 +14437,8 @@ export const register: Register = on => {
   })).catch(($, e, next) => next(e))
   // ... until its tool ran or was refused (the generic tool.call hook below, with the MCP gate)
   // ... and who an instance is, after a compaction its classic.SessionStart doesn't reach fleet for
-  on('session.compact', ($, e, next) => act('compact.hook', async () => {
-    const r: any = await under(below(), next(e))
+  on('session.compact', ($, e, next) => act('compact.hook', async mr => {
+    const r: any = await under(below(mr), next(e))
     try {
       if (e.agentId !== undefined || e.trigger === 'precompute' || !r || !Array.isArray(r.messages) || !myInstance || !jobRef) return r
       // What it had in flight, which a summary may have dropped: said at its next step (G2)
@@ -14368,8 +14462,8 @@ export const register: Register = on => {
   })).catch(($, e, next) => next(e))
 
   // The world's three hooks (changes.ts). They fail open: a fleet that errs lets the tool run as if it weren't there
-  on('tool.call', { tool: 'Read' }, ($, e, next) => act('read.note', async () => {
-    const r: any = await under(below(), next(e))
+  on('tool.call', { tool: 'Read' }, ($, e, next) => act('read.note', async mr => {
+    const r: any = await under(below(mr), next(e))
     if (!r || r.isError || r.deny !== undefined) return r
     await ensureWorld($)
     if (!worldOn()) return r
@@ -14377,17 +14471,17 @@ export const register: Register = on => {
     return withLines($, r, thread, await noteRead($, thread, e.file_path))
   })).catch(($, e, next) => next(e))
 
-  on('tool.call', { tool: ['Write', 'Edit', 'NotebookEdit'] }, ($, e, next) => act('write.land', async () => gate($, e, next))).catch(($, e, next) => next(e))
+  on('tool.call', { tool: ['Write', 'Edit', 'NotebookEdit'] }, ($, e, next) => act('write.land', async mr => gate($, e, next, mr))).catch(($, e, next) => next(e))
 
   // A guard that throws is skipped and the tool runs: before the command ran, the one hard line holds one that may reach
   // the network (in a background session); after it, or for any other command, it fails open as the rest of fleet
-  on('tool.call', { tool: 'Bash' }, ($, e, next) => act('bash.scan', async () => bashHook($, e, next))).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
+  on('tool.call', { tool: 'Bash' }, ($, e, next) => act('bash.scan', async mr => bashHook($, e, next, mr))).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
   // sessions' model tool mcp__sessions__wake: an instance of this project's roster isn't a model's to wake (its fleet
   // wakes it when something is for it; the person brings a stopped one back with /fleet up). Anything else passes
-  on('tool.call', { tool: /^mcp__sessions__wake$/ }, ($, e, next) => act('wake.guard', async () => {
+  on('tool.call', { tool: /^mcp__sessions__wake$/ }, ($, e, next) => act('wake.guard', async mr => {
     const refused = await rosterWakeRefusal($, (e as any).session)
-    return refused ? { deny: refused } : under(below(), next(e))
+    return refused ? { deny: refused } : under(below(mr), next(e))
   })).catch(($, e, next) => next(e))
 
   // An instance's main-loop requests run the roster's model and effort (B24/G32): a respawn replays the launch's
@@ -14443,7 +14537,7 @@ export const register: Register = on => {
     return r
   })
 
-  on('turn.start', ($, e, next) => act('turn.start', async () => {
+  on('turn.start', ($, e, next) => act('turn.start', async mr => {
     if (e.agentId === undefined) {
       // Whose turn this is: the person's when his prompt starts it (prompt.submit came just before, and the turn runs
       // with his text: fleet's own prompts never reach its own prompt.submit hook, so the text tells them apart)
@@ -14471,11 +14565,11 @@ export const register: Register = on => {
       if (String(e.text ?? '').includes('fleet: this session is ')) await touched(update($, identityTold, () => true))
       if (timersOn) bg(turnStarted($, e.text, e.turnId))
     }
-    return under(below(), next(e))
+    return under(below(mr), next(e))
   }))
 
-  on('turn.complete', ($, e, next) => act('turn.end', async () => {
-    const r = await under(below(), next(e))
+  on('turn.complete', ($, e, next) => act('turn.end', async mr => {
+    const r = await under(below(mr), next(e))
     if (e.agentId === undefined) {
       await touched(update($, personTurn, () => null))
       await touched(update($, fleetTurn, () => null))
@@ -14510,12 +14604,12 @@ export const register: Register = on => {
   // thread's digest (prompt.submit's context is in the turn's first request; an append there would not be)
   // A submit from the main prompt box empties it (prompt.change, origin clear): what a /fleet command of the person's
   // needs before it. A launch prompt, a resumed job's prompt or an agent's initialPrompt come with none
-  on('prompt.change', { origin: { kind: 'clear' } }, ($, e, next) => act('prompt.typed', async () => {
+  on('prompt.change', { origin: { kind: 'clear' } }, ($, e, next) => act('prompt.typed', async mr => {
     await noteTypedSubmit($)
-    return under(below(), next(e))
+    return under(below(mr), next(e))
   })).catch(($, e, next) => next(e))
 
-  on('prompt.submit', ($, e, next) => act('prompt.submit', async () => {
+  on('prompt.submit', ($, e, next) => act('prompt.submit', async mr => {
     if ((e.origin?.kind === 'composer' || e.origin?.kind === 'bridge') && timersOn) {
       bg(
         (async () => {
@@ -14552,10 +14646,10 @@ export const register: Register = on => {
       id = e.command ? '' : await identityOwed($)
     } catch {}
     const ids = id ? [id] : []
-    if (e.command || (!worldOn() && !myInstance)) return asked.length ? under(below(), next({ ...e, context: [...(e.context ?? []), ...asked] })) : under(below(), next(e))
+    if (e.command || (!worldOn() && !myInstance)) return asked.length ? under(below(mr), next({ ...e, context: [...(e.context ?? []), ...asked] })) : under(below(mr), next(e))
     const d = await digestFor($, 'main')
-    if (!d.lines.length && !asked.length && !ids.length) return under(below(), next(e))
-    const r = await under(below(), next({ ...e, context: [...(e.context ?? []), ...ids, ...asked, ...d.lines] }))
+    if (!d.lines.length && !asked.length && !ids.length) return under(below(mr), next(e))
+    const r = await under(below(mr), next({ ...e, context: [...(e.context ?? []), ...ids, ...asked, ...d.lines] }))
     if (r && r.drop === undefined && d.lines.length) bg(d.told())
     if (r && r.drop === undefined && ids.length) bg(touched(update($, identityTold, () => true)))
     return r
@@ -14563,8 +14657,8 @@ export const register: Register = on => {
 
   // fleet's own tools end each result with its clock: a role with no Bash has no other to stamp what it writes (an
   // outer hook, so it sees what each tool's own hook below answered)
-  on('tool.call', { tool: /^mcp__fleet__/ }, ($, e, next) => act('tool.fleet', async () => {
-    const r: any = await under(below(), next(e))
+  on('tool.call', { tool: /^mcp__fleet__/ }, ($, e, next) => act('tool.fleet', async mr => {
+    const r: any = await under(below(mr), next(e))
     // Beside its answer, as a line of context (the answer's own text stays as the tool wrote it)
     return r && typeof r.result === 'string' ? { ...r, context: [...(Array.isArray(r.context) ? r.context : []), `fleet's clock: ${await clockStamp($)}`] } : r
   })).catch(($, e, next) => next(e))
@@ -14658,19 +14752,19 @@ export const register: Register = on => {
   // Only fleet's and sessions' code notifies the person: in a background session of the project, the model's own
   // PushNotification (origin engine) is refused; a plugin's own call (from its timer) passes (H3)
   // A message sent in the same batch as a write the gate refused may announce what didn't land (G33): held once
-  on('tool.call', { tool: 'SendMessage' }, ($, e, next) => act('send.guard', async () => {
+  on('tool.call', { tool: 'SendMessage' }, ($, e, next) => act('send.guard', async mr => {
     const held = sameStepHold(threadOf(e))
     if (held) {
       log($, `held once: SendMessage by ${threadOf(e)} in the step of a refused write`)
       return { deny: held }
     }
-    return under(below(), next(e))
+    return under(below(mr), next(e))
   })).catch(($, e, next) => next(e))
 
-  on('tool.call', { tool: 'PushNotification' }, ($, e, next) => act('push.guard', async () => {
-    if (next.origin?.plugin !== 'engine') return under(below(), next(e))
+  on('tool.call', { tool: 'PushNotification' }, ($, e, next) => act('push.guard', async mr => {
+    if (next.origin?.plugin !== 'engine') return under(below(mr), next(e))
     await locate($)
-    if (!root || !jobRef) return under(below(), next(e))
+    if (!root || !jobRef) return under(below(mr), next(e))
     log($, "refused: the model's PushNotification (only fleet and sessions notify the person)")
     return { deny: "fleet: in this project only fleet notifies the person (in the brief, the band and their channel, within their caps). Ask with mcp__fleet__decide, or write it in your journal; nothing was sent." }
   })).catch(($, e, next) => next(e))
@@ -14678,12 +14772,12 @@ export const register: Register = on => {
   // The main thread's tool call in flight, for an instance's heartbeat: one that never returns (a hung read, a prompt
   // nobody sees) shows on its row past STUCK_MS instead of looking like work (every tool: a matcher that takes any name,
   // since one hook without a matcher is the MCP one below)
-  on('tool.call', { tool: /^/ }, ($, e, next) => act('outbound.check', async () => {
-    if (e.agentId !== undefined || !jobRef) return under(below(), next(e))
+  on('tool.call', { tool: /^/ }, ($, e, next) => act('call.flight', async mr => {
+    if (e.agentId !== undefined || !jobRef) return under(below(mr), next(e))
     const k = ++callSeq
     callsInFlight.set(k, { tool: String((e as any).tool ?? '').slice(0, 80), since: await $.clock.now() })
     try {
-      return await under(below(), next(e))
+      return await under(below(mr), next(e))
     } finally {
       callsInFlight.delete(k)
     }
@@ -14693,7 +14787,7 @@ export const register: Register = on => {
   // line); one whose result is outside content marks the conversation. fleet's own pass untouched
   // And every tool's call settles a permission prompt this instance waited on (it ran or was refused): what
   // classic.PostToolUse says, by an event a managed plugin can't send on past fleet
-  on('tool.call', ($, e, next) => act('tool.settle', async () => {
+  on('tool.call', ($, e, next) => act('outbound.check', async mr => {
     const tool = String((e as any).tool ?? '')
     // fleet's own call (an approved draft, its push notification): past the gate, as the person approved it, with
     // nobody's answers on it (they'd go where no model reads them); what came back from beneath is kept on its token
@@ -14702,7 +14796,7 @@ export const register: Register = on => {
       const id = typeof (e as any).tool_use_id === 'string' ? ((e as any).tool_use_id as string) : null
       if (id) ownInFlight.add(id)
       try {
-        const r: any = await under(below(), next(e))
+        const r: any = await under(below(mr), next(e))
         // The verdict fleet saw beneath it; whether that refusal held, the call's own result says (settle)
         own.refused = !!id && ownRefused.has(id)
         return r
@@ -14717,7 +14811,7 @@ export const register: Register = on => {
     // the world's digest); never on a plugin's own call of fleet's
     const answered = (r: any) => (e.agentId === undefined && next.origin?.plugin !== 'fleet' && !['Read', 'Write', 'Edit', 'NotebookEdit', 'Bash'].includes(tool) ? withAnswers($, r) : r)
     if (!tool.startsWith('mcp__') || tool.startsWith('mcp__fleet__')) {
-      const r = await under(below(), next(e))
+      const r = await under(below(mr), next(e))
       if (permissionWait && e.agentId === undefined) bg(promptAnswered($))
       return answered(r)
     }
@@ -14728,15 +14822,15 @@ export const register: Register = on => {
       const stale = await staleSend($, threadOf(e))
       if (stale) return { deny: stale }
     }
-    const r: any = await under(below(), next(e))
+    const r: any = await under(below(mr), next(e))
     if (permissionWait && e.agentId === undefined) bg(promptAnswered($))
     if (gate.outside && r && !r.isError && r.deny === undefined) bg(markOutside($, gate.outside))
     return answered(r)
   })).catch(($, e, next) => (next.called ? next(e) : (heldOnError(e) ?? next(e))))
 
   // Reading the web is free, and marks the conversation (decision 2b): its changes then wait for the person
-  on('tool.call', { tool: ['WebFetch', 'WebSearch'] }, ($, e, next) => act('outside.mark', async () => {
-    const r: any = await under(below(), next(e))
+  on('tool.call', { tool: ['WebFetch', 'WebSearch'] }, ($, e, next) => act('outside.mark', async mr => {
+    const r: any = await under(below(mr), next(e))
     if (r && !r.isError && r.deny === undefined && OUTSIDE_TOOLS.has(String(e.tool))) {
       bg(
         (async () => {
@@ -14756,9 +14850,9 @@ export const register: Register = on => {
 
   // An instance over its budget starts no new helper (the one thing the budget refuses: never a turn, never another
   // tool). It fails open: a fleet that errs lets the helper start
-  on('agent.spawn', ($, e, next) => act('helper.spawn', async () => {
+  on('agent.spawn', ($, e, next) => act('helper.spawn', async mr => {
     const refusal = myInstance ? await spawnRefusal($) : null
-    if (!refusal) return under(below(), next(e))
+    if (!refusal) return under(below(mr), next(e))
     log($, 'refused a helper: over budget')
     return { deny: refusal }
   })).catch(($, e, next) => next(e))
@@ -14768,8 +14862,8 @@ export const register: Register = on => {
   // refused: nobody sits at it, a dialog waits for whoever comes by, and decide asks without stopping. Elsewhere (the
   // person's own sessions, background ones too) it only watches: the dialog is the usual one, and what it returns goes
   // back unchanged
-  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => act('ask.guard', async () => {
-    if (next.origin.plugin !== 'engine') return under(below(), next(e))
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => act('ask.guard', async mr => {
+    if (next.origin.plugin !== 'engine') return under(below(mr), next(e))
     await locate($)
     if (root && jobRef && offered && myInstance) {
       log($, "refused: the model's AskUserQuestion in an instance (it asks with decide)")
@@ -14779,14 +14873,14 @@ export const register: Register = on => {
     try {
       askedAt = await $.clock.now()
     } catch {}
-    const r = await under(below(), next(e))
+    const r = await under(below(mr), next(e))
     bg(recordDialog($, e, r, askedAt))
     return r
   }))
 
   on('command.run', { command: 'fleet' }, async ($, e) => {
     try {
-      return { text: await act(commandAction(String(e.args ?? '')), () => fleetCommand($, e)) }
+      return { text: await (M.on ? act(commandAction(String(e.args ?? '')), () => fleetCommand($, e)) : fleetCommand($, e)) }
     } catch (err) {
       return { text: `fleet: ${String(err).slice(0, 300)}` }
     }
@@ -14795,12 +14889,12 @@ export const register: Register = on => {
   // Above the prompt: how many questions wait for the person in this project, and how many shared files are flagged
   // (suspect, or failing a check), with whatever is drawn there after it. Its first draw starts fleet when
   // session.start didn't come (a draw only draws: the start runs from a timer)
-  on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => act('band.draw', async () => {
+  on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => act('band.draw', async mr => {
     if (!started && !startScheduled) {
       startScheduled = true
       $.clock.after(0, () => bg(start($)))
     }
-    const beneath = await under(below(), next(e))
+    const beneath = await under(below(mr), next(e))
     if (e.props.hasSurvey) return beneath
     const n = await stateRead(read($, held))
     const f = await stateRead(read($, flags))

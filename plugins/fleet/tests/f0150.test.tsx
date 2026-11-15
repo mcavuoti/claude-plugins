@@ -197,7 +197,7 @@ test('a window opens and closes: one hand-in, in the shape sessions takes; a sec
   expect(d.to - d.from).toBe(3 * MIN)
   expect(refusals(d)).toEqual([])
   // The facts are the few that explain a rate, the same for every instance alike (the report groups sessions by them)
-  expect(d.facts).toEqual({ version: 'v0.1.0', kind: 'instance', sweeps: false, live: 'claude', wakes: 'open', world: 'on', role: { label: 'role', key: 'owner' } })
+  expect(d.facts).toEqual({ version: 'v0.1.0', kind: 'instance', sweeps: false, live: 'claude', world: 'on', role: { label: 'role', key: 'owner' } })
   // The fields sessions' format has, and no other
   expect(Object.keys(d).sort()).toEqual(['actions', 'facts', 'format', 'from', 'holdings', 'loadedAt', 'to', 'totals'])
   // The actions of an idle instance, each under its declared name, with what makes it run and what it grows with
@@ -485,7 +485,7 @@ test('holdings are noted at the open and read again at the close: a count and a 
   }
   await ring($, w, false)
   const d = handIns(w)[0].data
-  for (const name of ['latest', 'seen', 'known', 'revs', 'queue', 'register', 'intake', 'board', 'proofs', 'folders', 'told', 'calls', 'reads', 'timers']) {
+  for (const name of ['latest', 'seen', 'known', 'revs', 'queue', 'register', 'intake', 'board', 'proofs', 'folders', 'told', 'calls', 'reads', 'timers', 'timers.pending']) {
     expect(Object.keys(d.holdings)).toContain(name)
     expect(d.holdings[name].open.length).toBe(2)
     expect(d.holdings[name].close.length).toBe(2)
@@ -494,6 +494,15 @@ test('holdings are noted at the open and read again at the close: a count and a 
   expect(d.holdings.latest.close[0] - d.holdings.latest.open[0]).toBe(5)
   expect(d.holdings.seen.close[1]).toBeGreaterThan(d.holdings.seen.open[1])
   expect(d.holdings.seen.grows).toEqual(['landings'])
+  // The timers that repeat grow with nothing (the same set at both ends: a leak of them would show), the ones set once
+  // and waiting come and go with what happens, and so do the tool calls in flight: the report's "grew with nothing new
+  // to hold" is for a holding that says it grows with nothing
+  expect(d.holdings.timers.grows).toEqual([])
+  expect(d.holdings.timers.close[0]).toBe(d.holdings.timers.open[0])
+  expect(d.holdings.timers.close[0]).toBeGreaterThan(0)
+  expect(d.holdings['timers.pending'].grows).toEqual(['events'])
+  expect(d.holdings.calls.grows).toEqual(['calls'])
+  for (const [name, h] of Object.entries(d.holdings as Record<string, any>)) if (!h.grows.length) expect([name, h.close[0] - h.open[0]]).toEqual([name, 0])
   // An instance that doesn't sweep hands in no project part
   expect(d.project).toBe(undefined)
 })
@@ -514,7 +523,14 @@ test("the project's part comes from the session that sweeps: the roster by state
   const d = handIns(w)[0].data
   expect(d.facts).toEqual({ version: 'v0.1.0', kind: 'person', sweeps: true, live: 'claude', world: 'on' })
   expect(refusals(d)).toEqual([])
-  expect(Object.keys(d.project).sort()).toEqual(['disk', 'health', 'landings', 'roster', 'waiting', 'wakes'])
+  // (no wake was sent in this window: a section with nothing in it isn't handed in, the report would print its bare heading)
+  expect(Object.keys(d.project).sort()).toEqual(['disk', 'health', 'landings', 'roster', 'waiting'])
+  for (const section of Object.values(d.project as Record<string, object>)) expect(Object.keys(section).length).toBeGreaterThan(0)
+  // Times are whole minutes, named so (the report prints a number as it is)
+  expect(d.project.health.sweeperForMin).toBeGreaterThanOrEqual(3)
+  expect(d.project.health.sweeperForMin).toBeLessThan(20)
+  expect(d.project.waiting.oldestMin).toBe(0)
+  expect(Object.keys({ ...d.project.health, ...d.project.waiting }).filter(k => k.endsWith('Ms'))).toEqual([])
   expect(d.project.landings).toEqual({ tool: 1, command: 1 })
   expect(d.project.roster.instances).toBe(3)
   expect(d.project.waiting.questions).toBe(0)
@@ -626,7 +642,7 @@ test('a working instance in a window: each thing it does is counted under its de
     // its timers
     'deliver', 'beat', 'world.tick', 'lease', 'needs', 'instance.tick', 'heartbeat', 'nudge.pass:minute',
     // its own turn and tools
-    'prompt.typed', 'prompt.submit', 'turn.start', 'turn.end', 'gate', 'read.note', 'write.land', 'bash.scan', 'outbound.check', 'tool.settle', 'tool.fleet', 'tool.decide', 'reads.save', 'classic.hook', 'nudge.pass:landing',
+    'prompt.typed', 'prompt.submit', 'turn.start', 'turn.end', 'gate', 'read.note', 'write.land', 'bash.scan', 'outbound.check', 'call.flight', 'tool.fleet', 'tool.decide', 'reads.save', 'classic.hook', 'nudge.pass:landing',
     // the person
     'command:list', 'command:status', 'command:other', 'band.draw',
   ]
