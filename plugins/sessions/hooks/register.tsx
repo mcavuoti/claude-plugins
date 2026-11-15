@@ -1614,7 +1614,8 @@ let leaderNews = { bridge: false, ended: false }
 function fileChanged($: any, path: string, event: string) {
   const c = classify(path, locations)
   if (!c) return
-  if (meter.on) meter.tick(`event.${c.kind}`)
+  // (the debug window's own bell isn't the session's work)
+  if (meter.on && !(c.kind === 'bell' && c.name === DEBUG_BELL)) meter.tick(`event.${c.kind}`)
   scheduleFlush($, 30, d => {
     if (c.kind === 'registry') d.registry = true
     else if (c.kind === 'bell') d.bells.add(c.name)
