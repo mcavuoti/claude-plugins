@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { hashText, hourFolder } from '../hooks/changes'
-import { ACTIONS, HAND_IN_MAX, NAME, refusals } from '../hooks/meter'
+import { ACTIONS, HAND_IN_MAX, NAME, WINDOW_GRACE_MS, refusals } from '../hooks/meter'
 import { BAND, DEBUG_PATH, FAKE_LOG, FLEET, REF, ROOT, SID, decide, fleet, row, sessionsSay, startSession, world, type World, WITH_SESSIONS } from './world'
 import { PROJECT } from './up.test'
 
@@ -88,7 +88,13 @@ const logged = (w: World): any[] =>
     .split('\n')
     .filter(Boolean)
     .map(l => JSON.parse(l))
-const handIns = (w: World): any[] => logged(w).filter(x => x.debugReport).map(x => x.debugReport)
+const handIns = (w: World): any[] => {
+  const all = logged(w).filter(x => x.debugReport).map(x => x.debugReport)
+  // Each one must pass the rules of sessions' checker (a refusal there is a hand-in lost). A plugin's tests can't
+  // import another plugin's file, so meter.ts's refusals holds the same rules
+  for (const h of all) expect(refusals(h.data)).toEqual([])
+  return all
+}
 const windowAsks = (w: World): number => logged(w).filter(x => x.debugWindow).length
 
 // Owner B lands a change to a shared file, as a fleet of this version writes it: the file, its event, and
@@ -190,7 +196,9 @@ test('a window opens and closes: one hand-in, in the shape sessions takes; a sec
   expect(d.partial).toBe(undefined)
   expect(d.to - d.from).toBe(3 * MIN)
   expect(refusals(d)).toEqual([])
-  expect(d.facts).toMatchObject({ kind: 'instance', sweeps: false, live: 'claude', pace: 'quiet', wakes: 'open', world: 'on', turn: false, role: { label: 'role', key: 'owner' } })
+  expect(d.facts).toMatchObject({ version: 'v0.1.0', kind: 'instance', sweeps: false, live: 'claude', pace: 'quiet', wakes: 'open', world: 'on', turn: false, role: { label: 'role', key: 'owner' } })
+  // The fields sessions' format has, and no other
+  expect(Object.keys(d).sort()).toEqual(['actions', 'facts', 'format', 'from', 'holdings', 'loadedAt', 'to', 'totals'])
   // The actions of an idle instance, each under its declared name, with what makes it run and what it grows with
   for (const name of ['latest.changed', 'landing.chain', 'instance.tick', 'heartbeat', 'world.tick', 'lease', 'deliver', 'beat', 'needs', 'nudge.pass:minute']) expect(Object.keys(d.actions)).toContain(name)
   for (const [name, a] of Object.entries(d.actions as Record<string, any>)) {
@@ -340,8 +348,8 @@ test('a window whose close never came ends by itself: the first count past its e
   await startSession($, w)
   await goLive($, w)
   await idle(w, 2, 'other')
-  // 40 ms of window (the meter's own clock is the system's)
-  await ring($, w, true, REPORT, 40)
+  // A window that ends 40 ms from now, its grace included (the meter's own clock is the system's)
+  await ring($, w, true, REPORT, 40 - WINDOW_GRACE_MS)
   await idle(w, 1, 'other')
   await realMs(80)
   const asks = windowAsks(w)
@@ -440,9 +448,24 @@ test('the declared table itself: every action, word and part is of the pattern, 
     for (const dr of a.drivers) expect(['clock', 'self', 'person', 'peer']).toContain(dr)
     if (a.within) expect(Object.keys(ACTIONS)).toContain(a.within)
   }
-  expect(refusals({ a: 'Not A Word' })).toEqual(['data.a: the word "Not A Word"'])
-  expect(refusals({ 'a key': 1 })).toEqual(['data: the key "a key"'])
-  expect(refusals({ a: { label: 'person', key: 'x' } })).toEqual(['data.a: the label "person"'])
+  // What sessions' checker refuses, refusals names: a key the format doesn't have, a word off the pattern, a number
+  // that isn't a count, a driver or a label it doesn't know
+  const ok = { format: 1, loadedAt: 1, from: 2, to: 3, facts: {}, actions: {}, totals: { work: {}, failed: {}, sent: {}, started: {}, bytesRead: 0, bytesWritten: 0 }, holdings: {} }
+  const one = { drivers: ['clock'], grows: [], runs: 1, ms: 0, slowest: 0, mostWork: 0, work: {}, failed: {}, sent: {}, started: {}, bytesRead: 0, bytesWritten: 0 }
+  expect(refusals(ok)).toEqual([])
+  expect(refusals({ ...ok, actions: { beat: one }, holdings: { seen: { grows: ['landings'], open: [1, null], close: [2, 40] } }, project: { roster: { idle: 2 } }, partial: 'reloaded' })).toEqual([])
+  expect(refusals({ ...ok, extra: 1 }).length).toBe(1)
+  expect(refusals({ ...ok, format: 2 }).length).toBe(1)
+  expect(refusals({ ...ok, facts: { live: 'Not A Word' } }).length).toBe(1)
+  expect(refusals({ ...ok, facts: { 'a key': 1 } }).length).toBe(1)
+  expect(refusals({ ...ok, facts: { n: -1 } }).length).toBe(1)
+  expect(refusals({ ...ok, facts: { who: { label: 'person', key: 'x' } } }).length).toBe(1)
+  expect(refusals({ ...ok, facts: { who: { label: 'role', key: 'x', more: 1 } } }).length).toBe(1)
+  expect(refusals({ ...ok, actions: { beat: { ...one, drivers: ['moon'] } } }).length).toBe(1)
+  expect(refusals({ ...ok, actions: { beat: { ...one, note: 'x' } } }).length).toBe(1)
+  expect(refusals({ ...ok, actions: { beat: { ...one, ms: Number.NaN } } }).length).toBe(1)
+  expect(refusals({ ...ok, holdings: { seen: { grows: [], open: [1, null], close: null } } }).length).toBe(1)
+  expect(refusals({ ...ok, partial: 'late' }).length).toBe(1)
 })
 
 // ---- Holdings, and the project's part ----

@@ -127,8 +127,10 @@ export type ActionName = keyof typeof ACTIONS
 
 /** The pattern every key and every word of a hand-in matches (sessions' writer refuses anything else) */
 export const NAME = /^[a-z][A-Za-z0-9.:-]{0,47}$/
-/** A hand-in's top size, as sessions refuses a larger one */
-export const HAND_IN_MAX = 256 * 1024
+/** A hand-in's top size, as sessions refuses a larger one (characters as JSON) */
+export const HAND_IN_MAX = 262144
+/** How long past its end a window still counts, for a close that comes a little late (as sessions' own meter does) */
+export const WINDOW_GRACE_MS = 30000
 
 /** Programs fleet starts that are printed by name; any other is a project's own (`other`, with its purpose) */
 const PROGRAMS = new Set(['mv', 'ln', 'rm', 'mkdir', 'git', 'sh', 'python3', 'kill', 'ssh', 'claude'])
@@ -150,7 +152,7 @@ export type HandIn = {
   facts: Record<string, Value>
   actions: Record<string, { drivers: readonly Driver[]; grows: readonly string[]; within?: string } & Totals>
   totals: { work: Counts; failed: Counts; sent: Counts; started: Counts; bytesRead: number; bytesWritten: number }
-  holdings: Record<string, { grows: readonly string[]; open: [number, number | null] | null; close: [number, number | null] | null }>
+  holdings: Record<string, { grows: readonly string[]; open: [number, number | null]; close: [number, number | null] }>
   project?: Record<string, Record<string, Value>>
 }
 
@@ -179,7 +181,7 @@ export const M = {
 /** When this module loaded, by the system's clock: a hand-in says so, and a window that opened before it is partial */
 export const LOADED_AT = Date.now()
 
-/** A window opens: every counter from zero. `msLeft`: how long until it ends by itself */
+/** A window opens: every counter from zero. `msLeft`: how long until it ends by itself (its end, and the grace) */
 export function meterOpen(report: string, from: number, msLeft: number) {
   M.actions = new Map()
   M.totals = fresh()
@@ -476,7 +478,8 @@ export function snapshot(to: number, facts: Record<string, Value>, holdings: Rec
     if (!NAME.test(name)) continue
     const a = M.holdingsAtOpen?.[name]
     const b = holdings?.[name]
-    held[name] = { grows: (b ?? a)?.grows ?? [], open: a ? [a.count, a.bytes] : null, close: b ? [b.count, b.bytes] : null }
+    // (a holding seen at one end only is none at the other: sessions takes a count and a size for both)
+    held[name] = { grows: (b ?? a)?.grows ?? [], open: a ? [a.count, a.bytes] : [0, null], close: b ? [b.count, b.bytes] : [0, null] }
   }
   return {
     format: 1,
@@ -492,34 +495,93 @@ export function snapshot(to: number, facts: Record<string, Value>, holdings: Rec
   }
 }
 
-/** What in a hand-in the writer would refuse: a key or a word off the pattern, a value that isn't a number, a boolean,
- * such a word or a label. Empty when it would pass (the tests hold fleet to it) */
+/** What sessions' checker would refuse in a hand-in, each with where: the same rules as its checkHandIn (a plugin's
+ * tests can't import another plugin's file, so fleet's tests hold fleet to them here). The fields its format has and
+ * no other; every key and word of the pattern; every number finite and not negative; drivers and labels it knows;
+ * a holding with a count and a size at both ends. Empty when it would pass */
 export function refusals(data: unknown): string[] {
   const out: string[] = []
-  const word = (v: unknown, at: string) => {
-    if (typeof v === 'number' || typeof v === 'boolean' || v === null) return
-    if (typeof v === 'string') {
-      if (!NAME.test(v)) out.push(`${at}: the word ${JSON.stringify(v)}`)
-      return
-    }
-    if (Array.isArray(v)) {
-      v.forEach((x, i) => word(x, `${at}[${i}]`))
-      return
-    }
-    if (v && typeof v === 'object') {
-      const o = v as Record<string, unknown>
-      if (typeof o.label === 'string' && typeof o.key === 'string' && Object.keys(o).length === 2) {
-        if (o.label !== 'role' && o.label !== 'session') out.push(`${at}: the label ${JSON.stringify(o.label)}`)
-        return
-      }
-      for (const [k, x] of Object.entries(o)) {
-        if (!NAME.test(k)) out.push(`${at}: the key ${JSON.stringify(k)}`)
-        word(x, `${at}.${k}`)
-      }
-      return
-    }
-    out.push(`${at}: ${typeof v}`)
+  const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+  const amount = (x: unknown, at: string) => {
+    if (!(typeof x === 'number' && Number.isFinite(x) && x >= 0)) out.push(`${at}: not a count (${String(x)})`)
   }
-  word(data, 'data')
+  const word = (x: unknown, at: string) => {
+    if (!(typeof x === 'string' && NAME.test(x))) out.push(`${at}: the word ${JSON.stringify(x)}`)
+  }
+  const words = (x: unknown, at: string) => {
+    if (!Array.isArray(x)) out.push(`${at}: not a list`)
+    else x.forEach((v, i) => word(v, `${at}[${i}]`))
+  }
+  const fields = (x: unknown, at: string, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> | null => {
+    if (!isRecord(x)) {
+      out.push(`${at}: not an object`)
+      return null
+    }
+    const keys = Object.keys(x).filter(k => x[k] !== undefined)
+    for (const k of keys) if (!required.includes(k) && !optional.includes(k)) out.push(`${at}: the key ${JSON.stringify(k)} isn't in the format`)
+    for (const k of required) if (!keys.includes(k)) out.push(`${at}: no ${k}`)
+    return x
+  }
+  const named = (x: unknown, at: string, each: (v: unknown, at: string) => void) => {
+    if (!isRecord(x)) {
+      out.push(`${at}: not an object`)
+      return
+    }
+    for (const [k, v] of Object.entries(x)) {
+      if (!NAME.test(k)) out.push(`${at}: the key ${JSON.stringify(k)}`)
+      each(v, `${at}.${k}`)
+    }
+  }
+  const counts = (x: unknown, at: string) => named(x, at, amount)
+  const value = (x: unknown, at: string) => {
+    if (typeof x === 'boolean') return
+    if (typeof x === 'number') return amount(x, at)
+    if (typeof x === 'string') return word(x, at)
+    if (!isRecord(x) || Object.keys(x).length !== 2 || (x.label !== 'session' && x.label !== 'role') || typeof x.key !== 'string' || !x.key) out.push(`${at}: not a label`)
+  }
+  const values = (x: unknown, at: string) => named(x, at, value)
+  const WORK = ['work', 'failed', 'sent', 'started', 'bytesRead', 'bytesWritten']
+  const worked = (a: Record<string, unknown>, at: string) => {
+    counts(a.work, `${at}.work`)
+    counts(a.failed, `${at}.failed`)
+    counts(a.sent, `${at}.sent`)
+    counts(a.started, `${at}.started`)
+    amount(a.bytesRead, `${at}.bytesRead`)
+    amount(a.bytesWritten, `${at}.bytesWritten`)
+  }
+  const tuple = (x: unknown, at: string) => {
+    if (!Array.isArray(x) || x.length !== 2) return void out.push(`${at}: not a count and a size`)
+    amount(x[0], `${at}[0]`)
+    if (x[1] !== null) amount(x[1], `${at}[1]`)
+  }
+  const d = fields(data, 'data', ['format', 'loadedAt', 'from', 'to', 'facts', 'actions', 'totals', 'holdings'], ['partial', 'project'])
+  if (!d) return out
+  if (d.format !== 1) out.push(`data.format: ${String(d.format)}`)
+  if (d.partial !== undefined && d.partial !== 'reloaded') out.push(`data.partial: ${String(d.partial)}`)
+  amount(d.loadedAt, 'data.loadedAt')
+  amount(d.from, 'data.from')
+  amount(d.to, 'data.to')
+  values(d.facts, 'data.facts')
+  named(d.actions, 'data.actions', (v, at) => {
+    const a = fields(v, at, ['drivers', 'grows', 'runs', 'ms', 'slowest', 'mostWork', ...WORK], ['within'])
+    if (!a) return
+    if (!Array.isArray(a.drivers) || a.drivers.some(x => x !== 'clock' && x !== 'self' && x !== 'person' && x !== 'peer')) out.push(`${at}.drivers: ${JSON.stringify(a.drivers)}`)
+    words(a.grows, `${at}.grows`)
+    if (a.within !== undefined) word(a.within, `${at}.within`)
+    for (const k of ['runs', 'ms', 'slowest', 'mostWork']) amount(a[k], `${at}.${k}`)
+    worked(a, at)
+  })
+  const totals = fields(d.totals, 'data.totals', WORK)
+  if (totals) worked(totals, 'data.totals')
+  named(d.holdings, 'data.holdings', (v, at) => {
+    const h = fields(v, at, ['grows', 'open', 'close'])
+    if (!h) return
+    words(h.grows, `${at}.grows`)
+    tuple(h.open, `${at}.open`)
+    tuple(h.close, `${at}.close`)
+  })
+  if (d.project !== undefined) named(d.project, 'data.project', values)
+  if (isRecord(d.actions) && Object.keys(d.actions).length > 400) out.push('data.actions: more than 400')
+  if (isRecord(d.holdings) && Object.keys(d.holdings).length > 400) out.push('data.holdings: more than 400')
   return out
 }

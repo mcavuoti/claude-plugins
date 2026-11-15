@@ -381,7 +381,7 @@ import {
   type WakeCount,
   type WaveFacts,
 } from './roster'
-import { ACTIONS, HAND_IN_MAX, M, NAME, below, bytesRead as mBytesRead, bytesWritten as mBytesWritten, failed as mFailed, mark as mMark, meterHold, meterOff, meterOpen, note as mNote, noteSet as mNoteSet, purposeOf, run as runAction, sent as mSent, signalOf, sized, snapshot as meterSnapshot, started as mStarted, work as mWork, under, type ActionName, type Holding, type Value } from './meter'
+import { ACTIONS, HAND_IN_MAX, M, NAME, WINDOW_GRACE_MS, below, bytesRead as mBytesRead, bytesWritten as mBytesWritten, failed as mFailed, mark as mMark, meterHold, meterOff, meterOpen, note as mNote, noteSet as mNoteSet, purposeOf, run as runAction, sent as mSent, signalOf, sized, snapshot as meterSnapshot, started as mStarted, work as mWork, under, type ActionName, type Holding, type Value } from './meter'
 import { dateLine, groupedLines, localFleetLine, localFleetRecords, modelDiffers } from './roster'
 import {
   CONFIRM_DESCRIPTION,
@@ -859,7 +859,8 @@ async function debugRung($: any) {
     if (M.report === win.report && (M.on || M.expired)) return
     const held = await holdingsNow($)
     const now = await $.clock.now()
-    const left = Number(win.until) - now
+    // (its end, and the grace a late close gets, as sessions' own meter gives it)
+    const left = Number(win.until) + WINDOW_GRACE_MS - now
     if (!(left > 0)) return
     // (written before the counting starts: it isn't the window's work)
     await touched(update($, debugOpen, () => String(win.report)))
@@ -897,7 +898,10 @@ async function debugHandIn($: any, report: string) {
   // (the hand-in goes whatever becomes of this write)
   await touched(update($, debugOpen, () => '')).catch(() => {})
   // Past sessions' limit (it never should be): the parts that can go, go
-  if (JSON.stringify(data).length > HAND_IN_MAX) data = { ...data, holdings: {}, project: undefined }
+  if (JSON.stringify(data).length > HAND_IN_MAX) {
+    const { project: _dropped, ...rest } = data
+    data = { ...rest, holdings: {} }
+  }
   const r: any = await race($, () => $.sessions.debugReport({ source: 'fleet', report, data }))
   if (r?.ok) log($, `debug: handed in for report ${report}${data.partial ? ' (partial: reloaded)' : ''}`)
   else log($, `debug: the hand-in for report ${report} wasn't taken (${r ? (r.detail ?? r.reason ?? 'refused') : 'sessions did not answer'})`)
@@ -909,6 +913,7 @@ async function debugFacts($: any): Promise<Record<string, Value>> {
   const now = await $.clock.now()
   const threads = await read($, reads)
   return {
+    ...(version && NAME.test(`v${version}`) ? { version: `v${version}` } : {}),
     kind: inst ? 'instance' : jobRef ? 'background' : 'person',
     sweeps: sweep.holding,
     live: !live ? 'timers' : ownWatchLive ? 'own' : 'claude',
