@@ -87,6 +87,7 @@ import {
   wakeStagger,
   afterTick,
   rowsBelow,
+  wrappedLines,
   diedWithService,
   endedShown,
   clockText,
@@ -1044,4 +1045,19 @@ test('rows below the panel: the session rows and folded sections past its height
   expect(rowsBelow(items, 20, 3)).toBe(0)
   expect(rowsBelow(items, 8, 3)).toBe(2)
   expect(rowsBelow(items, 3, 3)).toBe(4)
+})
+
+test('wrappedLines: a row that wraps between its items, by their widths', () => {
+  // The panel's actions and the keyboard help, in a panel of 49 columns: three lines
+  const actions = [7, 3, 10, 3, 9, 3, 6, 3, 9, 3, 10, 3, 11]
+  expect(wrappedLines([...actions, 28], 49)).toBe(3)
+  expect(wrappedLines([...actions, 37], 49)).toBe(3)
+  // Wide enough for all of it, and for all but the help
+  expect(wrappedLines([...actions, 28], 120)).toBe(1)
+  expect(wrappedLines([...actions, 28], 90)).toBe(2)
+  // An item wider than the line wraps by itself, and the next one goes on after it
+  expect(wrappedLines([7, 3, 60], 20)).toBe(4)
+  expect(wrappedLines([45, 3], 20)).toBe(3)
+  expect(wrappedLines([40, 3], 20)).toBe(3)
+  expect(wrappedLines([], 20)).toBe(1)
 })

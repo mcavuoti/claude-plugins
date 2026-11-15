@@ -86,6 +86,7 @@ import {
   wakeStagger,
   afterTick,
   rowsBelow,
+  wrappedLines,
   shellQuote,
   isRef,
   recordBehind,
@@ -6642,7 +6643,24 @@ export const register: Register = (on, options) => {
     const help = e.props.isFocused ? (overflows ? '↑↓ Select · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
     // How many sessions (or folded sections) don't fit below: said at the top, where it's always in view, so a running
     // session past the bottom edge isn't taken for a missing one
-    const above = (inTerminal ? 1 : 0) + 1 + 1 + (note !== '' ? 1 : 0) + (about.waitingOnly ? 1 : 0)
+    // The line of actions at the top, in the order drawn: each letter is a button (its key, or a click)
+    const actions: { key: string; hotkey: string; label: string; bright?: boolean; press: () => void }[] = [
+      { key: 'stop', hotkey: 's', label: 'Stop', press: () => bg(stopSelected($)) },
+      { key: 'restart', hotkey: 'u', label: 'Restart', press: () => bg(restartSelected($)) },
+      { key: 'rename', hotkey: 'r', label: 'Rename', press: () => bg(toggleRename($)) },
+      { key: 'new', hotkey: 'n', label: 'New', press: () => { toggleNew($) } },
+      { key: 'agents', hotkey: 'a', label: 'Agents', press: () => bg(openAgentsView($)) },
+      // f: only the sessions waiting for you (drawn bright while it's on)
+      { key: 'waiting', hotkey: 'f', label: 'Waiting', bright: about.waitingOnly, press: () => bg(toggleWaiting($)) },
+      // c: fold the selected session's section into one line, or unfold the one selected
+      { key: 'fold', hotkey: 'c', label: 'Collapse', press: () => bg(toggleFold($)) },
+    ]
+    // The lines it takes: the row wraps between its items in the panel's width (Claude draws a button as "s: Stop"; the
+    // keyboard help after the last one is an item too)
+    const actionLines = inTerminal
+      ? wrappedLines([...actions.flatMap((a, i) => [...(i > 0 ? [3] : []), displayWidth(`${a.hotkey}: ${a.label}`)]), displayWidth(` · ${help}`)], e.props.bodyColumns ?? 48)
+      : 0
+    const above = actionLines + 1 + 1 + (note !== '' ? 1 : 0) + (about.waitingOnly ? 1 : 0)
     const below = overflows
       ? rowsBelow(
           plan.map(it => (it.kind === 'header' ? { lines: 1, counts: false } : it.kind === 'fold' ? { lines: 1, counts: true } : { lines: keepsLine(it.row) ? 2 : 1, counts: true })),
@@ -6737,24 +6755,13 @@ export const register: Register = (on, options) => {
     }
     return (
       <Box flexDirection="column" height={showUsage && bodyRows ? bodyRows : undefined}>
-        {/* A single line of actions at the top: the letters are buttons (key or click), followed by the keyboard help */}
+        {/* The actions at the top, followed by the keyboard help: one row, which wraps where the panel is narrower than it */}
         {inTerminal && (
           <Box flexDirection="row" flexWrap="wrap">
-            <Button key="stop" plain dimColor hotkey="s" label="Stop" onPress={() => { bg(stopSelected($)) }} />
-            <Text dimColor> · </Text>
-            <Button key="restart" plain dimColor hotkey="u" label="Restart" onPress={() => { bg(restartSelected($)) }} />
-            <Text dimColor> · </Text>
-            <Button key="rename" plain dimColor hotkey="r" label="Rename" onPress={() => { bg(toggleRename($)) }} />
-            <Text dimColor> · </Text>
-            <Button key="new" plain dimColor hotkey="n" label="New" onPress={() => toggleNew($)} />
-            <Text dimColor> · </Text>
-            <Button key="agents" plain dimColor hotkey="a" label="Agents" onPress={() => { bg(openAgentsView($)) }} />
-            <Text dimColor> · </Text>
-            {/* f: only the sessions waiting for you (drawn bright while it's on) */}
-            <Button key="waiting" plain dimColor={about.waitingOnly ? undefined : true} hotkey="f" label="Waiting" onPress={() => { bg(toggleWaiting($)) }} />
-            <Text dimColor> · </Text>
-            {/* c: fold the selected session's section into one line, or unfold the one selected */}
-            <Button key="fold" plain dimColor hotkey="c" label="Collapse" onPress={() => { bg(toggleFold($)) }} />
+            {actions.flatMap((a, i) => [
+              ...(i > 0 ? [<Text key={`dot:${a.key}`} dimColor> · </Text>] : []),
+              <Button key={a.key} plain dimColor={a.bright ? undefined : true} hotkey={a.hotkey} label={a.label} onPress={() => { a.press() }} />,
+            ])}
             <Text dimColor>{` · ${help}`}</Text>
           </Box>
         )}

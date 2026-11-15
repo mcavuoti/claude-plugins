@@ -714,6 +714,28 @@ test('the panel overflows: a "more below" line at the top, and only the rows tha
   expect(text).not.toContain('main moved under 1 file')
 })
 
+test('the "more below" count takes the lines the actions at the top wrap into: 15 sessions in a panel of 49 columns and 13 rows', async ($, on) => {
+  const many = Array.from({ length: 14 }, (_, i) => {
+    const n = String(i).padStart(2, '0')
+    return { id: `dddddd${n}`, sessionId: `dddddd${n}-0000-0000-0000-000000000000`, cwd: ROOT, kind: 'background', status: 'idle', pid: 5000 + i, name: `session ${n}` }
+  })
+  const w = world(on, { list: [list()[0], ...many] })
+  await startSession($, w)
+  await w.clock.advance(4000)
+  // Three lines of actions, a blank one and the "more below" line: 8 of the 13 rows are left for the list
+  const narrow = { ...PANEL, props: { ...PANEL.props, bodyColumns: 49, scroll: { offset: 0, bodyRows: 13 } }, viewport: { rows: 20, columns: 150, isFullscreen: true } }
+  const ui = await $.ui.mount(narrow as any)
+  const text = JSON.stringify(await ui.drawn())
+  await ui.unmount()
+  expect(text).toContain('↓ 7 more below')
+  // A panel wide enough for the actions and the help on one line has two rows more
+  const wide = { ...PANEL, props: { ...PANEL.props, bodyColumns: 120, scroll: { offset: 0, bodyRows: 13 } }, viewport: { rows: 20, columns: 150, isFullscreen: true } }
+  const again = await $.ui.mount(wide as any)
+  const wideText = JSON.stringify(await again.drawn())
+  await again.unmount()
+  expect(wideText).toContain('↓ 5 more below')
+})
+
 // A list taller than the panel, with the keyboard in it: Claude's ↑ and ↓ ask to move its window a row (ui.scroll, from
 // the person, with no pointer) where they'd offer the next element if the list fit. The selected row is the one the
 // panel draws with autoFocus (the mod's own moves of the focus don't land in the kit), and what the mod passes on to
