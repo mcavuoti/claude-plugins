@@ -534,8 +534,8 @@ function ringHere($: any, kinds: readonly ('deliver' | 'beat' | 'sweep')[]) {
 }
 async function rung($: any, kinds: ReadonlySet<'deliver' | 'beat' | 'sweep'>) {
   if (!timersOn) return
-  if (kinds.has('deliver') && jobRef) await deliverChain($)
-  if (kinds.has('beat')) await beatOnce($)
+  if (kinds.has('deliver') && jobRef) await act('deliver', () => deliverChain($))
+  if (kinds.has('beat')) await act('beat', () => beatOnce($))
   if (kinds.has('sweep') && sweep.holding) await sweepTick($)
 }
 /** A submit that failed is tried again 30 s later (retryAt): live, the delivery pass is told then */
@@ -609,6 +609,7 @@ function scheduleOwnWatch($: any, ms: number) {
   })
 }
 async function startOwnWatch($: any) {
+  if (M.on) mMark('watch')
   if (ownWatch || live || !timersOn || !root) return
   const h: OwnWatch = { how: '', pid: '', readyAt: 0, stopping: false }
   ownWatch = h
@@ -705,8 +706,23 @@ function stopOwnWatch($: any) {
   h.stopping = true
   if (h.pid) bg(run($, ['kill', h.pid]))
 }
+/** What a watched path's change is, for the meter */
+function changedAction(path: string): ActionName {
+  if (path.endsWith('/.claude/fleet/events/latest')) return 'latest.changed'
+  if (path.endsWith('/.claude/fleet/inbox/latest')) return 'inbox.changed'
+  if (path.includes('/.claude/fleet/decisions/queue/')) return 'queue.changed'
+  if (path.includes('/.claude/fleet/decisions/answers/')) return 'answers.changed'
+  if (path.includes('/.claude/fleet/decisions/overrules/')) return 'overrules.changed'
+  const at = path.lastIndexOf('/.claude/fleet/bell/')
+  if (at !== -1) {
+    const name = `bell:${path.slice(at + '/.claude/fleet/bell/'.length)}`
+    return name in ACTIONS ? (name as ActionName) : 'bell:other'
+  }
+  return path === debugFile ? 'debug.changed' : 'bell:other'
+}
 /** A watched path changed: Claude said so (engine) or fleet's own watch did. The same code the timers run */
 function fileChanged($: any, path: string, engine: boolean) {
+  if (M.on) mMark(changedAction(path))
   digestGen++
   const bellAt = path.lastIndexOf('/.claude/fleet/bell/')
   if (bellAt !== -1) bellRang(path.slice(bellAt + '/.claude/fleet/bell/'.length))
@@ -1082,6 +1098,11 @@ async function run($: any, argv: string[], opts: { cwd?: string; timeoutMs?: num
     return { exitCode: late ? 124 : 127, stdout: '', stderr: String(err) }
   }
 }
+/** A file put in place that other sessions watch (a question, an answer, an overrule): a signal sent, for the meter */
+function signalled(path: string) {
+  const signal = signalOf(path)
+  if (signal) mSent(signal)
+}
 /** What a process fleet starts is for, when its caller doesn't say (opts.as): by the file it's about */
 function startedFor(argv: readonly string[]): string {
   const prog = String(argv[0] ?? '')
@@ -1154,6 +1175,24 @@ function fsExists($: any, ...a: any[]): Promise<boolean> {
     mFailed('exists')
     throw err
   })
+}
+/** A call to a model, counted with its tokens */
+function modelCall($: any, request: any): Promise<any> {
+  if (!M.on) return $.model.complete(request)
+  mWork('model')
+  return $.model.complete(request).then(
+    (r: any) => {
+      const u = r?.usage ?? {}
+      const tokens = Number(u.input_tokens ?? 0) + Number(u.output_tokens ?? 0) + Number(u.cache_read_input_tokens ?? 0) + Number(u.cache_creation_input_tokens ?? 0)
+      if (tokens > 0) mWork('tokens', tokens)
+      if (r && r.isAnswered === false) mFailed('model')
+      return r
+    },
+    (err: unknown) => {
+      mFailed('model')
+      throw err
+    },
+  )
 }
 /** A $.state read, counted (the read's atom stays a literal at the call, for the engine's scan) */
 function stateRead<T>(p: T): T {
@@ -1232,7 +1271,10 @@ async function publishOnce($: any, path: string, text: string): Promise<'ok' | '
     r = await run($, ['ln', tmp, path])
   }
   await run($, ['rm', '-f', tmp])
-  if (r.exitCode === 0) return 'ok'
+  if (r.exitCode === 0) {
+    if (M.on) signalled(path)
+    return 'ok'
+  }
   return (await exists($, path)) ? 'exists' : 'failed'
 }
 
@@ -1261,6 +1303,7 @@ async function publishAll($: any, items: readonly { path: string; text: string }
     for (const line of r.stdout.split('\n')) {
       const m = /^(ok|exists|failed) (.+)$/.exec(line)
       if (m) out.set(m[2] as string, m[1] as 'ok' | 'exists' | 'failed')
+      if (m && m[1] === 'ok' && M.on) signalled(m[2] as string)
     }
     // What the shell didn't report (cut short: a timeout): one by one, its own leftovers removed first. One it linked
     // before it was cut comes back "exists": its caller tells its own from another's by the text
@@ -1280,6 +1323,7 @@ async function replace($: any, path: string, text: string): Promise<boolean> {
     const tmp = await tmpFile($, text)
     const r = await run($, ['mv', '-f', tmp, path])
     if (r.exitCode !== 0) await run($, ['rm', '-f', tmp])
+    else if (M.on) signalled(path)
     return r.exitCode === 0
   } finally {
     // A read that went out between the first wrote() and the move may have found it missing: forgotten again
@@ -1477,18 +1521,18 @@ function timers($: any) {
     // A slot it waits for in a line it joined before a reload: watched again
     $.clock.after(0, () => bg((async () => ((await stateRead(read($, slotWait))).length ? watchSlots($) : undefined))()))
     // An instance of the roster: its binding, heartbeat and spend; its seed, and its nudges
-    $.clock.after(1500, () => bg(instanceTick($)))
-    $.clock.every(30000, () => bg(instanceTick($)))
+    $.clock.after(1500, () => tick('instance.tick', () => instanceTick($)))
+    $.clock.every(30000, () => tick('instance.tick', () => instanceTick($)))
     // Its nudges: a pass every minute, and soon after what they act on moved (kickNudge)
-    $.clock.every(NUDGE_PASS_MS, () => bg(runNudge($)))
+    $.clock.every(NUDGE_PASS_MS, () => tick('nudge.pass:minute', () => runNudge($)))
     kickNudge($, 5000)
   }
   $.clock.after(0, () => bg(startWorld($)))
   $.clock.after(0, () => bg(restoreMark($)))
   // What fleet needs and doesn't find, for the band: looked at now and each minute (sessions may still be starting)
-  $.clock.after(0, () => bg(refreshNeeds($)))
-  $.clock.every(60000, () => bg(refreshNeeds($)))
-  $.clock.after(1000, () => bg(beatOnce($)))
+  $.clock.after(0, () => tick('needs', () => refreshNeeds($)))
+  $.clock.every(60000, () => tick('needs', () => refreshNeeds($)))
+  $.clock.after(1000, () => tick('beat', () => beatOnce($)))
 }
 
 // The pace of delivery, the world and the beat (0.14.1): one set of timers at a time, the one the session's state calls
@@ -1525,27 +1569,31 @@ function pace($: any) {
     let beatTicks = 0
     if (jobRef)
       paceTimers.push(
-        $.clock.every(2000, () => {
-          if (live && ++deliverTicks % 30 !== 0) return
-          bg(deliverChain($))
-        }),
+        $.clock.every(2000, () =>
+          tick('deliver', () => {
+            if (live && ++deliverTicks % 30 !== 0) return
+            return deliverChain($)
+          }),
+        ),
       )
-    paceTimers.push($.clock.every(2000, () => bg(worldTick($))))
+    paceTimers.push($.clock.every(2000, () => tick('world.tick', () => worldTick($))))
     paceTimers.push(
-      $.clock.every(10000, () => {
-        if (live && !sweep.holding && !sweep.takenAt && ++beatTicks % 6 !== 0) return
-        bg(beatOnce($))
-      }),
+      $.clock.every(10000, () =>
+        tick('beat', () => {
+          if (live && !sweep.holding && !sweep.takenAt && ++beatTicks % 6 !== 0) return
+          return beatOnce($)
+        }),
+      ),
     )
     return
   }
-  if (jobRef) paceTimers.push($.clock.every(QUIET_PASS_MS, () => bg(deliverChain($))))
+  if (jobRef) paceTimers.push($.clock.every(QUIET_PASS_MS, () => tick('deliver', () => deliverChain($))))
   if (set === 'sweeper') {
-    paceTimers.push($.clock.every(WORLD_SLOW_MS, () => bg(worldTick($))))
-    paceTimers.push($.clock.every(10000, () => bg(beatOnce($))))
+    paceTimers.push($.clock.every(WORLD_SLOW_MS, () => tick('world.tick', () => worldTick($))))
+    paceTimers.push($.clock.every(10000, () => tick('beat', () => beatOnce($))))
   } else {
-    paceTimers.push($.clock.every(QUIET_LEASE_MS, () => bg(worldTick($))))
-    paceTimers.push($.clock.every(QUIET_PASS_MS, () => bg(beatOnce($))))
+    paceTimers.push($.clock.every(QUIET_LEASE_MS, () => tick('world.tick', () => worldTick($))))
+    paceTimers.push($.clock.every(QUIET_PASS_MS, () => tick('beat', () => beatOnce($))))
   }
 }
 
@@ -2567,7 +2615,7 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
     return pulling
   }
   const readsBefore = chainReads
-  pulling = (async () => {
+  pulling = act('landing.pull', () => (async () => {
     const now = await $.clock.now()
     const folders = windowFolders(now, hours)
     for (let i = 0; i < folders.length; i++) {
@@ -2627,7 +2675,7 @@ function pullEvents($: any, hours = 2, indexed = false): Promise<void> {
     // Whole as of its listings: the reads by chain before it began are covered
     chainReadsPulled = Math.max(chainReadsPulled, readsBefore)
     settleLanded($)
-  })()
+  })())
     .catch(() => {})
     .finally(() => {
       pulling = null
@@ -2735,8 +2783,8 @@ function settleLanded($: any) {
       // Its wakes are shut (their window, or the day's count, as its last pass found them): a landing can't nudge it
       // before they open, and the pass set for that moment, or the minute's, has what landed meanwhile
       const t = await $.clock.now()
-      if (now && t >= nudgeShutUntil) kickNudge($)
-      if (later && t + FLAG_SETTLE_MS >= nudgeShutUntil) kickNudge($, FLAG_SETTLE_MS)
+      if (now && t >= nudgeShutUntil) kickNudge($, 0, 'landing')
+      if (later && t + FLAG_SETTLE_MS >= nudgeShutUntil) kickNudge($, FLAG_SETTLE_MS, 'landing')
     })(),
   )
 }
@@ -2854,7 +2902,10 @@ async function pullWhole($: any) {
 
 /** events/latest moved: the events its chain names after the one this session held, read one by one; a whole pull
  * when the chain doesn't reach back to it (then this session holds everything up to what latest named, again) */
-async function pullLatest($: any) {
+function pullLatest($: any): Promise<void> {
+  return act('landing.chain', () => pullLatestNow($))
+}
+async function pullLatestNow($: any) {
   const cur = parseLatest(await readText($, `${eventsDir()}/latest`))
   const from = cur?.chain && eventCursor !== null ? (cur.last === eventCursor ? cur.chain.length - 1 : cur.chain.lastIndexOf(eventCursor)) : -1
   if (!cur || !cur.chain || from === -1) {
@@ -3043,7 +3094,10 @@ async function flushReads($: any) {
   await saveReads($)
 }
 
-async function saveReads($: any) {
+function saveReads($: any) {
+  return act('reads.save', () => saveReadsNow($))
+}
+async function saveReadsNow($: any) {
   const mark = root ? await stateRead(read($, outside)) : null
   if (!worldOn() && !mark) return
   const sessionId = String(await $.session.id())
@@ -4724,7 +4778,10 @@ function authorOf(r: RunningNow, since: number, mtime: number | null, waited = f
 
 // A change nobody's event explains, still so a scan later, is recorded as outside fleet (an editor, a script, a session
 // without fleet), claimed no-clobber so that one session of the project records it
-async function scanWorld($: any) {
+function scanWorld($: any) {
+  return act('outside.scan', () => scanWorldNow($))
+}
+async function scanWorldNow($: any) {
   if (!worldOn()) return
   // Past MAX_WORLD_FILES the walk stops: tried again every 10 minutes, or as soon as world.json changes
   if (tooBig && (await $.clock.now()) - tooBigAt < 10 * 60000) return
@@ -4948,7 +5005,7 @@ async function worldTick($: any) {
     // every tick, so a sweeper that stopped renewing it is replaced within LEASE_MS + 30 s (+ the taker's 2 s)
     const quiet = live && !sweep.holding
     if (now - worldTickAt < (quiet ? QUIET_PASS_MS : WORLD_SLOW_MS) - 500) {
-      if (quiet) await lease($)
+      if (quiet) await act('lease', () => lease($))
       return
     }
     worldTickAt = now
@@ -4964,7 +5021,7 @@ async function worldTick($: any) {
   await eventsTick($, true)
   // The sweeper runs whenever the project has fleet: answers to retired instances, alerts, intake and slots don't wait
   // on the world (an empty, broken, newer or too big world.json turns off only the world's own parts)
-  await lease($)
+  await act('lease', () => lease($))
   await sweepTick($)
   if (!worldOn()) return
   await loadFlags($)
@@ -5057,14 +5114,21 @@ async function releaseLease($: any) {
 
 // Every 2 s: a full sweep every 60 s, and the suspects again soon after a landing anywhere in the project. The world's
 // parts (suspects, checks, the world commit) only while the world is on and this session has its baseline
-async function sweepTick($: any) {
+function sweepTick($: any): Promise<void> {
+  // (an action for the meter only in the session that sweeps: elsewhere it ends at its first line)
+  return M.on && sweep.holding ? runAction('sweep', () => sweepNow($)) : sweepNow($)
+}
+async function sweepNow($: any) {
   if (!sweep.holding) return
   // The queue or its answers moved (a question asked, answered, closed): the ask marks follow within this tick, on a
   // flag of their own, so a long sweep (a check, the code watch's ssh, intake's model calls) doesn't hold them
   if (!sweep.asking) {
     sweep.asking = true
     try {
-      if (await decisionsMoved($)) await asksTick($, await $.clock.now())
+      if (await decisionsMoved($)) {
+        const at = await $.clock.now()
+        await act('sweep.asks', () => asksTick($, at))
+      }
     } catch (err) {
       log($, `marks: ${String(err).slice(0, 200)}`)
     } finally {
@@ -5078,30 +5142,30 @@ async function sweepTick($: any) {
   if (!full && !(sweep.dirty && worldUp) && !sweep.intakeDirty && !sweep.slotsDirty && !sweep.wakeDirty) return
   sweep.running = true
   try {
-    if (worldUp && (full || sweep.dirty)) await computeSuspects($)
-    if (full || sweep.slotsDirty) await sweepSlotsNow($).catch(err => log($, `slots: ${String(err).slice(0, 200)}`))
+    if (worldUp && (full || sweep.dirty)) await act('sweep.suspects', () => computeSuspects($))
+    if (full || sweep.slotsDirty) await act('sweep.slots', () => sweepSlotsNow($)).catch(err => log($, `slots: ${String(err).slice(0, 200)}`))
     if (full) {
       sweep.lastSweep = now
       sweep.wakeDirty = false
       // Wakes and alerts first: a check or a commit that hangs to its timeout doesn't hold them
-      await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
-      await alertsTick($).catch(err => log($, `alerts: ${String(err).slice(0, 200)}`))
-      await writeSpends($).catch(err => log($, `spends: ${String(err).slice(0, 200)}`))
-      if (worldOn()) await indexEvents($).catch(err => log($, `events index: ${String(err).slice(0, 200)}`))
+      await act('sweep.roster', () => rosterTick($)).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
+      await act('sweep.alerts', () => alertsTick($)).catch(err => log($, `alerts: ${String(err).slice(0, 200)}`))
+      await act('sweep.spends', () => writeSpends($)).catch(err => log($, `spends: ${String(err).slice(0, 200)}`))
+      if (worldOn()) await act('sweep.index', () => indexEvents($)).catch(err => log($, `events index: ${String(err).slice(0, 200)}`))
       if (worldUp) {
-        await sweepChecks($)
-        await maybeCommit($)
+        await act('sweep.checks', () => sweepChecks($))
+        await act('sweep.commit', () => maybeCommit($))
       }
       // The code watch, whatever the world: each repository polled every everyMin (a poll that hangs to its timeout
       // holds nothing above)
-      await codeTick($).catch(err => log($, `code: ${String(err).slice(0, 200)}`))
+      await act('sweep.code', () => codeTick($)).catch(err => log($, `code: ${String(err).slice(0, 200)}`))
     }
     // An answer or an overrule landed (live updates): a retired asker is woken for it now, not at the next full sweep
     if (!full && sweep.wakeDirty) {
       sweep.wakeDirty = false
-      await rosterTick($).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
+      await act('sweep.roster', () => rosterTick($)).catch(err => log($, `roster: ${String(err).slice(0, 200)}`))
     }
-    if (full || sweep.intakeDirty) await intakeTick($).catch(err => log($, `intake: ${String(err).slice(0, 200)}`))
+    if (full || sweep.intakeDirty) await act('sweep.intake', () => intakeTick($)).catch(err => log($, `intake: ${String(err).slice(0, 200)}`))
   } catch (err) {
     log($, `sweep: ${String(err).slice(0, 200)}`)
   } finally {
@@ -5588,7 +5652,7 @@ async function intakeOne($: any, c: IntakeConfig, f: { source: string; name: str
   let r: any
   let thrown: { error: unknown } | undefined
   try {
-    r = await $.model.complete({ model: c.model, system: INTAKE_SYSTEM, prompt: intakePrompt(c.tags, ids, item, body), maxTokens: 500, effort: 'low', timeoutMs: 90000 })
+    r = await modelCall($, { model: c.model, system: INTAKE_SYSTEM, prompt: intakePrompt(c.tags, ids, item, body), maxTokens: 500, effort: 'low', timeoutMs: 90000 })
     st.calls++
     st.usd = Math.round((st.usd + usageUsd(c.model, r?.usage)) * 1e6) / 1e6
     st.perSource[f.source] = (st.perSource[f.source] ?? 0) + 1
@@ -5738,7 +5802,7 @@ async function ownerOf($: any, rel: string): Promise<Who | null> {
 async function runCheck($: any, check: Check, rels: string[]) {
   const versions = new Map<string, string | null>()
   for (const rel of rels) versions.set(rel, (await versionOf($, `${realRoot}/${rel}`)).v)
-  const r = await run($, [...check.argv, ...rels], { cwd: realRoot, timeoutMs: check.timeoutMs })
+  const r = await run($, [...check.argv, ...rels], { cwd: realRoot, timeoutMs: check.timeoutMs, as: 'check' })
   const out = r.exitCode === 124 ? null : checkOutcome(rels, r)
   if (!out) {
     const why = r.exitCode === 124 ? `timed out after ${Math.round(check.timeoutMs / 1000)} s` : (r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 200) || `exit ${r.exitCode}`
@@ -5939,7 +6003,7 @@ function shownFolder(path: string): string {
 async function pollGit($: any, r: Extract<Repo, { kind: 'git' }>, had: RepoState | null, now: number, fail: (p: string) => Poll): Promise<Poll> {
   const local = realRoot || (root as string)
   const base = r.host ? r.path : r.path === '.' ? local : `${local}/${r.path}`
-  const git = (dir: string, args: readonly string[], timeoutMs = 20000): Promise<Ran> => run($, gitArgv(r, dir, args), { timeoutMs })
+  const git = (dir: string, args: readonly string[], timeoutMs = 20000): Promise<Ran> => run($, gitArgv(r, dir, args), { timeoutMs, as: 'code' })
   let note = ''
   if (r.fetch) {
     const f = await git(base, GIT.fetch(r), 60000)
@@ -5990,7 +6054,7 @@ function p4Empty(r: Ran): boolean {
 // touched (describe), kept a week; then each instance's client's open files: one opened at a revision older than an
 // upstream change's, by someone else's client, is an overlap. Only read-only commands
 async function pollP4($: any, r: Extract<Repo, { kind: 'p4' }>, had: RepoState | null, now: number, fail: (p: string) => Poll): Promise<Poll> {
-  const p4 = (client: string | null, args: readonly string[], timeoutMs = 30000): Promise<Ran> => run($, p4Argv(r, client, args), { timeoutMs })
+  const p4 = (client: string | null, args: readonly string[], timeoutMs = 30000): Promise<Ran> => run($, p4Argv(r, client, args), { timeoutMs, as: 'code' })
   let marker = had?.marker && /^\d+$/.test(had.marker) ? Number(had.marker) : null
   let changes = had?.changes ?? []
   if (marker === null) {
@@ -6044,7 +6108,7 @@ async function pollCommand($: any, r: Extract<Repo, { kind: 'command' }>, had: R
   if (!(await checksStamp($)).ok) return fail('its commands run as you: fleet runs them only once you stamp them (/fleet accept checks)', true)
   const cwd = realRoot || (root as string)
   const marker = had?.marker ?? ''
-  const c = await run($, fillWords(r.changed, { marker }), { cwd, timeoutMs: r.timeoutMs })
+  const c = await run($, fillWords(r.changed, { marker }), { cwd, timeoutMs: r.timeoutMs, as: 'code' })
   if (c.exitCode !== 0) return fail(`${r.changed.join(' ')}: ${firstLine(c)}`)
   const lines = parseUpstream(c.stdout)
   let changes = had?.changes ?? []
@@ -6059,7 +6123,7 @@ async function pollCommand($: any, r: Extract<Repo, { kind: 'command' }>, had: R
     const client = i.code[r.name]?.client ?? ''
     watched[i.slug] = client || i.name
     if (!changes.length) continue
-    const o = await run($, fillWords(r.open, { instance: i.name, slug: i.slug, client, marker: next ?? '' }), { cwd, timeoutMs: r.timeoutMs })
+    const o = await run($, fillWords(r.open, { instance: i.name, slug: i.slug, client, marker: next ?? '' }), { cwd, timeoutMs: r.timeoutMs, as: 'code' })
     if (o.exitCode !== 0) {
       unseen.add(i.slug)
       continue
@@ -6409,7 +6473,7 @@ async function sendToPerson($: any, c: Channel, text: string): Promise<{ outcome
   }
   if (c.kind === 'command') {
     if (!(await channelStamp($, c)).ok) return { outcome: 'failed', answer: 'command: not stamped (/fleet accept channel lets fleet run it)' }
-    const r = await run($, c.argv, { cwd: realRoot || (root as string), stdin: `${text}\n`, timeoutMs: 20000 })
+    const r = await run($, c.argv, { cwd: realRoot || (root as string), stdin: `${text}\n`, timeoutMs: 20000, as: 'channel' })
     const out = (r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 120) ?? ''
     if (r.exitCode === 0) return { outcome: 'sent', answer: `command: ran${out ? ` (${out})` : ''}` }
     return { outcome: r.exitCode === 124 ? 'unknown' : 'failed', answer: `command: exit ${r.exitCode}${out ? ` (${out})` : ''}` }
@@ -7316,7 +7380,10 @@ function beatSoon($: any) {
     bg(heartbeat($))
   })
 }
-async function heartbeat($: any, force = true) {
+function heartbeat($: any, force = true) {
+  return act('heartbeat', () => heartbeatNow($, force))
+}
+async function heartbeatNow($: any, force = true) {
   const inst = myInstance
   if (!inst || !root) return
   const now = await $.clock.now()
@@ -7785,7 +7852,7 @@ async function doneText($: any, r: RunFile): Promise<string | null> {
     const host = sshHost(r.host)
     const down = hostDown.get(host)
     if (down && (await $.clock.now()) < down.until) return null
-    const res = await run($, viaHost(r.host, ['cat', '--', r.done.replace(/^~\//, '')]), { timeoutMs: 30000 })
+    const res = await run($, viaHost(r.host, ['cat', '--', r.done.replace(/^~\//, '')]), { timeoutMs: 30000, as: 'runs' })
     const back = await $.clock.now()
     if (res.exitCode === 255 || res.exitCode === 124) {
       const failures = (down?.failures ?? 0) + 1
@@ -8573,7 +8640,7 @@ let nudgeLastRun = 0
 const nudgeKicks: number[] = []
 const NUDGE_FAR_SLACK_MS = 1000
 let nudgeFrom = 0
-function kickNudge($: any, delayMs = 0) {
+function kickNudge($: any, delayMs = 0, why: 'landing' | 'bell' | 'window' | 'own' = 'own') {
   if (!jobRef || !root) return
   bg(
     (async () => {
@@ -8589,7 +8656,7 @@ function kickNudge($: any, delayMs = 0) {
       $.clock.after(at - now, () => {
         const i = nudgeKicks.indexOf(at)
         if (i !== -1) nudgeKicks.splice(i, 1)
-        bg(runNudge($))
+        tick(`nudge.pass:${why}`, () => runNudge($))
       })
     })(),
   )
@@ -8603,7 +8670,10 @@ const nudgeSeen: Record<'decisions' | 'work' | 'runs' | 'budget' | 'restart', st
  * runs from then), so it's told within seconds, not at the next pass. One stat a slot; its timer runs only while it
  * waits (watchSlots, started as it joins a line). Whether it still waits */
 let slotTimes: string | null = null
-async function slotWatch($: any): Promise<boolean> {
+function slotWatch($: any): Promise<boolean> {
+  return act('slot.watch', () => slotWatchNow($))
+}
+async function slotWatchNow($: any): Promise<boolean> {
   const waits = await stateRead(read($, slotWait))
   if (!waits.length) {
     slotTimes = null
@@ -8616,7 +8686,7 @@ async function slotWatch($: any): Promise<boolean> {
   slotTimes = times
   if (before !== null && before !== times) {
     digestGen++
-    kickNudge($)
+    kickNudge($, 0, 'bell')
   }
   return true
 }
@@ -8653,7 +8723,7 @@ async function watchForNudge($: any, records: readonly QueueRecord[], present: R
   see('budget', (await budgets($)).find(x => x.inst.slug === inst.slug)?.state ?? 'none')
   if (moved) {
     digestGen++
-    kickNudge($)
+    kickNudge($, 0, 'bell')
   }
 }
 /** A folder's time (a file added or removed in it moves it): -1 when it isn't there */
@@ -8800,7 +8870,7 @@ async function nudgeTick($: any) {
   if (verdict !== 'ok') {
     // The wakes' window shut: looked at again the moment it opens (an urgent nudge waits ten minutes at most)
     const opens = verdict === 'window' && mine ? mine.last + (urgent ? Math.min(URGENT_GAP_MIN, wakes.everyMin) : wakes.everyMin) * 60000 : 0
-    if (opens) kickNudge($, opens - now + 500)
+    if (opens) kickNudge($, opens - now + 500, 'window')
     // Until then (the day's count used up: until the next pass has looked again) a landing doesn't look at its nudges
     nudgeShutUntil = opens || now + NUDGE_PASS_MS + NUDGE_MIN_GAP_MS
     return
@@ -9003,6 +9073,7 @@ function dated(text: string, now: number): string {
  * was: turn.start) */
 async function submitOwn($: any, text: string): Promise<any> {
   const id = await identityOwed($)
+  if (M.on) mWork('prompt')
   return $.prompt.submit({ text: id ? `${id}\n\n${text}` : text })
 }
 
@@ -10111,7 +10182,7 @@ async function answerOutbound($: any, it: AnswerItem, rec: QueueRecord, origin: 
   }
   if ('command' in call) {
     const cwd = (await exists($, o.cwd)) ? o.cwd : (root as string)
-    const r = await run($, ['/bin/sh', '-c', call.command], { cwd, timeoutMs: 120000 })
+    const r = await run($, ['/bin/sh', '-c', call.command], { cwd, timeoutMs: 120000, as: 'outbound' })
     // What it said: its output's first line when it ran, its error's last line (curl's progress meter comes first)
     const rows = (s: string) => s.split(/[\r\n]+/).map(x => x.trim()).filter(Boolean)
     const ok = r.exitCode === 0
@@ -11042,7 +11113,7 @@ async function claudeCommand($: any): Promise<string | null> {
   if (claudeBin) return claudeBin
   const fixed = await $.env.get('FLEET_CLAUDE')
   if (fixed) return (claudeBin = String(fixed))
-  const which = await run($, ['/bin/sh', '-lc', 'command -v claude'])
+  const which = await run($, ['/bin/sh', '-lc', 'command -v claude'], { as: 'which' })
   const found = which.exitCode === 0 ? which.stdout.trim().split('\n').pop()?.trim() : ''
   return found ? (claudeBin = found) : null
 }
@@ -12032,7 +12103,10 @@ function verdictWords(v: Verdict): string {
 /** One choice, judged: the gates first (no model), then the exact repeats (no model), then one call for the rest with
  * the statute, the case law code picked and the question as data; every citation checked. The proposal is kept beside
  * the decision (decisions/judge/D-<n>.json, written once) */
-async function judgeDecision($: any, rec: QueueRecord) {
+function judgeDecision($: any, rec: QueueRecord) {
+  return act('judge', () => judgeDecisionNow($, rec))
+}
+async function judgeDecisionNow($: any, rec: QueueRecord) {
   if (judging.has(rec.id)) return
   judging.add(rec.id)
   try {
@@ -12100,7 +12174,7 @@ async function judgeDecision($: any, rec: QueueRecord) {
         const shown = relevantOf(ps, { area: rec.area ?? null, text }, c.precedents)
         let r: any = null
         try {
-          r = await $.model.complete({ model: c.model, system: JUDGE_SYSTEM, prompt: judgePrompt(statute.text, caseLawText(shown), questionText(rec, asked)), maxTokens: 900, effort: 'low', timeoutMs: 90000 })
+          r = await modelCall($, { model: c.model, system: JUDGE_SYSTEM, prompt: judgePrompt(statute.text, caseLawText(shown), questionText(rec, asked)), maxTokens: 900, effort: 'low', timeoutMs: 90000 })
         } catch (err) {
           file.problem = `the judge's call was refused (${String(err).slice(0, 160)})`
         }
@@ -13466,7 +13540,7 @@ async function briefCommand($: any, chief: boolean, origin: string): Promise<str
   const charter = (await readText($, `${fleetDir()}/charter.md`)) ?? ''
   let r: any
   try {
-    r = await $.model.complete({
+    r = await modelCall($, {
       model: c.model ?? 'sonnet',
       system: body || `You are ${c.name}, the chief of this project's fleet.`,
       prompt: [`The charter:\n\n${cut(charter, 20000)}`, `The brief:\n\n${text}`, CHIEF_PROMPT].join('\n\n---\n\n'),
@@ -13736,6 +13810,16 @@ async function bareVerb($: any, e: any, verb: string, rest: string): Promise<str
   return before.length || !list ? line : `${line}\n\n${list}`
 }
 
+/** Which action a /fleet command is, for the meter */
+function commandAction(args: string): ActionName {
+  const kind = parseCommand(args).kind
+  if (kind === 'list') return 'command:list'
+  if (kind === 'answer' || kind === 'note' || kind === 'drop') return 'command:answer'
+  if (kind === 'status') return 'command:status'
+  if (kind === 'brief') return 'command:brief'
+  if (kind === 'up') return 'command:up'
+  return 'command:other'
+}
 async function fleetCommand($: any, e: any): Promise<string> {
   const c = parseCommand(String(e.args ?? ''))
   await locate($)
@@ -14067,6 +14151,7 @@ export const register: Register = on => {
   // session named it; STEP_FAILS in a row and it isn't asked for again for STEP_BACKOFF_MS. The model that answered
   // goes to the heartbeat
   on('turn.step', async function* ($, e, next) {
+    if (M.on) mMark('turn.step')
     // The loop's step now: the calls of one batch come from one step, so the gate's "once" is spent only from a later one
     stepOf.set(typeof e.agentId === 'string' && e.agentId ? e.agentId : 'main', `${e.turnId}#${e.index}`)
     // A request before the instance's first binding (a respawn's first turn): bound now, once per process (a session
@@ -14456,7 +14541,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'fleet' }, async ($, e) => {
     try {
-      return { text: await fleetCommand($, e) }
+      return { text: await act(commandAction(String(e.args ?? '')), () => fleetCommand($, e)) }
     } catch (err) {
       return { text: `fleet: ${String(err).slice(0, 300)}` }
     }
