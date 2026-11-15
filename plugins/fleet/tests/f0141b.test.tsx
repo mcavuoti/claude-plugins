@@ -50,7 +50,7 @@ function session(on: any, kind: Kind, files: Record<string, string> = {}): { w: 
     c.state.set('get', (c.state.get('get') ?? 0) + 1)
     // A module loaded by a reload finds what the module before it kept in $.state
     const key = e?.ref?.key ?? e?.key
-    if (key === 'watching' && c.reload.watching) return { value: { value: 1, version: 1 } }
+    if (key === 'watching' && c.reload.watching) return { value: { value: 2, version: 1 } }
     // (until the module writes its own)
     if (key === 'reads' && c.reload.reads !== undefined) return { value: { value: c.reload.reads, version: 1 } }
     return next(e)

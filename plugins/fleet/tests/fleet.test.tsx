@@ -13,8 +13,8 @@ test('the stand-in for sessions serves the golden list of api 1', WITH_SESSIONS,
   const w = world(on)
   await startSession($, w)
   // The stand-in's own list, as fleet reads it through /fleet status
-  expect(await fleet($, 'status')).toContain('sessions: api 1, version 0.18.0')
-  expect(GOLDEN).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'watchCommand'])
+  expect(await fleet($, 'status')).toContain('sessions: api 1, version 0.21.0')
+  expect(GOLDEN).toEqual(['contract', 'current', 'status', 'sections', 'defineSection', 'assignSection', 'start', 'wake', 'setMarks', 'pin', 'restart', 'watchCommand', 'debugPath', 'debugWindow', 'debugReport'])
 })
 
 test('/fleet init sets the project up: config, decisions folders, .gitignore; again it only updates', WITH_SESSIONS, async ($, on) => {

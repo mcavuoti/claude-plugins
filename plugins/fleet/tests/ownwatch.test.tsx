@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { BAND, DEC, FLEET, ROOT, fleet, row, sessionsSay, startSession, WITH_SESSIONS, world } from './world'
+import { BAND, DEBUG_PATH, DEC, FLEET, ROOT, fleet, row, sessionsSay, startSession, WITH_SESSIONS, world } from './world'
 import { PROJECT } from './up.test'
 
 // Fleet's own watch (0.14.0): where no SessionStart was proved, a child process (the command sessions' watchCommand
@@ -64,7 +64,8 @@ test('with no SessionStart, fleet runs its own watch over the paths SessionStart
   await settle(w, 11 * SECOND)
   expect(all.length).toBe(1)
   const paths = all[0]!.argv.slice(3)
-  expect(paths).toEqual([`${FLEET}/events/latest`, `${DEC}/queue`, `${DEC}/answers`, `${DEC}/overrules`, `${FLEET}/bell`])
+  // (the last one is sessions' debug path: fleet watches it, and makes nothing there)
+  expect(paths).toEqual([`${FLEET}/events/latest`, `${DEC}/queue`, `${DEC}/answers`, `${DEC}/overrules`, `${FLEET}/bell`, DEBUG_PATH])
   // Made before it watches them
   expect(w.dirs.has(`${FLEET}/bell`)).toBe(true)
   expect(await liveLine($)).toContain('live updates off')
@@ -216,7 +217,7 @@ test("Claude's proof after the own watch went live ends it, and a reload remembe
   await settle(w, SECOND)
   expect(killedPid(w, '4242')).toBe(true)
   expect(await liveLine($)).toBe(PROVED)
-  expect(written).toEqual([1])
+  expect(written).toEqual([2])
   all[0]!.end(null, '', 'SIGTERM')
   await settle(w, 2 * MIN)
   expect(await liveLine($)).toBe(PROVED)

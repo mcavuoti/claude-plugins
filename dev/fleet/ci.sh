@@ -39,7 +39,20 @@ if [ "$count" -ne 1 ]; then
   status=1
 fi
 
-[ "$status" -eq 0 ] && echo "fleet: calls only, no sessions files, one way to run commands"
+# Every file and model call goes through a counted helper (fsRead, fsWrite, fsList, fsStat, fsExists: two lines each,
+# the call with the meter off and with it on; modelCall the same), so what a debug report says fleet did is all of it
+count=$(cat "$hooks"/* | grep -c '\$\.fs\.[a-z]*(' || true)
+if [ "$count" -ne 10 ]; then
+  echo "\$.fs is called on $count lines of plugins/fleet/hooks (10 are the counted helpers): call fsRead, fsWrite, fsList, fsStat or fsExists instead" >&2
+  status=1
+fi
+count=$(cat "$hooks"/* | grep -c '\$\.model\.[a-z]*(' || true)
+if [ "$count" -ne 2 ]; then
+  echo "\$.model is called on $count lines of plugins/fleet/hooks (2 are the counted helper): call modelCall instead" >&2
+  status=1
+fi
+
+[ "$status" -eq 0 ] && echo "fleet: calls only, no sessions files, one way to run commands, files and the model through the counted helpers"
 
 # The templates /fleet init copies: whole and consistent (roles with their files and fleet's tools, seeds, sections)
 python3 "$here/check-templates.py" || status=1
