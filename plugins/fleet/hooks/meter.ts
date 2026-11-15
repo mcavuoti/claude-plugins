@@ -5,7 +5,8 @@
 // commands started, bytes), what failed, what it sent that other sessions react to, and what it holds in memory.
 //
 // Off, which is always unless the person opened a window: `M.on` is false, every counted helper tests it and goes on,
-// and nothing here runs. No timer, no file, no call. A window opens and closes by a ring of sessions' debug path
+// and nothing here runs. No timer, no file, and no call but the one that learns sessions' debug path as a session
+// starts (register.tsx: debugPathNow). A window opens and closes by a ring of sessions' debug path
 // (register.tsx: debugRing): open → counters from zero; close → one hand-in (snapshot) and off. A window whose close
 // never came (the asking session died) ends by itself: the first count past its end stops the counting (what was
 // counted, a few numbers, stays until the next ring).

@@ -630,6 +630,8 @@ async function startOwnWatch($: any) {
     h.how = String(c.how)
     if (h.stopping) return
     let buf = ''
+    // (the one long-lived child: a process started, for the meter, like any command's)
+    if (M.on) mStarted(String(c.argv?.[0] ?? ''), 'watch')
     const stream = $.process.spawn({ argv: c.argv, cwd: '/' })
     for await (const chunk of stream as AsyncIterable<{ stream: string; text: string }>) {
       if (chunk.stream === 'stderr') {
