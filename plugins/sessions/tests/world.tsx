@@ -10,6 +10,8 @@ import { storeNamespace } from '../hooks/state'
 export const SID = 'aaaaaaaa-0000-0000-0000-000000000000'
 export const ROOT = '/Users/x/myapp'
 export const DATA = '/Users/x/.claude/mods/sessions-data'
+// Where Claude keeps the plugin's store, for a test of a file it can't read (the world's store itself is in memory)
+export const STORE_FILE = '/Users/x/.claude/plugins/store/sessions_inline-aaaaaaaaaaaa.json'
 export const BAND = { plugin: 'sessions', component: 'AbovePrompt', requestId: 'band', props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 80, scroll: { offset: 0, bodyRows: 3 }, view: {} } } as const
 export const COMMAND = { origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const
 // For a test that starts the mod and moves the mocked clock through many minutes: 30 s rather than the kit's 5 s,
@@ -192,8 +194,24 @@ export function world(on: On, options: WorldOptions = {}): World {
   const plain = (key: string) => (key.startsWith(namespace) ? key.slice(namespace.length) : key)
   const storeKeys = new Set<string>()
   const store = new Map<string, unknown>(Object.entries(options.store ?? {}))
+  // A store file Claude can't read (a test puts an empty or broken one at STORE_FILE): every call throws as the
+  // engine's does, until the file is gone or holds JSON
+  const unreadable = () => {
+    const text = files.get(STORE_FILE)
+    if (text === undefined) return false
+    try {
+      JSON.parse(text)
+      return false
+    } catch {
+      return true
+    }
+  }
+  const malformed = (): never => {
+    throw new Error(`sessions@inline: store file ${STORE_FILE} is malformed (JSON Parse error: Unexpected EOF)`)
+  }
   on('store.get', (_, e) => {
     storeKeys.add(e.key)
+    if (unreadable()) return malformed()
     return { value: store.get(plain(e.key)) as any }
   })
   // A write the lock refuses: the hook throws, nothing beneath answers, and the mod's call rejects
@@ -207,6 +225,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   }
   on('store.set', (_, e) => {
     storeKeys.add(e.key)
+    if (unreadable()) return malformed()
     if (refuses()) return refuse(e.key, 'set')
     store.set(plain(e.key), e.value)
     storeLock.landed.push(plain(e.key))
@@ -214,12 +233,13 @@ export function world(on: On, options: WorldOptions = {}): World {
   })
   on('store.delete', (_, e) => {
     storeKeys.add(e.key)
+    if (unreadable()) return malformed()
     if (refuses()) return refuse(e.key, 'delete')
     store.delete(plain(e.key))
     storeLock.landed.push(plain(e.key))
     return { value: undefined }
   })
-  on('store.keys', () => ({ value: [...store.keys()].map(k => `${namespace}${k}`) }))
+  on('store.keys', () => (unreadable() ? malformed() : { value: [...store.keys()].map(k => `${namespace}${k}`) }))
   const list = options.list ?? [{ id: id.value.slice(0, 8), sessionId: id.value, cwd: ROOT, kind: 'background', status: 'idle', pid: 4242, name: 'one' }]
   on('session.id', () => ({ value: id.value }))
   on('session.root', () => ({ value: root.value }))

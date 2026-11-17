@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { recordBehind } from '../hooks/state'
 import { PASS_MS } from '../hooks/leader'
-import { COMMAND, ROOT, SID, SLOW, startSession, world, type World } from './world'
+import { COMMAND, DATA, ROOT, SID, SLOW, startSession, STORE_FILE, world, type World } from './world'
 
 // Claude's store rejects a write while its lock is held (another session writing, or a lock a killed session left):
 // the write is tried again, waits to land late when it may, and is counted; a session's own record that went backwards
@@ -68,7 +68,7 @@ test('a write the store rejects once is tried again 50 ms later and lands; the r
   await w.clock.advance(60)
   expect(state(w)?.turnStarted).toBe(at)
   const said = await status($)
-  expect(said).toContain("Store: 1 write try rejected since this session started (the store's lock was held) · 1 landed on a later try · 0 given up · last: state:")
+  expect(said).toContain("Store: 1 write try rejected since this session started · 1 landed on a later try · 0 given up · last: state:")
   // A test session's keys, under its own namespace all along
   expect(w.namespace).not.toBe('')
   expect([...w.storeKeys].every(k => k.startsWith(w.namespace))).toBe(true)
@@ -254,4 +254,94 @@ test('u on another session: the version goes on its record as the store has it n
   expect(w.runs.some(a => a[0] === '/bin/claude' && a[1] === 'respawn' && a[2] === 'bbbbbbbb')).toBe(true)
   expect(w.store.get(`state:${BRAVO}`)).toEqual({ created: 1, finished: 200, answer: 'newer', version: '2.1.316' })
   await ui.unmount()
+})
+
+// A store file Claude can't read (empty, or cut short): every $.store call throws until the file is gone. The mod sets
+// it aside by itself and goes on; nothing is asked of the person
+const aside = (w: World) => [...w.files.keys()].filter(p => p.startsWith(`${DATA}/store-unreadable-`))
+
+test("a store file Claude can't read when a session starts: set aside, a new store, and the session's record in it; said once and in the status", async ($, on) => {
+  const w = world(on)
+  w.files.set(STORE_FILE, '')
+  await startSession($, w)
+  await w.clock.advance(1000)
+  // The empty file is in the mod's data folder now, and Claude's store works: the session's own record is there
+  expect(w.files.has(STORE_FILE)).toBe(false)
+  expect(aside(w).length).toBe(1)
+  expect(w.files.get(aside(w)[0]!)).toBe('')
+  expect(state(w)?.created).toBeGreaterThan(0)
+  expect(w.dirs.has(`${DATA}/store-mend.lock`)).toBe(false)
+  expect(w.files.has(`${DATA}/bell/mended`)).toBe(true)
+  expect(w.toasts.filter(t => t.includes("couldn't be read")).length).toBe(1)
+  const said = await status($)
+  expect(said).toContain("Store: its file couldn't be read and was mended: set aside as")
+  // No write was given up over it
+  expect(said).toContain('0 given up')
+})
+
+test("a store that breaks while a session runs: the next thing that touches it mends it, and the session puts its own record back", async ($, on) => {
+  turns(on)
+  const w = world(on)
+  await startSession($, w)
+  const at = w.clock.now()
+  await $.turn.start({ turnId: 't1', text: 'go' } as any)
+  await w.clock.advance(100)
+  expect(state(w)?.turnStarted).toBe(at)
+  // Claude's file is cut to nothing, and with it everything it held
+  w.files.set(STORE_FILE, '{"state:')
+  w.store.clear()
+  // The pass reads its own record back: the read finds the file, the file is set aside, and the record is written again
+  await w.clock.advance(PASS_MS + 1000)
+  expect(w.files.has(STORE_FILE)).toBe(false)
+  expect(w.files.get(aside(w)[0]!)).toBe('{"state:')
+  expect(state(w)?.turnStarted).toBe(at)
+  // A write right after works as ever: nothing was rejected
+  await $.turn.complete({ turnId: 't1', answer: 'done' } as any)
+  await w.clock.advance(100)
+  expect(state(w)?.finished).toBeGreaterThan(at)
+  expect(await status($)).not.toContain('given up after')
+})
+
+test("another session mended the store: at its bell this session puts back what it remembers of its own, with no file to move", async ($, on) => {
+  turns(on)
+  const w = world(on)
+  await startSession($, w)
+  const at = w.clock.now()
+  await $.turn.start({ turnId: 't1', text: 'go' } as any)
+  await w.clock.advance(100)
+  // The other session set the file aside, and Claude started a new, empty store
+  w.store.clear()
+  w.write(`${DATA}/bell/mended`, `format=3\nfrom=${BRAVO}\nat=${w.clock.now()}\n`)
+  await $.classic.FileChanged({ file_path: `${DATA}/bell/mended`, event: 'change' } as any)
+  await w.clock.advance(200)
+  expect(state(w)?.turnStarted).toBe(at)
+  expect(aside(w)).toEqual([])
+  expect(w.toasts.filter(t => t.includes("couldn't be read"))).toEqual([])
+})
+
+test("a mending lock left by a session that ended holding it is taken over, and the store is mended all the same", async ($, on) => {
+  const w = world(on)
+  await startSession($, w)
+  // Left long ago, by a session that's gone
+  w.dirs.add(`${DATA}/store-mend.lock`)
+  w.files.set(STORE_FILE, '')
+  w.store.clear()
+  await w.clock.advance(PASS_MS + 2000)
+  expect(w.files.has(STORE_FILE)).toBe(false)
+  expect(aside(w).length).toBe(1)
+  expect(w.dirs.has(`${DATA}/store-mend.lock`)).toBe(false)
+  expect(state(w)?.created).toBeGreaterThan(0)
+})
+
+test("a store call that fails while the store's file is fine (its lock held) moves nothing", async ($, on) => {
+  turns(on)
+  const w = world(on)
+  await startSession($, w)
+  w.files.set(STORE_FILE, '{"state:x": {"created": 1}}')
+  w.storeLock.next = 1
+  await $.turn.start({ turnId: 't1', text: 'go' } as any)
+  await w.clock.advance(1000)
+  expect(w.files.get(STORE_FILE)).toBe('{"state:x": {"created": 1}}')
+  expect(aside(w)).toEqual([])
+  expect(await status($)).not.toContain("couldn't be read")
 })

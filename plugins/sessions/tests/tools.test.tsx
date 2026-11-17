@@ -796,7 +796,7 @@ test("a claim Claude's store doesn't take (its lock held past the tries) is no c
   const t = setup(on)
   await started($, t)
   t.w.storeLock.until = t.w.clock.now() + 9000
-  expect(await denied(call($, t, { tool: 'mcp__sessions__wake', session: 'worker a' }, 9500))).toBe("Not woken: Claude's store didn't take the claim on this wake (its lock was held): try again in a few seconds.")
+  expect(await denied(call($, t, { tool: 'mcp__sessions__wake', session: 'worker a' }, 9500))).toMatch(/^Not woken: Claude's store didn't take the claim on this wake \(.+\): try again in a few seconds\.$/)
   expect(t.respawned).toEqual([])
   expect(t.w.store.get('broughtBack')).toBe(undefined)
   // The lock gone, the same wake goes through
