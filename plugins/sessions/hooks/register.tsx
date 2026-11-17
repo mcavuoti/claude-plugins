@@ -798,10 +798,173 @@ function landsLate(key: string): boolean {
   return key === 'panelClosed' || key === 'waitingOnly' || key === 'collapsed' || key === 'usageView' || key === 'endedDismissed' || key.startsWith('personStop:')
 }
 
+// Claude's store for this plugin can't be read: its file is empty or isn't JSON (a write cut short, a full disk), and
+// every $.store call throws from then on, in every session, until the file is gone or readable. Nothing kept in the
+// store works meanwhile (what the sessions remember of each other, the claim a wake or a `b` takes, who was seen), and
+// Claude never mends it. The mod does, with nothing for the person to do: the file is set aside in the mod's data
+// folder (what it held, if anything, stays there), Claude starts a new one at the next write, the call that found it
+// is tried again, and every session puts back what it remembers of its own records and of the person's choices (the
+// `mended` bell tells them). One session does the moving, under a lock in the data folder and after looking again: a
+// store another session mended meanwhile is left alone
+const MENDED_BELL = 'mended'
+// Claude names the file in its error ("store file <path> is malformed"); its words may change, so the file is looked at
+// too, and that's what decides
+const STORE_NAMED = /store file (\/\S*\/sessions_[A-Za-z0-9._-]+\.json) is malformed/
+// How often, at most, a failed store call makes this session look at the store's folder
+const STORE_LOOK_MS = 30000
+let storeLooked = 0
+let mending: Promise<boolean> | null = null
+// How many times this session found the store unreadable and it was mended, and where its file went when this session
+// moved it
+let storeMends = 0
+let storeAside = ''
+// What this session last knew of the keys that can be put back (landsLate): its own records and the person's choices
+const remembered = new Map<string, unknown>()
+let restoreDue = false
+
+// The start of this copy's store file's name in Claude's store folder: sessions_<marketplace>- for an installed copy
+// (it runs from <...>/plugins/cache/<marketplace>/sessions/<version>), sessions_inline- for a folder copy. A session
+// only ever mends its own copy's store
+function storePrefix(): string {
+  const m = PLUGIN_DIR.match(/\/plugins\/cache\/([A-Za-z0-9._-]+)\/sessions\//)
+  return `sessions_${m?.[1] ?? 'inline'}-`
+}
+
+// Whether a file isn't something Claude can read as a store: there, and empty or not JSON
+async function fileUnreadable($: any, path: string): Promise<boolean> {
+  try {
+    if (Number((await fsStat($, path)).size) === 0) return true
+    JSON.parse(String(await fsRead($, path)))
+    return false
+  } catch (err) {
+    return err instanceof SyntaxError
+  }
+}
+
+// This copy's store files that Claude can't read, after a store call failed with `err`: the one the error names, or
+// what a look at Claude's store folder finds (not after an error about its lock, and not more than twice a minute)
+async function unreadableStores($: any, err: unknown): Promise<string[]> {
+  const text = String(err)
+  const named = text.match(STORE_NAMED)?.[1]
+  if (named && named.split('/').pop()!.startsWith(storePrefix())) return (await fileUnreadable($, named)) ? [named] : []
+  if (/\block\b/i.test(text)) return []
+  const now = await $.clock.now()
+  if (storeLooked && now - storeLooked < STORE_LOOK_MS) return []
+  storeLooked = now
+  const base = home || String((await $.env.get('HOME')) ?? '')
+  if (!base) return []
+  const folder = `${base}/.claude/plugins/store`
+  let names: string[] = []
+  try {
+    names = (await fsList($, folder)).map((f: any) => String(f.name))
+  } catch {
+    return []
+  }
+  const out: string[] = []
+  for (const name of names) {
+    if (!name.startsWith(storePrefix()) || !/^sessions_[A-Za-z0-9._-]+\.json$/.test(name)) continue
+    if (await fileUnreadable($, `${folder}/${name}`)) out.push(`${folder}/${name}`)
+  }
+  return out
+}
+
+// The store reads again: by this session's hand (`aside`: where the unreadable file went) or by another's
+async function mended($: any, aside: string): Promise<boolean> {
+  storeCache.clear()
+  storeRefusing = false
+  restoreDue = true
+  storeMends++
+  if (!aside) return true
+  storeAside = aside
+  debugLine($, `store: its file was unreadable; set aside as ${aside}`)
+  await ring($, MENDED_BELL)
+  try {
+    $.ui.toast("sessions: Claude's store for the plugin couldn't be read; it was set aside and a new one started (/sessions status)")
+  } catch {}
+  return true
+}
+
+async function mendNow($: any, paths: string[]): Promise<boolean> {
+  const dir = await dataFolder($)
+  if (!dir) return false
+  const lock = `${dir}/store-mend.lock`
+  const still = async () => {
+    const out: string[] = []
+    for (const path of paths) if (await fileUnreadable($, path)) out.push(path)
+    return out
+  }
+  for (let i = 0; i < 30; i++) {
+    // Another session set them aside meanwhile
+    if ((await still()).length === 0) return mended($, '')
+    if ((await runSafe($, ['mkdir', lock])).exitCode === 0) {
+      try {
+        const bad = await still()
+        if (bad.length === 0) return mended($, '')
+        const now = await $.clock.now()
+        let first = ''
+        for (const [n, path] of bad.entries()) {
+          const aside = `${dir}/store-unreadable-${now}${n ? `-${n}` : ''}.json`
+          if ((await runSafe($, ['mv', path, aside])).exitCode === 0) first ||= aside
+        }
+        return first ? mended($, first) : false
+      } finally {
+        await runSafe($, ['rmdir', lock])
+      }
+    }
+    // A lock left by a session that ended holding it: gone after 10 s
+    try {
+      const st = await fsStat($, lock)
+      if ((await $.clock.now()) - Number(st.mtimeMs) > 10000) await runSafe($, ['rmdir', lock])
+    } catch {}
+    await $.clock.sleep(100)
+  }
+  return false
+}
+
+// True once the store's file was set aside (here or by another session), so the call is worth trying again; false when
+// its file isn't the trouble, or it couldn't be moved
+async function mendStore($: any, err: unknown): Promise<boolean> {
+  if (mending) return mending
+  const paths = await unreadableStores($, err)
+  if (!paths.length) return false
+  mending ??= mendNow($, paths).finally(() => {
+    mending = null
+  })
+  return mending
+}
+
+// A call to Claude's store: when it finds the store's file unreadable, the file is mended and the call tried once more
+async function withStore<T>($: any, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call()
+  } catch (err) {
+    if (!(await mendStore($, err))) throw err
+    return call()
+  }
+}
+
+// After the store was mended (here or in another session): what this session remembers and the new store lacks is
+// written again
+async function restoreRemembered($: any) {
+  restoreDue = false
+  for (const [key, value] of [...remembered]) {
+    if (lastAsked.has(key) || (await storeStored($, key)) !== undefined) continue
+    storeCounts.restored++
+    debugLine($, `store: ${key} wasn't in the mended store: written again`)
+    await storeSet($, key, value)
+  }
+}
+
+// Why the store's last write failed, in the engine's own words, for a message
+function storeWhy(): string {
+  return storeLast?.why ? ` (${storeLast.why})` : ''
+}
+
 // The store's own value of a key, whatever waits to land and whatever is kept in memory
 async function storeStored($: any, key: string): Promise<any> {
   try {
-    return await $.store.get(`${await storeNamespaceOf($)}${key}`)
+    const name = `${await storeNamespaceOf($)}${key}`
+    return await withStore($, () => $.store.get(name))
   } catch {
     return undefined
   }
@@ -813,8 +976,10 @@ async function storeGet($: any, key: string): Promise<any> {
   if (cacheable(key) && storeCache.has(key)) return storeCache.get(key)
   try {
     if (meter.on) meter.work('store')
-    const value = await $.store.get(`${await storeNamespaceOf($)}${key}`)
+    const name = `${await storeNamespaceOf($)}${key}`
+    const value = await withStore($, () => $.store.get(name))
     if (cacheable(key)) storeCache.set(key, value)
+    if (value !== undefined && landsLate(key)) remembered.set(key, value)
     return value
   } catch {
     return undefined
@@ -826,8 +991,7 @@ async function storeOnce($: any, key: string, w: StoreWrite): Promise<boolean> {
   try {
     const name = `${await storeNamespaceOf($)}${key}`
     if (meter.on) meter.work('store')
-    if (w.deleted) await $.store.delete(name)
-    else await $.store.set(name, w.value)
+    await withStore($, () => (w.deleted ? $.store.delete(name) : $.store.set(name, w.value)))
     if (meter.on) meter.sent('store')
   } catch (err) {
     storeCounts.rejections++
@@ -857,6 +1021,10 @@ async function storeWrite($: any, key: string, value: unknown, deleted: boolean,
   const w: StoreWrite = { value, deleted, since }
   noteAsked(key, w)
   lastAsked.set(key, w)
+  if (landsLate(key)) {
+    if (deleted) remembered.delete(key)
+    else remembered.set(key, value)
+  }
   if (lateWrites.size > 0 && landsLate(key)) {
     lateWrites.set(key, w)
     pumpLate($)
@@ -955,11 +1123,12 @@ async function storeDelete($: any, key: string, hold = true): Promise<boolean> {
 // /sessions status, about the store's rejected writes: one line, and only once there was one
 function storeText(now: number): string {
   const c = storeCounts
-  if (c.rejections + c.restored === 0) return ''
-  const parts = [`${c.rejections === 1 ? '1 write try' : `${c.rejections} write tries`} rejected since this session started (the store's lock was held)`, `${c.landedLater} landed on a later try`]
+  if (c.rejections + c.restored + storeMends === 0) return ''
+  const parts = [`${c.rejections === 1 ? '1 write try' : `${c.rejections} write tries`} rejected since this session started`, `${c.landedLater} landed on a later try`]
+  if (storeMends > 0) parts.unshift(`its file couldn't be read and was mended${storeAside ? `: set aside as ${storeAside}, a new one started` : ' by another session'}`)
   if (lateWrites.size > 0) parts.push(`${lateWrites.size} still trying`)
   parts.push(`${c.givenUp} given up`)
-  if (c.restored > 0) parts.push(`its own record put back ${c.restored === 1 ? 'once' : `${c.restored} times`} (another session's late write had put an older one over it)`)
+  if (c.restored > 0) parts.push(`its own record put back ${c.restored === 1 ? 'once' : `${c.restored} times`} (another session's late write had put an older one over it, or the store was mended)`)
   const last = storeLast ? ` · last: ${storeLast.key}, ${Math.max(0, Math.round((now - storeLast.at) / 1000))} s ago (${storeLast.why})` : ''
   return `Store: ${parts.join(' · ')}${last}`
 }
@@ -1053,7 +1222,7 @@ async function storeKeys($: any): Promise<string[]> {
   let keys: string[] = []
   try {
     const ns = await storeNamespaceOf($)
-    const all: string[] = await $.store.keys()
+    const all: string[] = await withStore($, () => $.store.keys())
     keys = ns ? all.filter(k => k.startsWith(ns)).map(k => k.slice(ns.length)) : all.filter(k => !k.startsWith('@'))
   } catch {}
   if (lateWrites.size === 0) return keys
@@ -1070,7 +1239,7 @@ async function storeKeys($: any): Promise<string[]> {
 // above, and stays in its own namespace
 async function everyStoreKey($: any): Promise<string[]> {
   try {
-    return await $.store.keys()
+    return await withStore($, () => $.store.keys())
   } catch {
     return []
   }
@@ -1687,6 +1856,14 @@ async function flushNow($: any) {
           bg(debugRing($))
           continue
         }
+        // A session mended the store (its file couldn't be read): what's kept in memory of it is forgotten, and this
+        // session puts back what it remembers of its own
+        if (name === MENDED_BELL) {
+          storeCache.clear()
+          bg(restoreRemembered($))
+          others = true
+          continue
+        }
         if (name === 'marks') forgetStored(k => k.startsWith('marks:'))
         else if (name === 'prefs') forgetStored(k => k === 'waitingOnly' || k === 'collapsed')
         else if (name === 'usage') bg(readUsage($, USAGE_FOLLOWER_MS))
@@ -1852,6 +2029,7 @@ async function pass($: any) {
 async function passNow($: any) {
   storeCache.clear()
   await restoreOwn($)
+  if (restoreDue) await restoreRemembered($)
   await syncFiles($, true)
   await requestRefresh($)
   await drawHeld($)
@@ -2451,7 +2629,7 @@ async function pruneNamespaces($: any, now: number) {
     for (const k of keys.filter(k => k.startsWith('state:'))) {
       let created = 0
       try {
-        created = Number((await $.store.get(`${ns}${k}`))?.created) || 0
+        created = Number((await withStore<any>($, () => $.store.get(`${ns}${k}`)))?.created) || 0
       } catch {}
       if (now - created < 300000) recent = true
     }
@@ -2461,7 +2639,7 @@ async function pruneNamespaces($: any, now: number) {
     debugLine($, `prune: ${drop.length === 1 ? 'a key' : `${drop.length} keys`} of a test namespace whose sessions are gone (${ns})`)
     for (const k of drop) {
       try {
-        await $.store.delete(`${ns}${k}`)
+        await withStore($, () => $.store.delete(`${ns}${k}`))
       } catch {}
     }
     // Cut short: found again at the next prune, which goes on
@@ -3106,7 +3284,7 @@ async function stillEnded($: any, s: EndedSession): Promise<string> {
     }
     // A claim the store didn't take is no claim: another panel could bring it back too
     if (!(await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at }))) {
-      why = "Claude's store didn't take the claim (its lock was held)"
+      why = `Claude's store didn't take the claim${storeWhy()}`
       return
     }
     why = ''
@@ -3543,7 +3721,7 @@ async function claimWake($: any, s: any, name: string): Promise<{ why: string; a
       await storeSet($, 'modelWakes', [...log, { at, by: myId, target: s.sessionId }])
       // A claim the store didn't take is no claim: a panel's b, or another wake, could bring it back too
       if (!(await storeSet($, 'broughtBack', { ...held, [s.sessionId]: at }))) {
-        why = "Claude's store didn't take the claim on this wake (its lock was held): try again in a few seconds"
+        why = `Claude's store didn't take the claim on this wake${storeWhy()}: try again in a few seconds`
         return
       }
       why = ''
@@ -5914,6 +6092,7 @@ function heldNow(): Held {
     'heartbeat-cache': { grows: ['sessions'], now: [beatCache.size, null] },
     'store-cache': { grows: ['keys'], now: [storeCache.size, null] },
     'store-queue': { grows: ['events'], now: [lateWrites.size + lastAsked.size, null] },
+    'store-kept': { grows: ['sessions'], now: [remembered.size, null] },
     queues: { grows: ['events'], now: [wakes.length + restarts.length + launches.length + waitsNow.length + answering.size, null] },
     'transcript-starts': { grows: ['sessions', 'time'], now: [transcriptStarts.size + recordedRoots.size, null] },
     'notified': { grows: ['sessions', 'time'], now: [pushedKnown.size + tellFailures.size, null] },
@@ -6382,8 +6561,7 @@ function sessionsApi($: any): Sessions {
       const key = `${await storeNamespaceOf($)}marks:${v.source}:${sid}`
       try {
         const now = await $.clock.now()
-        if (Object.keys(v.rows).length === 0) await $.store.delete(key)
-        else await $.store.set(key, { at: now, until: now + v.ttlMs, rows: v.rows })
+        await withStore($, () => (Object.keys(v.rows).length === 0 ? $.store.delete(key) : $.store.set(key, { at: now, until: now + v.ttlMs, rows: v.rows })))
       } catch (err) {
         return { ok: false, reason: 'busy', detail: `couldn't write the marks: ${String(err).slice(0, 120)}` }
       }
