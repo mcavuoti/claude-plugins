@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { buildNotice, heartbeatText, labelMinute, listedLaunchers, listHolds, listSignature, LIST_MIN_MS, LIST_QUIET_MS, nextSeenCheck, parseNotice, parseShowing, parseWindows, planSwitch, sameData, showingRuns, showingText, usageSummaryOf, windowTargetText, withShowing, type Showing } from '../hooks/state'
 import { TERMINAL } from '../hooks/platform/macos'
-import { COMMAND, DATA, ROOT, SID, SLOW, startSession, world, type World } from './world'
+import { COMMAND, DATA, HOURS, ROOT, SID, SLOW, startSession, world, type World } from './world'
 
 // What the panel costs while nothing happens: it draws only what changed, reads the session list again only when
 // Claude's files moved, runs ps and asks Terminal only for a session that a window could show, takes no lock with
@@ -302,7 +302,7 @@ test('seen: the question to Terminal only with someone at the computer and Termi
   expect(frontRuns(w).slice(k)).toContain('ioreg -n')
 })
 
-test('seen: a slow answer pauses every session\'s questions, longer each time, and /sessions status says so', SLOW, async ($, on) => {
+test('seen: a slow answer pauses every session\'s questions, longer each time, and /sessions status says so', HOURS, async ($, on) => {
   const w = world(on, { list: list(), store: { [`state:${SID}`]: { finished: 999_999_000 } } })
   w.ps.value = '  101 ttys001  claude attach aaaaaaaa'
   w.terminal.value = args => (args[0] === 'frente' ? 'true /dev/ttys002' : '')
