@@ -53,7 +53,9 @@ export type RateLimit = { kind: string; percent: number }
 // you), how many sessions the project has, how many others wait for you (red), have an answer to you unseen (yellow)
 // or finished unseen a turn you didn't start (yellow, hollow: unasked), and what they spent at list price (null: none
 // is on an API account)
-export type PanelSummary = { waitingOnly: boolean; sessions: number; waiting: number; unseen: number; unasked: number; spent: number | null }
+// (working: the other sessions in a turn; names: the first few that wait for the person or finished unseen, for the
+// line above the prompt where the panel isn't on screen)
+export type PanelSummary = { waitingOnly: boolean; sessions: number; waiting: number; unseen: number; unasked: number; spent: number | null; working?: number; names?: string[] }
 // The panel's line about the background sessions of every folder that ended with Claude's background service and are
 // still stopped: what it says ("3 sessions ended with the background service at 14:05"), what its key does ("brings
 // them back"), the latest death's time and how many; null: none, or the person dismissed it for that death

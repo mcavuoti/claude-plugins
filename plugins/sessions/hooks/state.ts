@@ -1691,6 +1691,66 @@ export function ringKeys(rows: readonly { sessionId: string; section: string; se
   return drawPlan(rows).flatMap(it => (it.kind === 'row' ? [`s:${it.row.sessionId}`] : it.kind === 'fold' ? [`h:${it.section}`] : []))
 }
 
+// ---- A small terminal: the line above the prompt, and the list as a block above it ----
+
+// The rows as the compact list draws them (the block above the prompt, where Claude seats the panel in a terminal too
+// narrow to dock it): every session a row, with no section headers, folds or indent; the ones that need the person
+// first, then finished and unseen, working, idle and stopped, each group in the order the panel has them
+export function compactRows<T extends { color: Color; needsPerson?: boolean; section: string; sectionTitle: string; folded?: boolean; depth: number }>(rows: readonly T[]): T[] {
+  const rank = (r: T) => (r.color === 'red' || r.needsPerson ? 0 : r.color === 'yellow' ? 1 : r.color === 'blue' ? 2 : r.color === 'green' ? 3 : 4)
+  return rows
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => rank(a.r) - rank(b.r) || a.i - b.i)
+    .map(x => ({ ...x.r, section: '', sectionTitle: '', folded: false, depth: 0 }))
+}
+
+// Where /sessions next goes: the first other session that waits for the person, else the first whose answer is unseen
+export function nextWaiting<T extends { color: Color; needsPerson?: boolean; current: boolean }>(rows: readonly T[]): T | null {
+  const others = rows.filter(r => !r.current)
+  return others.find(r => r.color === 'red' || r.needsPerson) ?? others.find(r => r.color === 'yellow') ?? null
+}
+
+// The session a name picks (/sessions <name>), case ignored: the one with that title, else the one whose title starts
+// with it, else the one that has it inside; `several` when more than one fits, null when none does
+export function sessionByName<T extends { title: string }>(rows: readonly T[], name: string): { row: T } | { several: T[] } | null {
+  const want = name.trim().toLowerCase()
+  if (!want) return null
+  for (const fits of [(t: string) => t === want, (t: string) => t.startsWith(want), (t: string) => t.includes(want)]) {
+    const found = rows.filter(r => fits(r.title.toLowerCase()))
+    if (found.length === 1) return { row: found[0]! }
+    if (found.length > 1) return { several: found }
+  }
+  return null
+}
+
+// The line above the prompt, cut to the width it has: it never wraps. `parts` are in the order drawn; `order` says
+// which to keep first when they don't all fit (the first of it is kept whatever its width). A part with a short form
+// goes in short, and grows to its full text when there's room left
+export type BandPart = { key: string; text: string; short?: string }
+export function fitBand(parts: readonly BandPart[], order: readonly string[], width: number, gap = 2): BandPart[] {
+  const kept = new Map<string, string>()
+  const used = () => [...kept.values()].reduce((n, t) => n + displayWidth(t), 0) + Math.max(0, kept.size - 1) * gap
+  for (const key of order) {
+    const part = parts.find(x => x.key === key)
+    if (!part || !part.text) continue
+    const text = part.short ?? part.text
+    if (kept.size === 0 || used() + gap + displayWidth(text) <= width) kept.set(key, text)
+  }
+  for (const part of parts) {
+    const now = kept.get(part.key)
+    if (now === undefined || now === part.text) continue
+    if (used() + displayWidth(part.text) - displayWidth(now) <= width) kept.set(part.key, part.text)
+  }
+  return parts.filter(x => kept.has(x.key)).map(x => ({ key: x.key, text: kept.get(x.key)! }))
+}
+
+// Whether a terminal is one where Claude seats a panel above the prompt and not at the side: not fullscreen, or under
+// the 110 columns it docks from
+export const DOCK_COLUMNS = 110
+export function smallWindow(w: { isFullscreen?: boolean; columns?: number } | undefined | null): boolean {
+  return !!w && (w.isFullscreen === false || (typeof w.columns === 'number' && w.columns < DOCK_COLUMNS))
+}
+
 // ---- Telling the person ----
 // The mod never stops anything for what follows: it marks rows, and notifies the person at most once for each thing
 // (PushNotification, which reaches the phone with Remote Control, else $.ui.notify, their own channel), keeping to the
