@@ -17,6 +17,8 @@ export const COMMAND = { origin: { kind: 'composer' }, presentation: { isFullscr
 // For a test that starts the mod and moves the mocked clock through many minutes: 30 s rather than the kit's 5 s,
 // which a slow or busy machine (the CI runners) can run past
 export const SLOW = { timeoutMs: 30000 } as const
+// For a test that moves the mocked clock through more than an hour: the CI runners take 22 to 30 s over the one there is
+export const HOURS = { timeoutMs: 120000 } as const
 // When a process started, as ps prints it under TZ=UTC and LC_ALL=C (and Claude's registry keeps it, procStart)
 export const STARTED = 'Mon Nov  9 04:32:54 2026'
 
