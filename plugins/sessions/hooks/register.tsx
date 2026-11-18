@@ -88,6 +88,11 @@ import {
   afterTick,
   rowsBelow,
   wrappedLines,
+  compactRows,
+  nextWaiting,
+  sessionByName,
+  fitBand,
+  smallWindow,
   shellQuote,
   isRef,
   recordBehind,
@@ -307,6 +312,20 @@ let currentFocus: string | undefined
 // What the arrows go through in the panel as the terminal last drew it (ringKeys of what its render hook drew), for
 // focusElement to wait for the frame it means to focus in; null until it's drawn
 let drawnRing: string[] | null = null
+// A terminal too narrow to dock the panel (or not fullscreen): Claude seats it above the prompt, and there the list is
+// compact and called up as a picker. smallNow: what the line above the prompt last saw; seated: where the panel was
+// last drawn ('' while it isn't); picker: called up with /sessions, it goes away on a pick or Esc; requestedRows: the
+// rows last asked of Claude for the block
+let smallNow = false
+let seated: '' | 'dock' | 'inline' = ''
+let picker = false
+let requestedRows = 0
+// The block was sent away because the terminal is small (not by the person's close): once the terminal is wide enough
+// to dock the panel, it's opened again. dismissing: a block Claude seated by itself is being sent away
+let sentAway = false
+let dismissing = false
+// What the arrows go through in the list as it's drawn now
+const ringOf = (shown: readonly Row[]): string[] => ringKeys(seated === 'inline' ? compactRows(shown) : shown)
 // Panel width: what the content needs, capped at the width Claude gives it on its own ("the default one").
 // That cap is measured by opening the panel without asking for a width, and measured again if the window size changes.
 let requestedWidth = 0
@@ -4414,7 +4433,7 @@ async function drawHeld($: any) {
     await update($, rows, () => h.rows)
     bg(adjustWidth($))
     if ((await $.ui.panes()).find((p: any) => p.id === PANE)?.isFocused) {
-      const target = refocusTarget(ringKeys(before), ringKeys(h.rows), currentFocus)
+      const target = refocusTarget(ringOf(before), ringOf(h.rows), currentFocus)
       if (target) bg(focusElement($, target))
     }
   }
@@ -4466,6 +4485,8 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
     unseen: others.filter(f => f.color === 'yellow' && !f.unasked).length,
     unasked: others.filter(f => f.color === 'yellow' && f.unasked).length,
     spent: spends.length ? spends.reduce((sum, f) => sum + (f.usd ?? 0), 0) : null,
+    working: others.filter(f => f.color === 'blue').length,
+    names: [...others.filter(f => f.color === 'red' || f.needsPerson), ...others.filter(f => f.color === 'yellow' && !f.needsPerson)].slice(0, 3).map(f => f.title),
   }
   // Nobody could be looking: kept, not drawn (held), and other sessions' events are read in batches from here on
   unseen = !reflow && !(await couldBeLooking($))
@@ -4481,7 +4502,7 @@ async function layout($: any, focused: boolean, reflow: '' | 'fold' | 'filter' =
   if (!sameData(await read($, summary), next)) await update($, summary, () => next)
   held = null
   if (!focused || reflow) return
-  const target = refocusTarget(ringKeys(shownBefore), ringKeys(shown), currentFocus)
+  const target = refocusTarget(ringOf(shownBefore), ringOf(shown), currentFocus)
   if (target) bg(focusElement($, target))
 }
 
@@ -4495,6 +4516,72 @@ async function openByYou($: any) {
   await storeDelete($, 'panelClosed', false)
   await $.ui.open({ id: PANE, title: 'Sessions', focus: true, columns: requestedWidth || undefined })
   await paneState($)
+}
+
+// On a small terminal /sessions calls the list up as a picker: above the prompt, with the keyboard in it, on the first
+// session that needs you (the compact list has them first). A pick or Esc sends it away again (closePicker, Claude's
+// closeOnEscape), so the conversation keeps the screen. It says nothing about the panel being closed by you
+async function openPicker($: any) {
+  picker = true
+  seated = 'inline'
+  requestedRows = 0
+  const list = compactRows(await rowsNow($))
+  const first = list.find(f => !f.current) ?? list[0]
+  if (first) selectedRow = `s:${first.sessionId}`
+  await $.ui.open({ id: PANE, title: 'Sessions', focus: true, closeOnEscape: true })
+  await paneState($)
+  // The focus lands a moment after the block is drawn: the command doesn't wait for it
+  if (first) bg(focusSession($, first.sessionId))
+}
+
+async function closePicker($: any) {
+  picker = false
+  seated = ''
+  requestedRows = 0
+  sentAway = true
+  try {
+    await $.ui.close({ id: PANE })
+  } catch {}
+  await paneState($)
+}
+
+// The block above the prompt as tall as its list, up to half the screen: asked of Claude again when that changes
+async function askRows($: any, rows: number) {
+  try {
+    if (!(await $.ui.panes()).some((x: any) => x.id === PANE)) return
+    await $.ui.open({ id: PANE, title: 'Sessions', rows, ...(picker ? { closeOnEscape: true as const } : {}) })
+  } catch {}
+}
+
+// Enter (or a click) on a row: this session's own gives the keyboard back to the prompt, another's switches to it. The
+// list called up above the prompt goes away once that's done
+async function pick($: any, f: Row) {
+  const called = picker || seated === 'inline'
+  let done = true
+  if (f.current) await toPrompt($)
+  else done = await jump($, f)
+  if (called && done) await closePicker($)
+}
+
+// /sessions next and /sessions <name>: straight to a session of this project, without the list. '' when it switched
+async function goTo($: any, what: string): Promise<string> {
+  if (!active || projectRows.length === 0) return "The panel hasn't read the session list yet: try again in a few seconds"
+  let target: Row
+  if (what === 'next') {
+    const next = nextWaiting(projectRows)
+    if (!next) return 'Nobody is waiting for you, and nothing finished unseen.'
+    target = next
+  } else {
+    const found = sessionByName(projectRows, what)
+    const some = (of: Row[]) => `${of.slice(0, 6).map(f => f.title).join(', ')}${of.length > 6 ? ` and ${of.length - 6} more` : ''}`
+    if (!found) return `No session here is named “${what}”. There ${projectRows.length === 1 ? 'is' : 'are'}: ${some(projectRows)}`
+    if ('several' in found) return `“${what}” fits several: ${some(found.several)}`
+    target = found.row
+  }
+  if (target.current) return `You're in “${target.title}” already`
+  if (!(await jump($, target))) return `Couldn't switch to “${target.title}”`
+  if (picker || seated === 'inline') await closePicker($)
+  return ''
 }
 
 // What the line above the prompt says about the panel: closed (by you, or gone), or waiting undrawn for a wider window
@@ -4556,8 +4643,23 @@ async function focusPanel($: any) {
   bg(seenNow($))
   // A panel you closed stays closed: you land on the prompt, and the line above it says how to open it
   if (await closedByYou($)) return
+  // On a small terminal the list is only there when called up (/sessions): you land on the prompt
+  if (smallNow) return
   const list = (await rowsNow($)).filter(f => !f.folded)
   await takeKeyboard($, (list.find(f => f.current) ?? list[0])?.sessionId)
+  // (Claude seated it above the prompt after all: the line above it hadn't yet said how small the terminal is)
+  if (seated === 'inline' && !picker) await closePicker($)
+}
+
+// The terminal is wide enough to dock the panel again, and the block had been sent away for being small: the panel
+// comes back, unless you closed it yourself meanwhile
+async function backWhenWide($: any) {
+  if (await closedByYou($)) return
+  try {
+    if ((await $.ui.panes()).some((x: any) => x.id === PANE)) return
+    await $.ui.open({ id: PANE, title: 'Sessions', columns: requestedWidth || undefined })
+  } catch {}
+  await paneState($)
 }
 
 // The panel takes the keyboard, on a session. Claude gives the panel the keyboard a moment after it's requested, on the
@@ -4596,7 +4698,7 @@ async function focusElement($: any, key: string) {
     } catch {
       return
     }
-    const undrawn = i < 29 && drawnRing !== null && !sameData(drawnRing, ringKeys(await rowsNow($)))
+    const undrawn = i < 29 && drawnRing !== null && !sameData(drawnRing, ringOf(await rowsNow($)))
     if (!undrawn && panes.find((p: any) => p.id === PANE)?.isFocused) {
       let r: any
       try {
@@ -5974,10 +6076,10 @@ async function announceUpdate($: any): Promise<string | undefined> {
 // read); a panel you closed stays closed
 async function keyboardBack($: any, key: string) {
   if (await closedByYou($)) return
-  let around = ringKeys(await rowsNow($))
+  let around = ringOf(await rowsNow($))
   for (let i = 0; around.length === 0 && i < 30; i++) {
     await $.clock.sleep(100)
-    around = ringKeys(await rowsNow($))
+    around = ringOf(await rowsNow($))
   }
   const target = around.includes(key) ? key : undefined
   debugLine($, `update in place: the keyboard back to the panel${target ? `, on ${target}` : ''}`)
@@ -6866,7 +6968,7 @@ async function start($: any) {
       name: 'sessions',
       description:
         'Sessions panel: open, focus or close. /sessions section <title>: put this session in a section (- takes it out); /sessions sections: list them. /sessions tell on|off: let scripts hand this session text with ccc tell. /sessions status: is the mod running here. /sessions setup: status line, shortcuts and the ccc command',
-      argumentHint: '[section <title> | section - | sections | tell on|off | status | debug perf [seconds] | debug show | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
+      argumentHint: '[next | <session name> | section <title> | section - | sections | tell on|off | status | debug perf [seconds] | debug show | setup [--dry-run] [--force-statusline] [--macos-launcher] [--shell=bash|zsh|fish]]',
       immediate: true,
     }),
   )
@@ -7143,16 +7245,27 @@ export const register: Register = (on, options) => {
       const r = await runSafe($, ['bash', `${PLUGIN_DIR}/setup/setup.sh`, ...words.slice(1)], { timeoutMs: 60000 })
       return { text: (r.stdout + (r.stderr ? `\n${r.stderr}` : '')).trim() || `setup exited with code ${r.exitCode}` }
     }
+    // Anything else is a session: the next one that waits for you, or one by its name
+    if (words.length > 0) {
+      const text = await goTo($, words.join(' '))
+      return text ? { text } : {}
+    }
     const pane = (await $.ui.panes()).find(p => p.id === PANE)
+    // A terminal too narrow to dock the panel: /sessions calls the list up, and again sends it away
+    if (smallWindow(e.presentation) || seated === 'inline') {
+      if (pane?.isFocused) await closePicker($)
+      else await openPicker($)
+      return {}
+    }
     if (pane?.isFocused) {
       await storeSet($, 'panelClosed', true, false)
       await $.ui.close({ id: PANE })
       await paneState($)
-      return { text: '' }
+      return {}
     }
     await openByYou($)
     bg(readUsage($))
-    return { text: '' }
+    return {}
   })
 
   // You closed the panel (its close mark or key): it stays closed in every session that starts, until you open it again.
@@ -7160,6 +7273,15 @@ export const register: Register = (on, options) => {
   on('ui.close', async ($, e, next) => {
     const r = await next(e)
     if (e.id === PANE && e.origin.kind === 'person') {
+      // The list called up above the prompt goes away when it's done with (Esc, its close mark): that isn't a choice
+      // to keep the panel closed, which a wide terminal would honour from then on
+      if (picker || seated === 'inline') {
+        picker = false
+        seated = ''
+        requestedRows = 0
+        await paneState($)
+        return r
+      }
       await storeSet($, 'panelClosed', true, false)
       if (!sameData(await read($, paneNote), 'closed')) await update($, paneNote, () => 'closed')
     }
@@ -7189,7 +7311,7 @@ export const register: Register = (on, options) => {
     const field = (await read($, askingName)) ? 'name' : (await read($, renaming)) ? 'rename-input' : null
     if (field) return e.element === field ? next(e) : next({ ...e, element: field })
     // The sessions and the folded sections' lines, in the order they're drawn
-    const ring = ringKeys(await rowsNow($))
+    const ring = ringOf(await rowsNow($))
     if (ring.length === 0) return next(e)
     let target = e.element
     if (!target || !ring.includes(target)) {
@@ -7222,7 +7344,7 @@ export const register: Register = (on, options) => {
     if (e.origin.kind !== 'person' || e.pointer || Math.abs(e.by) !== 1) return next(e)
     // With the New or Rename field open the keys are the field's
     if ((await read($, askingName)) || (await read($, renaming))) return next(e)
-    const ring = ringKeys(await rowsNow($))
+    const ring = ringOf(await rowsNow($))
     const from = selectedRow && ring.includes(selectedRow) ? selectedRow : currentFocus && ring.includes(currentFocus) ? currentFocus : undefined
     const target = from === undefined ? ring[0] : ring[ring.indexOf(from) + e.by]
     if (!target) return next(e)
@@ -7266,39 +7388,68 @@ export const register: Register = (on, options) => {
     const hollows = about.unasked || 0
     const id = await read($, shortId)
     const note = await read($, paneNote)
-    const why = note === 'closed' ? 'panel closed · /sessions to open' : note === 'narrow' ? 'panel hidden: window too narrow · /sessions to show' : ''
+    // A terminal where Claude seats the panel above the prompt (too narrow to dock it, or not fullscreen): there the
+    // list is called up with /sessions and this line is what stays on screen. With the panel docked now, the columns
+    // here are the conversation's alone, and say nothing of the window
+    const hidden = note !== ''
+    const small = e.surface === 'terminal' && (e.viewport?.isFullscreen === false || ((hidden || seated !== 'dock') && smallWindow({ columns: e.viewport?.columns })))
+    smallNow = small
+    if (!small && sentAway && note === 'closed' && e.surface === 'terminal') {
+      sentAway = false
+      $.clock.after(0, () => {
+        bg(backWhenWide($))
+      })
+    }
     // On a subscription, each of the account's windows once ("7d 43%"); off one (an API key) the panel shows the cost
     const account = limitsText(await read($, limits))
     // A session whose data is kept apart (a test session, or one a background service handed ccc's variables): its
     // seen and state never reach the other panels, so it says so where it can't go unnoticed
     const apart = (await storeNamespaceOf($)) ? 'data apart: /sessions status' : ''
-    const counts = (
-      <Text dimColor>
-        {reds > 0 && <Text color={TINT.red}>● </Text>}
-        {reds > 0 && `${reds}  `}
-        {yellows > 0 && <Text color={TINT.yellow}>● </Text>}
-        {yellows > 0 && `${yellows}  `}
-        {hollows > 0 && <Text color={TINT.yellow}>○ </Text>}
-        {hollows > 0 && `${hollows}  `}
-        {reds + yellows + hollows > 0 && !why && '/sessions  '}
-      </Text>
+    const needing = reds + yellows + hollows
+    // Built to the width it has, the least needed left out first: it never wraps. Who needs you always; then how to
+    // open the list, how many work, the first names that wait (those three only while the panel isn't on screen), this
+    // session's id and the account's windows
+    const kept = fitBand(
+      [
+        { key: 'counts', text: [reds > 0 ? `● ${reds}` : '', yellows > 0 ? `● ${yellows}` : '', hollows > 0 ? `○ ${hollows}` : ''].filter(Boolean).join('  ') },
+        { key: 'names', text: hidden ? (about.names ?? []).map(n => truncate(n, 16)).join(', ') : '' },
+        { key: 'working', text: hidden && (about.working || 0) > 0 ? `${about.working} working` : '' },
+        {
+          key: 'hint',
+          text: !hidden ? (needing > 0 ? '/sessions' : '') : small ? '/sessions' : note === 'closed' ? 'panel closed · /sessions to open' : 'panel hidden: window too narrow · /sessions to show',
+          short: '/sessions',
+        },
+        { key: 'account', text: account },
+        { key: 'id', text: `⟨${id}⟩` },
+        { key: 'apart', text: apart, short: 'data apart' },
+      ],
+      ['counts', 'apart', 'hint', 'working', 'names', 'id', 'account'],
+      e.props.bodyColumns ?? 80,
     )
-    const own =
-      !why || e.surface !== 'terminal' ? (
-        <Text dimColor>
-          {counts}
-          {why && `${why}  `}
-          {account && `${account}  `}⟨{id}⟩
-          {apart && <Text color={TINT.yellow}>{`  ${apart}`}</Text>}
-        </Text>
-      ) : (
-        <Box flexDirection="row">
-          {counts}
-          <Button key="show-panel" plain dimColor label={why} onPress={() => { bg(openByYou($)) }} />
-          <Text dimColor>{`  ${account ? `${account}  ` : ''}⟨${id}⟩`}</Text>
-          {apart && <Text color={TINT.yellow}>{`  ${apart}`}</Text>}
-        </Box>
-      )
+    const part = (key: string) => kept.find(x => x.key === key)?.text ?? ''
+    const said = (key: string) => (part(key) ? <Text key={key} dimColor>{`${part(key)}  `}</Text> : null)
+    const own = (
+      <Box flexDirection="row">
+        {part('counts') !== '' && (
+          <Text dimColor>
+            {reds > 0 && <Text color={TINT.red}>● </Text>}
+            {reds > 0 && `${reds}  `}
+            {yellows > 0 && <Text color={TINT.yellow}>● </Text>}
+            {yellows > 0 && `${yellows}  `}
+            {hollows > 0 && <Text color={TINT.yellow}>○ </Text>}
+            {hollows > 0 && `${hollows}  `}
+          </Text>
+        )}
+        {said('names')}
+        {said('working')}
+        {part('hint') !== '' && hidden && e.surface === 'terminal' && <Button key="show-panel" plain dimColor label={part('hint')} onPress={() => { bg(smallNow ? openPicker($) : openByYou($)) }} />}
+        {part('hint') !== '' && hidden && e.surface === 'terminal' && <Text>{'  '}</Text>}
+        {part('hint') !== '' && !(hidden && e.surface === 'terminal') && said('hint')}
+        {said('account')}
+        {part('id') !== '' && <Text dimColor>⟨{id}⟩</Text>}
+        {part('apart') !== '' && <Text color={TINT.yellow}>{`  ${part('apart')}`}</Text>}
+      </Box>
+    )
     if (meter.on) meter.tick('draw.band')
     return (
       <Box flexDirection="column">
@@ -7314,12 +7465,30 @@ export const register: Register = (on, options) => {
     const Input = e.surface === 'mobile' ? undefined : $.ui.resolve(e).Input
     // What's held while nobody could be looking, else what was written (read either way: its next write draws this)
     const written = await read($, rows)
-    const list = held?.rows ?? written
+    // Jumping and creating only make sense in Terminal; on the phone, VS Code or the app the list is read-only
+    const inTerminal = e.surface === 'terminal'
+    // Seated above the prompt (a terminal too narrow to dock the panel, or not fullscreen): the compact list, every
+    // row a session, the ones that need you first
+    const compact = inTerminal && e.props.placement === 'inline'
+    if (inTerminal) seated = compact ? 'inline' : 'dock'
+    if (!compact) picker = false
+    // The list above the prompt is only there when called up: one Claude seats there by itself (the panel a session
+    // opened at its start, before a narrow window showed it) goes away, and the line above the prompt says how to
+    // call it
+    if (compact && !picker && !dismissing) {
+      dismissing = true
+      $.clock.after(0, () => {
+        bg(
+          closePicker($).finally(() => {
+            dismissing = false
+          }),
+        )
+      })
+    }
+    const list = compact ? compactRows(held?.rows ?? written) : (held?.rows ?? written)
     const asking = await read($, askingName)
     const renamingRow = await read($, renaming)
     const note = await read($, notice)
-    // Jumping and creating only make sense in Terminal; on the phone, VS Code or the app the list is read-only
-    const inTerminal = e.surface === 'terminal'
     // One line per session. If it still doesn't fit, Claude's ↑↓ move its window instead of the focus, and the panel
     // moves the selection itself (its ui.scroll hook)
     const height = (e.viewport?.rows ?? 40) - 6
@@ -7346,7 +7515,7 @@ export const register: Register = (on, options) => {
     const plan = drawPlan(list)
     const shownRows = list.filter(f => !f.folded)
     // What the arrows go through in this frame, for a move of the focus to wait for (focusElement)
-    if (inTerminal) drawnRing = ringKeys(list)
+    if (inTerminal) drawnRing = ringOf(list)
     // The line about the sessions of every folder that ended with the background service, under the legend: one line,
     // more where the panel is narrower than it (it wraps between words)
     const endedNote = await read($, ended)
@@ -7357,25 +7526,6 @@ export const register: Register = (on, options) => {
     const endedRows = (endedLine ? Math.ceil((displayWidth(endedLine) + 4) / Math.max(20, (e.props.bodyColumns ?? 48) - 1)) : 0) + (awayFolder ? 1 : 0)
     // While the list doesn't fit, the status lines of rows that don't need you are left out (their badges stay), so more
     // sessions fit; a row that waits for you, or that a plugin marked as needing you, keeps its line
-    const crowded = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0) + 6 + (note !== '' ? 1 : 0) + endedRows > height
-    const keepsLine = (f: Row) => !!f.line && (!crowded || f.color === 'red' || f.needsPerson === true)
-    const lines = plan.length + shownRows.filter(keepsLine).length + (about.waitingOnly ? 1 : 0)
-    const overflows = lines + 6 + (note !== '' ? 1 : 0) + endedRows > height
-    // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
-    // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
-    // and a flexible spacer pushes the block down
-    const view = await read($, usageView)
-    const bodyRows: number | undefined = e.props.scroll?.bodyRows
-    const room = bodyRows ?? height
-    const showUsage =
-      inTerminal &&
-      e.props.placement === 'dock' &&
-      lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.unasked) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
-    // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
-    const usageData = showUsage ? await read($, usage) : null
-    const help = e.props.isFocused ? (overflows ? '↑↓ Select · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
-    // How many sessions (or folded sections) don't fit below: said at the top, where it's always in view, so a running
-    // session past the bottom edge isn't taken for a missing one
     // The line of actions at the top, in the order drawn: each letter is a button (its key, or a click)
     const actions: { key: string; hotkey: string; label: string; bright?: boolean; press: () => void }[] = [
       { key: 'stop', hotkey: 's', label: 'Stop', press: () => bg(stopSelected($)) },
@@ -7388,12 +7538,51 @@ export const register: Register = (on, options) => {
       // c: fold the selected session's section into one line, or unfold the one selected
       { key: 'fold', hotkey: 'c', label: 'Collapse', press: () => bg(toggleFold($)) },
     ]
+    // The compact list leaves out the two a small screen has least use for, and its help is short
+    const shownActions = compact ? actions.filter(a => a.key !== 'agents' && a.key !== 'fold') : actions
+    const compactHelp = '↑↓ Enter · Esc closes'
+    const actionWidths = (helpText: string) => [...shownActions.flatMap((a, i) => [...(i > 0 ? [3] : []), displayWidth(`${a.hotkey}: ${a.label}`)]), displayWidth(` · ${helpText}`)]
+    const bodyRows: number | undefined = e.props.scroll?.bodyRows
+    // The lines that aren't the list's, and the rows there are for all of it. Docked: the actions, the legend and the
+    // blank lines, against the window's height. Above the prompt: the actions and help (only while it has the keyboard)
+    // and a field, against the block's own rows
+    const fixed = compact ? (e.props.isFocused ? wrappedLines(actionWidths(compactHelp), e.props.bodyColumns ?? 48) : 0) + (asking || renamingRow ? 1 : 0) : 6
+    const tall = compact ? (bodyRows ?? height) : height
+    const crowded = plan.length + shownRows.filter(f => f.line).length + (about.waitingOnly ? 1 : 0) + fixed + (note !== '' ? 1 : 0) + endedRows > tall
+    const keepsLine = (f: Row) => !!f.line && (!crowded || f.color === 'red' || f.needsPerson === true)
+    const lines = plan.length + shownRows.filter(keepsLine).length + (about.waitingOnly ? 1 : 0)
+    const overflows = lines + fixed + (note !== '' ? 1 : 0) + endedRows > tall
+    // Above the prompt the block is as tall as its list, up to half the screen: Claude is asked for that many rows
+    if (compact) {
+      const most = Math.max(4, Math.floor(((e.viewport?.rows ?? 24) + (bodyRows ?? 0)) / 2))
+      const want = Math.max(2, Math.min(most, lines + fixed + (note !== '' ? 1 : 0) + endedRows + (list.length === 0 ? 1 : 0)))
+      if (want !== requestedRows) {
+        requestedRows = want
+        $.clock.after(0, () => {
+          bg(askRows($, want))
+        })
+      }
+    }
+    // The usage block (4 lines and one of spacing) goes at the bottom of the panel, only with the panel docked at the
+    // side and if it fits without making the list overflow. To keep it at the bottom, the panel takes its full height
+    // and a flexible spacer pushes the block down
+    const view = await read($, usageView)
+    const room = bodyRows ?? height
+    const showUsage =
+      inTerminal &&
+      e.props.placement === 'dock' &&
+      lines + 6 + (note !== '' ? 1 : 0) + endedRows + (list.some(f => f.outdated) ? 1 : 0) + (list.some(f => f.unasked) ? 1 : 0) + (list.some(f => f.pinned) ? 1 : 0) + (marks ? 1 : 0) + (spends ? 1 : 0) + (list.some(f => f.helpers > 0) ? 1 : 0) + (list.some(f => f.stale) ? 1 : 0) + 5 <= room
+    // Read only while the block is shown: a new reading of the token usage doesn't draw a panel that doesn't show it
+    const usageData = showUsage ? await read($, usage) : null
+    const help = e.props.isFocused ? (overflows ? '↑↓ Select · Enter Switch · Esc Back' : '↑↓ Select · Enter Switch · ← Back') : 'shift+→ to use the panel'
+    // How many sessions (or folded sections) don't fit below: said at the top, where it's always in view, so a running
+    // session past the bottom edge isn't taken for a missing one
     // The lines it takes: the row wraps between its items in the panel's width (Claude draws a button as "s: Stop"; the
     // keyboard help after the last one is an item too)
-    const actionLines = inTerminal
-      ? wrappedLines([...actions.flatMap((a, i) => [...(i > 0 ? [3] : []), displayWidth(`${a.hotkey}: ${a.label}`)]), displayWidth(` · ${help}`)], e.props.bodyColumns ?? 48)
-      : 0
-    const above = actionLines + 1 + 1 + (note !== '' ? 1 : 0) + (about.waitingOnly ? 1 : 0)
+    const actionLines = inTerminal ? wrappedLines(actionWidths(help), e.props.bodyColumns ?? 48) : 0
+    // What's drawn above the list: docked, the actions, a blank line and the "more below" line; above the prompt, that
+    // line alone
+    const above = (compact ? 1 : actionLines + 1 + 1) + (note !== '' ? 1 : 0) + (about.waitingOnly ? 1 : 0)
     const below = overflows
       ? rowsBelow(
           plan.map(it => (it.kind === 'header' ? { lines: 1, counts: false } : it.kind === 'fold' ? { lines: 1, counts: true } : { lines: keepsLine(it.row) ? 2 : 1, counts: true })),
@@ -7459,7 +7648,7 @@ export const register: Register = (on, options) => {
             plain
             autoFocus={f.sessionId === initial && !fields ? true : undefined}
             label={name(f)}
-            onPress={() => (f.current ? bg(toPrompt($)) : bg(jump($, f)))}
+            onPress={() => { bg(pick($, f)) }}
           />
         ) : (
           <Text bold={f.current ? true : undefined}>{name(f)}</Text>
@@ -7486,7 +7675,56 @@ export const register: Register = (on, options) => {
         <Text key={`h:${it.section}`} dimColor>{` ${label}`}</Text>
       )
     }
+    // The New and Rename fields, and the line about the sessions that ended with the background service: the same in
+    // both layouts
+    const nameFields = [
+      inTerminal && Input && asking ? (
+        <Input key="name" label="Name" placeholder="session name, or Enter for one after the folder (Esc cancels)" autoFocus onSubmit={(v: string) => { void createSession($, v).catch(() => {}) }} />
+      ) : null,
+      inTerminal && Input && renamingRow && !asking ? (
+        <Input
+          key="rename-input"
+          label={`Rename “${truncate(renamingRow.title, 24)}”`}
+          placeholder="new name (Esc cancels)"
+          autoFocus
+          onSubmit={(v: string) => { bg(rename($, v)) }}
+        />
+      ) : null,
+    ]
+    const endedBox = endedNote ? (
+      <Box flexDirection="row" flexWrap="wrap">
+        {(inTerminal ? `${endedNote.text} ·` : endedNote.text).split(' ').map((word, i) => (
+          <Text key={`ended:${i}`} color="warning">{`${word} `}</Text>
+        ))}
+        {inTerminal && <Button key="bring-back" plain hotkey="b" label={endedNote.action} onPress={() => { bg(bringBack($)) }} />}
+      </Box>
+    ) : null
     if (drawFrom) meter.timed('draw.panel', drawFrom)
+    // Above the prompt: the list and nothing around it. The actions and the keyboard help go under it, and only while
+    // it has the keyboard (their keys work then; there's no legend and no blank line)
+    if (compact) {
+      return (
+        <Box flexDirection="column">
+          {below > 0 && <Text dimColor>{truncate(`↓ ${below} more below`, total)}</Text>}
+          {note !== '' && <Text color="warning">{note}</Text>}
+          {about.waitingOnly && <Text dimColor>{truncate(`Waiting for you · ${list.length} of ${about.sessions} · f: all`, total)}</Text>}
+          {list.length === 0 && <Text dimColor>{about.waitingOnly ? 'Nobody is waiting for you.' : 'No other sessions in this folder.'}</Text>}
+          {plan.flatMap(it => (it.kind === 'row' ? row(it.row) : []))}
+          {nameFields}
+          {awayFolder !== '' && <Text key="away" dimColor>{outsideNote(awayFolder, myCwd, home, total)}</Text>}
+          {endedBox}
+          {e.props.isFocused && (
+            <Box flexDirection="row" flexWrap="wrap">
+              {shownActions.flatMap((a, i) => [
+                ...(i > 0 ? [<Text key={`dot:${a.key}`} dimColor> · </Text>] : []),
+                <Button key={a.key} plain dimColor={a.bright ? undefined : true} hotkey={a.hotkey} label={a.label} onPress={() => { a.press() }} />,
+              ])}
+              <Text dimColor>{` · ${compactHelp}`}</Text>
+            </Box>
+          )}
+        </Box>
+      )
+    }
     return (
       <Box flexDirection="column" height={showUsage && bodyRows ? bodyRows : undefined}>
         {/* The actions at the top, followed by the keyboard help: one row, which wraps where the panel is narrower than it */}
@@ -7511,18 +7749,7 @@ export const register: Register = (on, options) => {
         )}
         {/* The New and Rename fields go below the rows: above them, opening or closing shifted the rows by one, and since
             Claude tracks the focus by position, what you typed landed on another row or the focus ended up on d: Day */}
-        {inTerminal && Input && asking && (
-          <Input key="name" label="Name" placeholder="session name, or Enter for one after the folder (Esc cancels)" autoFocus onSubmit={(v: string) => { void createSession($, v).catch(() => {}) }} />
-        )}
-        {inTerminal && Input && renamingRow && !asking && (
-          <Input
-            key="rename-input"
-            label={`Rename “${truncate(renamingRow.title, 24)}”`}
-            placeholder="new name (Esc cancels)"
-            autoFocus
-            onSubmit={(v: string) => { bg(rename($, v)) }}
-          />
-        )}
+        {nameFields}
         <Text> </Text>
         <Text dimColor>
           <Text color={TINT.red}>●</Text> Attention  <Text color={TINT.blue}>●</Text> Working  <Text color={TINT.yellow}>●</Text> Done  <Text color={TINT.green}>●</Text> Idle  <Text color={TINT.gray}>●</Text> Stopped
@@ -7531,14 +7758,7 @@ export const register: Register = (on, options) => {
         {/* Sessions of any folder that ended with the background service: b asks, then brings them back. Under the
             legend, after every row and field: a line that comes and goes there moves nothing the arrows go through.
             A word each, so a panel narrower than the line wraps it between words with the key flowing after them */}
-        {endedNote && (
-          <Box flexDirection="row" flexWrap="wrap">
-            {(inTerminal ? `${endedNote.text} ·` : endedNote.text).split(' ').map((word, i) => (
-              <Text key={`ended:${i}`} color="warning">{`${word} `}</Text>
-            ))}
-            {inTerminal && <Button key="bring-back" plain hotkey="b" label={endedNote.action} onPress={() => { bg(bringBack($)) }} />}
-          </Box>
-        )}
+        {endedBox}
         {list.some(f => f.outdated) && (
           <Text dimColor>
             <Text color="claude">↑</Text>
