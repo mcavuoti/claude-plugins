@@ -149,7 +149,7 @@ test('/sessions on a small terminal: the list comes up with the keyboard, set to
   expect(text).not.toContain('Idle')
   expect(['bravo', 'charlie', 'alpha'].map(n => text.indexOf(n)).every((at, i, all) => at >= 0 && (i === 0 || at > all[i - 1]!))).toBe(true)
   // Under them, while it has the keyboard: the keys a small screen needs, and how to leave
-  expect(text).toContain('s: Stop · u: Restart · r: Rename · n: New · f: Waiting · ↑↓ Enter · Esc closes')
+  expect(text).toContain('s: Stop · u: Restart · r: Rename · n: New · p: Pin · f: Waiting · ↑↓ Enter · Esc closes')
   expect(await ui.find({ key: 'agents' })).toBe(undefined)
   expect(await ui.find({ key: 'fold' })).toBe(undefined)
   // The arrows go down the list as it's drawn

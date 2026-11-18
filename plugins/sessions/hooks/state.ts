@@ -714,6 +714,25 @@ export function pluginPinChange(
   return { pins: pins.filter(p => p !== id), plugin: record, changed: true }
 }
 
+// The person's own pin or unpin of one session (p in the panel, as Ctrl+T in `claude agents`), on pins.json as it is.
+// Pinned: it joins the pins and is the person's from then on, so neither Remote Control's automatic pin going off nor
+// a plugin's unpin takes it out. Unpinned: it leaves the pins, and so does a plugin's wish to keep it pinned (said by
+// wasPlugin: that plugin may ask again). Remote Control's own record is left to its pass, which reads one of its pins
+// gone as released by the person and doesn't pin it again until Remote Control goes off and on
+export function personPin(pins: readonly string[], auto: AutoPins | null, plugin: PluginPins, id: string): { pinned: boolean; pins: string[]; auto: AutoPins | null; plugin: PluginPins; wasPlugin: boolean } {
+  const without = (ids: readonly string[]) => ids.filter(x => x !== id)
+  if (pins.includes(id)) {
+    return { pinned: false, pins: without(pins), auto, plugin: { ids: without(plugin.ids), added: without(plugin.added) }, wasPlugin: plugin.ids.includes(id) }
+  }
+  return {
+    pinned: true,
+    pins: [...pins, id],
+    auto: auto ? { ids: without(auto.ids), released: without(auto.released) } : auto,
+    plugin: { ids: plugin.ids, added: without(plugin.added) },
+    wasPlugin: false,
+  }
+}
+
 // After reconcilePins (Remote Control's automatic pins): a session a plugin keeps pinned isn't unpinned when its Remote
 // Control goes off, and the pin becomes the plugin's to take out (added). A session gone from the list leaves the
 // record, and its pin goes too when a plugin added it. listed: the background sessions the list has

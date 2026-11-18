@@ -187,10 +187,8 @@ export const macos: Platform = {
 
   text: {
     switchNeedsWindow: 'To switch, use the panel from the Terminal window showing this session',
-    agentsNeedsWindow: 'To open the agent view, use the panel from the Terminal window showing this session',
     regularUnreachable: title => `“${title}” isn't in a Terminal window this panel can reach (another app or tmux): switch to it there`,
     cantOpen: title => `Couldn't open a window for “${title}”`,
-    cantOpenAgents: "Couldn't open the agent view",
     cantBring: "Terminal didn't bring that window forward",
   },
 }
