@@ -5,7 +5,7 @@ A Claude Code mod (a plugin built on function hooks) that adds a side panel to e
 Tested on macOS (Terminal.app) with Claude Code 2.1.289 to 2.1.319. On Linux it switches windows through its launcher instead of driving the terminal app; that mode was tested on macOS, and on a real Linux desktop it still needs the short check in [`dev/sessions/linux-checklist.md`](../../dev/sessions/linux-checklist.md) (see [Linux](#linux)).
 
 ```
-s: Stop · u: Restart · r: Rename · n: New · a: Agents · f: Waiting
+s: Stop · u: Restart · r: Rename · n: New · p: Pin · f: Waiting
  · c: Collapse · ↑↓ Select · Enter Switch · ← Back
 
  ● Data pipeline       ↑◆ Opus 5.5   43%   1m
@@ -15,11 +15,11 @@ s: Stop · u: Restart · r: Rename · n: New · a: Agents · f: Waiting
 
 ● Attention  ● Working  ● Done  ● Idle  ● Stopped
 ↑ Claude 2.1.291 available · u: Restart
-◆ Pinned (auto with Remote Control)
+◆ Pinned (p, or auto with Remote Control)
 
             (free space)
 
-d: Day · w: Week · m: Month · p: All
+d: Day · w: Week · m: Month · a: All
 ▁▁▂▃▅▇█▆▄▃▂▁▂▃▅▆▄▂▁               1.2B
 in 1.2B (97% cached) · out 3.4M (think 1.1M)
 cache 1.1B read · 40M written · 20k uncached
@@ -136,7 +136,8 @@ Claude in each session can list the project's other sessions and bring back a st
 - **When the background service goes down** (the machine restarted, or the service crashed or was killed), every background session it ran stops with it, and they stay stopped (gray) until you open each one. Every panel then says so under its legend, counting every folder's: `3 sessions ended with the background service at 14:05 · b: brings them back`. `b` asks first, saying how many and from which folders, then restarts them one at a time, a few seconds apart, each with its conversation (`claude respawn`), and looks at each one again just before: one that runs again, or that you stopped or removed meanwhile, is skipped. It never restarts a session you stopped yourself, one the service retired for being idle, or one that crashed. A toast says how it went (`Brought back 3 sessions, skipped 0, failed 0`). `Leave them stopped`, in the same question, hides the line until the service ends sessions again. In [`ccc tidy`](#opening-sessions-with-ccc) they're marked too.
 - **New** (`n`): asks for a name, creates a background session and switches to it. A name another session of the project already has isn't taken (`ccc <name>` could then open either): the field stays open for another. Enter without a name gives it one after the folder, like the names Claude gives regular sessions (`myapp-1f`), unused by the project's other sessions. (In `ccc`'s Name prompt, Enter on an empty line still goes back to the shell.)
 - **The New and Rename fields** keep you in them until you're done: Enter does it (an empty Rename field cancels), Esc cancels, and the arrows and Tab don't take you out, so a half-typed field can't be left behind.
-- **Agents** (`a`): opens Claude's agent view (`claude agents`) in the same window. The agent view draws no panels (they show only in a session's own screen): open a session from it, or `←` back from one, to see the panel again.
+- **Claude's agent view** (`claude agents`) is one `←` away from a session's empty prompt, or `ccc --agents` from a shell. It draws no panels (they show only in a session's own screen): open a session from it to see the panel again.
+- **Pin** (`p`, ◆): pins the selected background session, so Claude's background service doesn't close it for being idle (a session with no window is closed after an hour, or after 8 with Remote Control); `p` again unpins it. It's your own pin, the same as Ctrl+T in `claude agents`: Remote Control going off doesn't take it out, and neither does another plugin. Unpinning one that Remote Control's automatic pin holds keeps it unpinned until Remote Control goes off and on; unpinning one another plugin asked to keep pinned says so, since that plugin may pin it again. A regular session (`claude` in a window) isn't the service's to close, so it isn't pinned.
 - **Token usage**, at the bottom: bars for today by hour (`d`), 7 days (`w`) or 30 days (`m`), for all of Claude on this machine or just this project (`p`).
 - **Status line** (after `/sessions setup`): model · effort · folder · git branch · context % · cost.
 - **Closing the panel**: close it yourself (its ✕ or close key, or `/sessions` while it has the keyboard) and it stays closed, in this session and in every session that starts afterwards, until you open it again with `/sessions` or the button on the line above the prompt (`shift+→` then Enter, or a click). What you chose wins: arriving with `ccc` or Enter then lands on the prompt instead of the panel.
@@ -181,12 +182,12 @@ With the panel focused (`shift+→` after the setup, `ctrl+x Tab`, or `/sessions
 | `u` | Restart the selected session (yours too) |
 | `r` | Rename the selected session |
 | `n` | New: ask for a name (or Enter for an automatic one) and create a session |
-| `a` | Agents: Claude's agent view |
+| `p` | Pin: keep the selected background session from being closed for being idle (◆), or unpin it |
 | `f` | only the sessions waiting for you, or all of them again |
 | `c` | fold the selected session's section into one line, or unfold the folded section selected (Enter on it does too) |
 | `b` | bring back the sessions that ended with the background service (while the panel's line about them shows) |
 | `d` `w` `m` | tokens for today, 7 days, 30 days |
-| `p` | tokens for all of Claude or just this project |
+| `a` | tokens for all of Claude or just this project |
 | ← or Esc | back to the prompt |
 
 `/sessions` opens the panel with the keyboard (or closes it, if it has it). `/sessions section <title>`, `/sessions section -` and `/sessions sections` put this session in a section, take it out, and list them (see Sections above). `/sessions tell on` (`off`) lets scripts hand this session text with `ccc tell`. `/sessions status` says whether the mod runs in this session and what started it, whether it's live (watched files) or on the short timer and why (an update in place, which `u` or `/clear` ends, or a plugin ahead of sessions that keeps `SessionStart` from it, which nothing here ends), where its list comes from and which session leads (`session.start`, or the first draw, prompt or notice when that never came), the session's id and project folder, the mod's version and whether it's the installed copy or a folder copy, when it last wrote its heartbeat, which sessions of the project have no running panel, the API it serves other plugins, the tools it gave Claude here (or why none, and where the agent came from when `SessionStart` didn't say it), its sections, the notifications sent today and the last one, this session's spend against its usual hour, and, once Claude's store rejected a write of this session's, how many were rejected, landed on a later try or were given up.
@@ -226,7 +227,7 @@ The first start on such a machine waits up to a second for a `SessionStart` that
 
 On macOS the panel drives Terminal.app (which window is in front, bring one forward, open one). On Linux there's no portable way to drive a terminal, so the panel works from processes and its launcher only, which every terminal has, and asks the X11 desktop which window is in front:
 
-- **The window you're in** is the one whose launcher has your session open (what its launcher publishes, else found with `ps`). Open your windows with `ccc` (or the panel's Enter, New and Agents, which use the launcher too). `ccc` brings the project's window forward the same way the panel does (`wmctrl`/`xdotool`), or opens here when it can't.
+- **The window you're in** is the one whose launcher has your session open (what its launcher publishes, else found with `ps`). Open your windows with `ccc` (or the panel's Enter and New, which use the launcher too). `ccc` brings the project's window forward the same way the panel does (`wmctrl`/`xdotool`), or opens here when it can't.
 - **Switching** happens in that same window, through the launcher, exactly as on macOS.
 - **A session already open in another window** is brought forward with `wmctrl` or `xdotool` when one is installed (X11; the launcher titles each window with its session's name, and the whole title is matched, so no other window whose title holds that name comes up). On Wayland, or without either tool, the session opens in the current window too.
 - **Seen** (yellow → green): on X11 with `xprop` (part of the X11 utilities on most desktops), the panel reads the title of the window in front: a viewer titles its window with Claude's status mark and the session's name (`✳ name`, which a terminal may put inside its own words, `Terminal - ✳ name` or `✳ name – Konsole`), and a session whose whole name it shows is seen. A session with no name of its own, or a name another session also has, isn't told apart this way, nor is one inside an agent view. On Wayland, or without `xprop`, it stays yellow until you type in that session, use its panel or arrive there (Enter or a click in another panel, or `ccc`); with no X11 display at all (a host reached over ssh) or no `xprop`, the check doesn't run (no `ps`, no `xprop`), and `/sessions status` says so. There's no telling whether you're at the computer, so a window left in front while you're away counts as seen.
@@ -235,7 +236,7 @@ On macOS the panel drives Terminal.app (which window is in front, bring one forw
 | Feature | On Linux |
 |---|---|
 | List with colors, model, context % and time | works |
-| Enter to switch, New, Agents (`a`) | works in windows that run the launcher (`ccc`) |
+| Enter to switch, New | works in windows that run the launcher (`ccc`) |
 | Stop, Stop & Remove, Restart, Rename | works; questions show up in the other session, as on macOS |
 | Bring forward a window showing another session | X11 with `wmctrl` or `xdotool`; otherwise it opens in the current window |
 | A window opened without the launcher (`claude attach` typed by hand) | can't be switched in place (there's no way to type into it): open it with `ccc` |

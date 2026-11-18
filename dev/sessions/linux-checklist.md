@@ -23,7 +23,7 @@ the desktop (X11 or Wayland) and the terminal app.
    between), and an arrow key or a letter pressed right after Enter isn't printed as `^[[B` and doesn't reach the other
    session (nothing lands in its prompt box). While a session shows,
    `~/.claude/mods/sessions-data/windows/` has a `<tty>.showing` naming it (the launcher's watcher runs: `launcher.py
-   watch` in `ps`; inotify). Enter back. Then `a`: the same window shows the agent view.
+   watch` in `ps`; inotify). Enter back. Then `p` on a background session: ◆ on its row, and its id in `~/.claude/jobs/pins.json`; `p` again takes both away.
 7. **Inside the agent view:** open a session from the agent view, then Enter on another row in its panel: the window
    switches to that session.
 8. **Another window:** open a second terminal with `ccc --new`, open the other session there. From the first window,
@@ -36,8 +36,7 @@ the desktop (X11 or Wayland) and the terminal app.
    showing it. If not, the panel says it couldn't (check `$TERMINAL` and that one of the listed terminals is installed).
 10. **Restart your own session (`u` on your row):** the window comes back to it and says "Restarted".
 11. **Rename (`r`) and the field lock:** arrows don't leave the field, Esc cancels, Enter renames.
-12. **Version and folders from `/proc`:** a session on an older Claude shows ↑ after an update; `a` brings an existing
-    agent view for the same folder forward (or opens one in place).
+12. **Version and folders from `/proc`:** a session on an older Claude shows ↑ after an update.
 13. **Sections that fold, children, marks and ⚙n:** `/sessions section A` in one session, `c` on its row: one line
     `▸ A · 1` that Enter unfolds, the focus on it and then on the row. A child (another plugin's `parent`) is two columns
     in; a badge and a status line line up with the other rows; `⚙1` while a session runs a background shell.

@@ -60,10 +60,8 @@ export type Platform = {
   // Notices whose advice depends on how windows work on this system
   text: {
     switchNeedsWindow: string
-    agentsNeedsWindow: string
     regularUnreachable: (title: string) => string
     cantOpen: (title: string) => string
-    cantOpenAgents: string
     // Why ccc couldn't bring a window forward (it opens the session in its own window instead)
     cantBring: string
   }

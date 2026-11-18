@@ -67,6 +67,7 @@ import {
   adoptAutoPins,
   keepPluginPins,
   pluginPinChange,
+  personPin,
   pluginPinsOf,
   paneWidth,
   buildNotice,
@@ -1307,10 +1308,6 @@ function windowFile(tty: string): string {
 // so a folder named with $(…), backticks or ! runs nothing
 function launcherCommand(t: WindowTarget): string {
   return `cd ${shellQuote(myCwd)} && bash ${shellQuote(LAUNCHER)} ${t.command === 'attach' ? `attach ${shellQuote(t.id)}` : 'agents'}`
-}
-
-function agentsTarget(): WindowTarget {
-  return { command: 'agents', title: 'Agents', folder: myCwd }
 }
 
 // A single window: if a viewer or the agent view (clients) is in front and the window runs the launcher, switch to the
@@ -5467,23 +5464,44 @@ async function rename($: any, text: string) {
   }
 }
 
-async function openAgentsView($: any) {
-  const front = await frontWindowShowingMe($)
-  if (!front) {
-    $.ui.toast(platform.text.agentsNeedsWindow)
+// The p key: pins the selected background session (◆), so the background service doesn't close it for being idle, or
+// unpins it. It's your own pin, as Ctrl+T in `claude agents`: Remote Control going off doesn't take it out, and
+// another plugin's unpin doesn't either. Under the same lock Claude takes to change pins.json
+async function pinSelected($: any) {
+  const f = (await rowsNow($)).find(x => `s:${x.sessionId}` === selectedRow)
+  if (!f) {
+    $.ui.toast('Select a session with ↑↓ first')
     return
   }
-  await releaseFocus($)
-  const v = await windows($)
-  for (const c of v.agentsViews) {
-    // An agent view for this folder: if it's the window you're in, there's nothing to do; else bring it forward
-    if ((await platform.processCwd(sys($), c.pid)) !== myCwd) continue
-    if (c.tty === front || (await platform.bringWindow(sys($), c.tty, 'Agents'))) return
+  if (!f.id || !f.background || !/^[A-Za-z0-9_-]+$/.test(f.id) || !jobsDir) {
+    $.ui.toast(`${f.current ? 'This session' : `“${f.title}”`} isn't a background session: only those are pinned`)
+    return
   }
-  if (await switchInPlace($, agentsTarget(), front)) return
-  if (!(await platform.openWindow(sys($), front, 'Agents', launcherCommand(agentsTarget())))) {
-    $.ui.toast(platform.text.cantOpenAgents)
-  }
+  const id = f.id
+  const file = pinsPath()
+  let said = "Another session is changing the pins: try again"
+  await withLock($, file, async () => {
+    const pins = await pinsFromFile($, true)
+    if (!pins) {
+      said = "pins.json couldn't be read as a list of ids: left as it is"
+      return
+    }
+    const autoNow = await storeGet($, 'autoPins')
+    const auto: AutoPins | null = autoNow && Array.isArray(autoNow.ids) && Array.isArray(autoNow.released) ? { ids: autoNow.ids, released: autoNow.released } : null
+    const pluginNow = pluginPinsOf(await storeGet($, 'pluginPins'))
+    const c = personPin(pins, auto, pluginNow, id)
+    if (!(await writePins($, file, c.pins, c.pinned ? [] : [id]))) {
+      said = "Couldn't write pins.json: try again"
+      return
+    }
+    if (c.auto && !sameData(c.auto, auto)) await storeSet($, 'autoPins', c.auto)
+    if (!sameData(c.plugin, pluginNow)) await storeSet($, 'pluginPins', c.plugin)
+    said = c.pinned
+      ? `“${f.title}” pinned: the background service won't close it for being idle`
+      : `“${f.title}” unpinned${c.wasPlugin ? ' (a plugin had asked to keep it pinned, and may pin it again)' : ''}`
+  })
+  $.ui.toast(said)
+  await requestRefresh($)
 }
 
 // The project this session belongs to (sessionHome in state.ts), settled at the mod's start: its record in the store,
@@ -7532,14 +7550,15 @@ export const register: Register = (on, options) => {
       { key: 'restart', hotkey: 'u', label: 'Restart', press: () => bg(restartSelected($)) },
       { key: 'rename', hotkey: 'r', label: 'Rename', press: () => bg(toggleRename($)) },
       { key: 'new', hotkey: 'n', label: 'New', press: () => { toggleNew($) } },
-      { key: 'agents', hotkey: 'a', label: 'Agents', press: () => bg(openAgentsView($)) },
+      // p: pin the selected session, so the background service keeps it (◆ on its row), or unpin it
+      { key: 'pin', hotkey: 'p', label: 'Pin', press: () => bg(pinSelected($)) },
       // f: only the sessions waiting for you (drawn bright while it's on)
       { key: 'waiting', hotkey: 'f', label: 'Waiting', bright: about.waitingOnly, press: () => bg(toggleWaiting($)) },
       // c: fold the selected session's section into one line, or unfold the one selected
       { key: 'fold', hotkey: 'c', label: 'Collapse', press: () => bg(toggleFold($)) },
     ]
-    // The compact list leaves out the two a small screen has least use for, and its help is short
-    const shownActions = compact ? actions.filter(a => a.key !== 'agents' && a.key !== 'fold') : actions
+    // The compact list leaves out folding (it has no sections), and its help is short
+    const shownActions = compact ? actions.filter(a => a.key !== 'fold') : actions
     const compactHelp = '↑↓ Enter · Esc closes'
     const actionWidths = (helpText: string) => [...shownActions.flatMap((a, i) => [...(i > 0 ? [3] : []), displayWidth(`${a.hotkey}: ${a.label}`)]), displayWidth(` · ${helpText}`)]
     const bodyRows: number | undefined = e.props.scroll?.bodyRows
@@ -7777,7 +7796,7 @@ export const register: Register = (on, options) => {
             {truncate(' Done, not asked by you: a message or a task', total - 1)}
           </Text>
         )}
-        {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (auto with Remote Control)</Text>}
+        {list.some(f => f.pinned) && <Text dimColor>◆ Pinned (p, or auto with Remote Control)</Text>}
         {helperWidth > 0 && <Text dimColor>⚙ Running in the background: subagents, shells</Text>}
         {list.some(f => f.stale) && <Text dimColor>{truncate(`⧗ Working, or done and unseen, for ${howLong(staleMs)} or more`, total)}</Text>}
         {about.spent !== null && <Text dimColor>{truncate(`${formatUsd(about.spent)} est. spent here so far (list price)`, total)}</Text>}
@@ -7794,7 +7813,7 @@ export const register: Register = (on, options) => {
             <Button
               key="usage-scope"
               plain
-              hotkey="p"
+              hotkey="a"
               label={view.scope === 'all' ? 'All' : 'Project'}
               onPress={() => { bg(chooseUsageView($, { scope: view.scope === 'all' ? 'project' : 'all' })) }}
             />
